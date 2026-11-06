@@ -22,7 +22,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  const r=JSON.parse(line),p=r.params,reply=result=>send({jsonrpc:'2.0',id:r.id,result});
  if(r.method==='initialize')reply({});
  if(r.method==='thread/start') { if(p.model!=='gpt-6.1-terra'||p.approvalPolicy!=='never'||p.sandbox!=='workspace-write')throw Error('wrong config'); reply({thread:{id:threadId,ephemeral:false},model:p.model}); }
- if(r.method==='turn/start') { if(p.effort!=='high')throw Error('wrong depth');reply({turn:{id:turnId}});notice('turn/started',{threadId,turn:{id:turnId,status:'inProgress'}});notice('item/agentMessage/delta',{threadId,turnId,itemId:'progress',delta:'Working'}); }
+ if(r.method==='turn/start') { if(p.effort!=='high')throw Error('wrong depth');reply({turn:{id:turnId}});notice('turn/started',{threadId,turn:{id:turnId,status:'inProgress'}});setTimeout(()=>notice('item/agentMessage/delta',{threadId,turnId,itemId:'progress',delta:'Working'}),100); }
  if(r.method==='turn/steer'){ if(p.expectedTurnId!==turnId||p.threadId!==threadId)throw Error('wrong turn');reply({turnId});notice('item/completed',{threadId,turnId,item:{id:'reply',type:'agentMessage',phase:'final_answer',text:JSON.stringify({outcome:'completed',summary:'方向已调整',artifacts:[]})}});notice('turn/completed',{threadId,turn:{id:turnId,status:'completed'}}); }
  if(r.method==='turn/interrupt')reply({});
 });`);
@@ -35,6 +35,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const outcome = run.then(value => ({ value }), error => ({ error }));
   await until(() => accepted && paired.canSteer('attempt-live'));
   assert.equal(paired.canSteer('other-attempt'), false);
+  // Turn readiness and streamed text arrive independently; wait for the delayed delta.
+  await until(() => paired.taskMessages('attempt-live').length > 0);
   assert.equal(paired.taskMessages('attempt-live')[0].text, 'Working');
   assert.equal(await paired.steer('attempt-live', '新的方向', AbortSignal.timeout(1000)), 'isolated-turn');
   const result = await outcome; if (result.error) throw result.error;
