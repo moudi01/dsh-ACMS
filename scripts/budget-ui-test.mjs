@@ -1,0 +1,40 @@
+import { chromium, expect } from '@playwright/test';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { startPreview } from './preview-server.mjs';
+import { OWNER } from '../src/core/util.js';
+
+const server = await startPreview({ seed: false });
+const command = (name, args) => server.company.command(OWNER, randomUUID(), name, args);
+const project = command('project.save', { name: 'Budget fixture', repoRoot: server.source, mode: 'copy', checks: [] });
+const goal = command('goal.create', { title: '累计额度续跑测试', description: 'Isolated test', acceptance: 'Reviewed files', projectId: project.id, plan: false });
+const used = server.company.policy().maxGoalRuntimeMs + 1000;
+server.company.store.transaction(() => server.company.store.put('goals', { ...goal, runtimeMs: used }));
+const tasks = ['额度任务一', '额度任务二'].map(title => command('task.create', { goalId: goal.id, title }));
+for (const task of tasks) server.engine.block(task, 'budget', '目标执行时间额度已用完', '请增加公司额度，或缩小目标范围。');
+const material = command('task.create', { goalId: goal.id, title: '保留材料等待' });
+server.engine.block(material, 'human', '材料未齐', '材料到齐后再审查');
+const browser = await chromium.launch({ channel: 'chrome', headless: true });
+const page = await browser.newPage({ viewport: { width: 1280, height: 820 } });
+const errors = []; page.on('pageerror', e => errors.push(e.message));
+try {
+  await mkdir('test-results/ui', { recursive: true });
+  await page.goto(server.url);
+  await page.getByRole('button', { name: '查看并回复 →', exact: true }).first().click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('240.02 分钟');
+  await expect(dialog).toContainText('240.00 分钟');
+  await page.getByLabel('你的回复').fill('继续');
+  await expect(dialog.getByRole('button', { name: '回复并继续', exact: true })).toBeDisabled();
+  await page.getByLabel('追加目标累计执行额度（分钟）').fill('60');
+  await expect(dialog).toContainText('300.02 分钟');
+  await page.screenshot({ path: 'test-results/ui/budget-reply.png' });
+  await dialog.getByRole('button', { name: '追加额度并继续', exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(() => tasks.every(t => server.company.store.require('tasks', t.id).status === 'succeeded')).toBe(true);
+  expect(server.company.store.require('goals', goal.id).runtimeExtraMs).toBe(3601000);
+  expect(server.company.store.require('tasks', material.id).blocker.kind).toBe('human');
+  expect(errors).toEqual([]);
+  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, bothTasksReviewed: true, materialGatePreserved: true, browserErrors: errors }, null, 2));
+  console.log('Budget reply: explicit target allowance, automatic sibling resumption, independent review and preserved material gate passed.');
+} finally { await browser.close(); await server.close(); }

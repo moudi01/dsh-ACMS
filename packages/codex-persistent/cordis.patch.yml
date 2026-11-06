@@ -1,0 +1,6 @@
+- insert:
+    - id: acms-codex
+      name: dsh-acms-codex
+      config:
+        providerName: acms-codex
+        permissionMode: acms-workspace

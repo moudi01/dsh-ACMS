@@ -1,0 +1,16 @@
+{
+  "generatedAt": "2026-11-05T17:26:54.417Z",
+  "dshVersion": "0.2.1-rc.5",
+  "provider": "acms-codex",
+  "goalStatus": "succeeded",
+  "workStatus": "succeeded",
+  "automaticPlanning": true,
+  "finalReviewPassed": true,
+  "independentReviewer": true,
+  "integration": "merged",
+  "artifacts": 7,
+  "checkRuns": 2,
+  "activeExecutions": 0,
+  "pendingInteractions": 0,
+  "note": "Real model execution in an isolated DSH profile; reviewer sandbox failures were corrected during development before the final successful run."
+}

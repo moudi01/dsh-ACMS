@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>我的待办 · 把今天理清楚</title>
+  <style>
+    :root { color-scheme: light; --ink: #223c34; --muted: #64736d; --green: #24654e; --line: #dce4de; --paper: #fffefa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f3f5f0; color: var(--ink); font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.6; }
+    button, input { font: inherit; }
+    button, input[type="checkbox"] { cursor: pointer; }
+    button { min-height: 44px; }
+    :focus-visible { outline: 3px solid #b06d18; outline-offset: 4px; }
+    [hidden] { display: none !important; }
+    .page { width: min(100% - 40px, 720px); margin: 64px auto 40px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 650; letter-spacing: .08em; }
+    .brand-mark { display: grid; place-items: center; width: 30px; height: 30px; background: var(--green); color: white; border-radius: 9px; font-size: 18px; }
+    header { margin: 32px 0; }
+    h1 { margin: 0 0 10px; font-size: clamp(30px, 5vw, 40px); line-height: 1.3; letter-spacing: -.04em; }
+    .subtitle { margin: 0; color: var(--muted); }
+    .panel { background: var(--paper); border: 1px solid var(--line); border-radius: 20px; box-shadow: 0 12px 40px #243d3208; overflow: hidden; }
+    .entry { padding: 28px; border-bottom: 1px solid var(--line); }
+    .input-label { display: block; margin-bottom: 10px; font-size: 14px; font-weight: 650; }
+    .input-row { display: flex; gap: 10px; }
+    #task-input { width: 100%; min-width: 0; min-height: 48px; border: 1px solid #a4b4a9; border-radius: 10px; background: #fff; padding: 11px 14px; color: var(--ink); }
+    #task-input::placeholder { color: #6c7771; }
+    .add { flex-shrink: 0; border: 1px solid var(--green); border-radius: 10px; padding: 10px 20px; background: var(--green); color: white; font-weight: 600; }
+    .add:hover { background: #194b39; }
+    .hint { margin: 9px 0 0; color: var(--muted); font-size: 12px; }
+    .error { margin: 9px 0 0; color: #a02c2c; font-size: 14px; }
+    .storage-warning { margin: 20px 28px 0; padding: 12px 14px; background: #fff4dd; border: 1px solid #d8b275; border-radius: 8px; color: #704614; font-size: 14px; }
+    .list-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 22px 28px 16px; }
+    h2 { margin: 0; font-size: 16px; font-weight: 650; }
+    .count { margin: 0; font-size: 13px; color: var(--muted); }
+    #task-list { list-style: none; margin: 0; padding: 0 16px 16px; }
+    .task { display: flex; align-items: center; gap: 12px; min-height: 68px; border-bottom: 1px solid #e7ece6; padding: 10px 12px; }
+    .task:last-child { border-bottom: 0; }
+    .task-label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 13px; padding: 7px 0; cursor: pointer; }
+    .task-check { flex: 0 0 21px; width: 21px; height: 21px; margin: 0; accent-color: var(--green); }
+    .task-text { overflow-wrap: anywhere; white-space: pre-wrap; }
+    .task.is-complete .task-text { color: #6b756f; text-decoration: line-through; }
+    .delete { flex-shrink: 0; border: 1px solid transparent; padding: 6px 12px; background: transparent; border-radius: 8px; color: #86504b; font-size: 14px; }
+    .delete:hover { background: #fcf0eb; border-color: #efd2ca; color: #902f27; }
+    .empty { padding: 36px 24px 48px; text-align: center; }
+    .empty-icon { display: grid; place-items: center; width: 52px; height: 52px; margin: 0 auto 16px; border: 1px solid #d7e3d6; border-radius: 16px; background: #edf3e8; color: var(--green); font-size: 26px; }
+    .empty-title { margin: 0 0 6px; font-weight: 650; }
+    .empty-note { margin: 0; font-size: 14px; color: var(--muted); }
+    footer { display: flex; justify-content: space-between; gap: 12px; margin: 18px 4px 0; font-size: 12px; color: var(--muted); }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    @media (max-width: 520px) {
+      .page { width: calc(100% - 28px); margin-top: 28px; }
+      header { margin: 26px 0; }
+      .entry { padding: 20px; }
+      .input-row { flex-direction: column; }
+      .list-heading { padding: 20px 20px 12px; }
+      .storage-warning { margin: 16px 20px 0; }
+      #task-list { padding: 0 8px 12px; }
+      footer { flex-direction: column; gap: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">✓</span>我的待办</div>
+    <header>
+      <h1>把今天，理清楚。</h1>
+      <p class="subtitle">记下要做的事，一件一件慢慢完成。</p>
+    </header>
+    <section class="panel" aria-label="待办管理">
+      <form id="task-form" class="entry" novalidate>
+        <label class="input-label" for="task-input">添加一件待办</label>
+        <div class="input-row">
+          <input id="task-input" name="task" type="text" placeholder="例如：读完一章书" autocomplete="off" aria-describedby="input-hint input-error">
+          <button class="add" type="submit">＋ 添加任务</button>
+        </div>
+        <p id="input-hint" class="hint">输入后按 Enter，也可以快速添加。</p>
+        <p id="input-error" class="error" role="alert" hidden>请先输入任务内容。</p>
+      </form>
+      <p id="storage-warning" class="storage-warning" role="alert" hidden></p>
+      <div class="list-heading">
+        <h2>任务清单</h2>
+        <p id="task-count" class="count">0 项待完成 · 0 项已完成</p>
+      </div>
+      <div id="empty-state" class="empty">
+        <span class="empty-icon" aria-hidden="true">✓</span>
+        <p class="empty-title">从一件小事开始</p>
+        <p class="empty-note">在上方添加你的第一条待办。</p>
+      </div>
+      <ul id="task-list" aria-label="待办任务"></ul>
+    </section>
+    <footer>
+      <span id="save-status">任务自动保存在当前浏览器</span>
+      <span>一点进展，也值得记录。</span>
+    </footer>
+    <p id="announcement" class="sr-only" role="status" aria-live="polite"></p>
+    <noscript><p class="error">请启用浏览器的 JavaScript，才能添加和保存待办。</p></noscript>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const STORAGE_KEY = 'acms.todo.tasks.v1';
+      const form = document.getElementById('task-form');
+      const input = document.getElementById('task-input');
+      const inputError = document.getElementById('input-error');
+      const list = document.getElementById('task-list');
+      const emptyState = document.getElementById('empty-state');
+      const count = document.getElementById('task-count');
+      const warning = document.getElementById('storage-warning');
+      const saveStatus = document.getElementById('save-status');
+      const announcement = document.getElementById('announcement');
+      let tasks = [];
+
+      function showStorageWarning(message) {
+        warning.textContent = message;
+        warning.hidden = false;
+        saveStatus.textContent = '本地保存异常，请查看提示';
+      }
+
+      function loadTasks() {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw === null) return;
+          const saved = JSON.parse(raw);
+          const ids = new Set();
+          if (!Array.isArray(saved) || !saved.every(task => {
+            if (!task || typeof task.id !== 'string' || !task.id ||
+                typeof task.text !== 'string' || !task.text.trim() ||
+                typeof task.completed !== 'boolean' || ids.has(task.id)) return false;
+            ids.add(task.id);
+            return true;
+          })) throw new Error('Invalid stored tasks');
+          tasks = saved;
+        } catch (error) {
+          showStorageWarning('无法读取已保存的任务。你仍可使用待办；添加新任务并成功保存后，会替换原有记录。');
+        }
+      }
+
+      function saveTasks() {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+          warning.hidden = true;
+          saveStatus.textContent = '已自动保存到当前浏览器';
+        } catch (error) {
+          showStorageWarning('保存失败：当前修改仅在本页有效，刷新可能丢失。请检查浏览器是否允许本地存储。');
+        }
+      }
+
+      function render() {
+        list.replaceChildren();
+        for (const task of tasks) {
+          const row = document.createElement('li');
+          row.className = 'task' + (task.completed ? ' is-complete' : '');
+          const label = document.createElement('label');
+          label.className = 'task-label';
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.className = 'task-check';
+          checkbox.checked = task.completed;
+          const text = document.createElement('span');
+          text.className = 'task-text';
+          text.textContent = task.text;
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'delete';
+          remove.textContent = '删除';
+          remove.setAttribute('aria-label', '删除任务：' + task.text);
+          checkbox.addEventListener('change', () => {
+            task.completed = checkbox.checked;
+            row.classList.toggle('is-complete', task.completed);
+            saveTasks();
+            updateSummary();
+            announcement.textContent = task.completed ? '已完成：' + task.text : '已取消完成：' + task.text;
+          });
+          remove.addEventListener('click', () => {
+            const index = tasks.findIndex(item => item.id === task.id);
+            tasks.splice(index, 1);
+            saveTasks();
+            render();
+            const next = list.children[Math.min(index, tasks.length - 1)];
+            if (next) next.querySelector('.delete').focus();
+            else input.focus();
+            announcement.textContent = '已删除：' + task.text;
+          });
+          label.append(checkbox, text);
+          row.append(label, remove);
+          list.append(row);
+        }
+        updateSummary();
+      }
+
+      function updateSummary() {
+        const completed = tasks.filter(task => task.completed).length;
+        count.textContent = (tasks.length - completed) + ' 项待完成 · ' + completed + ' 项已完成';
+        emptyState.hidden = tasks.length > 0;
+        list.hidden = tasks.length === 0;
+      }
+
+      input.addEventListener('input', () => {
+        inputError.hidden = true;
+        input.removeAttribute('aria-invalid');
+      });
+      // 中文输入法确认候选词时，不把同一次回车作为提交。
+      input.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && (event.isComposing || event.keyCode === 229)) event.preventDefault();
+      });
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        const text = input.value.trim();
+        if (!text) {
+          inputError.hidden = false;
+          input.setAttribute('aria-invalid', 'true');
+          input.focus();
+          return;
+        }
+        const id = typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : Date.now().toString(36) + Math.random().toString(36).slice(2);
+        tasks.push({ id, text, completed: false });
+        saveTasks();
+        render();
+        input.value = '';
+        inputError.hidden = true;
+        input.removeAttribute('aria-invalid');
+        input.focus();
+        announcement.textContent = '已添加：' + text;
+      });
+
+      loadTasks();
+      render();
+    })();
+  </script>
+</body>
+</html>

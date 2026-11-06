@@ -1,0 +1,31 @@
+{
+  "name": "dsh-acms",
+  "version": "0.1.0",
+  "description": "ACMS — Agent Company Management System for DeepSeek Harness",
+  "type": "module",
+  "private": true,
+  "workspaces": ["packages/codex-persistent"],
+  "license": "UNLICENSED",
+  "main": "./src/host/index.js",
+  "exports": { ".": "./src/host/index.js", "./client": "./lib/client.js", "./package.json": "./package.json" },
+  "files": ["src", "lib", "cordis.patch.yml", "README.md", "docs", "scripts", "examples", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+  "engines": { "node": ">=24.0.0", "dsh": ">=0.2.1-rc.5 <0.3.0" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-renderer", "@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-client-connection"] }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.js packages/codex-persistent/test/*.test.mjs",
+    "check": "node scripts/check.mjs",
+    "demo": "node scripts/demo.mjs",
+    "test:ui": "node scripts/ui-test.mjs",
+    "test:usability": "node scripts/usability-test.mjs",
+    "test:structure": "node scripts/structure-test.mjs",
+    "test:empty-models": "node scripts/empty-models-test.mjs",
+    "test:pairing-ui": "node scripts/pairing-ui-test.mjs",
+    "test:budget-ui": "node scripts/budget-ui-test.mjs",
+    "package": "npm run build && npm pack"
+  },
+  "devDependencies": { "esbuild": "0.25.12", "react": "19.2.0", "react-dom": "19.2.0", "@playwright/test": "1.56.1" }
+}

@@ -1,0 +1,51 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { Field, ActionButton } from './components.jsx';
+import { api } from './api.js';
+const healthLabel = s => ({ available: '检测通过', unavailable: '检测失败' }[s] ?? '未检测');
+export function ModelPicker({ form, setForm, data, onCheck }) {
+  const catalog = data.runtime.modelCatalog ?? { models: [] }; const [defaults] = useState(catalog.defaultSelection);
+  const model = form.model || defaults?.model; const routes = catalog.models.find(m => m.id === model)?.routes ?? [];
+  const provider = !form.provider || form.provider === 'auto' ? defaults?.provider : form.provider;
+  const selected = routes.find(r => r.provider === provider && (!form.llmProvider || r.llmProvider === form.llmProvider));
+  const binding = selected && { model, provider: selected.provider, llmProvider: selected.llmProvider || '', reasoningEffort: form.reasoningEffort || '' };
+  const key = JSON.stringify(binding); const current = useRef(key); current.current = key;
+  const [result, setResult] = useState(null); const [error, setError] = useState(''); const [checking, setChecking] = useState(false);
+  const checked = result && result.key === key ? result.value : null;
+  const health = checked ?? selected?.health ?? { status: 'untested', reason: '尚未执行实际连通性检测' };
+  const reasoning = checked?.reasoning ?? selected?.health?.reasoning ?? selected?.reasoning;
+  const reason = checking ? '模型检测正在进行，请稍候' : !selected ? '请选择 DSH 模型或已配对的外部模型；旧桥接执行器已移除。' : health.status === 'unavailable' ? `模型检测失败：${health.reason}。请重新检测或选择其他模型。` : '';
+  useEffect(() => { setForm(f => ({ ...f, modelBlockReason: reason })); }, [reason]);
+  const bind = (model, route) => { setError(''); setForm(f => ({ ...f, model, provider: route.provider, llmProvider: route.llmProvider || '', reasoningEffort: '', modelBlockReason: '' })); };
+  const check = async () => { const submitted = key; onCheck?.(); setChecking(true); setError(''); try { const value = await api.modelCheck(binding); if (current.current === submitted) setResult({ key: submitted, value }); } catch(e) { if (current.current === submitted) setError(e.message); } finally { setChecking(false); } };
+  const rows = catalog.models.flatMap(m => m.routes.filter((r, i, all) => r.origin === 'external' || all.findIndex(x => x.origin === 'internal' && x.llmProvider === r.llmProvider) === i).map(r => ({ id: m.id, route: r })));
+  const active = data.attempts.filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending).length;
+  const noCheck = checking ? '正在检测，最长等待 45 秒' : !selected ? '请先选择模型' : selected.probeSupported === false ? `此运行环境暂不支持无工具检测：${selected.probeReason}` : data.runtime.activeProbes ? '已有模型检测正在进行' : active >= data.policy.maxConcurrent ? '执行资源已满，请等待任务结束' : '';
+  const sibling = inherits => routes.find(r => r.origin === 'internal' && r.llmProvider === selected?.llmProvider && r.inheritsParentContext === inherits);
+  return <section className="acms-model-picker" aria-label="模型配置"><div className="acms-model-list" role="radiogroup" aria-label="模型列表">{rows.map(({ id, route }) => {
+    const chosen = model === id && selected && (route.origin === 'external' ? route.provider === selected.provider : route.llmProvider === selected.llmProvider && selected.origin === 'internal');
+    return <label className="acms-model-row" data-selected={chosen} key={`${id}:${route.provider}:${route.llmProvider}`}><input type="radio" name="acms-model" aria-label={`${id} · ${route.displayName || route.llmProvider || (route.origin === 'internal' ? 'DSH' : '外部 agent')}`} checked={!!chosen} onChange={() => bind(id, route)} /><span><strong>{id}</strong><small>{route.origin === 'internal' ? 'DSH 内部' : '已配对外部 agent'} · {route.displayName || route.llmProvider}</small></span><em>{healthLabel(route.health?.status)}</em></label>;
+  })}</div>{!rows.length && <p className="acms-field-error">DSH 暂无模型列表，请检查 DSH 模型设置或配对外部 agent。</p>}
+  {selected ? <div className="acms-selected-model"><h3>{model}</h3><dl className="acms-model-facts"><dt>来源</dt><dd>{selected.origin === 'internal' ? 'DSH 内部模型' : `外部 agent：${selected.displayName}`}</dd><dt>任务上下文</dt><dd>{selected.persistent ? '按任务保留并续接；不同任务与审查相互隔离' : '每次执行创建新上下文；任务记录仍保留'}</dd></dl>
+    {selected.origin === 'internal' && <Field label="父代理上下文" hint="继承的是 ACMS 调度父代理，不是当前 DSH 聊天。"><div><label className="acms-checkbox"><input type="checkbox" checked={!!selected.inheritsParentContext} disabled={!sibling(!selected.inheritsParentContext)} onChange={e => bind(model, sibling(e.target.checked))} />继承父代理上下文</label>{!sibling(!selected.inheritsParentContext) && <small>当前 DSH 仅提供这一种上下文方式。</small>}</div></Field>}
+    <Field label="思考深度" hint={reasoning?.effective ? reasoning.source : '当前深度未知。点击检测后读取，打开页面不会自动检测。'}>{reasoning?.selectable ? <select value={form.reasoningEffort || ''} onChange={e => setForm(f => ({ ...f, reasoningEffort: e.target.value }))}><option value="">跟随配置（{reasoning.configured ?? reasoning.effective ?? '服务默认'}）</option>{reasoning.efforts.map(e => <option key={e.id} value={e.id}>{e.name} ({e.id})</option>)}</select> : <input readOnly value={form.reasoningEffort || reasoning?.effective || '尚未读取'} />}</Field>
+    <div className={`acms-model-health ${health.status}`} role="status"><b>{checking ? '正在检测…' : healthLabel(health.status)}</b><span>{health.reason}</span>{health.checkedAt && <small>{new Date(health.checkedAt).toLocaleString('zh-CN')} · {health.latencyMs} ms</small>}</div></div> : <p className="acms-field-error">{reason}</p>}
+  <ActionButton type="button" reason={noCheck} onClick={check}>{checking ? '检测中…' : '检测模型连通性'}</ActionButton><p className="acms-sectionnote">仅点击按钮时发送真实简短请求并读取配置，可能消耗少量额度。检测结果有效期 10 分钟。</p>{error && <p className="acms-field-error" role="alert">{error}</p>}</section>;
+}
+
+export function ModelsPage({ data, refresh }) {
+  const [form, setForm] = useState(() => data.runtime.modelCatalog?.defaultSelection ?? {});
+  const [invite, setInvite] = useState(null); const [candidate, setCandidate] = useState(null); const [busy, setBusy] = useState(false); const [message, setMessage] = useState('');
+  const [pairingOpen, setPairingOpen] = useState(false); const dialog = useRef(null); const invitationHeading = useRef(null); const inFlight = useRef(false);
+  useEffect(() => { if (pairingOpen) { dialog.current?.showModal(); invitationHeading.current?.focus(); } }, [pairingOpen]);
+  const run = async action => { if (inFlight.current) return; inFlight.current = true; setBusy(true); setMessage(''); try { await action(); } catch(e) { setMessage(e.message); } finally { inFlight.current = false; setBusy(false); } };
+  useEffect(() => { let cancelled = false; api.pairing({ action: 'pending' }).then(saved => { if (!cancelled && !inFlight.current && saved) setInvite(current => current ?? saved); }).catch(() => {}); return () => { cancelled = true; }; }, []);
+  const createInvitation = () => run(async () => { const next = await api.pairing({ action: 'invite' }); setInvite(next); setCandidate(null); });
+  const openPairing = () => { setPairingOpen(true); if (!invite) createInvitation(); };
+  return <><div className="acms-pagehead"><div><div className="acms-eyebrow">MODELS</div><h1>模型列表</h1><p>内部模型来自 DSH；外部模型通过配对目标 agent 的运行环境添加。</p></div><ActionButton className="primary" reason={busy ? '正在处理，请稍候' : ''} onClick={openPairing}>{invite ? '查看配对邀请' : busy ? '正在生成邀请…' : '＋ 配对外部 agent'}</ActionButton></div>
+  {message && !pairingOpen && <div className="acms-alert" role="status">{message}</div>}
+  {pairingOpen && <dialog ref={dialog} className="acms-modal wide" aria-labelledby="acms-pairing-title" onClose={() => setPairingOpen(false)} onClick={e => { if (e.target === dialog.current) setPairingOpen(false); }}><header><h2 id="acms-pairing-title" ref={invitationHeading} tabIndex={-1}>配对外部 agent</h2><button type="button" aria-label="关闭配对" onClick={() => setPairingOpen(false)}>×</button></header><div className="acms-form-body acms-pairing">
+  {message && <div className="acms-alert" role="status">{message}</div>}
+  {invite ? <><ol><li>复制 prompt，粘贴到本机目标 agent，让它准备自动启动入口。</li><li>目标 agent 完成后，读取回执并检查模型、启动文件和参数。</li><li>确认添加后进入模型列表；检测需要另行点击。</li></ol><Field label="配对 prompt"><textarea rows={8} readOnly value={invite.prompt || `已恢复待确认的回执：${invite.responseFile}。点击“读取配对结果”检查配置；如需新提示词，请重新生成邀请。`} /></Field><div className="acms-actions"><ActionButton reason={busy ? '正在处理，请稍候' : !invite.prompt ? '已恢复回执，无需再次复制提示词' : ''} onClick={() => run(async () => { await navigator.clipboard.writeText(invite.prompt); setMessage('已复制配对 prompt'); })}>复制 prompt</ActionButton><ActionButton reason={busy ? '正在处理，请稍候' : ''} onClick={() => run(async () => { setCandidate(null); setCandidate(await api.pairing({ action: 'inspect', id: invite.id })); })}>读取配对结果</ActionButton><ActionButton reason={busy ? '正在处理，请稍候' : ''} onClick={createInvitation}>重新生成邀请</ActionButton></div><p className="acms-sectionnote">邀请有效至 {new Date(invite.expiresAt).toLocaleString('zh-CN')}；关闭窗口会保留本页邀请。配对登记运行入口，不授予公司管理权限。</p>
+  {candidate && <div className="acms-pairing-candidate"><h3>核对运行配置</h3><dl className="acms-definition"><dt>模型</dt><dd>{candidate.model}</dd><dt>目标 agent</dt><dd>{candidate.name}</dd><dt>执行文件</dt><dd><code>{candidate.command}</code></dd><dt>固定参数</dt><dd><code>{JSON.stringify(candidate.args)}</code></dd><dt>上下文</dt><dd>{candidate.persistent ? '按任务续接' : '每次新建'}</dd><dt>思考深度</dt><dd>{candidate.reasoningEffort || '未知'}（配置声明，尚未验证）</dd><dt>无工具检测</dt><dd>{candidate.probeSupported === false ? `暂不支持：${candidate.probeReason}` : '待用户手动检测'}</dd></dl><p>登记不会启动模型；分配任务后，ACMS 将启动上述本机程序。</p><ActionButton className="primary" reason={busy ? '正在处理，请稍候' : ''} onClick={() => run(async () => { await api.pairing({ action: 'accept', id: invite.id, fingerprint: candidate.fingerprint }); await refresh(); setForm({ provider: candidate.id, model: candidate.model }); setPairingOpen(false); setInvite(null); setCandidate(null); setMessage('已添加外部模型，尚未进行连通性检测'); })}>确认添加模型</ActionButton></div>}</> : <><p>{busy ? '正在生成配对邀请…' : '配对邀请尚未生成。'}</p><ActionButton reason={busy ? '正在处理，请稍候' : ''} onClick={createInvitation}>重试生成邀请</ActionButton></>}</div></dialog>}
+  <section className="acms-panel"><ModelPicker form={form} setForm={setForm} data={data} onCheck={() => setMessage('')} /></section></>;
+}
