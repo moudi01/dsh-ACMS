@@ -342,7 +342,7 @@ export class Company {
       const pending = this.store.list('interactions').filter(i => i.taskId === task.id && i.status === 'pending');
       if (pending.some(i => i.kind !== 'budget' || (i.taskGeneration ?? task.generation) !== task.generation)) continue;
       for (const wait of pending) this.store.put('interactions', { ...wait, status: 'cancelled', reason: '目标累计执行额度已恢复，额度等待自动解除', resolvedBy: interactionId });
-      const ready = task.dependencies.every(id => { const dependency = this.store.require('tasks', id); return dependency.status === 'succeeded' || (dependency.status === 'archived' && dependency.legacy?.completionAccepted === true); });
+      const ready = task.dependencies.every(id => { const dependency = this.store.require('tasks', id); return dependency.status === 'succeeded'; });
       this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : ready ? 'ready' : 'blocked', blocker: null, attempts: 0, retryAt: null });
       this.store.event('task.budget.released', task.id, { interactionId }, actor);
     }
@@ -354,7 +354,7 @@ export class Company {
     const result = this.store.put('tasks', { ...task, status: 'ready', stageIndex: task.kind === 'review' ? task.stageIndex : 0, stopRequested: null }); this.store.event('task.reconciled', task.id, { evidence: args.evidence }, actor); return result;
   }
   snapshot() {
-    const collections = ['projects', 'goals', 'tasks', 'agents', 'workflows', 'workflowHistory', 'attempts', 'artifacts', 'verifications', 'interactions', 'proposals', 'migrations', 'changes', 'notifications'];
+    const collections = ['projects', 'goals', 'tasks', 'agents', 'workflows', 'workflowHistory', 'attempts', 'artifacts', 'verifications', 'interactions', 'proposals', 'changes', 'notifications'];
     const data = Object.fromEntries(collections.map(c => [c, this.store.list(c)]));
     data.entityTrash = ['project', 'goal', 'agent'].flatMap(kind => data[`${kind}s`].filter(e => e.status === 'deleted' && e.deletion?.rootId === e.id).map(e => ({ ...e, entityKind: kind })));
     for (const c of ['projects', 'goals', 'agents']) data[c] = data[c].filter(e => e.status !== 'deleted');
@@ -363,6 +363,6 @@ export class Company {
     data.tasks = data.tasks.filter(t => !deleted.has(t.id));
     for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) data[c] = data[c].filter(item => !deleted.has(item.taskId));
     data.goals = data.goals.map(g => ({ ...g, taskSummary: goalSummary(g, data.tasks) }));
-    return { ...data, ui: { migrationVisible: data.migrations.length === 0 }, policy: this.policy(), cursor: this.store.cursor() };
+    return { ...data, policy: this.policy(), cursor: this.store.cursor() };
   }
 }

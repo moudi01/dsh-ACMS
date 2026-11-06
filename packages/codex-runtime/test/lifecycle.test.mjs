@@ -5,17 +5,15 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { apply } from '../lib/index.js';
+import { startCodexRun } from '../lib/index.js';
+import { ThreadStore } from '../lib/store.js';
 
 const fakeBin = fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url));
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), 'codex-persistent-life-'));
+  const root = mkdtempSync(join(tmpdir(), 'codex-runtime-life-'));
   const stateFile = join(root, 'codex-threads.json');
   const children = [];
-  const providers = [];
   const ctx = {
-    logger: { warn() {} },
-    subagents: { registerProvider(provider) { providers.push(provider); } },
     subprocess: { spawn(spec) {
       const child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, stdio: 'pipe', env: { ...process.env, ...spec.env }, windowsHide: true });
       children.push(child);
@@ -34,10 +32,21 @@ function fixture(t) {
   });
   return {
     root, stateFile, children,
-    provider(mode = 'success', options = {}) {
-      apply(ctx, { codexBin: fakeBin, stateFile, startupTimeoutMs: 2000, turnTimeoutMs: 2000, disposeGraceMs: 100,
-        env: { FAKE_DB: join(root, 'fake-db.json'), FAKE_MODE: mode }, ...options });
-      return providers.at(-1);
+    runtime(mode = 'success', options = {}) {
+      return { async start(request) {
+        const store = new ThreadStore(stateFile, 'test:one');
+        try {
+          store.update({ status: 'starting', terminalResult: null });
+          return await startCodexRun(request, { codexBin: fakeBin, cwd: root, store,
+            model: 'fixture-model', permissionMode: 'acms-workspace',
+            startupTimeoutMs: 2000, turnTimeoutMs: 2000, disposeGraceMs: 100,
+            env: { FAKE_DB: join(root, 'fake-db.json'), FAKE_MODE: mode },
+            spawn: spec => ctx.subprocess.spawn(spec), onError: () => {}, ...options });
+        } catch (error) {
+          await store.close(error.timedOut ? 'timeout' : 'failed');
+          throw error;
+        }
+      } };
     },
     request(signal = new AbortController().signal) { return { prompt: [{ type: 'text', text: 'Test' }], label: 'test:one', cwd: root, parent: { id: 'parent' }, signal }; },
     summary() { return JSON.parse(readFileSync(stateFile, 'utf8'))['test:one']; }
@@ -46,7 +55,7 @@ function fixture(t) {
 
 test('separate app-server processes resume the same ID and return IDs; locks survive until cleanup', async t => {
   const f = fixture(t);
-  const provider = f.provider();
+  const provider = f.runtime();
   const first = await provider.start(f.request());
   await assert.rejects(provider.start(f.request()), { code: 'CODEX_THREAD_BUSY' });
   const a = await first.result;
@@ -69,7 +78,7 @@ test('separate app-server processes resume the same ID and return IDs; locks sur
 
 test('transport product failure is returned as error with original HTTP classification', async t => {
   const f = fixture(t);
-  const run = await f.provider('failure').start(f.request());
+  const run = await f.runtime('failure').start(f.request());
   const result = await run.result;
   await run.dispose();
   assert.equal(result.stopReason, 'error');
@@ -79,12 +88,12 @@ test('transport product failure is returned as error with original HTTP classifi
 
 test('app-server exit keeps the thread ID and a new dispatch resumes it', async t => {
   const f = fixture(t);
-  const run = await f.provider('process-exit').start(f.request());
+  const run = await f.runtime('process-exit').start(f.request());
   const failed = await run.result;
   await run.dispose();
   assert.equal(failed.stopReason, 'error');
   assert.match(failed.diagnostic, /category: process/);
-  const retry = await f.provider().start(f.request());
+  const retry = await f.runtime().start(f.request());
   const result = await retry.result;
   await retry.dispose();
   assert.equal(result.threadId, failed.threadId);
@@ -93,13 +102,13 @@ test('app-server exit keeps the thread ID and a new dispatch resumes it', async 
 
 test('turn timeout and explicit interruption both settle and release locks', async t => {
   const f = fixture(t);
-  const timeoutRun = await f.provider('turn-timeout', { turnTimeoutMs: 80 }).start(f.request());
+  const timeoutRun = await f.runtime('turn-timeout', { turnTimeoutMs: 80 }).start(f.request());
   const timed = await timeoutRun.result;
   await timeoutRun.dispose();
   assert.equal(timed.stopReason, 'error');
   assert.match(timed.diagnostic, /timeout exceeded/);
   assert.equal(f.summary().lastStatus, 'timeout');
-  const cancel = await f.provider('cancel').start(f.request());
+  const cancel = await f.runtime('cancel').start(f.request());
   await cancel.dispose();
   const cancelled = await cancel.result;
   assert.equal(cancelled.stopReason, 'aborted');
@@ -109,9 +118,9 @@ test('turn timeout and explicit interruption both settle and release locks', asy
 
 test('startup timeout rejects before publication, reaps the process, and clears the lease', async t => {
   const f = fixture(t);
-  await assert.rejects(f.provider('startup-timeout', { startupTimeoutMs: 80 }).start(f.request()), /stage: initialize/);
+  await assert.rejects(f.runtime('startup-timeout', { startupTimeoutMs: 80 }).start(f.request()), /stage: initialize/);
   assert.equal(f.summary().lastStatus, 'timeout');
-  const retry = await f.provider().start(f.request());
+  const retry = await f.runtime().start(f.request());
   assert.equal((await retry.result).stopReason, 'completed');
   await retry.dispose();
 });

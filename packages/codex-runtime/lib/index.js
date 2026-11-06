@@ -1,10 +1,7 @@
 // Fork of @deepseek-ai/dsh-subagent-codex 0.2.1-rc.5 (MIT).
 // Durable thread lifecycle; original permission/failure adapter preserved.
-import { ThreadStore, resolveThreadKey } from "./store.js";
 import { createRequire } from "node:module";
-import z from "@deepseek-ai/schemastery";
-import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
-import { NO_START_CAPABILITIES, assertPositiveFinite, assertUsableCwd, settleRunResult, subprocessRunHandle } from "@deepseek-ai/dsh-subagent";
+import { settleRunResult, subprocessRunHandle } from "@deepseek-ai/dsh-subagent";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -236,8 +233,8 @@ var CodexAppServerWire = class {
     const response = object(await this.guarded(this.transport.request(method, params, signal), signal), method + " response");
     const thread = object(response.thread, method + " thread");
     const id = string(thread.id, method + " thread id");
-    if (thread.ephemeral === true) throw new Error("codex-persistent: server returned an ephemeral thread");
-    if (previous && id !== previous) throw new Error("codex-persistent: resume returned a different thread id");
+    if (thread.ephemeral === true) throw new Error("codex-runtime: server returned an ephemeral thread");
+    if (previous && id !== previous) throw new Error("codex-runtime: resume returned a different thread id");
     this.threadId = id;
     for (const notification of this.earlyThreadNotifications.splice(0)) {
       const notificationThread = notification.params?.threadId ?? notification.params?.thread?.id;
@@ -578,22 +575,10 @@ var CodexAppServerWire = class {
 *
 * @module @deepseek-ai/dsh-subagent-codex/run
 */
-/** Default POSIX grace between subprocess termination tiers. */
-const DEFAULT_DISPOSE_GRACE_MS = 3e3;
 const codexPackageJsonPath = createRequire(import.meta.url).resolve("@openai/codex/package.json");
 const codexPackageManifest = JSON.parse(readFileSync(codexPackageJsonPath, "utf8"));
 /** Absolute package-local JavaScript wrapper selected by the package manifest. */
 const CODEX_PACKAGE_BIN = resolve(dirname(codexPackageJsonPath), codexPackageManifest.bin.codex);
-/** Native non-interactive Codex modes mapped to official `thread/start` fields. */
-const CODEX_PERMISSION_MODES = [
-	"acms-workspace",
-	"acms-review",
-	"never",
-	"approve-for-me",
-	"dangerously-bypass-approvals-and-sandbox"
-];
-/** Safe default for unattended Codex runs. */
-const DEFAULT_CODEX_PERMISSION_MODE = "acms-workspace";
 function failureDiagnostic(facts) {
 	const fields = [
 		"product: Codex",
@@ -875,76 +860,4 @@ async function startCodexRun(request, spec) {
     canSteer: () => !wire.closed && !wire.terminalObserved && !!wire.turnId, steer: (text, signal) => wire.steer(text, signal) });
 }
 //#endregion
-//#region lib/types/index.js
-/**
-* Profile-named Codex one-shot subagent provider. Every accepted run starts a
-* fresh official package-local Codex wrapper with `app-server --stdio` in the
-* delegating Session's workspace and publishes only after a persistent thread exists.
-*
-* @module @deepseek-ai/dsh-subagent-codex
-*/
-const name = "acms-codex";
-const inject = ["subagents", "subprocess"];
-const DEFAULT_PROVIDER_NAME = "acms-codex";
-const Config = z.object({
-  providerName: z.string().min(1).default(DEFAULT_PROVIDER_NAME),
-  model: z.string().min(1).default("gpt-6-astra"),
-  env: z.dict(z.string()).default({}),
-  permissionMode: z.union([...CODEX_PERMISSION_MODES]).default(DEFAULT_CODEX_PERMISSION_MODE),
-  disposeGraceMs: z.number().default(DEFAULT_DISPOSE_GRACE_MS),
-  startupTimeoutMs: z.number().default(60000),
-  turnTimeoutMs: z.number().default(1200000),
-  stateFile: z.string(),
-  threadKey: z.string(),
-  codexBin: z.string()
-});
-
-class CodexProvider {
-  capabilities = NO_START_CAPABILITIES;
-  inheritsParentContext = false;
-  constructor(name, ctx, config) { this.name = name; this.ctx = ctx; this.config = config; }
-  async start(request) {
-    const cwd = assertUsableCwd(name, "child cwd", request.cwd);
-    textTask(request.prompt);
-    request.signal.throwIfAborted();
-    const key = resolveThreadKey(this.config, request, this.name);
-    const store = new ThreadStore(this.config.stateFile, key);
-    try {
-      store.update({ status: "running", lastStatus: "starting", model: this.config.model,
-        provider: this.name, cwd, ownerPid: process.pid, startedAt: new Date().toISOString(), currentTurn: null,
-        toolCalls: 0, failure: null, terminalResult: null,
-        attemptId: /^ACMS_ATTEMPT_ID=([a-zA-Z0-9_-]+)\n/.exec(request.prompt.filter(b => b.type === 'text').map(b => b.text).join('\n'))?.[1] ?? null });
-      await store.publish(request.signal);
-      store.record("provider/runStarting", { provider: this.name, model: this.config.model });
-      return await startCodexRun(request, {
-        ...this.config, cwd, store,
-        permissionMode: this.config.permissionMode === 'acms-workspace' && String(request.label).includes(':role-reviewer:') ? 'acms-review' : this.config.permissionMode,
-        spawn: spawnSpec => this.ctx.subprocess.spawn(spawnSpec),
-        onError: (error, stopReason) => this.ctx.logger.warn(
-          'codex-persistent "' + this.name + '": child run failed (' + stopReason + '): ' + error.message)
-      });
-    } catch (error) {
-      try { await store.close(request.signal.aborted ? "cancelled" : error.timedOut ? "timeout" : "failed", {
-        failure: error.facts ?? { stage: "initialize", category: "unknown" }
-      }); } catch (closeError) { throw new AggregateError([error, closeError], "Codex startup and state cleanup failed"); }
-      throw error;
-    }
-  }
-}
-
-function apply(ctx, config = {}) {
-  const resolved = {
-    providerName: DEFAULT_PROVIDER_NAME, model: "gpt-6-astra", env: {},
-    permissionMode: DEFAULT_CODEX_PERMISSION_MODE, disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS,
-    startupTimeoutMs: 60000, turnTimeoutMs: 1200000, ...config,
-    stateFile: resolve(config.stateFile ?? process.env.ACMS_CODEX_STATE_FILE ?? ".acms/codex-threads.json")
-  };
-  for (const field of ["disposeGraceMs", "startupTimeoutMs", "turnTimeoutMs"]) {
-    assertPositiveFinite(name, field, resolved[field]);
-    if (resolved[field] > MAX_TIMER_DELAY_MS) throw new Error(field + " exceeds MAX_TIMER_DELAY_MS");
-  }
-  if (!CODEX_PERMISSION_MODES.includes(resolved.permissionMode)) throw new Error("Invalid Codex permissionMode");
-  if (resolved.codexBin) resolved.codexBin = resolve(resolved.codexBin);
-  ctx.subagents.registerProvider(new CodexProvider(resolved.providerName, ctx, resolved));
-}
-export { Config, apply, inject, name, CodexProvider, CodexAppServerWire, startCodexRun };
+export { CodexAppServerWire, startCodexRun };

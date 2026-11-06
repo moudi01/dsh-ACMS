@@ -4,20 +4,19 @@
 
 所有者提出目标；负责人自动规划；执行员按需创建；交付物通过检查后自动唤醒独立审查员。返工、依赖解锁和局部阻塞均由持久调度器衔接。日常操作在 DSH 的 ACMS 面板中完成。
 
-这是可运行的 **0.1.0 Demo**，已经验证真实 DSH 插件加载。它使用独立数据目录，不覆盖 Paperclip 原板，也不需要启动旧的 3084/3085 服务。
+这是可运行的 **0.1.0 Demo**，已经验证真实 DSH 插件加载。公司数据保存在独立目录，任务由 DSH 宿主调度。
 
 ![ACMS company overview](docs/images/overview.png)
 
 ## 已实现
 
-- 公司总览、任务看板、可点击依赖图、任务详情、实时进度、角色编辑、工作流编辑、产物与验收记录、阻塞回复、Paperclip 迁移预览。
+- 公司总览、任务看板、可点击依赖图、任务详情、实时进度、角色编辑、工作流编辑、产物与验收记录、阻塞回复。
 - 授权目标内自动拆解任务、按需创建临时执行员。常驻负责人和审查员；每轮结束释放进程；上下文是否续接取决于所选模型运行环境，和角色是否常驻分开。
 - 默认最多 4 个 AI 执行，并为协调/审查预留资源。执行、重试、清理和恢复均留有记录。
 - 文件产物与 SHA-256 标识、所有者配置的检查、独立审查、返工与重新审查。执行员不能自行将任务标为完成。
 - Git worktree 或独立目录副本。可选自动合并：先在隔离候选工作区验证，再更新干净的源项目。
 - 技术阻塞自动重试，达到阈值创建修复任务；缺少必要材料时仅阻塞相关分支。新的业务目标与公司硬边界由所有者控制。
 - SQLite WAL、幂等命令、版本冲突检查、单调度器租约、持久事件游标、重启恢复。执行状态不明时先核对，不盲目重复运行。
-- Paperclip 只读导入，保留任务标识、文档和评论。未完成任务一律暂停导入；历史完成记录归档，不伪造 ACMS 验收证明。
 
 ## 快速开始
 
@@ -38,7 +37,7 @@ pwsh -File .\scripts\install.ps1 -TargetProfile desktop
 
 安装脚本通过 DSH 官方 `plugin add` 命令注册包，并仅维护 profile patch 中带标记的 ACMS 配置块。脚本不重启 DSH。待现有工作可安全停止时重启宿主，点击侧边栏 **ACMS**。
 
-默认只使用 DSH 内部模型。外部模型在面板中生成配对 prompt，交给目标 agent 准备本机运行入口，经核对后加入列表；详见 [外部模型配对](docs/external-models.md)。旧桥接执行器不再参与 ACMS 自动选型，不影响原 Paperclip 插件自身的任务。
+默认只使用 DSH 内部模型。外部模型在面板中生成配对 prompt，交给目标 agent 准备本机运行入口，经核对后加入列表；详见 [外部模型配对](docs/external-models.md)。
 
 1. 在“模型列表”查看模型、上下文能力和思考深度。支持无工具检测的入口仅在点击“检测模型连通性”时发送请求；打开页面不检测。在“组织管理”为角色选择模型。
 2. 在首页点击“新建目标”，填写交付范围与验收标准；没有项目时可同时选择目录并创建项目，无需先建任务。
@@ -51,7 +50,7 @@ pwsh -File .\scripts\install.ps1 -TargetProfile desktop
 
 ```powershell
 npm run check      # 语法与插件契约
-npm test           # 调度、恢复、权限、迁移、Git 集成和原生 API
+npm test           # 调度、恢复、权限、Git 集成和原生 API
 npm run demo       # 确定性模拟闭环；不调用模型
 npm run test:ui    # 实际 client bundle；需要本机 Chrome
 npm run test:usability # 首次目标创建、目录浏览和剪贴板粘贴
@@ -61,7 +60,7 @@ npm run build     # 生成 lib/client.js
 
 UI 测试使用临时本机服务模拟 DSH 通道，仅用于测试。生产插件的界面与 API 都由 DSH 提供。真实 DSH 验收方法与范围见 [验证记录](docs/validation.md)。
 
-真实 AI 闭环交付的示例位于 [examples/todo/index.html](examples/todo/index.html)，可直接用浏览器打开。它是验收样例；ACMS 本身从 DSH 侧边栏进入。
+独立待办应用示例位于 [examples/todo/index.html](examples/todo/index.html)，可直接用浏览器打开。它是验收样例；ACMS 本身从 DSH 侧边栏进入。
 
 ## 项目结构
 
@@ -72,13 +71,12 @@ D:\ACMS/                     仓库根目录（本地路径因安装位置而异
 │  ├─ runtime/               调度、工作区、协作快照、对话与任务合同
 │  ├─ adapters/              DSH、外部配对和模拟执行适配器
 │  ├─ host/                  DSH 插件入口、API 路由和目录浏览
-│  ├─ client/                React 面板源码、样式和模型选择
-│  └─ migration/             Paperclip 只读迁移
-├─ packages/codex-persistent/ Codex app-server 会话、续接与进程管理；含独立许可和测试
+│  └─ client/                React 面板源码、样式和模型选择
+├─ packages/codex-runtime/    Codex app-server 会话、续接与进程管理；含独立许可和测试
 ├─ lib/client.js             由 npm run build 生成的 DSH 客户端 bundle
-├─ test/                     领域、调度、配对、迁移和集成测试
+├─ test/                     领域、调度、配对和集成测试
 ├─ scripts/                  构建、安装、卸载、演示及 UI 验证脚本
-├─ docs/                     架构、运行、协作、迁移、验证和图片
+├─ docs/                     架构、运行、协作、验证和图片
 ├─ examples/todo/            示例交付物，并非 ACMS 主界面
 ├─ .github/workflows/        Windows CI 工作流
 ├─ cordis.patch.yml          DSH 插件注册声明
@@ -86,7 +84,7 @@ D:\ACMS/                     仓库根目录（本地路径因安装位置而异
 └─ package-lock.json         npm 锁定依赖
 ```
 
-宿主入口是 `src/host/index.js`，通过 DSH 注册 API、工具和任务引擎；客户端入口是 `src/client/index.jsx`，构建产物为 `lib/client.js`。`packages/codex-persistent` 不会作为旧桥接模型自动出现在列表中，但其代码仍被 Codex app-server 配对入口使用，不是可直接删除的遗留目录。
+宿主入口是 `src/host/index.js`，通过 DSH 注册 API、工具和任务引擎；客户端入口是 `src/client/index.jsx`，构建产物为 `lib/client.js`。`packages/codex-runtime` 是内置会话库，供 Codex app-server 配对入口管理会话、消息和进程，不需要单独安装插件。
 
 运行数据默认位于 `%USERPROFILE%\.dsh\acms`，可由宿主 `dataDir` 或 `ACMS_DATA_DIR` 配置；这与源码仓库分开。通过 ACMS 添加的项目会在该项目根目录生成 `.acms/` 协作快照，传递任务、交接和历史证据；其中 `shared.md` 由所有者维护。详见 [项目协作目录](docs/COLLABORATION.md)。本仓库的 `.acms-lab/`、`node_modules/`、`dist/` 和 `test-results/` 是本地运行或生成数据，不应提交。
 
@@ -108,4 +106,4 @@ D:\ACMS/                     仓库根目录（本地路径因安装位置而异
 
 运行数据、数据库、认证、测试 host token、个人线程与 `.acms-lab` 均被 `.gitignore` 排除。提交前检查 `git status`；不要把运行数据目录加入仓库。
 
-项目尚未选定开源许可证：原始 ACMS 代码暂为 `UNLICENSED`。上传到 GitHub 不等于授予开源许可；确定许可证后更新根 `LICENSE` 和 `package.json`。可选 provider 保留其 MIT 许可，见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+项目尚未选定开源许可证：原始 ACMS 代码暂为 `UNLICENSED`。上传到 GitHub 不等于授予开源许可；确定许可证后更新根 `LICENSE` 和 `package.json`。内置 Codex 运行库保留其 MIT 许可，见 [第三方说明](THIRD_PARTY_NOTICES.md)。

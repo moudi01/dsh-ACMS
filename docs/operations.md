@@ -10,8 +10,6 @@
 | `-TargetProfile` | 已存在的 profile，默认 desktop |
 | `-DshHomePath` | DSH_HOME；隔离测试应使用独立目录 |
 | `-DataDirectory` | ACMS 公司数据库和工作副本目录，必须在源项目之外 |
-| `-EnableCodex` | 历史兼容选项；新模型接入请使用界面配对 |
-| `-CodeHomePath` | Codex 专用 CODEX_HOME，只保存于本地安装配置 |
 
 通过 DSH 官方 plugin CLI 管理 bundles。不要手工修改 profile package.json。安装脚本备份已有 patch，并维护 `BEGIN ACMS MANAGED CONFIG` 到 `END ACMS MANAGED CONFIG` 区段。再次安装更新该区段。
 
@@ -21,9 +19,9 @@
 
 修改代码后的部署：先运行 `npm run build`，再在项目目录运行 `node scripts/deploy-live.mjs desktop`。DSH 默认仅监视配置文件，单纯修改宿主源码不会加载新代码；部署脚本会生成版本化宿主 bundle、备份配置，并仅切换 ACMS 的宿主入口，其他插件不受影响。存在活动 ACMS 执行时脚本拒绝部署。界面更新后按 Ctrl+R 刷新 DSH。其他 profile 可替换最后的 `desktop`，自定义 home 使用 `DSH_HOME`。
 
-初始模型列表仅包含 DSH 模型目录中的内部模型；不再自动加载旧桥接执行器，界面不提供模型筛选条件。内部模型可以选择是否继承 ACMS 调度父代理上下文，常规内部执行每轮新建上下文。外部模型不显示父代理继承开关。
+初始模型列表仅包含 DSH 模型目录中的内部模型。内部模型可以选择是否继承 ACMS 调度父代理上下文，常规内部执行每轮新建上下文。外部模型不显示父代理继承开关。
 
-外部模型使用“模型列表 → 配对外部 agent”：复制 prompt，交给目标 agent 生成本机运行入口，读取并确认回执后添加。之后 ACMS 自动启动该环境执行和审查任务。详见 [配对协议与边界](external-models.md)。现有旧执行器角色需要重新选择内部模型或已配对模型，不会默默改为另一个外部环境。
+外部模型使用“模型列表 → 配对外部 agent”：复制 prompt，交给目标 agent 生成本机运行入口，读取并确认回执后添加。之后 ACMS 自动启动该环境执行和审查任务。详见 [配对协议与边界](external-models.md)。角色可以选择内部模型或已配对的外部模型。
 
 页面只显示已有模型目录和缓存配置，打开页面、切换模型、读取配对回执都不调用模型。只有点击“检测模型连通性”才发送简短真实请求并读取配置。检测结果按模型和通道保存 10 分钟，失败的配置不能直接保存或派发，可重测恢复。内部模型支持时可设置思考深度；外部显示配对声明/runner 返回值，标注来源，未知值不猜测。
 

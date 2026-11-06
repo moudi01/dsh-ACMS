@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 async function walk(dir) { const entries = await readdir(dir, { withFileTypes: true }); return (await Promise.all(entries.map(e => e.isDirectory() ? walk(path.join(dir, e.name)) : path.join(dir, e.name)))).flat(); }
 let failed = false;
-for (const file of [...await walk('src'), ...await walk('scripts'), ...await walk('test'), ...await walk('packages/codex-persistent/lib')].filter(f => /\.(js|mjs|cjs)$/.test(f))) {
+for (const file of [...await walk('src'), ...await walk('scripts'), ...await walk('test'), ...await walk('packages/codex-runtime/lib')].filter(f => /\.(js|mjs|cjs)$/.test(f))) {
   const result = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
   if (result.status !== 0) { failed = true; console.error(file, result.stderr); }
 }

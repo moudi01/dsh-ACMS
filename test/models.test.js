@@ -7,9 +7,9 @@ import { Store } from '../src/core/store.js';
 function setup(policy = { allowedProviders: [], allowedModels: [], maxConcurrent: 4 }) {
   const requests = [];
   const entries = [
-    { name: 'acms-codex', config: { model: 'gpt-6-astra' }, capabilities: {} },
-    { name: 'codex-astra', config: { model: 'gpt-6-astra' }, capabilities: {} },
-    { name: 'codex-persistent-sol', config: { model: 'gpt-6.1-sol' }, capabilities: {} },
+    { name: 'unsupported-provider', config: { model: 'gpt-6-astra' }, capabilities: {} },
+    { name: 'unregistered-model', config: { model: 'gpt-6-astra' }, capabilities: {} },
+    { name: 'fixed-model-provider', config: { model: 'gpt-6.1-sol' }, capabilities: {} },
     { name: 'codex', config: {}, capabilities: {} },
     { name: 'spawn', prepareContinuable() {}, inheritsParentContext: false, capabilities: { agentOptions: true, depthLimit: true } },
     { name: 'fork', prepareContinuable() {}, inheritsParentContext: true, capabilities: { agentOptions: true, depthLimit: true } },
@@ -47,29 +47,29 @@ test('model catalog deduplicates real model IDs and keeps separate executor/back
   assert.equal(catalog.defaultSelection.model, 'deepseek-flash');
   assert(!catalog.models.some(m => m.routes.some(r => r.provider === 'codex')), 'Unspecified Codex defaults must not be guessed');
 });
-test('legacy bridge routes are removed; native model carries exact LLM route', async () => {
+test('unsupported providers are rejected; native model carries exact LLM route', async () => {
   const { adapter, requests } = setup(); const signal = new AbortController().signal;
   const start = agent => adapter.start({ agent, task: { workspace: { path: '.' } }, attempt: { id: 'a', contextKey: 'context' }, prompt: 'Fixture', signal });
   const native = await start({ provider: 'spawn', model: 'deepseek-flash', llmProvider: 'secondary' }); await native.result; await native.dispose();
   assert.deepEqual(requests[0].request.agentOptions, { provider: 'secondary', model: 'deepseek-flash' });
-  await assert.rejects(adapter.choose({ provider: 'acms-codex', model: 'gpt-6.1-sol' }), { code: 'NO_PROVIDER' });
+  await assert.rejects(adapter.choose({ provider: 'unsupported-provider', model: 'gpt-6.1-sol' }), { code: 'NO_PROVIDER' });
   await assert.rejects(adapter.choose({ provider: 'spawn', model: 'deepseek-flash', llmProvider: 'removed' }), { code: 'MODEL_UNAVAILABLE' });
 });
-test('automatic selection respects model/provider restrictions including legacy fixed models without explicit model', async () => {
-  const { adapter } = setup({ allowedProviders: ['acms-codex', 'spawn'], allowedModels: ['deepseek-flash'] });
+test('automatic selection respects model/provider restrictions including unsupported fixed models without explicit model', async () => {
+  const { adapter } = setup({ allowedProviders: ['unsupported-provider', 'spawn'], allowedModels: ['deepseek-flash'] });
   const selected = await adapter.choose({ provider: 'auto', model: '' }); assert.equal(selected.name, 'spawn'); assert.equal(selected.model, 'deepseek-flash');
   assert.deepEqual((await adapter.modelCatalog()).models.map(m => m.id), ['deepseek-flash']);
-  await assert.rejects(adapter.choose({ provider: 'acms-codex', model: '' }), { code: 'NO_PROVIDER' });
-  await assert.rejects(adapter.choose({ provider: 'codex-persistent-sol', model: 'gpt-6.1-sol' }), { code: 'NO_PROVIDER' });
+  await assert.rejects(adapter.choose({ provider: 'unsupported-provider', model: '' }), { code: 'NO_PROVIDER' });
+  await assert.rejects(adapter.choose({ provider: 'fixed-model-provider', model: 'gpt-6.1-sol' }), { code: 'NO_PROVIDER' });
 });
-test('unavailable catalogs never restore legacy bridge models', async () => {
+test('unavailable catalogs never infer unsupported providers', async () => {
   const { adapter, services } = setup(); services.llm.listModels = async () => { throw new Error('Unavailable'); };
   const catalog = await adapter.modelCatalog(); assert.equal(catalog.warnings.length, 2); assert(!catalog.models.some(m => m.id === 'gpt-6-astra')); assert(catalog.models.some(m => m.id === 'deepseek-flash'));
 });
-test('legacy role editors require reselection instead of guessing removed model identities', async () => {
+test('unregistered role editors require reselection instead of guessing removed model identities', async () => {
   const { adapter } = setup(); const runtime = { providers: adapter.providers(), modelCatalog: await adapter.modelCatalog() };
-  const fixed = initialModelBinding({ id: 'old', provider: 'codex-astra', model: '' }, runtime);
-  assert.equal(fixed.model, ''); assert.equal(fixed.provider, 'codex-astra');
+  const fixed = initialModelBinding({ id: 'old', provider: 'unregistered-model', model: '' }, runtime);
+  assert.equal(fixed.model, ''); assert.equal(fixed.provider, 'unregistered-model');
   assert.equal(initialModelBinding({ id: 'unknown', provider: 'codex' }, runtime).model, '');
   assert.equal(initialModelBinding({ id: 'auto', provider: 'auto', model: '' }, runtime).provider, 'auto');
   assert.equal(modelName({ provider: 'auto' }, runtime), 'deepseek-flash');

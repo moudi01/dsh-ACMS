@@ -94,7 +94,7 @@ export class Engine {
         if (!['ready', 'blocked'].includes(task.status)) continue;
         if (this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending')) continue;
         if (task.blocker && !task.blocker.resolutionTaskIds) continue;
-        const ready = task.dependencies.every(d => { const dep = this.store.require('tasks', d); return dep.status === 'succeeded' || (dep.status === 'archived' && dep.legacy?.completionAccepted === true); });
+        const ready = task.dependencies.every(d => { const dep = this.store.require('tasks', d); return dep.status === 'succeeded'; });
         const next = ready ? 'ready' : 'blocked';
         if (next !== task.status) { this.store.put('tasks', { ...task, status: next, ...(ready ? { blocker: null } : {}) }); this.store.event('task.readiness', task.id, { status: next }, SYSTEM); }
       }

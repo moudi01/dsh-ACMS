@@ -21,8 +21,8 @@ function terminal(server, status = 'completed', error) {
 }
 
 async function harness(t, options = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-persistent-wire-'));
-  const store = new ThreadStore(path.join(dir, 'threads.json'), 'paperclip-agent:wire-test');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-runtime-wire-'));
+  const store = new ThreadStore(path.join(dir, 'threads.json'), 'acms-task:wire-test');
   if (options.previous) store.update({ threadId: options.previous });
   const inbound = new PassThrough();
   const outbound = new PassThrough();
@@ -62,7 +62,7 @@ async function harness(t, options = {}) {
     outbound.destroy();
     await store.close('test-complete');
     assert.ok(path.resolve(dir).startsWith(path.resolve(os.tmpdir()) + path.sep));
-    assert.ok(path.basename(dir).startsWith('codex-persistent-wire-'));
+    assert.ok(path.basename(dir).startsWith('codex-runtime-wire-'));
     fs.rmSync(dir, { recursive: true, force: true });
   });
   await wire.initialize(signal);

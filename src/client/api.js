@@ -16,7 +16,6 @@ export const api = {
   directories: directory => request(`directories?path=${encodeURIComponent(directory)}`),
   modelDetails: (input, signal) => request('model-details', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input), signal }),
   modelCheck: input => request('model-check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
-  migration: input => request('import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
   async command(name, args) {
     const key = JSON.stringify([name, args]); const requestId = pending.get(key) ?? crypto.randomUUID(); pending.set(key, requestId);
     const result = await request('command', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, args, requestId }) });

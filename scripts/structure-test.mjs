@@ -45,7 +45,7 @@ try {
   const receipt = JSON.parse(prompt.slice(prompt.indexOf('{\n  "protocol"'), prompt.lastIndexOf('\n完成后')));
   const invite = server.company.store.require('modelInvites', receipt.inviteId); const runner = path.join(server.root, 'paired-runner.mjs');
   await writeFile(runner, `let raw='';for await(const b of process.stdin)raw+=b;const r=JSON.parse(raw);console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,model:r.model,executed:true,reasoningEffort:'high',output:'Fixture OK'}));`);
-  await writeFile(invite.responseFile, JSON.stringify({ ...receipt, name: '配对环境样例', model: 'gpt-paired-fixture', command: process.execPath, args: [runner], persistent: true, reasoningEffort: 'high' }));
+  await writeFile(invite.responseFile, JSON.stringify({ ...receipt, name: '配对环境样例', model: 'gpt-paired-fixture', command: process.execPath, args: [runner], persistent: true, reasoningEffort: 'high', probeSupported: true, probeReason: null }));
   await page.getByRole('button', { name: '读取配对结果' }).click(); await expect(page.getByRole('heading', { name: '核对运行配置' })).toBeVisible(); expect(diagnostics.length).toBe(0);
   await page.getByRole('button', { name: '确认添加模型' }).click(); await expect(page.getByRole('radio', { name: /^gpt-paired-fixture ·/ })).toBeChecked();
   await expect(page.getByRole('checkbox', { name: '继承父代理上下文' })).toHaveCount(0); expect(diagnostics.length).toBe(0);

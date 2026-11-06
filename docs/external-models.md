@@ -1,8 +1,8 @@
 # 外部模型配对
 
-ACMS 初始模型列表只读取 DSH 的内部模型目录，不再把旧桥接的 Codex/persistent provider 自动加入列表或作为自动派发候选。
+ACMS 初始模型列表读取 DSH 的内部模型目录，外部模型经所有者配对确认后加入。
 
-外部模型通过「模型列表 → 配对外部 agent」添加。交互参考 [Paperclip 的外部 agent 邀请流程](https://github.com/paperclipai/paperclip-docs/blob/main/docs/how-to/bring-your-own-agent.md)：生成 prompt，目标 agent 准备运行环境，所有者核对后接入。ACMS Demo 使用本机回执文件与进程协议，**不兼容 Paperclip 的邀请 API**，也不需要另开管理网站或端口。
+外部模型通过「模型列表 → 配对外部 agent」添加：生成配对 prompt，由目标 agent 准备运行入口，再由所有者核对回执。ACMS 使用本机回执文件与进程协议。
 
 ## 操作
 
@@ -22,6 +22,12 @@ ACMS 以 `shell: false`、隐藏窗口方式启动程序，把单个 JSON 请求
 检测是可选能力：仅在运行时可确认禁用所有工具和文件写入时声明支持，并使用独立上下文请求短回答；只读沙箱或提示词约束不足以声明支持。任务请求：按具体任务和审查角色隔离；只有配对 agent 声明支持续接时才传 `retainContext=true`。外部模型不能继承 DSH 父代理上下文。断电或重启后无法确认的外部执行仍进入核对状态，不盲目重复执行。
 
 思考深度初始显示回执声明并标注来源，检测后显示 runner 返回值；未公开时显示未知。此能力及回答真实性依赖已确认的 runner 实现，不能把自报元数据当作服务端证明。
+
+## Codex app-server 入口
+
+支持 app-server 的 Codex 环境可在回执中声明 `runtime: "codex-app-server"`，由 `command` 和固定 `args` 直接启动 CLI。ACMS 使用内置 `@acms/codex-runtime` 管理线程、轮次、即时消息及进程清理，不另装 provider 插件。
+
+该入口使用 app-server 的 JSON-RPC 协议，不使用单请求 runner 的 stdin/stdout 响应格式。模型和思考深度由回执明确指定；`persistent` 决定是否按任务键恢复线程，独立聊天和审查保持隔离。此入口必须声明 `probeSupported: false`，登记不会调用模型。
 
 ## 管理角色的派工与自动续跑
 

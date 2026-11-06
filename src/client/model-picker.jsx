@@ -13,7 +13,7 @@ export function ModelPicker({ form, setForm, data, onCheck }) {
   const checked = result && result.key === key ? result.value : null;
   const health = checked ?? selected?.health ?? { status: 'untested', reason: '尚未执行实际连通性检测' };
   const reasoning = checked?.reasoning ?? selected?.health?.reasoning ?? selected?.reasoning;
-  const reason = checking ? '模型检测正在进行，请稍候' : !selected ? '请选择 DSH 模型或已配对的外部模型；旧桥接执行器已移除。' : health.status === 'unavailable' ? `模型检测失败：${health.reason}。请重新检测或选择其他模型。` : '';
+  const reason = checking ? '模型检测正在进行，请稍候' : !selected ? '请选择 DSH 模型或已配对的外部模型。' : health.status === 'unavailable' ? `模型检测失败：${health.reason}。请重新检测或选择其他模型。` : '';
   useEffect(() => { setForm(f => ({ ...f, modelBlockReason: reason })); }, [reason]);
   const bind = (model, route) => { setError(''); setForm(f => ({ ...f, model, provider: route.provider, llmProvider: route.llmProvider || '', reasoningEffort: '', modelBlockReason: '' })); };
   const check = async () => { const submitted = key; onCheck?.(); setChecking(true); setError(''); try { const value = await api.modelCheck(binding); if (current.current === submitted) setResult({ key: submitted, value }); } catch(e) { if (current.current === submitted) setError(e.message); } finally { setChecking(false); } };

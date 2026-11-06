@@ -4,19 +4,50 @@
   "description": "ACMS — Agent Company Management System for DeepSeek Harness",
   "type": "module",
   "private": true,
-  "workspaces": ["packages/codex-persistent"],
+  "workspaces": [
+    "packages/codex-runtime"
+  ],
   "license": "UNLICENSED",
   "main": "./src/host/index.js",
-  "exports": { ".": "./src/host/index.js", "./client": "./lib/client.js", "./package.json": "./package.json" },
-  "files": ["src", "lib", "cordis.patch.yml", "README.md", "docs", "scripts", "examples", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
-  "engines": { "node": ">=24.0.0", "dsh": ">=0.2.1-rc.5 <0.3.0" },
+  "exports": {
+    ".": "./src/host/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "docs",
+    "scripts",
+    "examples",
+    "CHANGELOG.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "packages/codex-runtime"
+  ],
+  "engines": {
+    "node": ">=24.0.0",
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
+  },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
-    "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-renderer", "@deepseek-ai/dsh-client-ui-layout", "@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-client-connection"] }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test --test-concurrency=1 test/*.test.js packages/codex-persistent/test/*.test.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.js packages/codex-runtime/test/*.test.mjs",
     "check": "node scripts/check.mjs",
     "demo": "node scripts/demo.mjs",
     "test:ui": "node scripts/ui-test.mjs",
@@ -27,5 +58,10 @@
     "test:budget-ui": "node scripts/budget-ui-test.mjs",
     "package": "npm run build && npm pack"
   },
-  "devDependencies": { "esbuild": "0.25.12", "react": "19.2.0", "react-dom": "19.2.0", "@playwright/test": "1.56.1" }
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "@playwright/test": "1.56.1"
+  }
 }

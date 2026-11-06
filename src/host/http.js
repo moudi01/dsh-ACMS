@@ -1,6 +1,5 @@
 import { promises as fs } from 'node:fs';
 import { assert, OWNER } from '../core/util.js';
-import { inspectPaperclip, importPaperclip } from '../migration/paperclip.js';
 import { browseDirectories } from './directories.js';
 
 export function json(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } }); }
@@ -69,22 +68,13 @@ export function createRoutes(runtime) {
       assert(Number.isSafeInteger(after) && after >= 0, 'CURSOR', 'Invalid event cursor');
       return json(await waitForEvents(company.store, after, request.signal));
     },
-    '/api/acms/import': async request => {
-      assert(company.store.list('migrations').length === 0, 'MIGRATION_COMPLETED', '旧看板迁移已完成，一次性迁移功能已关闭');
-      const input = await body(request); const inspected = await inspectPaperclip(input.directory);
-      if (input.mode === 'preview') return json(inspected.preview);
-      assert(input.mode === 'apply', 'IMPORT_MODE', 'Choose preview or apply');
-      const result = importPaperclip(company, inspected, input);
-      await workspaces.publishProject(company.store.require('projects', input.projectId));
-      return json(result);
-    },
     '/api/acms/artifact': async request => {
       const artifactId = new URL(request.url).searchParams.get('id'); const artifact = company.store.require('artifacts', artifactId);
       const bytes = await fs.readFile(artifact.blob);
       return json({ ...artifact, content: bytes.subarray(0, 262144).toString('utf8'), truncated: bytes.length > 262144 });
     },
   };
-  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/import', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
+  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
     try { return await handler(request); } catch (e) {
       const status = ['NOT_FOUND'].includes(e.code) ? 404 : ['CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT'].includes(e.code) ? 409 : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);

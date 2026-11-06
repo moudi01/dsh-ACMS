@@ -22,7 +22,7 @@
 
 First runnable ACMS demo for DeepSeek Harness.
 
-- Native company dashboard, task board, dependency graph, organization/workflow editors, artifact evidence, local blocker responses and paused legacy import.
+- Native company dashboard, task board, dependency graph, organization/workflow editors, artifact evidence, local blocker responses.
 - Persistent autonomous scheduling, bounded temporary agents, independent automatic review, repair/rework loops and durable command/event handling.
 - Isolated worktrees, dedicated reviewer verification copies, candidate merge validation and conservative restart reconciliation.
 - Optional task-scoped persistent Codex provider with bounded process lifetime and recoverable completion receipts.

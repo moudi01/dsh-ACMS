@@ -53,28 +53,14 @@ export function acquireLease(path) {
           }
         }
       }
-      const busy = new Error('codex-persistent: thread key is already running (retry after it settles)');
+      const busy = new Error('codex-runtime: thread key is already running (retry after it settles)');
       busy.code = 'CODEX_THREAD_BUSY';
       throw busy;
     }
   }
-  const busy = new Error('codex-persistent: thread lease is busy');
+  const busy = new Error('codex-runtime: thread lease is busy');
   busy.code = 'CODEX_THREAD_BUSY';
   throw busy;
-}
-
-export function resolveThreadKey(config, request, provider) {
-  const parent = request.parent;
-  const parentSessionId = request.parentSessionId ?? parent?.session?.id ?? parent?.sessionId ?? parent?.id;
-  const label = request.label ?? request.threadKey;
-  const template = config.threadKey;
-  let key = template ? template.replace(/\{(label|parentSessionId|provider)\}/g, (_, name) => {
-    const value = { label, parentSessionId, provider }[name];
-    if (!value) throw new Error(`codex-persistent: threadKey requires ${name}`);
-    return value;
-  }) : label || parentSessionId;
-  if (typeof key !== 'string' || !key.trim() || key.length > 2048) throw new Error('codex-persistent: no usable thread key (configure threadKey, label or parent Session id)');
-  return key;
 }
 
 const TOOL_TYPES = new Set(['commandExecution', 'fileChange', 'mcpToolCall', 'dynamicToolCall', 'webSearch', 'imageView', 'imageGeneration', 'collabAgentToolCall']);

@@ -86,3 +86,12 @@ test('reviewer cannot approve files modified after verification', async t => {
   const task = f.task(); await f.start(); await until(() => f.store.list('attempts').some(a => a.kind === 'review' && a.status === 'failed'));
   assert.notEqual(f.store.require('tasks', task.id).status, 'succeeded');
 });
+
+test('archiving an unverified dependency does not release downstream execution', async t => {
+  const f = await fixture(t); const upstream = f.task();
+  const downstream = f.task({ title: 'Dependent on verified delivery', dependencies: [upstream.id] });
+  f.store.transaction(() => f.store.put('tasks', { ...upstream, status: 'archived' }));
+  await f.start(); await f.engine.tick();
+  assert.equal(f.adapter.calls.length, 0);
+  assert.notEqual(f.store.require('tasks', downstream.id).status, 'succeeded');
+});

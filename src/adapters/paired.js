@@ -4,8 +4,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { assert, digest, OWNER, parseResult } from '../core/util.js';
 import { parsePairedResult } from './paired-result.mjs';
-import { startCodexRun } from '../../packages/codex-persistent/lib/index.js';
-import { ThreadStore } from '../../packages/codex-persistent/lib/store.js';
+import { startCodexRun } from '../../packages/codex-runtime/lib/index.js';
+import { ThreadStore } from '../../packages/codex-runtime/lib/store.js';
 
 const PROTOCOL = 'acms.runner.v1';
 export class PairedRuntimes {

@@ -19,11 +19,11 @@ flowchart LR
   E --> U
 ```
 
-ACMS 是 `dsh-acms` host + client bundle；可选执行包为 `dsh-acms-codex`。没有独立产品管理服务器。客户端通过 DSH Fetch 通道访问 `/api/acms/*`，事件采用有游标的 20 秒长轮询。断线后补读事件再刷新快照，不依赖浏览器维持任务运行。
+ACMS 是 `dsh-acms` host + client bundle；内置 `@acms/codex-runtime` 会话库处理 Codex app-server 配对执行。没有独立产品管理服务器。客户端通过 DSH Fetch 通道访问 `/api/acms/*`，事件采用有游标的 20 秒长轮询。断线后补读事件再刷新快照，不依赖浏览器维持任务运行。
 
 ## 数据与事务
 
-SQLite 使用 WAL、FULL synchronous、同步短事务。文件与模型调用不放进数据库事务。核心集合：projects、goals、tasks、agents、workflows/history、attempts、artifacts、verifications、interactions、migrations。
+SQLite 使用 WAL、FULL synchronous、同步短事务。文件与模型调用不放进数据库事务。核心集合：projects、goals、tasks、agents、workflows/history、attempts、artifacts、verifications、interactions。
 
 每次写入递增实体 revision；编辑可以携带 `expectedRevision` 防止覆盖。命令的 requestId 与参数指纹一起持久化，同一请求重放返回原结果，不同参数复用同一 ID 会被拒绝。数据库事务提交后才发布事件。
 

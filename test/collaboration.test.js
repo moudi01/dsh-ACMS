@@ -23,21 +23,21 @@ test('adding a project through the UI route creates .acms and preserves owner no
   assert.equal((await command('agent.save',{name:'Another worker',role:'worker'})).ok,true);
 });
 
-test('migration evidence reaches an existing Git workspace without committing source notes; context is excluded from delivery changes', async t => {
+test('task handoff reaches an existing Git workspace without committing source notes; context is excluded from delivery changes', async t => {
   const f = await fixture(t);
   const git = async args => { const r = await run('git',args,f.source); assert.equal(r.code,0,r.stderr); return r.stdout; };
   await git(['init']); await git(['add','README.md']); await git(['-c','user.name=Test','-c','user.email=test@localhost','commit','-m','baseline']);
   f.command('project.save',{...f.project,mode:'git',expectedRevision:f.project.revision});
   const parent = f.task({title:'Parent scope'}); const task = f.task({title:'Continue',parentId:parent.id});
-  f.store.transaction(()=> f.store.put('tasks',{...parent,legacy:{identifier:'OLD-1',status:'done',documents:[{key:'approved-scope',title:'Scope',body:'Only inspect existing assets.'}],comments:[{body:'Latest checkpoint; do not repeat the inventory.'}]}}));
+  f.store.transaction(()=> f.store.put('attempts',{id:'checkpoint',taskId:parent.id,status:'blocked',summary:'Only inspect existing assets.',handoff:'Latest checkpoint; do not repeat the inventory.'}));
   let workspace = await f.workspaces.prepare(task,{});
   await writeFile(path.join(workspace.path,'ongoing.md'),'Existing unfinished work');
   await writeFile(path.join(f.source,'.acms/shared.md'),'Use the approved scope and previous checkpoint.');
   workspace = await f.workspaces.prepare({...task,workspace},{});
   const context = JSON.parse(await readFile(path.join(workspace.path,workspace.collaboration.index),'utf8'));
-  const imported = context.tasks.find(t=>t.id===parent.id); const doc = imported.documents[0];
-  assert.equal(await readFile(path.join(workspace.path,'.acms',doc.path),'utf8'),'Only inspect existing assets.');
-  assert.match(imported.comments.recent[0].body,/Latest checkpoint/);
+  const previous = context.tasks.find(t=>t.id===parent.id).attempts[0];
+  assert.equal(previous.summary,'Only inspect existing assets.');
+  assert.match(previous.handoff,/Latest checkpoint/);
   assert.match(await readFile(path.join(workspace.path,'.acms/shared.md'),'utf8'),/approved scope/);
   assert.equal(await readFile(path.join(workspace.path,'ongoing.md'),'utf8'),'Existing unfinished work');
   assert.deepEqual((await f.workspaces.captureChanges({...task,workspace})).map(c=>c.path),['ongoing.md']);

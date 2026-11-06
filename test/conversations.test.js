@@ -48,7 +48,7 @@ test('same-attempt steering acknowledges executor delivery, rejects stale turns 
   await until(() => !chats.deliveries.size); assert.equal(f.store.require('conversationMessages', failed.id).status, 'failed');
 });
 
-test('legacy interruption cleans up before continuation, keeps workspace and contract, avoids repairs', async t => {
+test('single-request runner interruption cleans up before continuation, keeps workspace and contract, avoids repairs', async t => {
   let calls = 0, workingPath;
   const f = await fixture(t, async input => {
     if (input.task.kind === 'work') { calls++; workingPath ??= input.task.workspace.path; assert.equal(input.task.workspace.path, workingPath); }

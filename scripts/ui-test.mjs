@@ -35,7 +35,7 @@ try {
   await page.getByLabel('角色名称', { exact: true }).fill('文档协调员');
   const diagnostics = []; page.on('request', r => { if (/model-(check|details)/.test(r.url())) diagnostics.push(r.url()); });
   for (const name of ['deepseek-flash', 'deepseek-reasoner']) await expect(page.getByRole('radio', { name: new RegExp('^'+name+' ·') })).toHaveCount(1);
-  await expect(page.getByLabel('模型来源', { exact: true })).toHaveCount(0); await expect(page.getByText('codex-persistent')).toHaveCount(0);
+  await expect(page.getByLabel('模型来源', { exact: true })).toHaveCount(0);
   await page.getByRole('radio', { name: /^deepseek-reasoner ·/ }).check(); await page.getByLabel('人员类型', { exact: true }).selectOption('temporary');
   await page.getByRole('checkbox', { name: '继承父代理上下文', exact: true }).check();
   await expect(page.getByRole('radio', { name: /^deepseek-reasoner ·/ })).toBeChecked(); expect(diagnostics.length).toBe(0);
@@ -45,6 +45,7 @@ try {
   const saved = () => server.company.snapshot().agents.find(a => a.name === '文档协调员');
   expect(saved().model).toBe('deepseek-reasoner'); expect(saved().temporary).toBe(true); expect(saved().provider).toBe('simulation-fork'); expect(saved().reasoningEffort).toBe('low');
   await page.getByRole('heading', { name: '文档协调员' }).click();
+  await page.getByRole('button', { name: '编辑角色', exact: true }).click();
   await page.getByRole('radio', { name: /^offline-test-model ·/ }).check(); expect(diagnostics.length).toBe(0);
   await page.getByRole('button', { name: '检测模型连通性', exact: true }).click();
   await expect(page.getByRole('button', { name: '保存', exact: true })).toBeDisabled(); await expect(page.getByText(/模型检测失败：模拟认证失败/)).toBeVisible();
@@ -52,6 +53,7 @@ try {
   await expect(page.locator('.acms-model-health').getByText('检测通过', { exact: true })).toBeVisible(); expect(diagnostics.length).toBe(2);
   await page.screenshot({ path: 'test-results/ui/model-diagnostics.png', fullPage: true });
   await page.getByRole('button', { name: '取消', exact: true }).click();
+  await page.getByRole('button', { name: '关闭详情', exact: true }).click();
   const owner = { kind: 'owner', id: 'owner' }; const issueCommand = (name, args) => server.company.command(owner, crypto.randomUUID(), name, args);
   const deleteGoal = issueCommand('goal.create', { title: 'Delete fixture', description: 'Fixture', acceptance: 'Fixture', projectId: server.company.snapshot().projects[0].id, plan: false });
   const deleteTask = issueCommand('task.create', { title: '可删除的任务', goalId: deleteGoal.id }); issueCommand('task.cancel', { id: deleteTask.id });
@@ -74,24 +76,6 @@ try {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth); if (overflow) throw new Error('Mobile viewport has page-level horizontal overflow');
   await page.getByRole('button', { name: '公司设置', exact: true }).click(); await page.getByRole('button', { name: '编辑边界', exact: true }).click();
   await expect(page.getByRole('dialog')).toBeVisible(); await page.keyboard.press('Escape'); await expect(page.locator('dialog')).toHaveCount(0);
-  const legacy = path.join(server.root, 'legacy'); await mkdir(path.join(legacy, 'board', 'issues'), { recursive: true });
-  await writeFile(path.join(legacy, 'board', 'index.json'), JSON.stringify([{ identifier: 'DEMO-1' }]));
-  await writeFile(path.join(legacy, 'board', 'issues', 'DEMO-1.json'), JSON.stringify({ id: 'old-demo', title: '迁移待办样例', status: 'todo', documents: [{ title: '历史说明', body: 'Synthetic fixture only' }] }));
-  await page.getByRole('button', { name: '迁移旧看板', exact: true }).click();
-  await page.getByLabel('Paperclip bridge 根目录').fill(legacy); await page.getByRole('button', { name: '只读预览' }).click();
-  await expect(page.getByText('DEMO-1 · 迁移待办样例')).toBeVisible();
-  await page.getByLabel('旧执行停止与结果核对证据').fill('Synthetic legacy system has no executors; source files were inspected.');
-  await page.getByLabel('我已统一停止旧调度和执行，核对历史完成记录，允许导入为暂停任务').check();
-  await page.getByRole('button', { name: '导入暂停任务' }).click();
-  await expect(page.getByText(/已导入 1 个任务/)).toBeVisible();
-  await expect(page.getByRole('button', { name: '迁移旧看板', exact: true })).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: '任务工作台', exact: true })).toBeVisible();
-  await page.reload(); await expect(page.getByRole('heading', { name: '让工作持续向前。' })).toBeVisible();
-  await expect(page.getByRole('button', { name: '迁移旧看板', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '公司设置', exact: true }).click(); await expect(page.getByText('再次导入')).toHaveCount(0);
-  const repeated = await page.request.post(`${server.url}/api/acms/import`, { data: { mode: 'preview', directory: legacy } });
-  expect((await repeated.json()).error.code).toBe('MIGRATION_COMPLETED');
-  if (errors.length) throw new Error(errors.join('\n'));
-  const report = { passed: true, mode: 'isolated DSH client-loader/host-route harness with simulation provider', checked: ['actual DSH loader bundle', 'dashboard', 'task dependency graph', 'workflow version publish and explicit task migration', 'real model-name selection and saved binding', 'model list without legacy executors or filters; parent inheritance for internal models', 'reasoning selection and persistence', 'failed model diagnostics disable saving with reason; successful retry recovers', 'task deletion and restore', 'disabled task actions explain why', 'human answer and automatic wake', 'dark theme', '390px responsive layout', 'dialog Escape', 'legacy import regression unchanged', 'no uncaught browser errors'], screenshots: ['docs/images/overview.png', 'test-results/ui/graph.png', 'test-results/ui/model-diagnostics.png', 'test-results/ui/dark.png', 'test-results/ui/mobile.png'] };
+  const report = { passed: true, mode: 'isolated DSH client-loader/host-route harness with simulation provider', checked: ['actual DSH loader bundle', 'dashboard', 'task dependency graph', 'workflow version publish and explicit task migration', 'real model-name selection and saved binding', 'model list without unsupported executors or filters; parent inheritance for internal models', 'reasoning selection and persistence', 'failed model diagnostics disable saving with reason; successful retry recovers', 'task deletion and restore', 'disabled task actions explain why', 'human answer and automatic wake', 'dark theme', '390px responsive layout', 'dialog Escape', 'no uncaught browser errors'], screenshots: ['docs/images/overview.png', 'test-results/ui/graph.png', 'test-results/ui/model-diagnostics.png', 'test-results/ui/dark.png', 'test-results/ui/mobile.png'] };
   await writeFile('test-results/ui/report.json', JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2));
 } catch (e) { console.error('Browser errors:', errors); await page.screenshot({ path: 'test-results/ui/failure.png', fullPage: true }); throw e; } finally { await browser.close(); await server.close(); }
