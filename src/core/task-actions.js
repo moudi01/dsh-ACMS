@@ -1,3 +1,10 @@
+// Stopping does not mean the old execution has been observed to stop. Keep
+// receipt refresh available for persisted stop intents without a live host.
+export function canReconcileTask(task, attempts) {
+  return task.status === 'reconciling' || (task.status === 'stopping' && attempts.some(a => a.taskId === task.id
+    && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending)));
+}
+
 export function taskDeletionReason(task, tasks, attempts) {
   if (task.kind === 'review') return '审查任务随对应的执行任务一起删除。';
   const ids = new Set([task.id, ...tasks.filter(t => t.reviewOf === task.id && t.status !== 'deleted').map(t => t.id)]);

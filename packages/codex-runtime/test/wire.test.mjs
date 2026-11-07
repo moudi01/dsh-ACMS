@@ -38,7 +38,7 @@ async function harness(t, options = {}) {
     if (method === 'initialize') return { userAgent: 'isolated-mock-app-server' };
     if (method === 'thread/start' || method === 'thread/resume') {
       await options.onOpening?.({ server, store, method, params });
-      return { thread: { id: options.previous ?? THREAD, ephemeral: false }, model: 'gpt-6-astra' };
+      return { thread: { id: options.previous ?? THREAD, ephemeral: false }, model: options.returnedModel ?? 'gpt-6-astra' };
     }
     if (method === 'turn/start') {
       if (options.onTurn) await options.onTurn({ server, store, params });
@@ -73,6 +73,10 @@ async function harness(t, options = {}) {
     events: () => fs.readFileSync(store.eventsPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)),
   };
 }
+
+test('wire rejects a mismatched model before submitting a turn', async t => {
+  await assert.rejects(harness(t, { returnedModel: 'foreign-model' }), /different model/);
+});
 
 test('wire uses initialize handshake and durable start/resume permission fields', async t => {
   for (const [mode, expected] of [

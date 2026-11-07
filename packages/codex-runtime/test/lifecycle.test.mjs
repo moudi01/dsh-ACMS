@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCodexRun } from '../lib/index.js';
 import { ThreadStore } from '../lib/store.js';
+import { startOwnedProcess } from '../../../src/runtime/owned-process.js';
 
 const fakeBin = fileURLToPath(new URL('./fake-app-server.mjs', import.meta.url));
 function fixture(t) {
@@ -123,4 +124,70 @@ test('startup timeout rejects before publication, reaps the process, and clears 
   const retry = await f.runtime().start(f.request());
   assert.equal((await retry.result).stopReason, 'completed');
   await retry.dispose();
+});
+
+for (const failure of ['denied', 'timeout', 'false']) test(`cleanup ${failure} retains a durable lease after a completed turn`, async t => {
+  const f = fixture(t);
+  let store;
+  const run = await startCodexRun(f.request(), {
+    codexBin: fakeBin, cwd: f.root, store: store = new ThreadStore(f.stateFile, 'fault'),
+    model: 'fixture-model', permissionMode: 'acms-workspace', startupTimeoutMs: 2000, turnTimeoutMs: 2000, disposeGraceMs: 50,
+    env: { FAKE_DB: join(f.root, 'fault-db.json'), FAKE_MODE: 'success' }, onError: () => {},
+    spawn(spec) {
+      const child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, stdio: 'pipe', env: { ...process.env, ...spec.env }, windowsHide: true });
+      f.children.push(child);
+      const done = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', exitCode => resolve({ exitCode })); });
+      return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, done,
+        terminate: () => child.kill(),
+        waitForExit: () => failure === 'denied' ? Promise.reject(new Error('injected access denied')) : failure === 'timeout' ? new Promise(() => {}) : Promise.resolve(false),
+      };
+    },
+  });
+  assert.equal((await run.result).stopReason, 'completed');
+  const before = Date.now();
+  await assert.rejects(run.dispose(), { cleanupUncertain: true });
+  assert(Date.now() - before < 1000);
+  assert.equal(store.summary.status, 'reconciling'); assert.equal(store.summary.cleanupPending, true);
+  assert.equal(existsSync(store.lockPath), true);
+  assert.throws(() => new ThreadStore(f.stateFile, 'fault'), { code: 'CODEX_THREAD_BUSY' });
+  await new Promise(resolve => setTimeout(resolve, 30));
+});
+
+test('startup failure plus uncertain cleanup preserves error identity and lease before a handle exists', async t => {
+  const f = fixture(t); const store = new ThreadStore(f.stateFile, 'startup-fault');
+  const { PassThrough } = await import('node:stream');
+  await assert.rejects(startCodexRun(f.request(), {
+    store, cwd: f.root, model: 'fixture-model', permissionMode: 'acms-workspace', startupTimeoutMs: 30, disposeGraceMs: 50,
+    spawn: () => ({ stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), done: new Promise(() => {}), terminate() {}, waitForExit: () => new Promise(() => {}) }),
+  }), error => error.cleanupUncertain && error instanceof AggregateError && /initialize/.test(error.message));
+  assert.equal(store.summary.cleanupPending, true); assert.equal(existsSync(store.lockPath), true);
+  await assert.rejects(store.close('failed'), { cleanupUncertain: true });
+});
+
+test('an uncertain asynchronous spawn failure quarantines before returning to the caller', async t => {
+  const f = fixture(t); const store = new ThreadStore(f.stateFile, 'spawn-fault');
+  await assert.rejects(startCodexRun(f.request(), {
+    store, cwd: f.root, spawn: async () => { throw Object.assign(new Error('injected launch service lost its receipt'), { cleanupUncertain: true }); },
+  }), { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' });
+  assert.equal(store.summary.cleanupPending, true); assert.equal(existsSync(store.lockPath), true);
+  await assert.rejects(store.close('failed'), { cleanupUncertain: true });
+});
+
+test('app-server uses verified native containment on normal completion and startup timeout', { skip: process.platform !== 'win32' }, async t => {
+  const f = fixture(t);
+  for (const mode of ['success', 'startup-timeout']) {
+    const store = new ThreadStore(f.stateFile, `native-${mode}`);
+    const pending = startCodexRun(f.request(), {
+      store, codexBin: fakeBin, cwd: f.root, model: 'fixture-model', permissionMode: 'acms-workspace', startupTimeoutMs: mode === 'success' ? 2000 : 100, turnTimeoutMs: 2000, disposeGraceMs: 1000,
+      spawn: spec => startOwnedProcess(spec, { cleanupMs: 900 }),
+      env: { FAKE_DB: join(f.root, 'native-db.json'), FAKE_MODE: mode }, onError: () => {},
+    });
+    if (mode === 'success') {
+      const run = await pending; assert.equal((await run.result).stopReason, 'completed'); await run.dispose();
+      assert.equal(store.summary.status, 'idle'); assert.equal(existsSync(store.lockPath), false);
+    } else {
+      await assert.rejects(pending, error => !error.cleanupUncertain && /initialize/.test(error.message));
+      await store.close('failed'); assert.equal(existsSync(store.lockPath), false);
+    }
+  }
 });

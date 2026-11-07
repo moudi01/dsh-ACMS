@@ -44,7 +44,7 @@ stateDiagram-v2
   running --> paused: 主动暂停
   paused --> ready: 恢复
   running --> reconciling: 执行事实不明
-  reconciling --> ready: 核对旧执行已停止
+  reconciling --> ready: 身份匹配的停止回执，且已确认清理
 ```
 
 完成执行只提交结果；不能直接写 `succeeded`。检查通过后，在同一事务中推进流程并创建 review task，下一次调度立即唤醒审查员，不需要所有者发消息。审查与原作者使用不同 agent 身份。审查员使用独立验证副本，可以创建测试临时文件；原作者工作区不在其可写根目录中。

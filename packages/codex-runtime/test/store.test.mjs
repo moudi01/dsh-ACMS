@@ -188,3 +188,17 @@ test('filename mapping handles Windows device names, case, and long Unicode keys
   }
   assert.notEqual(fileStem('CON').toLowerCase(), fileStem('con').toLowerCase())
 })
+
+test('uncertain cleanup persists a quarantine and cannot release the thread lease', async t => {
+  const f = await fixture(t)
+  const store = new ThreadStore(f.stateFile, 'uncertain-tree')
+  t.after(() => store.release())
+  store.quarantine('injected job verification denied')
+  await assert.rejects(store.close('failed'), { cleanupUncertain: true })
+  assert.equal(readJson(store.summaryPath, {}).cleanupPending, true)
+  assert.equal(readJson(store.summaryPath, {}).status, 'reconciling')
+  assert.throws(() => new ThreadStore(f.stateFile, 'uncertain-tree'), { code: 'CODEX_THREAD_BUSY' })
+  // Simulate loss of the host lease; the durable quarantine still forbids reuse.
+  store.release()
+  assert.throws(() => new ThreadStore(f.stateFile, 'uncertain-tree'), { code: 'CODEX_THREAD_BUSY', cleanupUncertain: true })
+})

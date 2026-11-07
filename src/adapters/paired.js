@@ -1,15 +1,15 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { startOwnedProcess, bounded, cleanupError } from '../runtime/owned-process.js';
 import { assert, digest, OWNER, parseResult } from '../core/util.js';
 import { parsePairedResult } from './paired-result.mjs';
-import { startCodexRun } from '../../packages/codex-runtime/lib/index.js';
 import { ThreadStore } from '../../packages/codex-runtime/lib/store.js';
+import { executionIdentity, ExecutionReceipt, assertNoUnknownRuns, readExecution } from '../runtime/execution-receipt.js';
 
 const PROTOCOL = 'acms.runner.v1';
 export class PairedRuntimes {
-  constructor(company, dataDir, options = {}) { this.company = company; this.store = company.store; this.dataDir = dataDir; this.running = new Map(); this.spawn = options.spawn; }
+  constructor(company, dataDir, options = {}) { this.company = company; this.store = company.store; this.dataDir = dataDir; this.running = new Map(); this.receipts = new Set(); this.spawn = options.spawn; this.ownedProcess = options.ownedProcess ?? startOwnedProcess; this.cleanupMs = options.cleanupMs ?? 5000; }
   list() { return this.store?.list('externalModels') ?? []; }
   async pending() {
     const invitations = this.store.list('modelInvites').filter(i => i.status === 'pending' && Date.parse(i.expiresAt) > Date.now()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -72,41 +72,72 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
     this.store.transaction(() => { this.store.remove('externalModels', id); this.store.event('model.unpaired', id, {}, OWNER); });
     return { id };
   }
+  execution(modelId, input) { return executionIdentity(this.store.require('externalModels', modelId), input); }
+  readProgress(attempt) { return readExecution(this.dataDir, attempt); }
   async run(modelId, input, signal) {
+    signal?.throwIfAborted();
+    input = { ...input, attemptId: input.attemptId ?? randomUUID(), contextKey: input.contextKey ?? randomUUID(), generation: input.generation ?? 0, kind: input.kind ?? (input.mode === 'probe' ? 'probe' : 'chat') };
+    const ref = this.execution(modelId, input);
+    if (input.execution && digest(input.execution) !== digest(ref)) throw cleanupError('执行配置在持久化身份后发生变化');
+    let receipt;
+    try { assertNoUnknownRuns(this.dataDir, modelId, this.receipts); receipt = new ExecutionReceipt(this.dataDir, ref); }
+    catch (error) { throw cleanupError(`执行台账拒绝重复或未知执行：${error.message}`, error); }
+    this.receipts.add(ref.runKey);
+    let response, failure;
+    try {
+      receipt.update({ status: 'running' });
+      response = await this.runRunner(modelId, { ...input, execution: ref }, signal);
+      return response;
+    } catch (error) { failure = error; throw error; }
+    finally {
+      try { receipt.finish(response, failure); }
+      catch (error) { failure = cleanupError(`无法发布可靠清理回执：${error.message}`, error); throw failure; }
+      finally {
+        this.receipts.delete(ref.runKey);
+        if (failure?.cleanupUncertain && ![...this.running.values()].some(r => r.attemptId === input.attemptId)) {
+          this.running.set(ref.runKey, { modelId, attemptId: input.attemptId, cleanupUncertain: true, cleanupError: failure.message });
+        }
+      }
+    }
+  }
+  async runRunner(modelId, input, signal) {
     signal?.throwIfAborted(); const model = this.store.require('externalModels', modelId); const requestId = randomUUID();
+    const held = [...this.running.values()].find(r => r.cleanupUncertain && r.modelId === modelId);
+    if (held) throw cleanupError(held.cleanupError || '此执行器仍有未确认清理的执行，需先核对进程容器');
     assert(input.mode !== 'probe' || model.probeSupported !== false, 'PAIRED_PROBE_UNSUPPORTED', `此运行环境暂不支持无工具检测：${model.probeReason}`);
     if (model.runtime === 'codex-app-server') return this.runCodex(model, input, signal);
     const request = { ...input, protocol: PROTOCOL, requestId, model: model.model, reasoningEffort: model.reasoningEffort, approvalPolicy: 'never', sandbox: input.mode === 'probe' ? 'read-only' : 'workspace-write', retainContext: input.mode === 'task' && model.persistent && !input.freshContext };
     await fs.mkdir(input.cwd, { recursive: true }); signal?.throwIfAborted();
-    return new Promise((resolve, reject) => {
-      const child = spawn(model.command, model.args, { cwd: input.cwd, shell: false, windowsHide: true, detached: process.platform !== 'win32', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
-      let stdout = '', stderr = '', failure, termination; const id = requestId;
-      const kill = () => {
-        if (termination || !child.pid) return;
-        if (process.platform === 'win32') termination = new Promise(done => { const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); killer.once('close', done); killer.once('error', () => { child.kill(); done(); }); });
-        else { try { process.kill(-child.pid, 'SIGKILL'); } catch {} termination = Promise.resolve(); }
-      };
-      const abort = () => { failure = signal?.reason ?? new Error('执行已取消'); kill(); };
-      this.running.set(id, { child, kill, modelId });
-      const timer = setTimeout(() => { failure = new Error('执行器超时'); kill(); }, input.mode === 'probe' ? 40000 : this.company.policy().turnTimeoutMs);
-      const clean = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); this.running.delete(id); };
-      child.stdout.on('data', b => { if (stdout.length + b.length > 2097152) { failure = new Error('执行器响应超过 2 MiB'); kill(); } else stdout += b; });
-      child.stderr.on('data', b => { stderr = (stderr + b).slice(-4000); });
-      child.stdin.on('error', () => {});
-      child.once('error', e => { clean(); reject(e); });
-      child.once('close', async code => {
-        await termination; clean();
-        try {
-          if (failure) throw failure;
-          const result = parsePairedResult({ code, stdout }, { requestId, model: model.model });
-          assert(!result.error && result.executed === true, 'PAIRED_RUN_FAILED', '外部执行器未确认真实模型调用完成');
-          assert(input.mode !== 'probe' || typeof result.output === 'string' && result.output.trim(), 'PAIRED_PROTOCOL', '检测未返回实际模型文本');
-          resolve({ ...result, output: input.mode === 'task' ? parseResult(result.output) : result.output });
-        } catch (e) { reject(e); }
-      });
+    const run = { modelId, attemptId: input.attemptId }; this.running.set(requestId, run);
+    let timer, child, failure, stdout = '', bytes = 0;
+    const aborted = Promise.withResolvers(); aborted.promise.catch(() => {});
+    const stop = error => { failure ??= error; aborted.reject(failure); };
+    const abort = () => stop(signal?.reason instanceof Error ? signal.reason : new Error('执行已取消'));
+    try {
+      child = run.child = await this.ownedProcess({ argv: [model.command, ...model.args], cwd: input.cwd,
+        env: { ELECTRON_RUN_AS_NODE: '1' }, runMs: input.mode === 'probe' ? 40000 : this.company.policy().turnTimeoutMs }, { cleanupMs: this.cleanupMs, signal });
+      timer = setTimeout(() => stop(new Error('执行器超时')), input.mode === 'probe' ? 40000 : this.company.policy().turnTimeoutMs);
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', b => { bytes += Buffer.byteLength(b); if (bytes > 2097152) stop(new Error('执行器响应超过 2 MiB')); else stdout += b; });
+      child.stdout.on('error', stop); child.stderr.on('error', stop); child.stderr.resume();
+      child.stdin.on('error', stop);
       signal?.addEventListener('abort', abort, { once: true });
-      child.stdin.end(JSON.stringify(request), () => { if (!failure && !signal?.aborted) input.onAccepted?.(); }); if (signal?.aborted) abort();
-    });
+      if (signal?.aborted) abort();
+      else child.stdin.end(JSON.stringify(request), () => { if (!failure && !signal?.aborted) input.onAccepted?.(); });
+      const outcome = await Promise.race([child.done, aborted.promise]);
+      if (failure) throw failure;
+      if (outcome.cleanup?.reason) throw new Error(outcome.cleanup.reason);
+      const result = parsePairedResult({ code: outcome.exitCode, stdout }, { requestId, model: model.model });
+      assert(!result.error && result.executed === true, 'PAIRED_RUN_FAILED', '外部执行器未确认真实模型调用完成');
+      assert(input.mode !== 'probe' || typeof result.output === 'string' && result.output.trim(), 'PAIRED_PROTOCOL', '检测未返回实际模型文本');
+      return { ...result, output: input.mode === 'task' ? parseResult(result.output) : result.output };
+    } catch (error) { if (error.cleanupUncertain) { run.cleanupUncertain = true; run.cleanupError = error.message; } throw error; }
+    finally {
+      clearTimeout(timer); signal?.removeEventListener('abort', abort);
+      try { if (child) await bounded(child.cleanup(), this.cleanupMs, 'runner cleanup deadline exceeded'); }
+      catch (error) { run.cleanupUncertain = true; run.cleanupError = error.message; throw error.cleanupUncertain ? error : cleanupError(error.message, error); }
+      finally { if (!run.cleanupUncertain) this.running.delete(requestId); }
+    }
   }
   canSteer(attemptId) { return !!attemptId && [...this.running.values()].some(r => r.attemptId === attemptId && r.handle?.canSteer()); }
   async steer(attemptId, text, signal) {
@@ -116,17 +147,22 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
   }
   taskMessages(attemptId) { return [...(this.running.get(attemptId)?.messages.values() ?? [])]; }
   async runCodex(model, input, signal) {
-    assert(this.spawn, 'PAIRED_RUNTIME', '宿主未提供 Codex 子进程服务');
+    const { startCodexRun } = await import('../../packages/codex-runtime/lib/index.js');
+    signal ??= new AbortController().signal;
     await fs.mkdir(input.cwd, { recursive: true }); signal?.throwIfAborted();
     const runId = input.attemptId ?? randomUUID();
-    const key = model.persistent && !input.freshContext ? `${model.id}:${input.contextKey}` : `${model.id}:${runId}`;
-    const store = new ThreadStore(path.join(this.dataDir, 'codex-chat-threads.json'), key);
+    const key = input.execution.threadKey;
+    let store;
+    try {
+      store = new ThreadStore(path.join(this.dataDir, 'codex-chat-threads.json'), key);
+      if (store.summary.status && store.summary.status !== 'idle') throw new Error('Previous Codex session is not reliably settled');
+    } catch (error) { store?.quarantine(error.message); throw cleanupError(error.message, error); }
     const run = { modelId: model.id, attemptId: input.attemptId, messages: new Map() }; this.running.set(runId, run);
     try {
-      store.update({ attemptId: input.attemptId ?? null, status: 'starting', terminalResult: null });
+      store.update({ attemptId: input.attemptId, executionIdentity: input.execution, status: 'starting', terminalResult: null, lastSnippet: '', toolCalls: 0, turnTokenUsage: null });
       run.handle = await startCodexRun({ prompt: [{ type: 'text', text: input.prompt }], signal }, {
         argv: [model.command, ...model.args], cwd: input.cwd, model: model.model, reasoningEffort: model.reasoningEffort,
-        permissionMode: 'acms-workspace', store, spawn: this.spawn, env: { ELECTRON_RUN_AS_NODE: '1' },
+        permissionMode: 'acms-workspace', store, spawn: spec => this.ownedProcess({ ...spec, runMs: this.company.policy().turnTimeoutMs }, { spawn: this.spawn, cleanupMs: this.cleanupMs, signal }), env: { ELECTRON_RUN_AS_NODE: '1' },
         disposeGraceMs: 5000, startupTimeoutMs: 60000, turnTimeoutMs: this.company.policy().turnTimeoutMs,
         onAccepted: input.onAccepted,
         onNotification: (method, p) => {
@@ -137,13 +173,15 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
         onError: () => {},
       });
       const result = await run.handle.result;
-      signal.throwIfAborted();
       assert(result.stopReason === 'completed', 'PAIRED_RUN_FAILED', result.diagnostic || 'Codex 执行未完成');
       return { executed: true, reasoningEffort: model.reasoningEffort, output: parseResult(result.structured ?? result.output?.filter(b => b.type === 'text').map(b => b.text).join('\n')) };
-    } finally {
-      try { if (run.handle) await run.handle.dispose(); else await store.close('failed'); }
-      catch (error) { error.cleanupUncertain = true; error.code = 'PAIRED_CLEANUP_UNCONFIRMED'; throw error; }
-      finally { this.running.delete(runId); }
+    } catch (error) { if (error.cleanupUncertain) { run.cleanupUncertain = true; run.cleanupError = error.message; store.quarantine(error.message); } throw error; }
+    finally {
+      try {
+        if (run.handle) await bounded(run.handle.dispose(), this.cleanupMs + 1000, 'Codex cleanup deadline exceeded');
+        else if (!run.cleanupUncertain) await store.close('failed');
+      } catch (error) { run.cleanupUncertain = true; run.cleanupError = error.message; store.quarantine(error.message); throw cleanupError(error.message, error); }
+      finally { if (!run.cleanupUncertain) this.running.delete(runId); }
     }
   }
 }

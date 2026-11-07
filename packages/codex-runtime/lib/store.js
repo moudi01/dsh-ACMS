@@ -85,6 +85,7 @@ export class ThreadStore {
         turnTokenUsage: null, currentTurn: null, turnId: null, totalToolCalls: 0
       };
       this.summary = { ...this.summary, key, eventFile: this.eventFile, summaryFile: this.summaryFile };
+      if (this.summary.cleanupPending) throw Object.assign(new Error('codex-runtime: previous process cleanup requires reconciliation'), { code: 'CODEX_THREAD_BUSY', cleanupUncertain: true });
       this.seq = this.summary.lastSeq ?? 0;
       // Recover an append that reached disk before its summary. Drop only a partial final line.
       if (existsSync(this.eventsPath)) {
@@ -145,8 +146,16 @@ export class ThreadStore {
     this.update(fields);
     return event;
   }
+  quarantine(reason) {
+    // A dead host/expired lock is not evidence that its descendants stopped.
+    // Persist the hold before returning; retain this run's lease on disk.
+    this.quarantined = true;
+    try { this.update({ status: 'reconciling', cleanupPending: true, cleanupError: reason }); }
+    catch (error) { throw Object.assign(error, { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' }); }
+  }
   async close(status, extra = {}) {
     if (this.closed) return;
+    if (this.quarantined) throw Object.assign(new Error(this.summary.cleanupError), { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' });
     try {
       this.record('provider/runSettled', { status, ...extra });
       this.update({ ...extra, status: 'idle', lastStatus: status, currentTurn: null });

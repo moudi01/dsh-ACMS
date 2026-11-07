@@ -1,8 +1,7 @@
 /** DSH normally watches configuration, not imported source modules. Publish one
  * immutable host bundle and change only ACMS's managed entry to hot-reload it. */
-import { build } from 'esbuild';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { buildHost } from './host-bundle.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -28,12 +27,8 @@ const checkIdle = () => {
   } finally { db.close(); }
 };
 checkIdle();
-const bundle = await build({ absWorkingDir: root, entryPoints: ['src/host/index.js'], platform: 'node', format: 'esm', bundle: true, packages: 'external', write: false, target: 'node24' });
-const bytes = bundle.outputFiles[0].contents;
-const revision = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
-const filename = path.join(root, 'dist', `host-${revision}.mjs`);
+const { filename, revision } = await buildHost({ root });
 const next = replaceHostEntry(previous, filename);
-await mkdir(path.dirname(filename), { recursive: true }); await writeFile(filename, bytes);
 if (next !== previous) {
   checkIdle();
   const backups = path.join(dataDir, 'install-backups'); await mkdir(backups, { recursive: true });
