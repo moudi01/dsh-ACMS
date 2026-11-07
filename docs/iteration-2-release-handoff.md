@@ -144,3 +144,9 @@
 - 检查：新增 `test/agent-api-integration.test.js`，使用真实 HTTP 路由、临时 SQLite 与真实审查状态机，覆盖空偏好、偏好保存/清除 revision、批准与退回两种审查结论、审查任务详情追溯；`test/agent-api.test.js` 同步空偏好断言。全量 317/317、owner check 317/317、首次接入 27/27、公开文档 5/5。
 - 证据：`test-results/iteration-2-final-v9/`（test.log、agent-api-integration.log、owner-check.log、external-onboarding-ui.log、external-onboarding-doc.log 等）；独立复现证据由审查方保留在 D:/ACMS/test-results/current-review/attempt_2222a18b/api-integration-reproduction.json。
 - 边界：授权判断未改；PR/CI/合入/升级/真实宿主验收未发生；本版仍需 ACMS 重新安排非作者复审。
+
+## 10. v9 CI repair delta (supersedes section 8 CI-pending wording)
+
+PR #23 run 42383001370 failed 315/317 in the published ACL guard. The failure is an explicit foreign ACE on the token file, not a test-only issue. The published block now rebuilds the ACL and removes foreign explicit ACEs; the new regression covers an explicit Everyone ACE.
+
+Local evidence: commit 6634c677bd629e6c79480a0cacd376cb8ec260b9 has the exact PR #23 tree 72ced9318a1c1d7a24fdfd9a30300a9a46d6ca4a; red exit 1 (ci-fix-red.log), green 6/6 (ci-fix-green.log), check exit 0. Non-author review, PR update, CI, merge, backup, upgrade and live acceptance remain pending.

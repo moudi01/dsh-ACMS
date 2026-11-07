@@ -79,3 +79,30 @@ test("the onboarding guide, API contract, and issue form describe the same goal 
   assert.equal(access.includes("指定后仅限该目标"), false);
   assert.match(api, /目标由该凭据提交/);
 });
+
+import { mkdir, writeFile } from "node:fs/promises";
+
+test("the published token setup removes explicit foreign ACEs on an existing token file", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "acms-onboarding-foreign-"));
+  const tokenFile = path.join(home, ".dsh", "acms", "agent-token");
+  try {
+    await mkdir(path.dirname(tokenFile), { recursive: true });
+    await writeFile(tokenFile, "stale", "utf8");
+    const grant = spawnSync("icacls", [tokenFile, "/grant", "*S-1-1-0:(R)"], { encoding: "utf8", windowsHide: true });
+    assert.equal(grant.status, 0, grant.stderr || grant.stdout);
+    const before = readTokenAcl(tokenFile);
+    const beforeRules = [].concat(before.rules || []);
+    assert.ok(beforeRules.some((rule) => rule.sid !== before.currentUser), "fixture must contain an explicit foreign ACE");
+    const token = "acms_ag_" + "x".repeat(48);
+    const run = runTokenSetup({ home, token });
+    assert.equal(run.status, 0, run.stderr || run.stdout);
+    const after = readTokenAcl(tokenFile);
+    const afterRules = [].concat(after.rules || []);
+    assert.equal(after.protected, true);
+    assert.equal(afterRules.length, 1);
+    assert.equal(afterRules[0].sid, after.currentUser);
+    assert.equal(afterRules[0].inherited, false);
+  } finally {
+    await removeFixture(home);
+  }
+});

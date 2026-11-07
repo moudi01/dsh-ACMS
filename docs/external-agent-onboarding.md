@@ -40,7 +40,18 @@ icacls $tokenFile /inheritance:r /grant:r "*${me}:(R,W)" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls 失败：退出码 $LASTEXITCODE" }
 $acl = Get-Acl -LiteralPath $tokenFile
 if (-not $acl.AreAccessRulesProtected) { throw "token 文件仍继承父目录权限" }
-$other = @($acl.Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $me })
+# Some hosts (including GitHub Windows runners) create the file with explicit
+# default-DACL ACEs for other identities. /inheritance:r only removes inherited
+# ACEs, so rebuild the DACL and keep only the current user before verifying.
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) {
+  if ($rule.IsInherited) { continue }
+  $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+  if ($sid -ne $me) { [void]$acl.RemoveAccessRuleSpecific($rule) }
+}
+Set-Acl -LiteralPath $tokenFile -AclObject $acl -ErrorAction Stop
+$acl = Get-Acl -LiteralPath $tokenFile
+if (@($acl.Access).Count -ne 1) { throw "token file must have exactly one ACE" }$other = @($acl.Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $me })
 if ($other.Count -gt 0) { throw "token 文件仍允许其他身份访问" }
 Remove-Variable -Name token,secure,ptr -ErrorAction SilentlyContinue
 "token 已写入 $tokenFile；ACL：仅当前用户可读写"
