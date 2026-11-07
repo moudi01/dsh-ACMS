@@ -1,0 +1,34 @@
+# Node v24.22.0 internal/fs/rimraf, extracted at runtime
+# extraction: process.binding(natives)[internal/fs/rimraf]
+
+function rimraf excerpt:
+function rimraf(path, options, callback) {
+  let retries = 0;
+
+  _rimraf(path, options, function CB(err) {
+    if (err) {
+      if (retryErrorCodes.has(err.code) && retries < options.maxRetries) {
+        retries++;
+        const delay = retries * options.retryDelay;
+        return setTimeout(_rimraf, delay, path, options, CB);
+      }
+
+      // The file is already gone.
+      if (err.code === 'ENOENT')
+        err = null;
+    }
+
+    callback(err);
+  });
+}
+
+
+function _rimraf(path, options, callback) {
+  // SunOS lets the root user unlink directories. Use lstat here to make sure
+  // it's not a directory.
+  lstat(path, (err, stats) => {
+    if (err) {
+      if (err.code === 'ENOENT')
+        return callback(null);
+
+      /

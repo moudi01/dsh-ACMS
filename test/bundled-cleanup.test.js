@@ -14,7 +14,7 @@ function alive(pid) { try { process.kill(pid, 0); return true; } catch (error) {
 
 test('immutable host build publishes a matching content-addressed helper and the bundle locates it', async t => {
   const directory = await mkdtemp(path.join(tmpdir(), 'acms-bundle-test-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.after(() => rm(directory, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 }));
   const built = await buildHost({ root, outDir: directory });
   const source = await readFile(path.join(root, 'src/runtime/owned-job.cs'));
   assert.deepEqual(await readFile(built.resource), source);
@@ -32,7 +32,7 @@ for (const mode of ['hold', 'parent-exit', 'natural-race']) test(`bundled runtim
   t.after(async () => {
     await run?.cleanup().catch(() => {}); other?.terminate(); await other?.done;
     await until(() => pids.every(pid => !alive(pid)), 10000);
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 });
   });
   const built = await buildHost({ root, outDir: directory, entryPoint: 'src/runtime/owned-process.js' });
   // Import the emitted bundle, not the source module. There is no adjacent

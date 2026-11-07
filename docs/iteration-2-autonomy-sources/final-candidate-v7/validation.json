@@ -1,0 +1,107 @@
+{
+  "format": "acms.iteration-2.final-validation.v7",
+  "generatedAt": "2026-11-07T13:42:11.699Z",
+  "attempt": "attempt_c350a352-92ca-49e6-8c09-eac3c555d389",
+  "environment": {
+    "node": "v24.22.0",
+    "platform": "win32 x64",
+    "npm": "11.19.1"
+  },
+  "commands": [
+    {
+      "name": "npm run check",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/check.log"
+    },
+    {
+      "name": "npm test",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/test.log",
+      "tests": 315,
+      "pass": 315,
+      "fail": 0
+    },
+    {
+      "name": "npm run build",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/build.log",
+      "outputBytes": 222255,
+      "fileBytes": 222458
+    },
+    {
+      "name": "npm run test:ui",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/ui-test.log"
+    },
+    {
+      "name": "npm run test:usability",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/usability-test.log"
+    },
+    {
+      "name": "npm run test:structure",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/structure-test.log"
+    },
+    {
+      "name": "npm run test:model-preferences-ui",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/model-preferences-ui.log"
+    },
+    {
+      "name": "npm run test:pairing-ui",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/pairing-ui.log"
+    },
+    {
+      "name": "npm run test:empty-models",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/empty-models-green.log"
+    },
+    {
+      "name": "node scripts/external-onboarding-ui-test.mjs",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/external-onboarding-ui.log",
+      "assertions": 27
+    },
+    {
+      "name": "node --test test/external-onboarding-doc.test.js",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/green-doc-scope.log",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0
+    },
+    {
+      "name": "node --test --test-name-pattern goal scope test/agent-api.test.js",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/union-scope-behavior.log",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0
+    },
+    {
+      "name": "owner-check.mjs",
+      "exitCode": 0,
+      "log": "test-results/iteration-2-final-v7/owner-check.log",
+      "tests": 315,
+      "pass": 315,
+      "fail": 0
+    }
+  ],
+  "red": {
+    "name": "node --test test/external-onboarding-doc.test.js (before fix)",
+    "exitCode": 1,
+    "log": "test-results/iteration-2-final-v7/red-doc-scope.log",
+    "failedAssertion": "guide still contains 指定后只能访问该目标"
+  },
+  "evidence": {
+    "receipt": "docs/iteration-2-autonomy-sources/external-onboarding-ui-receipt.json",
+    "p2": "docs/iteration-2-autonomy-sources/final-candidate-v7/p2-goal-scope-fix.json"
+  },
+  "notes": [
+    "All commands executed in the isolated workspace; logs are raw redirection output.",
+    "UI receipt uses isolated preview host and simulated provider; realModelCalls=0.",
+    "No PR, CI, merge, deployment or real DSH host acceptance was executed."
+  ]
+}

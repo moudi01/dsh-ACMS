@@ -1,0 +1,100 @@
+{
+  "format": "acms.iteration-2.autonomy.validation.v1",
+  "generatedAt": "2026-11-07T12:00:49.614Z",
+  "head": "821677a89c195281e1e7b541f41096ff8177d00f",
+  "node": "v24.22.0",
+  "platform": "win32 x64",
+  "commands": [
+    {
+      "file": "static-check.log",
+      "command": "node scripts/check.mjs",
+      "exitCode": 0,
+      "tests": null,
+      "pass": null,
+      "fail": null
+    },
+    {
+      "file": "full-test.log",
+      "command": "npm test",
+      "exitCode": 0,
+      "tests": 312,
+      "pass": 312,
+      "fail": 0
+    },
+    {
+      "file": "autonomy-test.log",
+      "command": "node --test --test-concurrency=1 test/autonomy.test.js",
+      "exitCode": 0,
+      "tests": 20,
+      "pass": 20,
+      "fail": 0
+    },
+    {
+      "file": "targeted-test.log",
+      "command": "node --test --test-concurrency=1 test/recovery-boundaries.test.js test/domain.test.js test/task-management.test.js test/engine.test.js test/action-batch.test.js",
+      "exitCode": 0,
+      "tests": 52,
+      "pass": 52,
+      "fail": 0
+    },
+    {
+      "file": "build.log",
+      "command": "npm run build",
+      "exitCode": 0,
+      "tests": null,
+      "pass": null,
+      "fail": null
+    },
+    {
+      "file": "structure.log",
+      "command": "npm run test:structure",
+      "exitCode": 0,
+      "tests": null,
+      "pass": null,
+      "fail": null
+    },
+    {
+      "file": "external-onboarding.log",
+      "command": "node scripts/external-onboarding-ui-test.mjs",
+      "exitCode": 0,
+      "tests": null,
+      "pass": null,
+      "fail": null
+    }
+  ],
+  "buildRestored": true,
+  "manualEvidence": [
+    {
+      "file": "coordination-regressions-red.log",
+      "note": "Five new boundary tests executed after temporarily restoring the three source files from ae05874; expected 0 pass / 5 fail."
+    },
+    {
+      "file": "coordination-regressions-green.log",
+      "note": "The same five boundary tests executed against the fixed working tree; 5 pass / 0 fail."
+    },
+    {
+      "file": "manager-authority-red.log",
+      "note": "This round three manager-authority cases executed after temporarily restoring src/core/coordination.js, src/core/domain.js and src/core/plan-ledger.js from ae2672b; expected 0 pass / 3 fail."
+    },
+    {
+      "file": "manager-authority-green.log",
+      "note": "The same three manager-authority cases executed against the fixed working tree; 3 pass / 0 fail."
+    },
+    {
+      "file": "coordination-third-round-red.log",
+      "note": "This round three defects executed after restoring the four source files from HEAD; expected 0 pass / 3 fail."
+    },
+    {
+      "file": "coordination-third-round-green.log",
+      "note": "The same three cases executed against the fixed working tree; 3 pass / 0 fail."
+    }
+  ],
+  "modelEvidence": "SimulatedAdapter only; no real model invocation",
+  "notes": [
+    "full-test.log is produced by npm test with node --test-concurrency=1 from package.json.",
+    "build.log is produced by npm run build; lib/client.js line-ending-only change is restored only when normalized content is identical.",
+    "No database, credential, deployment or PR action is performed by this script.",
+    "The red/green boundary logs are generated manually from the fixed test file; each red log temporarily restores the three source files from the named base commit (ae05874 for the earlier five cases, ae2672b for this round three cases) and then restores the fixed versions.",
+    "Boundary evidence was regenerated after the four independent-review defects were fixed and again after this round two P1 defects were fixed."
+  ]
+}

@@ -63,7 +63,7 @@ async function harness(t, options = {}) {
     await store.close('test-complete');
     assert.ok(path.resolve(dir).startsWith(path.resolve(os.tmpdir()) + path.sep));
     assert.ok(path.basename(dir).startsWith('codex-runtime-wire-'));
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 });
   });
   await wire.initialize(signal);
   await wire.startThread(CWD, signal);

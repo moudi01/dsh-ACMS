@@ -26,6 +26,7 @@ export class SimulatedAdapter {
   async close() {}
 }
 export async function defaultSimulation({ task }) {
+  if (task.kind === 'coordination') return { outcome: 'coordinated', summary: '模拟协调：恢复返工并保留原分派' };
   if (task.kind === 'plan') return { outcome: 'planned', summary: '模拟拆解完成', tasks: [
     { key: 'deliver', title: '生成示例交付物', description: '创建可审查的交付文件', acceptance: '包含任务说明和验证结果', dependencies: [] },
     { key: 'handoff', title: '整理交接说明', description: '基于前一步交付物创建交接说明', acceptance: '交接文档存在且可读', dependencies: ['deliver'] },

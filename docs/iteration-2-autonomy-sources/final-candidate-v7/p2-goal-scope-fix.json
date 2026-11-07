@@ -1,0 +1,54 @@
+{
+  "format": "acms.iteration-2.p2-goal-scope-fix.v1",
+  "generatedAt": "2026-11-07T13:42:06.532Z",
+  "attempt": "attempt_c350a352-92ca-49e6-8c09-eac3c555d389",
+  "review": {
+    "attempt": "attempt_439973df-3f74-4934-9d92-b82678074cde",
+    "severity": "P2",
+    "summary": "签发提示、结果/列表与 agent-api.md 的目标范围并集语义不一致；指定目标后仍可访问由本凭据提交的目标。"
+  },
+  "before": {
+    "hint": "留空时，凭据可提交新目标并读取其自己提交的目标；指定后仅限该目标。",
+    "guide": "指定后只能访问该目标。"
+  },
+  "after": {
+    "hint": "留空时，凭据只能访问其自己提交的目标；指定后，可访问该目标以及本凭据提交的目标。",
+    "guide": "指定后，可访问该目标以及自己提交的目标。"
+  },
+  "behavior": "goalAllowed: goal.id in scope.goalIds OR goal.source.principalId === credential.id OR read-only allGoals in project",
+  "files": [
+    "src/client/access.jsx",
+    "lib/client.js",
+    "docs/external-agent-onboarding.md",
+    "docs/agent-api.md",
+    "test/agent-api.test.js",
+    "test/external-onboarding-doc.test.js",
+    "scripts/external-onboarding-ui-test.mjs"
+  ],
+  "checks": {
+    "apiBehavior": "goal scope is the union of configured goals and goals the credential submitted",
+    "docConsistency": "the onboarding guide, API contract, and issue form describe the same goal scope",
+    "ui": [
+      "goalScopeHintAccurate",
+      "goalScopeIssuedShowsUnion"
+    ]
+  },
+  "counts": {
+    "npmTest": "315/315",
+    "docTests": "5/5",
+    "uiAssertions": "27/27",
+    "ownerCheck": "315/315"
+  },
+  "logs": {
+    "red": "test-results/iteration-2-final-v7/red-doc-scope.log",
+    "green": "test-results/iteration-2-final-v7/green-doc-scope.log",
+    "behavior": "test-results/iteration-2-final-v7/union-scope-behavior.log",
+    "ui": "test-results/iteration-2-final-v7/external-onboarding-ui.log"
+  },
+  "realModelCalls": 0,
+  "limits": [
+    "authorization logic unchanged",
+    "no new permissions",
+    "PR/CI/merge/deploy/real-host acceptance not executed"
+  ]
+}

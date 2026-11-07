@@ -1,0 +1,42 @@
+{
+  "format": "acms.iteration-2.final-candidate.v6.environment-evidence.v1",
+  "generatedAt": "2026-11-07T13:00:00.000Z",
+  "node": "v24.22.0",
+  "platform": "win32 x64",
+  "rmRetry": {
+    "sourceFile": "final-candidate-v6/node-rimraf-retry-source.txt",
+    "formula": "delay = retries * retryDelay (retries is 1-based)",
+    "upperBoundMs": 32500,
+    "measured": [
+      { "maxRetries": 5, "retryDelay": 20, "elapsedMs": 342, "code": "EBUSY" },
+      { "maxRetries": 10, "retryDelay": 20, "elapsedMs": 1165, "code": "EBUSY" }
+    ],
+    "note": "32.5s is an upper bound excluding I/O; measured samples come from the same machine and Node build."
+  },
+  "psModulePath": {
+    "failureReceipt": "D:/ACMS/test-results/iteration-2/autonomy-host-acl-v5/receipt.json",
+    "failureLog": "D:/ACMS/test-results/iteration-2/autonomy-host-acl-v5/onboarding-doc-acl-exact-artifact.log",
+    "failureError": "Get-Acl autoload failed with CommandNotFoundException because Microsoft.PowerShell.Security could not be loaded under the inherited module search path.",
+    "controlledSuccessReceipt": "D:/ACMS/test-results/iteration-2/autonomy-host-acl-v5-system-modules/receipt.json",
+    "helperBehavior": "scripts/onboarding-doc.mjs removes PSModulePath for child processes only.",
+    "defaultEnvironmentDirectRun": {
+      "log": "final-candidate-v6/onboarding-doc-default-env.json",
+      "status": 0,
+      "tokenOk": true,
+      "inheritedPsModulePath": "C:\\Users\\Administrator\\Documents\\WindowsPowerShell\\Modules;C:\\Program Files\\WindowsPowerShell\\Modules;C:\\Windows\\system32\\WindowsPowerShell\\v1.0\\Modules",
+      "note": "The documented block was executed unmodified except a console-encoding prefix in a child PowerShell that inherited this machine default module path."
+    },
+    "unverified": [
+      "GitHub CI run on windows-latest",
+      "hosts whose inherited module path actually shadows Windows PowerShell modules"
+    ]
+  },
+  "emptyModels": {
+    "failureLog": "docs/iteration-2-sources/issue-5/empty-models-known-failure.txt",
+    "cause": "The test script clicked a background nav button while the pairing modal stayed open; Playwright reported pointer events intercepted by a dialog.",
+    "classification": "Existing test-script sequencing defect; the product dialog correctly blocks background clicks.",
+    "fix": "scripts/empty-models-test.mjs adds two lines that close the pairing dialog and assert zero dialogs.",
+    "greenLog": "test-results/iteration-2-final/empty-models-green.log",
+    "greenResult": "test-results/empty-models-result.json"
+  }
+}

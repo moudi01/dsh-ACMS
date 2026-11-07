@@ -26,7 +26,7 @@ async function treeRun(t, mode) {
     await run.cleanup().catch(() => {});
     // Never signal raw fixture PIDs; wait for containment or the fixture TTL.
     await until(() => pids.every(pid => !alive(pid)), 10000);
-    await rm(cwd, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 });
   });
   await until(async () => {
     try { pids = (await readFile(file, 'utf8')).trim().split('\n').map(s => JSON.parse(s).pid); return pids.length === 3; }
@@ -65,7 +65,7 @@ test('abrupt host exit closes the control pipe and reaps the real owned tree', w
   const file = path.join(cwd, 'pids.jsonl'); let pids = [];
   const host = spawnNode({ argv: [process.execPath, fileURLToPath(new URL('./fixtures/owned-host.mjs', import.meta.url)), file], cwd });
   host.stdout.resume(); host.stderr.resume(); host.stdin.end();
-  t.after(async () => { host.terminate(); await host.done; await until(() => pids.every(pid => !alive(pid)), 10000); await rm(cwd, { recursive: true, force: true }); });
+  t.after(async () => { host.terminate(); await host.done; await until(() => pids.every(pid => !alive(pid)), 10000); await rm(cwd, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 }); });
   await until(async () => { try { pids = (await readFile(file, 'utf8')).trim().split('\n').map(x => JSON.parse(x).pid); return pids.length === 3; } catch { return false; } });
   host.terminate(); await host.done;
   await until(() => pids.every(pid => !alive(pid)), 3000);

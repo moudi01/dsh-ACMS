@@ -1,0 +1,89 @@
+{
+  "attemptId": "attempt_9562f7e8-60d1-48f1-94c8-84e5e842d5b7",
+  "taskId": "task_ab7105f7-1f5d-4775-9752-9088b3543044",
+  "baseline": "178987ad4337a499f925d4377de44a3b5f11d550",
+  "generatedAt": "2026-11-07T08:59:52.374Z",
+  "node": "v24.22.0",
+  "platform": "win32 x64",
+  "environment": {
+    "nodeModulesInstalled": true,
+    "note": "Isolated task workspace with local node_modules available. The full test suite is executed directly; no dependency installation or test weakening was used for this evidence."
+  },
+  "checks": [
+    {
+      "name": "agent-api-protocol",
+      "command": "node --test --test-concurrency=1 test/agent-api.test.js test/agent-api-lifecycle.test.js",
+      "exitCode": 0,
+      "log": "agent-api-tests.log",
+      "counts": {
+        "tests": 26,
+        "pass": 26,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "name": "affected-regression",
+      "command": "node --test --test-concurrency=1 test/domain.test.js test/transport.test.js test/delegation-permissions.test.js test/action-batch.test.js test/recovery-boundaries.test.js test/engine.test.js",
+      "exitCode": 0,
+      "log": "regression.log",
+      "counts": {
+        "tests": 53,
+        "pass": 53,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "name": "static-checks",
+      "command": "node scripts/check.mjs",
+      "exitCode": 0,
+      "log": "static-checks.log",
+      "counts": {
+        "tests": null,
+        "pass": null,
+        "fail": null,
+        "cancelled": null,
+        "skipped": null
+      }
+    },
+    {
+      "name": "full-suite",
+      "command": "node --test --test-concurrency=1 test/action-batch.test.js test/agent-api-lifecycle.test.js test/agent-api.test.js test/bundled-cleanup.test.js test/collaboration.test.js test/conversations.test.js test/delegation-permissions.test.js test/deployment.test.js test/domain.test.js test/engine.test.js test/entity-management.test.js test/exploratory-regression.test.js test/graceful-pause.test.js test/models.test.js test/owned-process.test.js test/paired-cleanup.test.js test/paired-conversations.test.js test/paired-recovery.test.js test/paired.test.js test/recovery-boundaries.test.js test/recovery.test.js test/runtime-budget.test.js test/task-management.test.js test/transport.test.js",
+      "exitCode": 0,
+      "log": "full-suite.log",
+      "counts": {
+        "tests": 216,
+        "pass": 216,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    }
+  ],
+  "repository": {
+    "head": "178987ad4337a499f925d4377de44a3b5f11d550",
+    "dirty": true,
+    "changed": [
+      "M package.json",
+      " M src/core/domain.js",
+      " M src/core/store.js",
+      " M src/core/util.js",
+      " M src/host/http.js",
+      " M src/host/index.js",
+      " M src/runtime/engine.js",
+      "?? docs/agent-api.md",
+      "?? docs/iteration-2-agent-api-delivery.md",
+      "?? docs/iteration-2-agent-api-sources/",
+      "?? examples/agent-api/",
+      "?? scripts/acms-agent.mjs",
+      "?? src/core/agent-identity.js",
+      "?? src/core/external-access.js",
+      "?? src/host/agent-api.js",
+      "?? test/agent-api-lifecycle.test.js",
+      "?? test/agent-api.test.js"
+    ]
+  }
+}

@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { assert, parseResult, digest, OWNER } from '../core/util.js';
+import { assert, parseResult, digest, OWNER, SYSTEM } from '../core/util.js';
+import { SELECTOR_VERSION, MAX_CANDIDATES, bindingFromAgent, buildCandidates, emptyRequirements, selectRoute, selectionError } from '../core/model-selection.js';
 import { inside } from '../runtime/workspaces.js';
 import { PairedRuntimes } from './paired.js';
 import { unknownExecution } from '../runtime/execution-receipt.js';
@@ -9,8 +10,8 @@ import { unknownExecution } from '../runtime/execution-receipt.js';
 export class DshAdapter {
   constructor(ctx, company, dataDir, options = {}) { this.ctx = ctx; this.company = company; this.dataDir = dataDir; this.parent = null; this.creatingParent = null; this.activations = new Map(); this.metadata = new Map(); this.diagnostics = new Map(); this.activeProbes = 0; this.paired = options.paired ?? new PairedRuntimes(company, dataDir, { spawn: spec => ctx.subprocess.spawn(spec) }); }
   providers() {
-    const native = [...this.ctx.subagents.providers.values()].filter(p => typeof p.prepareContinuable === 'function' && p.capabilities.agentOptions).map(p => ({ name: p.name, model: null, capabilities: p.capabilities, persistent: false, local: true, origin: 'internal', inheritsParentContext: p.inheritsParentContext === true }));
-    return [...native, ...this.paired.list().map(p => ({ name: p.id, displayName: p.name, model: p.model, capabilities: {}, persistent: p.persistent, local: false, origin: 'external', inheritsParentContext: false, reasoningEffort: p.reasoningEffort, probeSupported: p.probeSupported, probeReason: p.probeReason }))];
+    const native = [...this.ctx.subagents.providers.values()].filter(p => typeof p.prepareContinuable === "function" && p.capabilities.agentOptions).map(p => ({ name: p.name, model: null, capabilities: p.capabilities, persistent: false, local: true, origin: "internal", capabilitySource: "runtime", continuity: "unsupported", runningMessages: "supported", tools: "supported", sandbox: "supported", inheritsParentContext: p.inheritsParentContext === true, cost: null }));
+    return [...native, ...this.paired.list().map(p => ({ name: p.id, displayName: p.name, model: p.model, capabilities: {}, persistent: p.persistent, local: false, origin: "external", capabilitySource: "config", continuity: p.persistent === true ? "supported" : p.persistent === false ? "unsupported" : "unknown", runningMessages: p.runtime === "codex-app-server" ? "supported" : "unknown", tools: "unknown", sandbox: "unknown", inheritsParentContext: null, reasoningEffort: p.reasoningEffort, probeSupported: p.probeSupported, probeReason: p.probeReason, cost: null }))];
   }
   healthKey(route) { return digest([route.provider, route.llmProvider || '', route.model, route.reasoningEffort || '']); }
   healthFor(route) {
@@ -41,7 +42,7 @@ export class DshAdapter {
       const info = native.find(m => m.id === model && m.provider === llmProvider);
       const savedDepth = defaults.model === model && defaults.provider === llmProvider ? defaults.reasoningEffort : null;
       const reasoning = p.origin === 'external' ? { effective: p.reasoningEffort, source: '配对 agent 声明', selectable: false, efforts: [] } : { effective: savedDepth ?? info?.reasoning?.defaultEffort ?? null, configured: savedDepth ?? info?.reasoning?.defaultEffort ?? null, efforts: info?.reasoning?.efforts ?? [], selectable: !!info?.reasoning?.efforts?.length, source: savedDepth ? 'DSH 默认配置' : 'DSH 模型列表' };
-      const route = { provider: p.name, llmProvider, displayName: p.displayName || llm.listProviders().find(x => x.id === llmProvider)?.name || llmProvider, reasoning, persistent: p.persistent, origin: p.origin, inheritsParentContext: p.inheritsParentContext, probeSupported: p.probeSupported, probeReason: p.probeReason, health: this.healthFor({ provider: p.name, llmProvider, model }) };
+      const route = { provider: p.name, llmProvider, displayName: p.displayName || llm.listProviders().find(x => x.id === llmProvider)?.name || llmProvider, reasoning, persistent: p.persistent, origin: p.origin, capabilitySource: p.capabilitySource ?? (p.origin === "external" ? "config" : "runtime"), continuity: p.continuity ?? (p.persistent === true ? "supported" : p.persistent === false ? "unsupported" : "unknown"), runningMessages: p.runningMessages ?? "unknown", tools: p.tools ?? "unknown", sandbox: p.sandbox ?? "unknown", cost: null, inheritsParentContext: p.inheritsParentContext, probeSupported: p.probeSupported, probeReason: p.probeReason, health: this.healthFor({ provider: p.name, llmProvider, model }) };
       if (!entry.routes.some(r => r.provider === p.name && r.llmProvider === llmProvider)) entry.routes.push(route);
       models.set(model, entry);
     };
@@ -59,24 +60,47 @@ export class DshAdapter {
     const promise = Promise.resolve().then(() => work(controller.signal)).finally(() => { clearTimeout(timeout); signal?.removeEventListener('abort', abort); this.diagnostics.delete(id); });
     this.diagnostics.set(id, { controller, promise }); return promise;
   }
-  async modelDetails(input, signal) {
-    const provider = await this.choose(input, { ignoreHealth: true }); input = { ...input, provider: provider.name, llmProvider: provider.llmProvider ?? '', model: provider.model }; const key = this.healthKey(input);
+  async routeDetails(route, signal) {
+    // Resolve metadata for the route that was already selected. Selection must not run again
+    // here: the recorded route, model details and activation arguments have to describe the
+    // same provider/model/reasoning decision.
+    const provider = this.providers().find(p => p.name === route.provider);
+    assert(provider, "NO_PROVIDER", "当前执行配置已移除或未配对，请从 DSH 模型列表选择，或先配对外部 agent");
+    const routeModel = route.model ?? provider.model;
+    const routeLlmProvider = route.llmProvider ?? provider.llmProvider ?? "";
+    assert(routeModel, "NO_PROVIDER", "当前执行配置未提供具体模型，请重新选择后再执行");
+    const requested = route.reasoningEffort ?? null;
+    const input = { provider: provider.name, llmProvider: routeLlmProvider, model: routeModel, ...(requested ? { reasoningEffort: requested } : {}) };
+    const key = this.healthKey({ provider: provider.name, llmProvider: routeLlmProvider, model: routeModel });
     const cached = this.metadata.get(key);
     let details = cached && Date.now() - cached.at < 60000 ? cached.value : null;
     if (!details) {
       details = await this.diagnostic(async checkSignal => {
         if (provider.capabilities.agentOptions) {
-          const info = await this.ctx.get('llm').resolveModelInfo(provider.llmProvider, provider.model, checkSignal);
-          const defaultSelection = this.defaultModel(); const same = defaultSelection.provider === provider.llmProvider && defaultSelection.model === provider.model;
-          return { reasoning: { efforts: info.reasoning?.efforts ?? [], effective: (same ? defaultSelection.reasoningEffort : null) ?? info.reasoning?.defaultEffort ?? null, source: same && defaultSelection.reasoningEffort ? 'DSH 默认配置' : info.reasoning?.defaultEffort ? '模型通道配置' : '服务默认（未公开）', selectable: !!info.reasoning?.efforts?.length } };
+          const info = await this.ctx.get("llm").resolveModelInfo(routeLlmProvider, routeModel, checkSignal);
+          const defaultSelection = this.defaultModel(); const same = defaultSelection.provider === routeLlmProvider && defaultSelection.model === routeModel;
+          return { reasoning: { efforts: info.reasoning?.efforts ?? [], effective: (same ? defaultSelection.reasoningEffort : null) ?? info.reasoning?.defaultEffort ?? null, source: same && defaultSelection.reasoningEffort ? "DSH 默认配置" : info.reasoning?.defaultEffort ? "模型通道配置" : "服务默认（未公开）", selectable: !!info.reasoning?.efforts?.length } };
         }
-        return { reasoning: { effective: provider.reasoningEffort ?? null, source: '配对 agent 声明', selectable: false, efforts: [] } };
+        return { reasoning: { effective: provider.reasoningEffort ?? null, source: "配对 agent 声明", selectable: false, efforts: [] } };
       }, signal, 20000);
       this.metadata.set(key, { at: Date.now(), value: details });
     }
-    const selected = input.reasoningEffort || details.reasoning.effective;
-    if (input.reasoningEffort) assert(details.reasoning.selectable && details.reasoning.efforts.some(e => e.id === input.reasoningEffort), 'REASONING_UNSUPPORTED', '所选执行方式不支持这个思考深度');
-    return { ...details, reasoning: { ...details.reasoning, configured: details.reasoning.effective, effective: selected, source: input.reasoningEffort ? '角色指定' : details.reasoning.source }, health: this.healthFor(input), provider: provider.name, model: provider.model };
+    let effective = details.reasoning.effective;
+    if (requested) {
+      const listed = details.reasoning.selectable === true && (details.reasoning.efforts ?? []).some(effort => effort.id === requested);
+      if (!listed && details.reasoning.effective !== requested) {
+        const known = details.reasoning.selectable === true || details.reasoning.effective != null;
+        const error = new Error("所选执行方式不支持这个思考深度（要求 " + requested + "）");
+        error.name = "AcmsError"; error.code = "REASONING_UNSUPPORTED"; error.reason = known ? "route_mismatch" : "capability_unknown";
+        throw error;
+      }
+      effective = requested;
+    }
+    return { ...details, reasoning: { ...details.reasoning, configured: details.reasoning.effective, effective, source: requested ? "角色指定" : details.reasoning.source }, health: this.healthFor(input), provider: provider.name, model: routeModel, llmProvider: routeLlmProvider };
+  }
+  async modelDetails(input, signal) {
+    const provider = await this.choose(input, { ignoreHealth: true });
+    return this.routeDetails({ provider: provider.name, llmProvider: provider.llmProvider ?? "", model: provider.model, reasoningEffort: input.reasoningEffort ?? null }, signal);
   }
   async probeModel(input, signal) {
     assert(!this.activeProbes, 'MODEL_CHECK_BUSY', '已有模型检测正在进行，请稍候');
@@ -113,62 +137,114 @@ export class DshAdapter {
     if (!this.creatingParent) this.creatingParent = this.ctx.agents.create({ sessionId: `acms-root-${randomUUID()}`, meta: { cwd: this.dataDir }, agentOptions: {} }).then(handle => { this.parent = handle; return handle; });
     return this.creatingParent;
   }
-  async choose(agent, { ignoreHealth = false } = {}) {
-    const all = this.providers(); const policy = this.company.policy();
-    const allowed = this.ordered(all.filter(p => !policy.allowedProviders.length || policy.allowedProviders.includes(p.name)));
-    const automatic = !agent.provider || agent.provider === 'auto';
+  preferences() {
+    const saved = this.company.store?.get?.("modelPreferences", "model");
+    return saved && Array.isArray(saved.order) ? { revision: saved.revision ?? 0, order: saved.order } : { revision: 0, order: [] };
+  }
+  candidates(catalog) {
+    return buildCandidates({ providers: this.providers(), catalog, policy: this.company.policy() });
+  }
+  async select(agent, { ignoreHealth = false, requirements } = {}) {
     const catalog = await this.modelCatalog();
-    const preferred = automatic ? (agent.model ? catalog.models.find(m => m.id === agent.model)?.routes.find(r => ignoreHealth || r.health.status !== 'unavailable') : catalog.defaultSelection) : null;
-    if (automatic && agent.model && !preferred && catalog.models.some(m => m.id === agent.model)) assert(false, 'MODEL_UNAVAILABLE', '该模型的执行配置最近均检测失败，请重新检测或选择其他模型');
-    const selected = automatic ? allowed.find(p => p.name === preferred?.provider) ?? allowed[0] : allowed.find(p => p.name === agent.provider);
-    assert(selected, 'NO_PROVIDER', '当前执行配置已移除或未配对，请从 DSH 模型列表选择，或先配对外部 agent');
-    const model = agent.model || (selected.capabilities.agentOptions ? (preferred?.model ?? this.defaultModel().model) : selected.model);
-    assert(!policy.allowedModels.length || policy.allowedModels.includes(model), 'MODEL_DENIED', 'Model is unknown or outside the owner policy');
-    if (!selected.capabilities.agentOptions) {
-      if (!ignoreHealth) assert(this.healthFor({ ...agent, provider: selected.name, model }).status !== 'unavailable', 'MODEL_UNAVAILABLE', '该模型最近连通性检测失败，请重新检测或改用其他模型');
-      assert(!agent.model || selected.model === agent.model, 'MODEL_ROUTE_MISMATCH', '所选模型与执行器配置不一致，请重新选择模型');
-      assert(!agent.reasoningEffort, 'REASONING_UNSUPPORTED', '外部执行器使用其自身配置的思考深度，请在模型详情中查看');
-      return { ...selected, model };
+    const policy = this.company.policy();
+    return selectRoute({ candidates: this.candidates(catalog), preferences: this.preferences(), requirements: requirements ?? {}, binding: bindingFromAgent(agent), policy, ignoreHealth });
+  }
+  async modelContext(requirements) {
+    const selection = await this.select({ provider: "auto", model: "" }, { requirements });
+    const preferences = this.preferences();
+    return {
+      selectionVersion: SELECTOR_VERSION,
+      preferences: { revision: preferences.revision, order: preferences.order },
+      candidates: selection.considered.slice(0, MAX_CANDIDATES),
+      requirementsDefaults: emptyRequirements(),
+      policy: { allowedProviders: this.company.policy().allowedProviders ?? [], allowedModels: this.company.policy().allowedModels ?? [] }
+    };
+  }
+  providerFor(selection) {
+    if (!selection || selection.status !== "selected") throw selectionError(selection);
+    const chosen = selection.chosen;
+    const provider = this.providers().find(p => p.name === chosen.provider);
+    assert(provider, "NO_PROVIDER", "当前执行配置已移除或未配对，请从 DSH 模型列表选择，或先配对外部 agent");
+    if (!provider.capabilities?.agentOptions) return { ...provider, model: chosen.model, llmProvider: "" };
+    return { ...provider, model: chosen.model, llmProvider: chosen.llmProvider ?? "" };
+  }
+  async choose(agent, { ignoreHealth = false, requirements } = {}) {
+    const selection = await this.select(agent, { ignoreHealth, requirements });
+    if (selection.status !== "selected") throw this.selectionFailure(agent, selection);
+    return this.providerFor(selection);
+  }
+  selectionFailure(agent, selection, { explainDepth = true } = {}) {
+    const binding = bindingFromAgent(agent);
+    if (binding.provider && !this.providers().some(p => p.name === binding.provider)) { const error = selectionError(selection); error.code = "NO_PROVIDER"; return error; }
+    if (explainDepth && binding.reasoningEffort) {
+      const provider = this.providers().find(p => p.name === binding.provider);
+      if (provider && !provider.capabilities?.agentOptions) { const error = new Error("外部执行器使用其自身配置的思考深度，请在模型详情中查看"); error.name = "AcmsError"; error.code = "REASONING_UNSUPPORTED"; error.details = { selection }; return error; }
     }
-    const routes = catalog.models.find(m => m.id === model)?.routes.filter(r => r.provider === selected.name) ?? [];
-    const route = agent.llmProvider ? routes.find(r => r.llmProvider === agent.llmProvider) : routes[0];
-    assert(route, 'MODEL_UNAVAILABLE', '所选模型当前没有可用的 DSH 模型通道，请刷新后重新选择');
-    if (!ignoreHealth) assert(this.healthFor({ ...agent, provider: selected.name, llmProvider: route.llmProvider, model }).status !== 'unavailable', 'MODEL_UNAVAILABLE', '该模型最近连通性检测失败，请重新检测或改用其他模型');
-    return { ...selected, model, llmProvider: route.llmProvider };
+    return selectionError(selection);
+  }
+  depthSelectionFailure(selection, provider, reason) {
+    const explicit = selection.binding?.mode === "explicit";
+    const chosen = selection.chosen;
+    const message = "所选执行方式不支持要求的思考深度：" + provider.name + " / " + provider.model + (chosen?.reasoningEffort ? " / " + chosen.reasoningEffort : "");
+    return {
+      ...selection, status: "blocked", chosen: null,
+      blocked: { code: explicit ? "EXPLICIT_BINDING_UNAVAILABLE" : "NO_ELIGIBLE_CANDIDATE", message },
+      fallbacks: [...(selection.fallbacks ?? []), { candidateId: chosen?.candidateId ?? null, model: provider.model, provider: provider.name, reason: reason ?? "route_mismatch", detail: message }].slice(0, MAX_CANDIDATES)
+    };
+  }
+  recordRoute(attempt, selection, provider, llmProvider, reasoningEffort) {
+    if (!attempt?.id || !this.company.store) return;
+    this.company.store.transaction(() => {
+      const saved = this.company.store.require("attempts", attempt.id);
+      this.company.store.put("attempts", { ...saved, selection, provider: provider.name, model: provider.model, llmProvider, reasoningEffort });
+      this.company.store.event("attempt.route.selected", attempt.id, { selection }, SYSTEM);
+    });
   }
   async start({ task, attempt, agent, prompt, signal, onAccepted }) {
-    const provider = await this.choose(agent);
-    if (provider.origin === 'external') {
-      const input = { mode: 'task', attemptId: attempt.id, generation: attempt.taskGeneration, kind: task.kind, cwd: task.workspace.path, contextKey: attempt.contextKey, prompt, onAccepted };
+    const selection = await this.select(agent, { requirements: task.requirements });
+    if (selection.status !== "selected") throw this.selectionFailure(agent, selection, { explainDepth: false });
+    const provider = this.providerFor(selection);
+    if (provider.origin === "external") {
+      const reasoningEffort = selection.chosen.reasoningEffort ?? provider.reasoningEffort ?? null;
+      this.recordRoute(attempt, selection, provider, null, reasoningEffort);
+      const input = { mode: "task", attemptId: attempt.id, generation: attempt.taskGeneration, kind: task.kind, cwd: task.workspace.path, contextKey: attempt.contextKey, prompt, onAccepted };
       input.execution = this.paired.execution(provider.name, input);
       // Commit the selected route and exact run/session keys before any launch.
       this.company.store.transaction(() => {
-        const saved = this.company.store.require('attempts', attempt.id);
-        this.company.store.put('attempts', { ...saved, provider: provider.name, model: provider.model, kind: task.kind, execution: input.execution });
+        const saved = this.company.store.require("attempts", attempt.id);
+        this.company.store.put("attempts", { ...saved, provider: provider.name, model: provider.model, kind: task.kind, execution: input.execution });
       });
       const result = this.paired.run(provider.name, input, signal).then(r => {
-        if (this.company.store) this.company.store.transaction(() => { const saved = this.company.store.get('attempts', attempt.id); if (saved) this.company.store.put('attempts', { ...saved, reasoningEffort: r.reasoningEffort ?? null }); });
+        if (this.company.store) this.company.store.transaction(() => { const saved = this.company.store.get("attempts", attempt.id); if (saved) this.company.store.put("attempts", { ...saved, reasoningEffort: r.reasoningEffort ?? null }); });
         return r.output;
       });
-      return { accepted: false, childId: attempt.id, parentId: null, provider: provider.name, model: provider.model, reasoningEffort: provider.reasoningEffort, result, dispose: () => result.catch(error => { if (error.cleanupUncertain) throw error; }) };
+      return { accepted: false, childId: attempt.id, parentId: null, provider: provider.name, model: provider.model, reasoningEffort, result, dispose: () => result.catch(error => { if (error.cleanupUncertain) throw error; }) };
     }
+    let routed = selection; let details = null;
+    if (provider.capabilities.agentOptions) {
+      try { details = await this.routeDetails({ provider: provider.name, llmProvider: provider.llmProvider ?? "", model: provider.model, reasoningEffort: selection.chosen.reasoningEffort ?? null }, signal); }
+      catch (error) { if (error.code !== "REASONING_UNSUPPORTED") throw error; throw selectionError(this.depthSelectionFailure(selection, provider, error.reason)); }
+      const effective = details.reasoning.effective ?? null;
+      if (routed.chosen && routed.chosen.reasoningEffort !== effective) routed = { ...routed, chosen: { ...routed.chosen, reasoningEffort: effective } };
+    }
+    const reasoningEffort = details?.reasoning.effective ?? routed.chosen.reasoningEffort ?? provider.reasoningEffort ?? null;
+    this.recordRoute(attempt, routed, provider, provider.capabilities?.agentOptions ? provider.llmProvider : null, reasoningEffort);
     const parentHandle = await this.root(); signal.throwIfAborted();
-    const reasoning = provider.capabilities.agentOptions ? await this.modelDetails(agent, signal) : null;
     const activation = await this.ctx.subagents.startActivation({ provider: provider.name, label: attempt.contextKey,
-      request: { parent: parentHandle.agent, cwd: task.workspace.path, prompt: [{ type: 'text', text: prompt }],
-        ...(provider.capabilities.agentOptions ? { agentOptions: { provider: provider.llmProvider, model: provider.model, ...(reasoning?.reasoning.effective ? { reasoningEffort: reasoning.reasoning.effective } : {}) } } : {}),
+      request: { parent: parentHandle.agent, cwd: task.workspace.path, prompt: [{ type: "text", text: prompt }],
+        ...(provider.capabilities.agentOptions ? { agentOptions: { provider: provider.llmProvider, model: provider.model, ...(reasoningEffort ? { reasoningEffort } : {}) } } : {}),
         ...(provider.capabilities.depthLimit ? { maxDepth: 1 } : {}),
-      }, signal, delivery: 'caller' });
+      }, signal, delivery: "caller" });
     this.activations.set(attempt.id, activation);
     let disposing;
-    const dispose = () => disposing ??= Promise.resolve(activation.dispose()).finally(() => { this.activations.delete(attempt.id); signal.removeEventListener('abort', abort); });
+    const dispose = () => disposing ??= Promise.resolve(activation.dispose()).finally(() => { this.activations.delete(attempt.id); signal.removeEventListener("abort", abort); });
     const abort = () => { dispose().catch(() => {}); };
-    signal.addEventListener('abort', abort, { once: true }); if (signal.aborted) abort();
+    signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
     const result = Promise.resolve(activation.result).then(value => {
-      assert(value.stopReason === 'completed', 'PROVIDER_FAILED', value.diagnostic ?? `Provider ended with ${value.stopReason}`);
-      return parseResult(value.structured ?? value.output?.filter(b => b.type === 'text').map(b => b.text).join('\n'));
+      assert(value.stopReason === "completed", "PROVIDER_FAILED", value.diagnostic ?? ("Provider ended with " + value.stopReason));
+      return parseResult(value.structured ?? value.output?.filter(b => b.type === "text").map(b => b.text).join("\n"));
     });
-    return { childId: activation.childId, parentId: parentHandle.agent.id, provider: provider.name, model: provider.model, reasoningEffort: reasoning?.reasoning.effective ?? null, result, dispose };
+    return { childId: activation.childId, parentId: parentHandle.agent.id, provider: provider.name, model: provider.model, reasoningEffort, result, dispose };
   }
   canSteer(attempt) {
     return this.activations.has(attempt.id) && typeof this.ctx.subagents.sendMessage === 'function' || this.paired.canSteer?.(attempt.id) === true;
@@ -186,13 +262,18 @@ export class DshAdapter {
     return messages.filter(m => m.role === 'assistant').slice(-20).map((m, i) => ({ id: m.id ?? `assistant-${i}`, text: m.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') ?? '' }));
   }
   async chat({ agent, prompt, cwd, contextKey, signal, onAccepted, onText }) {
-    const provider = await this.choose(agent);
+    const selection = await this.select(agent);
+    if (selection.status !== 'selected') throw this.selectionFailure(agent, selection);
+    const provider = this.providerFor(selection);
     if (provider.origin === 'external') {
       const response = await this.paired.run(provider.name, { mode: 'task', cwd, contextKey, freshContext: true, onAccepted,
         prompt: `${prompt}\nThis is a standalone conversation in a private scratch directory. Return only JSON {"outcome":"completed","summary":"your natural-language reply","artifacts":[]}. Do not alter company state.` }, signal);
       const text = response.output.summary; if (text) onText(text); return text;
     }
-    const details = await this.modelDetails(agent, signal); let text = '', accepted = false, finished = false;
+    let details;
+    try { details = await this.routeDetails({ provider: provider.name, llmProvider: provider.llmProvider ?? '', model: provider.model, reasoningEffort: selection.chosen.reasoningEffort ?? null }, signal); }
+    catch (error) { if (error.code !== 'REASONING_UNSUPPORTED') throw error; throw selectionError(this.depthSelectionFailure(selection, provider, error.reason)); }
+    let text = '', accepted = false, finished = false;
     for await (const chunk of this.ctx.get('llm').stream({ provider: provider.llmProvider, model: provider.model,
       ...(details.reasoning.effective ? { reasoningEffort: details.reasoning.effective } : {}),
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }], tools: [], maxTokens: 4096, signal })) {

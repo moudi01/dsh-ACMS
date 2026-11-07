@@ -17,8 +17,14 @@ function resolve(value, results) {
 export function runActionBatch(company, actor, { taskId, generation, batchId, actions }) {
   const { store } = company;
   assert(actor?.kind === 'agent', 'FORBIDDEN', 'Management batches require an assigned agent');
-  assert(store.require('agents', actor.id).role === 'manager', 'FORBIDDEN', 'Only a manager can submit management actions');
+  const manager = store.require('agents', actor.id);
+  assert(manager.role === 'manager', 'FORBIDDEN', 'Only a manager can submit management actions');
   const task = store.require('tasks', taskId);
+  // The caller-supplied actor.goalId is derived from the task goal, so it cannot
+  // prove that the manager belongs to that goal. Re-read the persisted manager and
+  // reject a goal-scoped manager acting on another goal's task, for example after a
+  // manual task.edit reassignment. A global manager (no goalId) stays eligible.
+  assert(!manager.goalId || manager.goalId === task.goalId, 'SCOPE_DENIED', 'Manager may only act within its assigned goal');
   assert(task.agentId === actor.id && task.goalId === actor.goalId && task.generation === generation && task.status === 'running' && !task.stopRequested, 'STALE_RESULT', 'Management batch belongs to an obsolete assignment');
   assert(typeof batchId === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(batchId), 'INVALID_BATCH_ID', 'actionBatchId must be a stable 1–80 character identifier');
   assert(Array.isArray(actions) && actions.length > 0 && actions.length <= 10, 'INVALID_ACTIONS', 'Management batches contain 1–10 actions');

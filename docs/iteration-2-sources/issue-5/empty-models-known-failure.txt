@@ -1,0 +1,45 @@
+﻿node : node:internal/modules/run_main:107
+所在位置 行:1 字符: 1
++ node scripts/empty-models-test.mjs 2>&1 | Out-File -Encoding utf8 doc ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (node:internal/modules/run_main:107:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    triggerUncaughtException(
+    ^
+
+locator.click: Timeout 30000ms exceeded.
+Call log:
+[2m  - waiting for getByRole('button', { name: '组织管理', exact: true })[22m
+[2m    - locator resolved to <button data-active="false">…</button>[22m
+[2m  - attempting click action[22m
+[2m    2 × waiting for element to be visible, enabled and stable[22m
+[2m      - element is visible, enabled and stable[22m
+[2m      - scrolling into view if needed[22m
+[2m      - done scrolling[22m
+[2m      - <dialog open="" class="acms-modal wide" aria-labelledby="acms-pairing-title">…</dialog> from <main class="acms-main">…</main> subtree intercepts po
+inter events[22m
+[2m    - retrying click action[22m
+[2m    - waiting 20ms[22m
+[2m    2 × waiting for element to be visible, enabled and stable[22m
+[2m      - element is visible, enabled and stable[22m
+[2m      - scrolling into view if needed[22m
+[2m      - done scrolling[22m
+[2m      - <dialog open="" class="acms-modal wide" aria-labelledby="acms-pairing-title">…</dialog> from <main class="acms-main">…</main> subtree intercepts po
+inter events[22m
+[2m    - retrying click action[22m
+[2m      - waiting 100ms[22m
+[2m    58 × waiting for element to be visible, enabled and stable[22m
+[2m       - element is visible, enabled and stable[22m
+[2m       - scrolling into view if needed[22m
+[2m       - done scrolling[22m
+[2m       - <dialog open="" class="acms-modal wide" aria-labelledby="acms-pairing-title">…</dialog> from <main class="acms-main">…</main> subtree intercepts p
+ointer events[22m
+[2m     - retrying click action[22m
+[2m       - waiting 500ms[22m
+
+    at C:\Users\Administrator\.dsh\acms\workspaces\task_bec5ae18-2b18-4f35-a791-f52d0542903e\scripts\empty-models-test.mjs:18:65 {
+  name: 'TimeoutError'
+}
+
+Node.js v24.22.0

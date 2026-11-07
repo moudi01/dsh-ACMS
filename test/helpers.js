@@ -19,7 +19,7 @@ export async function fixture(t, handler = defaultSimulation) {
   const project = command('project.save', { name: 'Fixture', repoRoot: source, mode: 'copy', checks: [] });
   const goal = command('goal.create', { title: 'Fixture goal', description: 'Create verified test files.', acceptance: 'Files exist and independent review passes.', projectId: project.id, plan: false });
   let started = false;
-  t.after(async () => { if (started) await engine.stop(); store.close(); const absolute = path.resolve(root); if (!inside(path.resolve(tmpdir()), absolute) || !path.basename(absolute).startsWith('acms-test-')) throw new Error('Refusing unsafe fixture cleanup'); await rm(absolute, { recursive: true, force: true }); });
+  t.after(async () => { if (started) await engine.stop(); store.close(); const absolute = path.resolve(root); if (!inside(path.resolve(tmpdir()), absolute) || !path.basename(absolute).startsWith('acms-test-')) throw new Error('Refusing unsafe fixture cleanup'); await rm(absolute, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 }); });
   return { root, source, dataDir, store, company, workspaces, adapter, engine, project, goal, command,
     task: (args = {}) => command('task.create', { goalId: goal.id, title: 'Deliver a file', description: 'Create a useful output file.', acceptance: 'Output exists and has content.', ...args }),
     start: async () => { await engine.start(); started = true; },

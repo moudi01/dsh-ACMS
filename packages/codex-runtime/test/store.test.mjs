@@ -49,7 +49,7 @@ async function fixture(t) {
         await exit
       }
     }
-    await fs.rm(stateDir, { recursive: true, force: true })
+    await fs.rm(stateDir, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 })
   })
   function start(key, mode = 'hold') {
     const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_CODE, stateFile, key, mode], {
