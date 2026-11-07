@@ -1,0 +1,1 @@
+First-goal creation, native picker contract, directory browser, real clipboard paste, and disabled-action guidance passed.

@@ -11,8 +11,8 @@ export function readJson(path, fallback) {
 export function atomicJson(path, value) {
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try { writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' }); renameSync(temp, path); }
-  finally { if (existsSync(temp)) unlinkSync(temp); }
+  try { writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' }); renameAtomic(temp, path); }
+  finally { if (existsSync(temp)) { try { unlinkSync(temp); } catch {} } }
 }
 
 export function fileStem(key) {
@@ -161,5 +161,16 @@ export class ThreadStore {
       this.update({ ...extra, status: 'idle', lastStatus: status, currentTurn: null });
       await this.publish();
     } finally { this.closed = true; this.release(); }
+  }
+}
+
+const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+function renameAtomic(temp, path, attempts = 30) {
+  for (let attempt = 0; ; attempt++) {
+    try { return renameSync(temp, path); }
+    catch (error) {
+      if (!TRANSIENT_RENAME_CODES.has(error.code) || attempt >= attempts) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * (attempt + 1), 100));
+    }
   }
 }

@@ -1,0 +1,731 @@
+{
+  "format": "acms.iteration-2.final-files.v2",
+  "generatedAt": "2026-11-07T14:27:57.225Z",
+  "measuredCommit": "c0bb65b00f0ecb918ab0eb99a9673cc1fd39a0db",
+  "baseCommit": "178987ad4337a499f925d4377de44a3b5f11d550",
+  "branch": "acms/task_5f526a54-6871-4fe7-9425-c43c0b3b1bde",
+  "hashSource": "git blob bytes at measuredCommit (canonical LF for text, exact bytes for binary)",
+  "counts": {
+    "total": 118,
+    "added": 89,
+    "modified": 29
+  },
+  "sourceTreeHash": "dc2b5170e1701e0f629f02afc1d6fbf69502ac64d606cb46a78863ebce3bed16",
+  "excluded": [
+    "docs/iteration-2-final-files.json",
+    "docs/iteration-2-final-SHA256SUMS",
+    "node_modules/",
+    "test-results/",
+    ".acms/"
+  ],
+  "files": [
+    {
+      "path": "CHANGELOG.md",
+      "status": "M",
+      "bytes": 4468,
+      "sha256": "5a06fe0438e37fddc0e8cccc718a907880f9fcde1a9ddaaf27f32688d271ff24"
+    },
+    {
+      "path": "docs/agent-api.md",
+      "status": "A",
+      "bytes": 18928,
+      "sha256": "215d59812b99e30ebc36e7691601c435aeab231fb59034276522264c09ab0152"
+    },
+    {
+      "path": "docs/external-agent-onboarding.md",
+      "status": "A",
+      "bytes": 8384,
+      "sha256": "8b873f8cf88d378dcb5a861ea576ce6fb88f1d6a0773092532386d42d915eecc"
+    },
+    {
+      "path": "docs/images/model-preferences.png",
+      "status": "A",
+      "bytes": 89276,
+      "sha256": "e132ac319f7387702535d328de121488ea6f12eab69a95d0cba927a780d64a1a"
+    },
+    {
+      "path": "docs/images/model-selection-evidence.png",
+      "status": "A",
+      "bytes": 86453,
+      "sha256": "367849768080c65d0a9c513df6be655dc101dcb022d1ac1a38c20b717ac8bc85"
+    },
+    {
+      "path": "docs/images/overview.png",
+      "status": "M",
+      "bytes": 102036,
+      "sha256": "4445c9dd929cf5060a693e9f5c9ba66b555c046e3a1125816e8feb328d4074fc"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-delivery.md",
+      "status": "A",
+      "bytes": 13467,
+      "sha256": "bdf8d9ebfb3a5acf02b5368c5dc1f425bf2f1e0a422afbb1082a29ad1e9d5a18"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-sources/collect-evidence.mjs",
+      "status": "A",
+      "bytes": 3327,
+      "sha256": "a5d5ceb2d7eaff7ab6be95bf64a2815bee3b3022a308e61527d1f11e6264f1a2"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-sources/files.json",
+      "status": "A",
+      "bytes": 3912,
+      "sha256": "16a35d8a185bbc96e56128bd1b97dc7d60e68477370c7590fd53f987216434ef"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-sources/hash-manifest.mjs",
+      "status": "A",
+      "bytes": 1364,
+      "sha256": "518ed36f415e257843f33db429eacf0e2591a93769c0413040fcadaa084c2029"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-sources/SHA256SUMS",
+      "status": "A",
+      "bytes": 1677,
+      "sha256": "0446113e8cf2a0235138980b8e53137ebe28be232b28f56408038a20c1a94be3"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-sources/validation.json",
+      "status": "A",
+      "bytes": 3263,
+      "sha256": "7f9d84433ca105ba89e8427d6ece0ae5ce1e6d2b43f590379a67616f7754be0b"
+    },
+    {
+      "path": "docs/iteration-2-agent-api-sources/write-delivery.mjs",
+      "status": "A",
+      "bytes": 12576,
+      "sha256": "94ad86f03a10e961dc7e9a49d97f42b19cf8d939e06506ebde9cc9d23feb8b3b"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/build-cumulative-archive.mjs",
+      "status": "A",
+      "bytes": 6555,
+      "sha256": "dd6adfcdbb6e4f87eaabe59326055a571b288283a64800170362baace1d05e0b"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/collect-evidence.mjs",
+      "status": "A",
+      "bytes": 4845,
+      "sha256": "723497daea0f0fd36d96157f407829874642022fabd06b78dc4431f03c32e54a"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/external-onboarding-ui-receipt.json",
+      "status": "A",
+      "bytes": 58416,
+      "sha256": "24701017246a2a4042c3b60684e45d2a2b43c63ab48f2241581a06a0dfb02b96"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/files.json",
+      "status": "A",
+      "bytes": 20498,
+      "sha256": "22e544b2da46db2382e8e491529cf8f4f6cda2147c45002d89c185b5527c9780"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v6/empty-models-analysis.md",
+      "status": "A",
+      "bytes": 1298,
+      "sha256": "550cd50dd144dd6e3e5cb437c5cbd3dc06db788dab11f3fb701224edf58e8311"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v6/environment-evidence.json",
+      "status": "A",
+      "bytes": 2583,
+      "sha256": "cb5ab84fc86bd58c41bb3fb77d06cf50740aaf77370e4cc05da5e08954ec8653"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v6/node-rimraf-retry-source.txt",
+      "status": "A",
+      "bytes": 874,
+      "sha256": "bb3f772eedf1350a74354f0072a7d3298a5281ef87c132f1ec93374000943739"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v6/onboarding-doc-default-env.json",
+      "status": "A",
+      "bytes": 448,
+      "sha256": "c60fcab756478b6797124b8d72c4b7ef4d547467831576510d9c9ff486b2bb78"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v7/p2-goal-scope-fix.json",
+      "status": "A",
+      "bytes": 2126,
+      "sha256": "f0332d3eb36b6080c8d132e73daaea3959d5165009d29d4131644da10c6566b3"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v7/README.md",
+      "status": "A",
+      "bytes": 703,
+      "sha256": "13bf154c1a1d4f23499d28b21ee3649fdf09fd8a53b94da7fc3f9f631501c32c"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/final-candidate-v7/validation.json",
+      "status": "A",
+      "bytes": 3187,
+      "sha256": "462d63b5de28f375fc5b15992d9ebd03fff7bcfe5fcf2b5e2e825c7848bf464c"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/hash-manifest.mjs",
+      "status": "A",
+      "bytes": 1492,
+      "sha256": "de9d93e23ae894d2db941a6c542b37b562dbd61dc5b1ce8818187a17c8be9d20"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/manager-plan-receipt.json",
+      "status": "A",
+      "bytes": 11132,
+      "sha256": "49e0eeaf5f37db6ed15eb2d992e1628d4953471ac2f56189d657c79f74147b07"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/plan-task-mapping.json",
+      "status": "A",
+      "bytes": 2550,
+      "sha256": "6b7f0a0942bd8e5437e271c2dd258db5fb9beaac06cbf3ee93492dd6905e47a3"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/SHA256SUMS",
+      "status": "A",
+      "bytes": 12167,
+      "sha256": "32e3a7c32266a477947a109d37e70cb4b47d95a37040d7f5a4e9fe563cf5e15d"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/validation.json",
+      "status": "A",
+      "bytes": 3607,
+      "sha256": "d5eb921df8a3750a409d1ca4d20933b405fe101ea4ee95f911050f7496dc18e8"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/verify-cumulative-archive.mjs",
+      "status": "A",
+      "bytes": 2328,
+      "sha256": "9449cfe862ceb9a7a854efbf8129d17863e81eb36aca545334751ab397d2463e"
+    },
+    {
+      "path": "docs/iteration-2-autonomy-sources/zip-util.mjs",
+      "status": "A",
+      "bytes": 4511,
+      "sha256": "9045ddc5857fa4299031037694748af82b2b135ea9d82f9dcfe02a058f60b203"
+    },
+    {
+      "path": "docs/iteration-2-autonomy.md",
+      "status": "A",
+      "bytes": 40106,
+      "sha256": "36aabac4603ada55a7479a35ed9afd18722ecea70e939da4522d191773e7794b"
+    },
+    {
+      "path": "docs/iteration-2-final-author-verification.md",
+      "status": "A",
+      "bytes": 4379,
+      "sha256": "842e1c7a4e685912efed53fcb8e350ffd5397013d63df5f173289338f542f085"
+    },
+    {
+      "path": "docs/iteration-2-final-verification.md",
+      "status": "A",
+      "bytes": 4634,
+      "sha256": "85465f683ba8882b29e24e2bc5dedde85bf4bb1cfeeab02a12f914b0db6b529e"
+    },
+    {
+      "path": "docs/iteration-2-issue-5.md",
+      "status": "A",
+      "bytes": 16326,
+      "sha256": "66e2ddf0c539e663ae0f7d0cd5cd34acc9315e92a89cb4c00498ca405e3dca8b"
+    },
+    {
+      "path": "docs/iteration-2-pr-description.md",
+      "status": "A",
+      "bytes": 2721,
+      "sha256": "b7ce3e9e2d945a338b2052e6c99f71bc4f276c14f8d6f1c5fa5029b9fe97e7d8"
+    },
+    {
+      "path": "docs/iteration-2-release-handoff.md",
+      "status": "A",
+      "bytes": 20569,
+      "sha256": "96bbce267b55d03f9075ee66031cfc38fbf911996c11a2c4dd0fee1e311733a9"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/build.txt",
+      "status": "A",
+      "bytes": 57,
+      "sha256": "2363c5f460c06ee53e090a327a4a9d12cf2f97d6a0ab09ac089763d1d1e9d1dc"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-build.txt",
+      "status": "A",
+      "bytes": 57,
+      "sha256": "2363c5f460c06ee53e090a327a4a9d12cf2f97d6a0ab09ac089763d1d1e9d1dc"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-full.txt",
+      "status": "A",
+      "bytes": 24659,
+      "sha256": "6519de0eb7cb6d96ea2ec0fd561284df85cf1b5e0b9cc9a4151c00ed901becc5"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-owner-check-1.txt",
+      "status": "A",
+      "bytes": 25157,
+      "sha256": "214b57177340f6cd9bcea469cf4187ad9c9d8cc1e3d3b1e75d39100d5f94cb90"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-owner-check-2.txt",
+      "status": "A",
+      "bytes": 25164,
+      "sha256": "07aaea0e1bdf907e77f37babf49df382a3b8c5cc888675a8f5750a02d7a9a2b4"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-red.txt",
+      "status": "A",
+      "bytes": 1101,
+      "sha256": "d85471f2c40913d5c3fea562d1bda85ebb346079055a27556c619fa2a881f182"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-static.txt",
+      "status": "A",
+      "bytes": 43,
+      "sha256": "9b853d270e9b4039527854e2954ba898a12ba240556cba9fb86c87b744a581ca"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-structure.txt",
+      "status": "A",
+      "bytes": 131,
+      "sha256": "ebfc97f9e2637b88e15f02127058b9ce22197a38db8915fe9e271566f3caa5af"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-targeted.txt",
+      "status": "A",
+      "bytes": 4499,
+      "sha256": "8d11506b612fe229441ba38860d1cffbae10a8095dd801b043e8eb77ba5472d6"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-ui-regression.txt",
+      "status": "A",
+      "bytes": 957,
+      "sha256": "9ffc92135bee8b3cb2997139bc99d0a601fec58a60ff7c41748f2f99e9246e0e"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-ui-report.json",
+      "status": "A",
+      "bytes": 524,
+      "sha256": "b14a9c139658d13a401d5170c983e1ddbba88988305aaba6d19db82dc6c0a157"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-ui.txt",
+      "status": "A",
+      "bytes": 525,
+      "sha256": "6055a82a5cf735c93d21bd76b287a0608fa84c9696dd8668f428c698d6d22416"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/chat-route-usability.txt",
+      "status": "A",
+      "bytes": 123,
+      "sha256": "396916cb6167a3b8de32e369e578fd6b274a884d8c20d77842d7ef9f510f150a"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/empty-models-known-failure.txt",
+      "status": "A",
+      "bytes": 2186,
+      "sha256": "7ba67bb71c2befb5ba6f6d7c8726a0820d8f5ba3ae716df46867afd4f481831f"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/full-test.txt",
+      "status": "A",
+      "bytes": 24544,
+      "sha256": "6c45aa48c87095ee2adda623462806dbe9b465f61556505673b9aa17ebf5e409"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/owner-check-1.txt",
+      "status": "A",
+      "bytes": 25045,
+      "sha256": "47f2215a95b40f2555aa2c64cdb600df2988e3967dcce49e411858067eda3245"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/owner-check-2.txt",
+      "status": "A",
+      "bytes": 25050,
+      "sha256": "4223dd2e14a86b8d9e1a6ccff78022b4d4007d91d2bf68addc34eb5fd06f2a82"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/regression-p1p2-red.txt",
+      "status": "A",
+      "bytes": 1852,
+      "sha256": "f1684803d062d32db7500c6ec1ac7caa63c76416eea635777aba57bd6606839b"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/regression-red.txt",
+      "status": "A",
+      "bytes": 8878,
+      "sha256": "21c19f8dcc2c965bea5337766663e825b9bfdea0df6dff6a6d091cde30d83fbc"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/route-consistency-tests.txt",
+      "status": "A",
+      "bytes": 313,
+      "sha256": "4f75b7e6d932de0139e3404b31a8e8d01f4e98d49e32a59d85ac5aafce8a077c"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/SHA256SUMS",
+      "status": "A",
+      "bytes": 6115,
+      "sha256": "b9eed6bf4da54ebc193dc5fc3e187d297ae5a2f6389c686c5e789d79250a620f"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/static-check.txt",
+      "status": "A",
+      "bytes": 43,
+      "sha256": "9b853d270e9b4039527854e2954ba898a12ba240556cba9fb86c87b744a581ca"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/targeted-tests.txt",
+      "status": "A",
+      "bytes": 3676,
+      "sha256": "99342cf806ebacaa21497455aa26663d9658b4b3a528a7a9619413f7815fd5f0"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/test-log.md",
+      "status": "A",
+      "bytes": 6727,
+      "sha256": "d97d4bae87fade4d309d329e280bdc3a06a6495555d52e947de93249a9ef13d7"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/ui-regression.txt",
+      "status": "A",
+      "bytes": 957,
+      "sha256": "9ffc92135bee8b3cb2997139bc99d0a601fec58a60ff7c41748f2f99e9246e0e"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/ui-report.json",
+      "status": "A",
+      "bytes": 524,
+      "sha256": "b14a9c139658d13a401d5170c983e1ddbba88988305aaba6d19db82dc6c0a157"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/ui-run.txt",
+      "status": "A",
+      "bytes": 525,
+      "sha256": "6055a82a5cf735c93d21bd76b287a0608fa84c9696dd8668f428c698d6d22416"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/ui-structure.txt",
+      "status": "A",
+      "bytes": 131,
+      "sha256": "ebfc97f9e2637b88e15f02127058b9ce22197a38db8915fe9e271566f3caa5af"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/usability.txt",
+      "status": "A",
+      "bytes": 123,
+      "sha256": "396916cb6167a3b8de32e369e578fd6b274a884d8c20d77842d7ef9f510f150a"
+    },
+    {
+      "path": "docs/iteration-2-sources/issue-5/validation.json",
+      "status": "A",
+      "bytes": 9726,
+      "sha256": "5807fd7a1fe66d2e395d3d77c4c9af442aa1523eb2575fdce0a3ca68142443cf"
+    },
+    {
+      "path": "docs/model-preferences.md",
+      "status": "A",
+      "bytes": 8414,
+      "sha256": "a30968fe7016876933b677424fba344b222bff8da2c9f1c9edfe0f26f628d858"
+    },
+    {
+      "path": "examples/agent-api/flow.mjs",
+      "status": "A",
+      "bytes": 5975,
+      "sha256": "437f51ec7051d45920f9bf3c7ee18fd7ee27435e9992558a11ecce650edd3c58"
+    },
+    {
+      "path": "lib/client.js",
+      "status": "M",
+      "bytes": 222458,
+      "sha256": "67deddb8c9613775fd243fa58245fdc98da883edcbcde6e9c84fc53eb4c4b19c"
+    },
+    {
+      "path": "package.json",
+      "status": "M",
+      "bytes": 1908,
+      "sha256": "5f0ad65440a80a5b1ef72601251ed9aa498e22e5e7327487e27858cd1a4863ca"
+    },
+    {
+      "path": "packages/codex-runtime/lib/store.js",
+      "status": "M",
+      "bytes": 8982,
+      "sha256": "b0fcc78b2f7df695eb90106c77fe237a1ffeaf3796cd35f313b2402404b259df"
+    },
+    {
+      "path": "packages/codex-runtime/test/lifecycle.test.mjs",
+      "status": "M",
+      "bytes": 10394,
+      "sha256": "c7b2867c53e07067e872d7a47b8d036ae708ae8300f7c29c3dfd324d9d2ee181"
+    },
+    {
+      "path": "packages/codex-runtime/test/store.test.mjs",
+      "status": "M",
+      "bytes": 9510,
+      "sha256": "483112874899c5ed07f1da593bb68a167d46d83fd9e96dea351ed7b3168816b3"
+    },
+    {
+      "path": "packages/codex-runtime/test/wire.test.mjs",
+      "status": "M",
+      "bytes": 13896,
+      "sha256": "ba2f221d93d361478ed382a70b227a04047a08661956b0f622a387a0e47e7d1e"
+    },
+    {
+      "path": "README.md",
+      "status": "M",
+      "bytes": 9839,
+      "sha256": "09d1b7aa5f55bc422e464dce5302184f1e5b8f22f24b8883436fc866564af8ea"
+    },
+    {
+      "path": "scripts/acms-agent.mjs",
+      "status": "A",
+      "bytes": 8654,
+      "sha256": "f42f03397f4c13d9a3abebebea1b55d6948081893d3481dcf12a1d79df74ebd3"
+    },
+    {
+      "path": "scripts/empty-models-test.mjs",
+      "status": "M",
+      "bytes": 2108,
+      "sha256": "f5f742e2289c414d6f606bee86647cd505c2f45a0812c272305d2ce2a600a686"
+    },
+    {
+      "path": "scripts/external-onboarding-ui-test.mjs",
+      "status": "A",
+      "bytes": 13167,
+      "sha256": "ec3aaa0f63c3df0a812b6d102fddde34503e05636d319d3802cd450d2d3c8763"
+    },
+    {
+      "path": "scripts/final-candidate-manifest.mjs",
+      "status": "A",
+      "bytes": 2556,
+      "sha256": "a8e10093e29d97c1a58dfd702473ff3c0e130f520a3c90240a35e80c7c58e4d9"
+    },
+    {
+      "path": "scripts/model-preferences-ui-test.mjs",
+      "status": "A",
+      "bytes": 5483,
+      "sha256": "ebe1916a6eba2e9c2e3a6825db42e4f5200cf4f7465be095932093ad8dd6f62b"
+    },
+    {
+      "path": "scripts/onboarding-doc.mjs",
+      "status": "A",
+      "bytes": 2764,
+      "sha256": "6d93f6f1ac73b373f9040f5aa5526a17fab4d3e5447806bb80b23d1085891645"
+    },
+    {
+      "path": "scripts/preview-server.mjs",
+      "status": "M",
+      "bytes": 8215,
+      "sha256": "e32e9333c7b729e59986ee869df98f9a835f546cd98553a89280729f0646f139"
+    },
+    {
+      "path": "src/adapters/dsh.js",
+      "status": "M",
+      "bytes": 29512,
+      "sha256": "69211bd877920d129d09fce5808fc7bd8bc3d9aa3a8bac30e8cc11b8d1eefd02"
+    },
+    {
+      "path": "src/adapters/simulated.js",
+      "status": "M",
+      "bytes": 2857,
+      "sha256": "4a1cb5242394eb9eeec8c9d114c55c6f2085939399d987417abe337d9dd14693"
+    },
+    {
+      "path": "src/client/access.jsx",
+      "status": "A",
+      "bytes": 9440,
+      "sha256": "7f0bf9fbfe7cc70126d6d52e952f3b0b82ec681a092f2cadb91edce01163d645"
+    },
+    {
+      "path": "src/client/app.jsx",
+      "status": "M",
+      "bytes": 57064,
+      "sha256": "83558f60bd2e9ad4a47e80cefc428b578bf290075fb201ea7cec249e30b6453a"
+    },
+    {
+      "path": "src/client/model-picker.jsx",
+      "status": "M",
+      "bytes": 17119,
+      "sha256": "4c529c6e8e9ea0b1000ddd460e25ed45f397b5e59611a4bf7ceb15a1db3ea690"
+    },
+    {
+      "path": "src/client/style.css",
+      "status": "M",
+      "bytes": 35328,
+      "sha256": "6f2304864347bdbc94ebe5c1abe8ec7252b12d559e65e788e5b601366bf285b4"
+    },
+    {
+      "path": "src/core/action-batch.js",
+      "status": "M",
+      "bytes": 3512,
+      "sha256": "2e555c79101ade9bf4959eb54563a04cccde68454a08133e1d2e1bda8abbcd17"
+    },
+    {
+      "path": "src/core/agent-identity.js",
+      "status": "A",
+      "bytes": 7352,
+      "sha256": "20782c0a9f696dff5a7a802a62c2aa12a44310f7df85fe80f230f8c2a46c1132"
+    },
+    {
+      "path": "src/core/coordination.js",
+      "status": "A",
+      "bytes": 12955,
+      "sha256": "65045f8a8214d2cc2241ba705eb741a3237115c49536d8d8d4d78f8893a52bf5"
+    },
+    {
+      "path": "src/core/domain.js",
+      "status": "M",
+      "bytes": 41040,
+      "sha256": "b1393cbc8e5832ee7b3f5e7e77bcf2e72d2907eac0f37415865f65be3fef5a89"
+    },
+    {
+      "path": "src/core/external-access.js",
+      "status": "A",
+      "bytes": 9494,
+      "sha256": "78b2ab546e1d4abacf3d2ac227710752537eaf38ae6e43a25d0f09e2c1872f86"
+    },
+    {
+      "path": "src/core/model-selection.js",
+      "status": "A",
+      "bytes": 19131,
+      "sha256": "06e7e8a1e648bafed6fc1675474421fabf0a149ec8039704822a06753f72c356"
+    },
+    {
+      "path": "src/core/plan-ledger.js",
+      "status": "A",
+      "bytes": 8862,
+      "sha256": "f95bda09f1bebc2c0e9290a40d711638ac357a0dd09eb235575c4e2cb5cc8efe"
+    },
+    {
+      "path": "src/core/store.js",
+      "status": "M",
+      "bytes": 12678,
+      "sha256": "c53b66d8c07c5b9102d52115d7a53384ebd0a13ca3e2e3c6985731ec7d52446f"
+    },
+    {
+      "path": "src/core/util.js",
+      "status": "M",
+      "bytes": 2547,
+      "sha256": "abbc27e9f4f4797cba493de149fd7946c40772a65239e4faf0fea901ccef09d8"
+    },
+    {
+      "path": "src/host/agent-api.js",
+      "status": "A",
+      "bytes": 33051,
+      "sha256": "ac6b1ccd4ee6d2f412d63fb82a14563997b7f3aab84dc256c4efcea38b096f82"
+    },
+    {
+      "path": "src/host/http.js",
+      "status": "M",
+      "bytes": 6439,
+      "sha256": "b0fea029b12f265559154e10ba5f68d84470db482d533788e33d1fddd1c6f34c"
+    },
+    {
+      "path": "src/host/index.js",
+      "status": "M",
+      "bytes": 3661,
+      "sha256": "36feb5718320b276ba67f50038a6cd208ab09bb473ec4b2319e9495b276b8bd3"
+    },
+    {
+      "path": "src/runtime/engine.js",
+      "status": "M",
+      "bytes": 33379,
+      "sha256": "7400c5a4a5c454464e5f064cc5f4b50cd6a557d6bedd40366847396898ede7ac"
+    },
+    {
+      "path": "src/runtime/prompt.js",
+      "status": "M",
+      "bytes": 12450,
+      "sha256": "dc39237b17123b35847b9ff2ecfd14c806d4b92c0d2fb0b38c65785a5ff52dd5"
+    },
+    {
+      "path": "src/runtime/review-flow.js",
+      "status": "A",
+      "bytes": 5006,
+      "sha256": "b2207faced52dd869286731449e0964d3f01be90b27edfc688ec1cf1b6038132"
+    },
+    {
+      "path": "test/agent-api-integration.test.js",
+      "status": "A",
+      "bytes": 4885,
+      "sha256": "b641ab603e94c776aca185d53a09235822781bf0f4b5ed711aec528b3d39e081"
+    },
+    {
+      "path": "test/agent-api-lifecycle.test.js",
+      "status": "A",
+      "bytes": 2350,
+      "sha256": "2e31b74a5f34618e2eaad1e5bb4189f0abacbdf94ec0f6d064c023098bf633a5"
+    },
+    {
+      "path": "test/agent-api.test.js",
+      "status": "A",
+      "bytes": 50028,
+      "sha256": "a500749c32566c2e43f9141028defaa3f8338f33e489a2da5164ba5f61a5ad80"
+    },
+    {
+      "path": "test/autonomy.test.js",
+      "status": "A",
+      "bytes": 31848,
+      "sha256": "a3df1ff05638095491230143860d1d295bf1359975382a45b3c9ac7f4cb54d07"
+    },
+    {
+      "path": "test/bundled-cleanup.test.js",
+      "status": "M",
+      "bytes": 3539,
+      "sha256": "9b11500f5a5c30c25de29d0364d1734c7d99faf2d5878c016c98966da1b7fff3"
+    },
+    {
+      "path": "test/external-onboarding-doc.test.js",
+      "status": "A",
+      "bytes": 4035,
+      "sha256": "38872f3959fc0eca6225de2fd48286a21f3dc35b9ca8ff0df0f2e96339d82fa3"
+    },
+    {
+      "path": "test/helpers.js",
+      "status": "M",
+      "bytes": 2619,
+      "sha256": "b535a50a861f7675e49c255a682e254e9d97f7c2aeb6765e485396b4837462be"
+    },
+    {
+      "path": "test/issue5-chat-route.test.js",
+      "status": "A",
+      "bytes": 3168,
+      "sha256": "58392be0c2e086ef2843f7f43157d525fb4432051810ac84a3d05be7c7f4dc61"
+    },
+    {
+      "path": "test/issue5-route-consistency.test.js",
+      "status": "A",
+      "bytes": 4509,
+      "sha256": "47acbb28af2b4e9defd49bd41dc1e59b9903b8fd53fc51b83c52183fffce9a89"
+    },
+    {
+      "path": "test/model-preferences.test.js",
+      "status": "A",
+      "bytes": 7397,
+      "sha256": "aa28613caffbfbf2dc9f88d766c7ac0de580c4ff6be809d20eaa6edb9d23bc19"
+    },
+    {
+      "path": "test/model-selection.test.js",
+      "status": "A",
+      "bytes": 17579,
+      "sha256": "ba8774a740eda40b85ab69a5d252cf3330c6dc58434bde86d0733c19795b2e53"
+    },
+    {
+      "path": "test/models.test.js",
+      "status": "M",
+      "bytes": 16993,
+      "sha256": "3f7e82bccccc463ae0da595c54e20945c52b9d28bb0baee8d6b7f3c7e5fe4270"
+    },
+    {
+      "path": "test/owned-process.test.js",
+      "status": "M",
+      "bytes": 7385,
+      "sha256": "dd44c75a61e44ce2ed9a296bd276c2e41eea07e108238ac21a8ecd6e25c8bd52"
+    },
+    {
+      "path": "test/recovery-boundaries.test.js",
+      "status": "M",
+      "bytes": 9883,
+      "sha256": "15dc7c2145c92ad6f10f8c542739d58efe6ac64fa2ca9ac4751de9095875a23a"
+    }
+  ]
+}

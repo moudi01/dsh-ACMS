@@ -1,0 +1,212 @@
+{
+  "attemptId": "attempt_27d934ff-49ea-4ddf-90d7-d8c937089d3a",
+  "taskId": "task_bec5ae18-2b18-4f35-a791-f52d0542903e",
+  "goalId": "goal_a50f7722-7856-4f98-a303-2a8c17af36bc",
+  "baseline": "178987ad4337a499f925d4377de44a3b5f11d550",
+  "branch": "acms/task_bec5ae18-2b18-4f35-a791-f52d0542903e",
+  "sourceCommit": "4b4e75ee6371f900ec97a0764a7572e17afcf328",
+  "recordedAt": "2026-11-07T10:00:56.467Z",
+  "rework": "Fix the chat entry defect preserved from the cancelled review: chat performs one selection, reads details for that exact route and passes the same reasoning effort instead of re-selecting with ignoreHealth and reading another model. The original review record is preserved and the revision is submitted for independent review.",
+  "commands": [
+    {
+      "summary": "263 tests, 263 pass, 0 fail, exit 0",
+      "exitCode": 0,
+      "command": "node --test --test-concurrency=1 test/*.test.js packages/codex-runtime/test/*.test.mjs",
+      "log": "chat-route-full.txt"
+    },
+    {
+      "summary": "48 tests, 48 pass, 0 fail, exit 0",
+      "exitCode": 0,
+      "command": "node --test test/model-selection.test.js test/model-preferences.test.js test/models.test.js test/issue5-route-consistency.test.js test/issue5-chat-route.test.js test/conversations.test.js",
+      "log": "chat-route-targeted.txt"
+    },
+    {
+      "summary": "chat regression test fails on the previous source and passes after the fix",
+      "exitCode": 0,
+      "command": "node --test test/issue5-chat-route.test.js",
+      "log": "chat-route-red.txt (exit 1 on previous source), chat-route-targeted.txt (green)"
+    },
+    {
+      "summary": "syntax and package contract checks passed",
+      "exitCode": 0,
+      "command": "node scripts/check.mjs",
+      "log": "chat-route-static.txt"
+    },
+    {
+      "summary": "built lib/client.js; bundle hash unchanged",
+      "exitCode": 0,
+      "command": "node scripts/build.mjs",
+      "log": "chat-route-build.txt"
+    },
+    {
+      "summary": "ordered preference add/move/label/save/clear and selection evidence passed; zero automatic diagnostics",
+      "exitCode": 0,
+      "command": "node scripts/model-preferences-ui-test.mjs",
+      "log": "chat-route-ui.txt, chat-route-ui-report.json"
+    },
+    {
+      "summary": "hierarchy, pairing, manual-only probes and internal parent context passed",
+      "exitCode": 0,
+      "command": "node scripts/structure-test.mjs",
+      "log": "chat-route-structure.txt"
+    },
+    {
+      "summary": "dashboard, workflows, model selection, diagnostics, trash, blockers, themes passed",
+      "exitCode": 0,
+      "command": "node scripts/ui-test.mjs",
+      "log": "chat-route-ui-regression.txt"
+    },
+    {
+      "summary": "first goal, native picker, directory browser, clipboard paste and disabled guidance passed",
+      "exitCode": 0,
+      "command": "node scripts/usability-test.mjs",
+      "log": "chat-route-usability.txt"
+    },
+    {
+      "summary": "owner check exit 0 twice in a row, 263 tests each",
+      "exitCode": 0,
+      "command": "C:/Program Files/nodejs/node.exe D:/ACMS/test-results/iteration-1/owner-check.mjs",
+      "log": "chat-route-owner-check-1.txt, chat-route-owner-check-2.txt"
+    }
+  ],
+  "tests": {
+    "total": 263,
+    "passed": 263,
+    "failed": 0,
+    "targeted": {
+      "total": 48,
+      "passed": 48,
+      "failed": 0
+    }
+  },
+  "regressionRed": {
+    "command": "node --test test/model-selection.test.js test/models.test.js",
+    "exitCode": 1,
+    "failedNewTests": 6,
+    "log": "regression-red.txt",
+    "note": "Sources were temporarily restored to the previous delivered version to prove the new tests catch the old defects; fixed sources were restored before the green runs."
+  },
+  "textIntegrity": {
+    "checkedFiles": [
+      "docs/iteration-2-issue-5.md",
+      "docs/model-preferences.md",
+      "docs/iteration-2-sources/issue-5/test-log.md"
+    ],
+    "result": "no U+FFFD or doubled ASCII question-mark corruption; documents readable and UTF-8 without BOM"
+  },
+  "deliveredFiles": [
+    "src/core/model-selection.js",
+    "src/core/domain.js",
+    "src/adapters/dsh.js",
+    "src/runtime/engine.js",
+    "src/runtime/prompt.js",
+    "src/client/model-picker.jsx",
+    "src/client/app.jsx",
+    "src/client/style.css",
+    "src/host/http.js",
+    "test/model-selection.test.js",
+    "test/model-preferences.test.js",
+    "test/models.test.js",
+    "scripts/model-preferences-ui-test.mjs",
+    "docs/model-preferences.md",
+    "docs/iteration-2-issue-5.md",
+    "docs/images/model-preferences.png",
+    "docs/images/model-selection-evidence.png",
+    "docs/images/overview.png",
+    "docs/iteration-2-sources/issue-5/test-log.md",
+    "docs/iteration-2-sources/issue-5/full-test.txt",
+    "docs/iteration-2-sources/issue-5/targeted-tests.txt",
+    "docs/iteration-2-sources/issue-5/regression-red.txt",
+    "docs/iteration-2-sources/issue-5/static-check.txt",
+    "docs/iteration-2-sources/issue-5/build.txt",
+    "docs/iteration-2-sources/issue-5/ui-run.txt",
+    "docs/iteration-2-sources/issue-5/ui-report.json",
+    "docs/iteration-2-sources/issue-5/ui-structure.txt",
+    "docs/iteration-2-sources/issue-5/ui-regression.txt",
+    "docs/iteration-2-sources/issue-5/usability.txt",
+    "docs/iteration-2-sources/issue-5/empty-models-known-failure.txt",
+    "package.json",
+    "lib/client.js",
+    "CHANGELOG.md",
+    "README.md",
+    "test/owned-process.test.js",
+    "test/helpers.js",
+    "test/bundled-cleanup.test.js",
+    "packages/codex-runtime/test/lifecycle.test.mjs",
+    "packages/codex-runtime/test/store.test.mjs",
+    "packages/codex-runtime/test/wire.test.mjs",
+    "docs/iteration-2-sources/issue-5/owner-check-1.txt",
+    "docs/iteration-2-sources/issue-5/owner-check-2.txt",
+    "test/issue5-route-consistency.test.js",
+    "docs/iteration-2-sources/issue-5/regression-p1p2-red.txt",
+    "docs/iteration-2-sources/issue-5/route-consistency-tests.txt",
+    "test/issue5-chat-route.test.js",
+    "docs/iteration-2-sources/issue-5/chat-route-red.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-targeted.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-full.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-static.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-build.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-ui.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-ui-report.json",
+    "docs/iteration-2-sources/issue-5/chat-route-structure.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-ui-regression.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-usability.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-owner-check-1.txt",
+    "docs/iteration-2-sources/issue-5/chat-route-owner-check-2.txt"
+  ],
+  "knownIssues": [
+    "node scripts/empty-models-test.mjs still exits 1 because its script opens the pairing dialog and then clicks the organization panel; pre-existing dialog interception, original output retained in empty-models-known-failure.txt.",
+    "GitHub PR, CI, merge, host backup/upgrade and post-release agent acceptance remain with the release task and are not claimed here."
+  ],
+  "releaseBoundary": "No PR, CI, merge, host upgrade or post-release acceptance is claimed.",
+  "previousCheckFailure": {
+    "attemptId": "attempt_e57d57b7-d95a-46eb-b07c-8ee1f350a4cd",
+    "verificationId": "verification_103aab99-fc22-4d7c-9cfd-b600756ac208",
+    "code": 1,
+    "test": "test/owned-process.test.js:68",
+    "error": "EBUSY: resource busy or locked, rmdir acms-owned-crash-* temp directory",
+    "conclusion": "windows temp dir cleanup timing flake, unrelated to issue-5 product logic"
+  },
+  "reworkRegressionRed": {
+    "command": "node --test --test-concurrency=1 test/issue5-route-consistency.test.js",
+    "exitCode": 1,
+    "failedNewTests": 2,
+    "log": "regression-p1p2-red.txt",
+    "note": "Sources were restored to the previous delivered commit 6299aca; the P1 test observed m2 detail depth low instead of max and the P2 test observed route_mismatch instead of unauthorized_provider. Fixed sources were restored before green runs."
+  },
+  "reviewFixes": [
+    {
+      "id": "P1",
+      "file": "src/adapters/dsh.js",
+      "defect": "routeDetails ignored the selected route model/llmProvider and cached details by provider registration defaults",
+      "fix": "read and cache details by the full selected route provider/llmProvider/model",
+      "tests": [
+        "test/issue5-route-consistency.test.js"
+      ]
+    },
+    {
+      "id": "P2",
+      "file": "src/core/model-selection.js",
+      "defect": "preference entry authorization was checked only when the model was absent, mislabeling an unauthorized entrance as route_mismatch",
+      "fix": "classify unauthorized_model, unauthorized_provider, preference_model_absent, route_mismatch in that order",
+      "tests": [
+        "test/issue5-route-consistency.test.js"
+      ]
+    },
+    {
+      "id": "CHAT-P1",
+      "file": "src/adapters/dsh.js",
+      "defect": "chat re-selected with ignoreHealth after choosing a route, so details and reasoning depth could come from a different model than the actual call",
+      "fix": "select once, resolve the provider from that selection and read details by the selected route and effort",
+      "tests": [
+        "test/issue5-chat-route.test.js"
+      ]
+    }
+  ],
+  "chatRouteRegressionRed": {
+    "command": "node --test test/issue5-chat-route.test.js",
+    "exitCode": 1,
+    "log": "chat-route-red.txt",
+    "note": "src/adapters/dsh.js was temporarily restored to the previous delivered version; the test observed the details request for deepseek/m2 even though selection had fallen back to m1. The fixed source was restored before the green runs."
+  }
+}

@@ -13,9 +13,10 @@ import { Conversations } from '../src/runtime/conversations.js';
 import { WorkspaceManager } from '../src/runtime/workspaces.js';
 import { SimulatedAdapter, defaultSimulation } from '../src/adapters/simulated.js';
 import { createRoutes } from '../src/host/http.js';
+import { createAgentApi } from '../src/host/agent-api.js';
 import { OWNER } from '../src/core/util.js';
 
-export async function startPreview({ seed = true } = {}) {
+export async function startPreview({ seed = true, startEngine = true, agentApi = false } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'acms-ui-test-')); const source = path.join(root, 'source'); const dataDir = path.join(root, 'data');
   await mkdir(source); await writeFile(path.join(source, 'README.md'), '# Isolated UI test project\n');
   const store = new Store(path.join(dataDir, 'company.db')); const company = new Company(store);
@@ -42,10 +43,13 @@ export async function startPreview({ seed = true } = {}) {
     command('task.create', { goalId: goal.id, title: '完善待办交互与使用说明', description: '补全任务创建、状态切换和交接说明。', dependencies: [a.id] });
     command('task.create', { goalId: goal.id, title: '确认品牌素材', description: '核对图标和品牌配色，素材缺失时仅暂停这个分支。' });
   }
-  await engine.start();
+  if (startEngine) await engine.start();
   const bundle = await build({ entryPoints: ['scripts/preview-entry.jsx'], bundle: true, format: 'iife', platform: 'browser', write: false, define: { 'process.env.NODE_ENV': '"production"' } });
   const client = await readFile('lib/client.js');
-  const routes = createRoutes({ dataDir, store, company, adapter, workspaces, engine, conversations }); const pending = new Set();
+  const runtime = { dataDir, store, company, adapter, workspaces, engine, conversations };
+  const agent = agentApi ? createAgentApi(runtime, { dataDir }) : null;
+  if (agent) await agent.start();
+  const routes = createRoutes(runtime); const pending = new Set();
   const server = http.createServer((req, res) => {
     const handler = (async () => {
       const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
@@ -61,7 +65,8 @@ export async function startPreview({ seed = true } = {}) {
     pending.add(handler); handler.finally(() => pending.delete(handler));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  return { root, source, dataDir, company, engine, url: `http://127.0.0.1:${server.address().port}`,
-    async close() { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await Promise.allSettled([...pending]); await conversations.close(); await engine.stop(); store.close(); },
+  return { root, source, dataDir, company, engine, adapter, url: `http://127.0.0.1:${server.address().port}`,
+    agent, discoveryFile: agent?.discoveryFile ?? null,
+    async close() { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await Promise.allSettled([...pending]); if (agent) await agent.close(); await conversations.close(); if (startEngine) await engine.stop(); store.close(); },
   };
 }

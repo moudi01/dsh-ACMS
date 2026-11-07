@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "mode": "isolated preview harness with simulation provider",
+  "checked": [
+    "ordered preference add, move, label, save, clear",
+    "preferences persisted through command/domain with revision",
+    "viewing and saving preferences never requested model-check or model-details",
+    "attempt selection basis and fallback reasons rendered in task detail"
+  ],
+  "screenshots": [
+    "test-results/ui/model-preferences.png",
+    "test-results/ui/model-selection-evidence.png"
+  ],
+  "diagnostics": []
+}

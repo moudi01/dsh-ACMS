@@ -50,9 +50,10 @@ for (const branch of ['human', 'technical-retry', 'technical-repair', 'repair-li
       assert.equal(accepted.handoff, output.reversibleDefault); assert.equal(accepted.cleanupPending, false);
       if (branch === 'technical-retry') { assert.equal(saved.feedback, output.reason); assert(saved.retryAt); }
       const questions = f.store.list('interactions').filter(i => i.taskId === task.id && i.status === 'pending');
-      assert.equal(questions.length, ['human', 'repair-limit'].includes(branch) ? 1 : 0);
+      assert.equal(questions.length, branch === 'human' ? 1 : 0);
       if (branch === 'human') assert.equal(questions[0].question, output.question);
       assert.equal(f.store.list('tasks').filter(t => t.repairOf === task.id).length, branch === 'technical-repair' ? 1 : 0);
+      assert.equal(f.store.list('tasks').filter(t => t.kind === 'coordination' && t.coordinationOf === task.id).length, branch === 'repair-limit' ? 1 : 0);
       const elapsed = f.store.require('goals', task.goalId).runtimeMs;
       await f.engine.recover(); await f.engine.tick();
       assert.equal(f.store.require('goals', task.goalId).runtimeMs, elapsed);

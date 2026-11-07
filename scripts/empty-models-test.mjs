@@ -15,6 +15,8 @@ try {
   await page.getByRole('button', { name: '＋ 配对外部 agent' }).click();
   await expect(page.getByLabel('配对 prompt')).toHaveValue(/acms.runner.v1/);
   await page.screenshot({ path: 'test-results/ui/empty-models.png' });
+  await page.getByRole('button', { name: '关闭配对' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
   await page.getByRole('button', { name: '组织管理', exact: true }).click();
   await page.getByRole('button', { name: '＋ 创建角色', exact: true }).click();
   await page.getByLabel('角色名称').fill('未绑定模型的角色');

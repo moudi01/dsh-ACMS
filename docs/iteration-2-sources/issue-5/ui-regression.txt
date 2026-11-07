@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "mode": "isolated DSH client-loader/host-route harness with simulation provider",
+  "checked": [
+    "actual DSH loader bundle",
+    "dashboard",
+    "task dependency graph",
+    "workflow version publish and explicit task migration",
+    "real model-name selection and saved binding",
+    "model list without unsupported executors or filters; parent inheritance for internal models",
+    "reasoning selection and persistence",
+    "failed model diagnostics disable saving with reason; successful retry recovers",
+    "task deletion and restore",
+    "disabled task actions explain why",
+    "human answer and automatic wake",
+    "dark theme",
+    "390px responsive layout",
+    "dialog Escape",
+    "no uncaught browser errors"
+  ],
+  "screenshots": [
+    "docs/images/overview.png",
+    "test-results/ui/graph.png",
+    "test-results/ui/model-diagnostics.png",
+    "test-results/ui/dark.png",
+    "test-results/ui/mobile.png"
+  ]
+}

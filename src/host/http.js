@@ -50,11 +50,6 @@ export function createRoutes(runtime) {
         await workspaces.validateProject({ ...previous, ...input.args, mode: input.args?.mode ?? previous?.mode ?? 'git' });
       }
       if (input.name === 'goal.createWithProject') await workspaces.validateProject({ ...input.args?.project, mode: input.args?.project?.mode ?? 'copy' });
-      if (input.name === 'agent.save' && adapter.choose) {
-        const previous = input.args?.id ? company.store.get('agents', input.args.id) : {};
-        await adapter.choose({ ...previous, ...input.args });
-        if (input.args?.reasoningEffort) await adapter.modelDetails({ ...previous, ...input.args }, request.signal);
-      }
       let result = company.command(OWNER, input.requestId, input.name, input.args ?? {});
       const projectId = input.name === 'project.save' ? result.id : result?.projectId ?? (result?.goalId ? company.store.get('goals', result.goalId)?.projectId : null);
       if (projectId && company.store.get('projects', projectId)?.status !== 'deleted' && workspaces.publishProject) {

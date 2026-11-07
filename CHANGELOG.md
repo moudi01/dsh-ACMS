@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Final candidate hardening: keep the published ACL step working when the host exports a foreign PSModulePath, clean ACL fixtures without EPERM, retry transient Windows index-rename errors, correct the fs.rm retry documentation, and verify the empty-models flow by closing the pairing dialog before navigation.
+
+- Add an owner-facing external access panel to issue scoped user-agent credentials once, list redacted credentials and revoke them; document first-run onboarding and verify closed-workbench CLI use end to end.
+- Recheck a manager's persisted goal scope in management batches, page the full recent decision window, and stop coordination recursion after a technical block; build cumulative archives whose embedded manifests are verified against the archive bytes.
+- Add owner-managed ordered model preferences with explainable automatic selection: explicit bindings win, preferences never widen authorization, unknown capabilities stay unknown, and fallbacks or blocked candidates are recorded without surprising model probes.
+- Read model details and cache them by the full selected route so the chosen model and reasoning depth drive both the record and the actual activation; label an unauthorized preferred entrance as unauthorized_provider when another entrance offers the same model.
+
+- Retry Windows temp-directory cleanup in tests (EBUSY while handles release) so the project owner check stays deterministic after a process tree is terminated.
 - Preserve validated external-runner errors with bounded, redacted messages. Keep failed exits as failures, and require reconciliation when descendant cleanup is unconfirmed instead of automatically retrying or dispatching repair work.
 - Prevent managers from delegating more permissions than their effective current/captured grants. Add atomic external management batches with prior-result ID references, durable retry deduplication and automatic result-fed continuation.
 - Invalidate obsolete blocker answers after cancellation or contract/workflow changes; answering a paused task preserves its pause.

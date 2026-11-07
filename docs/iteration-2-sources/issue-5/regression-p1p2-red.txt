@@ -1,0 +1,48 @@
+✖ route details use the selected model and llmProvider per route (5.0374ms)
+✖ preference for an unauthorized entrance reports unauthorized_provider when another entrance offers the model (1.0227ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 0
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 70.5749
+
+✖ failing tests:
+
+test at test\issue5-route-consistency.test.js:28:1
+✖ route details use the selected model and llmProvider per route (5.0374ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'low' !== 'max'
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/issue5-route-consistency.test.js:38:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'low',
+    expected: 'max',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\issue5-route-consistency.test.js:55:1
+✖ preference for an unauthorized entrance reports unauthorized_provider when another entrance offers the model (1.0227ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'route_mismatch'
+  - 'unauthorized_provider'
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/issue5-route-consistency.test.js:63:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'route_mismatch',
+    expected: 'unauthorized_provider',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

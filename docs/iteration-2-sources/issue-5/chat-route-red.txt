@@ -1,0 +1,35 @@
+✖ chat keeps the selected fallback route and its details consistent when a preference is unavailable (5.3373ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 67.2047
+
+✖ failing tests:
+
+test at test\issue5-chat-route.test.js:26:1
+✖ chat keeps the selected fallback route and its details consistent when a preference is unavailable (5.3373ms)
+  AssertionError [ERR_ASSERTION]: details are read for the selected fallback route only
+  + actual - expected
+  
+    [
+      [
+        'deepseek',
+  +     'm2'
+  -     'm1'
+      ]
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/issue5-chat-route.test.js:40:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: [ [ 'deepseek', 'm2' ] ],
+    expected: [ [ 'deepseek', 'm1' ] ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

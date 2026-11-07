@@ -1,0 +1,1591 @@
+{
+  "format": "acms.iteration-2.external-onboarding.receipt.v1",
+  "generatedAt": "2026-11-07T14:22:49.357Z",
+  "mode": "trusted-host preview harness: real client bundle, real host routes, real user-agent API and CLI; simulated engine/provider",
+  "environment": {
+    "node": "v24.22.0",
+    "platform": "win32 x64"
+  },
+  "candidate": {
+    "headAtRun": "9a725c11e65093a5f43d8ef6b2ed55f9089b6ff7",
+    "workingTreeAtRun": "19 changed paths at run time; frozen source/tests/docs hashes are in docs/iteration-2-final-files.json",
+    "finalManifest": "docs/iteration-2-final-files.json"
+  },
+  "workbench": {
+    "uiUrl": "http://127.0.0.1:60110",
+    "browserClosedAt": "2026-11-07T14:22:48.148Z",
+    "credentialIssuedBeforeClose": true
+  },
+  "credential": {
+    "id": "cred_b6c137a3-2f23-44c9-b15e-de760096972e",
+    "name": "外部接入验收代理",
+    "tokenPrefix": "acms_ag_x8Odep",
+    "scope": {
+      "projectIds": [
+        "project_c231ae32-f213-4db8-8282-c7a3bd6063af"
+      ],
+      "goalIds": [
+        "goal_b6973f24-67b9-4eea-9318-b10981e2858f"
+      ],
+      "allGoals": false,
+      "projectCreate": false,
+      "commands": [
+        "goal.submit",
+        "status.read",
+        "events.read",
+        "interaction.answer",
+        "task.pause",
+        "task.resume"
+      ]
+    },
+    "tokenReturnedOnce": true
+  },
+  "goalScope": {
+    "hint": "留空时，凭据只能访问其自己提交的目标；指定后，可访问该目标以及本凭据提交的目标。",
+    "issued": "指定目标：goal_b6973f24-67b9-4eea-9318-b10981e2858f（另含本凭据提交的目标）"
+  },
+  "tokenSetup": {
+    "source": "docs/external-agent-onboarding.md section 3, executed verbatim",
+    "exitCode": 0,
+    "stdout": "token ��д�� C:\\Users\\Administrator\\AppData\\Local\\Temp\\acms-ui-test-HSaztz\\data\\agent-token��ACL������ǰ�û��ɶ�д",
+    "acl": {
+      "protected": true,
+      "currentUser": "S-1-5-21-4042452463-3959558241-2546926668-500",
+      "rules": [
+        {
+          "sid": "S-1-5-21-4042452463-3959558241-2546926668-500",
+          "inherited": false,
+          "rights": "Write, Read, Synchronize"
+        }
+      ]
+    }
+  },
+  "cli": [
+    {
+      "name": "discover",
+      "exitCode": 0,
+      "command": "acms-agent discover",
+      "ok": true,
+      "value": {
+        "apiVersion": "1.0",
+        "contractVersion": 1,
+        "operations": [
+          "GET /discover",
+          "GET /status",
+          "GET /projects",
+          "GET /projects/{id}",
+          "GET /goals",
+          "GET /goals/{id}",
+          "GET /tasks",
+          "GET /tasks/{id}",
+          "GET /reviews",
+          "GET /blockers",
+          "GET /events",
+          "POST /goals",
+          "POST /projects",
+          "POST /interactions/{id}/answer",
+          "POST /tasks/{id}/pause",
+          "POST /tasks/{id}/resume"
+        ],
+        "limits": {
+          "bodyBytes": 262144,
+          "pageSize": 200,
+          "longPollMs": 20000
+        },
+        "instanceId": "cd84f624-b17d-400a-a587-0e6b5751d691"
+      }
+    },
+    {
+      "name": "projects",
+      "exitCode": 0,
+      "command": "acms-agent projects",
+      "ok": true,
+      "value": {
+        "projects": [
+          {
+            "id": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "name": "产品演示项目",
+            "repoRoot": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\acms-ui-test-HSaztz\\source",
+            "mode": "copy",
+            "checks": [],
+            "autoMerge": false,
+            "source": null,
+            "createdAt": "2026-11-07T14:22:47.205Z",
+            "updatedAt": "2026-11-07T14:22:47.205Z"
+          }
+        ]
+      }
+    },
+    {
+      "name": "status",
+      "exitCode": 0,
+      "command": "acms-agent status",
+      "ok": true,
+      "value": {
+        "goal": {
+          "id": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+          "title": "交付待办应用 Demo",
+          "description": "用一个小型产品验证自主规划、执行、审查与交付。",
+          "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+          "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+          "status": "active",
+          "workflowId": "default",
+          "constraints": [],
+          "source": null,
+          "priority": null,
+          "createdAt": "2026-11-07T14:22:47.206Z",
+          "updatedAt": "2026-11-07T14:22:47.358Z",
+          "revision": 6
+        },
+        "tasks": [
+          {
+            "id": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "搭建应用基础结构",
+            "description": "组织页面和数据结构，形成后续开发可使用的基础。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "work",
+            "status": "succeeded",
+            "agentId": "agent_39033e74-5552-4965-8f04-596375a06fdc",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 1,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976",
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.207Z",
+            "updatedAt": "2026-11-07T14:22:47.303Z"
+          },
+          {
+            "id": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "完善待办交互与使用说明",
+            "description": "补全任务创建、状态切换和交接说明。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "work",
+            "status": "succeeded",
+            "agentId": "agent_d1b7eca8-e61d-4b76-ba7b-87b42b417d2d",
+            "parentId": null,
+            "dependencies": [
+              "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef"
+            ],
+            "stageIndex": 1,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1",
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.208Z",
+            "updatedAt": "2026-11-07T14:22:47.360Z"
+          },
+          {
+            "id": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "确认品牌素材",
+            "description": "核对图标和品牌配色，素材缺失时仅暂停这个分支。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "work",
+            "status": "blocked",
+            "agentId": "agent_4709cbd7-c010-4663-9257-eb91c122bd59",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": {
+              "kind": "human",
+              "reason": "当前没有可用的品牌文件。"
+            },
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.209Z",
+            "updatedAt": "2026-11-07T14:22:47.253Z"
+          },
+          {
+            "id": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "审查：搭建应用基础结构",
+            "description": "阶段：独立审查。独立核对交付物、检查结果和验收标准。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "review",
+            "status": "succeeded",
+            "agentId": "reviewer",
+            "parentId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "feedback": null,
+            "requiresArtifacts": false,
+            "createdAt": "2026-11-07T14:22:47.272Z",
+            "updatedAt": "2026-11-07T14:22:47.302Z"
+          },
+          {
+            "id": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "审查：完善待办交互与使用说明",
+            "description": "阶段：独立审查。独立核对交付物、检查结果和验收标准。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "review",
+            "status": "succeeded",
+            "agentId": "reviewer",
+            "parentId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "feedback": null,
+            "requiresArtifacts": false,
+            "createdAt": "2026-11-07T14:22:47.336Z",
+            "updatedAt": "2026-11-07T14:22:47.358Z"
+          },
+          {
+            "id": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "外部接入暂停验证任务",
+            "description": "由本测试创建，用于验证凭据的暂停与恢复命令。",
+            "acceptance": "暂停后可恢复。",
+            "kind": "work",
+            "status": "ready",
+            "agentId": "agent_55ce2a18-951a-4bcf-a767-b4ad534a5dfc",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 0,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.594Z",
+            "updatedAt": "2026-11-07T14:22:47.594Z"
+          }
+        ],
+        "attempts": [
+          {
+            "id": "attempt_2d50704f-5e75-4d00-93e5-2a3347022fd5",
+            "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "agentId": "agent_39033e74-5552-4965-8f04-596375a06fdc",
+            "status": "completed",
+            "model": "",
+            "provider": "simulation",
+            "llmProvider": null,
+            "selection": null,
+            "startedAt": "2026-11-07T14:22:47.216Z",
+            "finishedAt": "2026-11-07T14:22:47.271Z",
+            "summary": "模拟交付已生成"
+          },
+          {
+            "id": "attempt_e213d39e-0af4-4502-baf8-3906d1ded80c",
+            "taskId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "agentId": "agent_4709cbd7-c010-4663-9257-eb91c122bd59",
+            "status": "completed",
+            "model": "",
+            "provider": "simulation",
+            "llmProvider": null,
+            "selection": null,
+            "startedAt": "2026-11-07T14:22:47.218Z",
+            "finishedAt": "2026-11-07T14:22:47.252Z",
+            "summary": "当前没有可用的品牌文件。"
+          },
+          {
+            "id": "attempt_e2627d3a-0248-40d9-b345-05d04b30b2b4",
+            "taskId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "agentId": "reviewer",
+            "status": "completed",
+            "model": "",
+            "provider": "simulation",
+            "llmProvider": null,
+            "selection": null,
+            "startedAt": "2026-11-07T14:22:47.273Z",
+            "finishedAt": "2026-11-07T14:22:47.301Z",
+            "summary": "模拟审查通过"
+          },
+          {
+            "id": "attempt_953bbf93-0674-47ad-b85a-d1ea3d624966",
+            "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "agentId": "agent_d1b7eca8-e61d-4b76-ba7b-87b42b417d2d",
+            "status": "completed",
+            "model": "",
+            "provider": "simulation",
+            "llmProvider": null,
+            "selection": null,
+            "startedAt": "2026-11-07T14:22:47.305Z",
+            "finishedAt": "2026-11-07T14:22:47.335Z",
+            "summary": "模拟交付已生成"
+          },
+          {
+            "id": "attempt_35d72d8a-f6c0-409b-9f92-3b4f4599cdb2",
+            "taskId": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "agentId": "reviewer",
+            "status": "completed",
+            "model": "",
+            "provider": "simulation",
+            "llmProvider": null,
+            "selection": null,
+            "startedAt": "2026-11-07T14:22:47.337Z",
+            "finishedAt": "2026-11-07T14:22:47.358Z",
+            "summary": "模拟审查通过"
+          }
+        ],
+        "artifacts": [
+          {
+            "id": "artifact_attempt_2d50704f-5e75-4d00-93e5-2a3347022fd5_0",
+            "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "path": "deliverable.md",
+            "title": "搭建应用基础结构",
+            "hash": "152a13ecc391a0d49c07bb750237947ef745ae84811f7060c900e55ff17ee3e0",
+            "bytes": 105,
+            "createdAt": "2026-11-07T14:22:47.271Z"
+          },
+          {
+            "id": "artifact_attempt_953bbf93-0674-47ad-b85a-d1ea3d624966_0",
+            "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "path": "deliverable.md",
+            "title": "完善待办交互与使用说明",
+            "hash": "8b6a1c4152fa56ed7f67a1ede108320652ed9c67d27540218fcaa953af4b058f",
+            "bytes": 114,
+            "createdAt": "2026-11-07T14:22:47.335Z"
+          }
+        ],
+        "verifications": [
+          {
+            "id": "verification_f0c92772-09ea-4468-a50d-c1aa226d5c70",
+            "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "kind": "checks",
+            "passed": true,
+            "summary": null,
+            "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976",
+            "createdAt": "2026-11-07T14:22:47.271Z"
+          },
+          {
+            "id": "verification_9ec2b795-eacf-4a34-803f-b788310895f1",
+            "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "kind": "review",
+            "passed": true,
+            "summary": "模拟审查通过",
+            "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976",
+            "createdAt": "2026-11-07T14:22:47.302Z"
+          },
+          {
+            "id": "verification_139c97ce-5bb3-484f-a855-4d3d341bc370",
+            "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "kind": "checks",
+            "passed": true,
+            "summary": null,
+            "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1",
+            "createdAt": "2026-11-07T14:22:47.335Z"
+          },
+          {
+            "id": "verification_3218d470-e37e-432f-8434-40b406f042f6",
+            "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "kind": "review",
+            "passed": true,
+            "summary": "模拟审查通过",
+            "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1",
+            "createdAt": "2026-11-07T14:22:47.358Z"
+          }
+        ],
+        "interactions": [
+          {
+            "id": "interaction_a7fca6c0-2fad-4b84-81ff-61ea1a7b5b30",
+            "taskId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "kind": "human",
+            "question": "请提供品牌素材，或确认沿用默认样式。",
+            "status": "pending",
+            "generation": 1,
+            "expectedRevision": 1,
+            "createdAt": "2026-11-07T14:22:47.253Z"
+          }
+        ],
+        "cursor": 45,
+        "modelPreferences": {
+          "id": "model",
+          "order": [],
+          "revision": 0,
+          "updatedAt": null,
+          "updatedBy": null
+        }
+      }
+    },
+    {
+      "name": "tasks",
+      "exitCode": 0,
+      "command": "acms-agent tasks",
+      "ok": true,
+      "value": {
+        "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+        "tasks": [
+          {
+            "id": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "搭建应用基础结构",
+            "description": "组织页面和数据结构，形成后续开发可使用的基础。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "work",
+            "status": "succeeded",
+            "agentId": "agent_39033e74-5552-4965-8f04-596375a06fdc",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 1,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976",
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.207Z",
+            "updatedAt": "2026-11-07T14:22:47.303Z"
+          },
+          {
+            "id": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "完善待办交互与使用说明",
+            "description": "补全任务创建、状态切换和交接说明。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "work",
+            "status": "succeeded",
+            "agentId": "agent_d1b7eca8-e61d-4b76-ba7b-87b42b417d2d",
+            "parentId": null,
+            "dependencies": [
+              "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef"
+            ],
+            "stageIndex": 1,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1",
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.208Z",
+            "updatedAt": "2026-11-07T14:22:47.360Z"
+          },
+          {
+            "id": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "确认品牌素材",
+            "description": "核对图标和品牌配色，素材缺失时仅暂停这个分支。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "work",
+            "status": "blocked",
+            "agentId": "agent_4709cbd7-c010-4663-9257-eb91c122bd59",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": {
+              "kind": "human",
+              "reason": "当前没有可用的品牌文件。"
+            },
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.209Z",
+            "updatedAt": "2026-11-07T14:22:47.253Z"
+          },
+          {
+            "id": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "审查：搭建应用基础结构",
+            "description": "阶段：独立审查。独立核对交付物、检查结果和验收标准。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "review",
+            "status": "succeeded",
+            "agentId": "reviewer",
+            "parentId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "feedback": null,
+            "requiresArtifacts": false,
+            "createdAt": "2026-11-07T14:22:47.272Z",
+            "updatedAt": "2026-11-07T14:22:47.302Z"
+          },
+          {
+            "id": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "审查：完善待办交互与使用说明",
+            "description": "阶段：独立审查。独立核对交付物、检查结果和验收标准。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "review",
+            "status": "succeeded",
+            "agentId": "reviewer",
+            "parentId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "feedback": null,
+            "requiresArtifacts": false,
+            "createdAt": "2026-11-07T14:22:47.336Z",
+            "updatedAt": "2026-11-07T14:22:47.358Z"
+          },
+          {
+            "id": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "外部接入暂停验证任务",
+            "description": "由本测试创建，用于验证凭据的暂停与恢复命令。",
+            "acceptance": "暂停后可恢复。",
+            "kind": "work",
+            "status": "ready",
+            "agentId": "agent_55ce2a18-951a-4bcf-a767-b4ad534a5dfc",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 0,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.594Z",
+            "updatedAt": "2026-11-07T14:22:47.594Z"
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "name": "reviews",
+      "exitCode": 0,
+      "command": "acms-agent reviews",
+      "ok": true,
+      "value": {
+        "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+        "reviews": [
+          {
+            "id": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "审查：搭建应用基础结构",
+            "description": "阶段：独立审查。独立核对交付物、检查结果和验收标准。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "review",
+            "status": "succeeded",
+            "agentId": "reviewer",
+            "parentId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "feedback": null,
+            "requiresArtifacts": false,
+            "createdAt": "2026-11-07T14:22:47.272Z",
+            "updatedAt": "2026-11-07T14:22:47.302Z"
+          },
+          {
+            "id": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "审查：完善待办交互与使用说明",
+            "description": "阶段：独立审查。独立核对交付物、检查结果和验收标准。",
+            "acceptance": "交付物存在，功能说明完整，独立审查通过。",
+            "kind": "review",
+            "status": "succeeded",
+            "agentId": "reviewer",
+            "parentId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 1,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "feedback": null,
+            "requiresArtifacts": false,
+            "createdAt": "2026-11-07T14:22:47.336Z",
+            "updatedAt": "2026-11-07T14:22:47.358Z"
+          }
+        ],
+        "verifications": [
+          {
+            "id": "verification_9ec2b795-eacf-4a34-803f-b788310895f1",
+            "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "kind": "review",
+            "passed": true,
+            "summary": "模拟审查通过",
+            "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976",
+            "createdAt": "2026-11-07T14:22:47.302Z",
+            "reviewTaskId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d"
+          },
+          {
+            "id": "verification_3218d470-e37e-432f-8434-40b406f042f6",
+            "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "kind": "review",
+            "passed": true,
+            "summary": "模拟审查通过",
+            "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1",
+            "createdAt": "2026-11-07T14:22:47.358Z",
+            "reviewTaskId": "task_145bb612-127e-4945-8d64-c96481233e1f"
+          }
+        ],
+        "cursor": 45
+      }
+    },
+    {
+      "name": "blockers",
+      "exitCode": 0,
+      "command": "acms-agent blockers",
+      "ok": true,
+      "value": {
+        "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+        "blockers": [
+          {
+            "id": "interaction_a7fca6c0-2fad-4b84-81ff-61ea1a7b5b30",
+            "taskId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "kind": "human",
+            "question": "请提供品牌素材，或确认沿用默认样式。",
+            "status": "pending",
+            "generation": 1,
+            "expectedRevision": 1,
+            "createdAt": "2026-11-07T14:22:47.253Z"
+          }
+        ],
+        "count": 1,
+        "cursor": 45
+      }
+    },
+    {
+      "name": "events",
+      "exitCode": 0,
+      "command": "acms-agent events",
+      "ok": true,
+      "value": {
+        "entries": [
+          {
+            "seq": 4,
+            "at": "2026-11-07T14:22:47.206Z",
+            "type": "goal.created",
+            "entityId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {}
+          },
+          {
+            "seq": 5,
+            "at": "2026-11-07T14:22:47.206Z",
+            "type": "command.accepted",
+            "entityId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "command": "goal.create",
+              "requestId": "51004f29-2e73-4991-98dd-0310ebf26ba2"
+            }
+          },
+          {
+            "seq": 6,
+            "at": "2026-11-07T14:22:47.207Z",
+            "type": "task.created",
+            "entityId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+              "kind": "work",
+              "title": "搭建应用基础结构"
+            }
+          },
+          {
+            "seq": 7,
+            "at": "2026-11-07T14:22:47.207Z",
+            "type": "command.accepted",
+            "entityId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "command": "task.create",
+              "requestId": "f2e624a4-3124-4dfe-8fac-1ac5a44077d9"
+            }
+          },
+          {
+            "seq": 8,
+            "at": "2026-11-07T14:22:47.208Z",
+            "type": "task.created",
+            "entityId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+              "kind": "work",
+              "title": "完善待办交互与使用说明"
+            }
+          },
+          {
+            "seq": 9,
+            "at": "2026-11-07T14:22:47.208Z",
+            "type": "command.accepted",
+            "entityId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "command": "task.create",
+              "requestId": "f01d2c40-5751-4077-9568-938c694e9cce"
+            }
+          },
+          {
+            "seq": 10,
+            "at": "2026-11-07T14:22:47.209Z",
+            "type": "task.created",
+            "entityId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+              "kind": "work",
+              "title": "确认品牌素材"
+            }
+          },
+          {
+            "seq": 11,
+            "at": "2026-11-07T14:22:47.209Z",
+            "type": "command.accepted",
+            "entityId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "command": "task.create",
+              "requestId": "0cb3463d-2434-4d57-9013-0b1b0ac7b396"
+            }
+          },
+          {
+            "seq": 12,
+            "at": "2026-11-07T14:22:47.217Z",
+            "type": "attempt.claimed",
+            "entityId": "attempt_2d50704f-5e75-4d00-93e5-2a3347022fd5",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+              "kind": "work",
+              "contextKey": "acms:goal_b6973f24-67b9-4eea-9318-b10981e2858f:task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef:role-worker:agent_39033e74-5552-4965-8f04-596375a06fdc:g1"
+            }
+          },
+          {
+            "seq": 13,
+            "at": "2026-11-07T14:22:47.218Z",
+            "type": "attempt.claimed",
+            "entityId": "attempt_e213d39e-0af4-4502-baf8-3906d1ded80c",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+              "kind": "work",
+              "contextKey": "acms:goal_b6973f24-67b9-4eea-9318-b10981e2858f:task_5aa97551-0645-4dbb-b854-c053a800c002:role-worker:agent_4709cbd7-c010-4663-9257-eb91c122bd59:g1"
+            }
+          },
+          {
+            "seq": 14,
+            "at": "2026-11-07T14:22:47.236Z",
+            "type": "attempt.starting",
+            "entityId": "attempt_e213d39e-0af4-4502-baf8-3906d1ded80c",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5aa97551-0645-4dbb-b854-c053a800c002"
+            }
+          },
+          {
+            "seq": 15,
+            "at": "2026-11-07T14:22:47.239Z",
+            "type": "attempt.starting",
+            "entityId": "attempt_2d50704f-5e75-4d00-93e5-2a3347022fd5",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef"
+            }
+          },
+          {
+            "seq": 16,
+            "at": "2026-11-07T14:22:47.252Z",
+            "type": "attempt.finished",
+            "entityId": "attempt_e213d39e-0af4-4502-baf8-3906d1ded80c",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+              "status": "completed"
+            }
+          },
+          {
+            "seq": 17,
+            "at": "2026-11-07T14:22:47.253Z",
+            "type": "task.blocked",
+            "entityId": "task_5aa97551-0645-4dbb-b854-c053a800c002",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "kind": "human",
+              "reason": "当前没有可用的品牌文件。"
+            }
+          },
+          {
+            "seq": 18,
+            "at": "2026-11-07T14:22:47.271Z",
+            "type": "attempt.finished",
+            "entityId": "attempt_2d50704f-5e75-4d00-93e5-2a3347022fd5",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+              "status": "completed"
+            }
+          },
+          {
+            "seq": 19,
+            "at": "2026-11-07T14:22:47.272Z",
+            "type": "task.created",
+            "entityId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+              "kind": "review",
+              "title": "审查：搭建应用基础结构"
+            }
+          },
+          {
+            "seq": 20,
+            "at": "2026-11-07T14:22:47.272Z",
+            "type": "review.queued",
+            "entityId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+              "reviewerId": "reviewer",
+              "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976"
+            }
+          },
+          {
+            "seq": 21,
+            "at": "2026-11-07T14:22:47.274Z",
+            "type": "attempt.claimed",
+            "entityId": "attempt_e2627d3a-0248-40d9-b345-05d04b30b2b4",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+              "kind": "review",
+              "contextKey": "acms:goal_b6973f24-67b9-4eea-9318-b10981e2858f:task_b61b17a0-b7e8-4281-8bda-30c34fd7833d:role-reviewer:reviewer:g1"
+            }
+          },
+          {
+            "seq": 22,
+            "at": "2026-11-07T14:22:47.282Z",
+            "type": "attempt.starting",
+            "entityId": "attempt_e2627d3a-0248-40d9-b345-05d04b30b2b4",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d"
+            }
+          },
+          {
+            "seq": 23,
+            "at": "2026-11-07T14:22:47.301Z",
+            "type": "attempt.finished",
+            "entityId": "attempt_e2627d3a-0248-40d9-b345-05d04b30b2b4",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+              "status": "completed"
+            }
+          },
+          {
+            "seq": 24,
+            "at": "2026-11-07T14:22:47.302Z",
+            "type": "review.decided",
+            "entityId": "task_b61b17a0-b7e8-4281-8bda-30c34fd7833d",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "agent",
+              "id": "reviewer"
+            },
+            "onBehalfOf": null,
+            "decision": "approve",
+            "data": {
+              "taskId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+              "artifactHash": "41dc50367900388030dce6bc4212e9b83c3aa07a169daf2ea95e0e9f15fe1976"
+            }
+          },
+          {
+            "seq": 25,
+            "at": "2026-11-07T14:22:47.303Z",
+            "type": "task.succeeded",
+            "entityId": "task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "integration": {
+                "status": "available",
+                "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\acms-ui-test-HSaztz\\data\\workspaces\\task_5dc71c78-28cc-475e-8489-1cd6dfcdcaef"
+              }
+            }
+          },
+          {
+            "seq": 26,
+            "at": "2026-11-07T14:22:47.305Z",
+            "type": "task.readiness",
+            "entityId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "status": "ready"
+            }
+          },
+          {
+            "seq": 27,
+            "at": "2026-11-07T14:22:47.305Z",
+            "type": "attempt.claimed",
+            "entityId": "attempt_953bbf93-0674-47ad-b85a-d1ea3d624966",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+              "kind": "work",
+              "contextKey": "acms:goal_b6973f24-67b9-4eea-9318-b10981e2858f:task_3007e063-341f-4a32-9f11-a8a056022091:role-worker:agent_d1b7eca8-e61d-4b76-ba7b-87b42b417d2d:g1"
+            }
+          },
+          {
+            "seq": 28,
+            "at": "2026-11-07T14:22:47.317Z",
+            "type": "attempt.starting",
+            "entityId": "attempt_953bbf93-0674-47ad-b85a-d1ea3d624966",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091"
+            }
+          },
+          {
+            "seq": 29,
+            "at": "2026-11-07T14:22:47.335Z",
+            "type": "attempt.finished",
+            "entityId": "attempt_953bbf93-0674-47ad-b85a-d1ea3d624966",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+              "status": "completed"
+            }
+          },
+          {
+            "seq": 30,
+            "at": "2026-11-07T14:22:47.336Z",
+            "type": "task.created",
+            "entityId": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+              "kind": "review",
+              "title": "审查：完善待办交互与使用说明"
+            }
+          },
+          {
+            "seq": 31,
+            "at": "2026-11-07T14:22:47.336Z",
+            "type": "review.queued",
+            "entityId": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+              "reviewerId": "reviewer",
+              "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1"
+            }
+          },
+          {
+            "seq": 32,
+            "at": "2026-11-07T14:22:47.337Z",
+            "type": "attempt.claimed",
+            "entityId": "attempt_35d72d8a-f6c0-409b-9f92-3b4f4599cdb2",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_145bb612-127e-4945-8d64-c96481233e1f",
+              "kind": "review",
+              "contextKey": "acms:goal_b6973f24-67b9-4eea-9318-b10981e2858f:task_145bb612-127e-4945-8d64-c96481233e1f:role-reviewer:reviewer:g1"
+            }
+          },
+          {
+            "seq": 33,
+            "at": "2026-11-07T14:22:47.345Z",
+            "type": "attempt.starting",
+            "entityId": "attempt_35d72d8a-f6c0-409b-9f92-3b4f4599cdb2",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_145bb612-127e-4945-8d64-c96481233e1f"
+            }
+          },
+          {
+            "seq": 34,
+            "at": "2026-11-07T14:22:47.358Z",
+            "type": "attempt.finished",
+            "entityId": "attempt_35d72d8a-f6c0-409b-9f92-3b4f4599cdb2",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "taskId": "task_145bb612-127e-4945-8d64-c96481233e1f",
+              "status": "completed"
+            }
+          },
+          {
+            "seq": 35,
+            "at": "2026-11-07T14:22:47.358Z",
+            "type": "review.decided",
+            "entityId": "task_145bb612-127e-4945-8d64-c96481233e1f",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "agent",
+              "id": "reviewer"
+            },
+            "onBehalfOf": null,
+            "decision": "approve",
+            "data": {
+              "taskId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+              "artifactHash": "d83ec7ee372f1b19a27a14d36daf7a2314510d9a3f17a748a1d3855692a738e1"
+            }
+          },
+          {
+            "seq": 37,
+            "at": "2026-11-07T14:22:47.360Z",
+            "type": "task.succeeded",
+            "entityId": "task_3007e063-341f-4a32-9f11-a8a056022091",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "system",
+              "id": "scheduler"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "integration": {
+                "status": "available",
+                "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\acms-ui-test-HSaztz\\data\\workspaces\\task_3007e063-341f-4a32-9f11-a8a056022091"
+              }
+            }
+          },
+          {
+            "seq": 42,
+            "at": "2026-11-07T14:22:47.594Z",
+            "type": "task.created",
+            "entityId": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+              "kind": "work",
+              "title": "外部接入暂停验证任务"
+            }
+          },
+          {
+            "seq": 43,
+            "at": "2026-11-07T14:22:47.594Z",
+            "type": "command.accepted",
+            "entityId": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "actor": {
+              "kind": "owner",
+              "id": "owner"
+            },
+            "onBehalfOf": null,
+            "decision": null,
+            "data": {
+              "command": "task.create",
+              "requestId": "9a16bec5-3f5d-4e79-bb56-57bf465ab317"
+            }
+          }
+        ],
+        "nextCursor": 45,
+        "latestCursor": 45,
+        "hasMore": false
+      }
+    },
+    {
+      "name": "submit",
+      "exitCode": 0,
+      "command": "acms-agent submit",
+      "ok": true,
+      "value": {
+        "goalId": "goal_a52ec205-7a8c-4b27-a220-f8dcb987c00c",
+        "planTaskId": "task_394e2901-51a5-4cf8-9311-3856255aeb03",
+        "cursor": 49
+      }
+    },
+    {
+      "name": "submit-replay",
+      "exitCode": 0,
+      "command": "acms-agent submit-replay",
+      "ok": true,
+      "value": {
+        "goalId": "goal_a52ec205-7a8c-4b27-a220-f8dcb987c00c",
+        "planTaskId": "task_394e2901-51a5-4cf8-9311-3856255aeb03",
+        "cursor": 49
+      }
+    },
+    {
+      "name": "pause",
+      "exitCode": 0,
+      "command": "acms-agent pause",
+      "ok": true,
+      "value": {
+        "id": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+        "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+        "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+        "title": "外部接入暂停验证任务",
+        "description": "由本测试创建，用于验证凭据的暂停与恢复命令。",
+        "acceptance": "暂停后可恢复。",
+        "kind": "work",
+        "agentId": "agent_55ce2a18-951a-4bcf-a767-b4ad534a5dfc",
+        "dependencies": [],
+        "parentId": null,
+        "reviewOf": null,
+        "reviewArtifactHash": null,
+        "status": "paused",
+        "workflowSnapshot": {
+          "id": "default",
+          "name": "执行与独立验收",
+          "version": 1,
+          "steps": [
+            {
+              "id": "execute",
+              "type": "work",
+              "name": "执行",
+              "role": "worker"
+            },
+            {
+              "id": "review",
+              "type": "review",
+              "name": "独立审查",
+              "role": "reviewer"
+            }
+          ],
+          "maxReworks": 2,
+          "published": true,
+          "revision": 1,
+          "createdAt": "2026-11-07T14:22:47.204Z",
+          "updatedAt": "2026-11-07T14:22:47.204Z"
+        },
+        "stageIndex": 0,
+        "generation": 1,
+        "attempts": 0,
+        "reworks": 0,
+        "priority": 50,
+        "longLived": false,
+        "requiresArtifacts": true,
+        "requirements": {
+          "continuity": "none",
+          "inheritsParentContext": null,
+          "runningMessages": "none",
+          "tools": "none",
+          "sandbox": "none",
+          "verified": "none",
+          "isolation": null,
+          "model": null,
+          "provider": null,
+          "llmProvider": null,
+          "reasoningEffort": null
+        },
+        "origin": null,
+        "coordinationOf": null,
+        "coordinationKey": null,
+        "reviewTaskId": null,
+        "reviewRound": null,
+        "feedbackHash": null,
+        "artifactIds": [],
+        "stopRequested": null,
+        "checksSnapshot": [],
+        "checkIds": [],
+        "revision": 2,
+        "createdAt": "2026-11-07T14:22:47.594Z",
+        "updatedAt": "2026-11-07T14:22:49.203Z",
+        "resumeStatus": "ready",
+        "recoveryRequested": false
+      }
+    },
+    {
+      "name": "tasks-paused",
+      "exitCode": 0,
+      "command": "acms-agent tasks-paused",
+      "ok": true,
+      "value": {
+        "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+        "tasks": [
+          {
+            "id": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+            "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+            "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+            "title": "外部接入暂停验证任务",
+            "description": "由本测试创建，用于验证凭据的暂停与恢复命令。",
+            "acceptance": "暂停后可恢复。",
+            "kind": "work",
+            "status": "paused",
+            "agentId": "agent_55ce2a18-951a-4bcf-a767-b4ad534a5dfc",
+            "parentId": null,
+            "dependencies": [],
+            "stageIndex": 0,
+            "attemptCount": 0,
+            "blocker": null,
+            "lastAnswer": null,
+            "artifactHash": null,
+            "reviewOf": null,
+            "feedback": null,
+            "requiresArtifacts": true,
+            "createdAt": "2026-11-07T14:22:47.594Z",
+            "updatedAt": "2026-11-07T14:22:49.203Z"
+          }
+        ],
+        "truncated": false
+      }
+    },
+    {
+      "name": "resume",
+      "exitCode": 0,
+      "command": "acms-agent resume",
+      "ok": true,
+      "value": {
+        "id": "task_8eb05ad9-d31d-4d6d-9e00-20312cf74cfd",
+        "goalId": "goal_b6973f24-67b9-4eea-9318-b10981e2858f",
+        "projectId": "project_c231ae32-f213-4db8-8282-c7a3bd6063af",
+        "title": "外部接入暂停验证任务",
+        "description": "由本测试创建，用于验证凭据的暂停与恢复命令。",
+        "acceptance": "暂停后可恢复。",
+        "kind": "work",
+        "agentId": "agent_55ce2a18-951a-4bcf-a767-b4ad534a5dfc",
+        "dependencies": [],
+        "parentId": null,
+        "reviewOf": null,
+        "reviewArtifactHash": null,
+        "status": "ready",
+        "workflowSnapshot": {
+          "id": "default",
+          "name": "执行与独立验收",
+          "version": 1,
+          "steps": [
+            {
+              "id": "execute",
+              "type": "work",
+              "name": "执行",
+              "role": "worker"
+            },
+            {
+              "id": "review",
+              "type": "review",
+              "name": "独立审查",
+              "role": "reviewer"
+            }
+          ],
+          "maxReworks": 2,
+          "published": true,
+          "revision": 1,
+          "createdAt": "2026-11-07T14:22:47.204Z",
+          "updatedAt": "2026-11-07T14:22:47.204Z"
+        },
+        "stageIndex": 0,
+        "generation": 1,
+        "attempts": 0,
+        "reworks": 0,
+        "priority": 50,
+        "longLived": false,
+        "requiresArtifacts": true,
+        "requirements": {
+          "continuity": "none",
+          "inheritsParentContext": null,
+          "runningMessages": "none",
+          "tools": "none",
+          "sandbox": "none",
+          "verified": "none",
+          "isolation": null,
+          "model": null,
+          "provider": null,
+          "llmProvider": null,
+          "reasoningEffort": null
+        },
+        "origin": null,
+        "coordinationOf": null,
+        "coordinationKey": null,
+        "reviewTaskId": null,
+        "reviewRound": null,
+        "feedbackHash": null,
+        "artifactIds": [],
+        "stopRequested": null,
+        "checksSnapshot": [],
+        "checkIds": [],
+        "revision": 3,
+        "createdAt": "2026-11-07T14:22:47.594Z",
+        "updatedAt": "2026-11-07T14:22:49.332Z",
+        "resumeStatus": "ready",
+        "recoveryRequested": false
+      }
+    }
+  ],
+  "http": {
+    "noToken": {
+      "status": 401,
+      "code": "UNAUTHORIZED",
+      "body": {
+        "ok": false,
+        "apiVersion": "1.0",
+        "requestId": "req_f6c28114-467b-424e-a621-c7fe6748bc0d",
+        "error": {
+          "code": "UNAUTHORIZED",
+          "message": "A valid bearer credential is required",
+          "details": {},
+          "retryable": false
+        }
+      }
+    },
+    "crossGoal": {
+      "status": 403,
+      "code": "SCOPE_DENIED"
+    },
+    "forgedOwner": {
+      "status": 400,
+      "code": "INVALID_REQUEST"
+    },
+    "revoked": {
+      "status": 401,
+      "code": "UNAUTHORIZED"
+    }
+  },
+  "checks": {
+    "tokenShape": true,
+    "tokenReturnedOnceAndRedacted": true,
+    "tokenSetupExitZero": true,
+    "tokenFileMatchesIssued": true,
+    "tokenAclProtected": true,
+    "tokenAclOwnerOnly": true,
+    "tokenAclNoInherited": true,
+    "tokenAclReadWrite": true,
+    "discover": true,
+    "projectsRead": true,
+    "statusRead": true,
+    "tasksRead": true,
+    "reviewsRead": true,
+    "blockersRead": true,
+    "eventsRead": true,
+    "readOnlyDidNotCreateTasks": true,
+    "noModelCheck": true,
+    "submit": true,
+    "submitReplay": true,
+    "pause": true,
+    "resume": true,
+    "noTokenDenied": true,
+    "crossGoalDenied": true,
+    "forgedOwnerDenied": true,
+    "revokedDenied": true,
+    "goalScopeHintAccurate": true,
+    "goalScopeIssuedShowsUnion": true
+  },
+  "realModelCalls": 0,
+  "modelCheckRequests": 0,
+  "screenshot": "test-results/ui/external-access-issued.png",
+  "limitations": [
+    "This receipt is not production deployment evidence. It uses the isolated preview harness and a simulated provider.",
+    "The browser page was closed before the CLI calls; the host preview process (the analogue of the DSH plugin process) stayed alive so the loopback agent API remained reachable.",
+    "The token file ACL assertions execute the published PowerShell block and read the DACL back; they do not run against the production host.",
+    "The final release acceptance still needs the same steps executed against the upgraded real ACMS host with a real owner and the real provider policy."
+  ]
+}

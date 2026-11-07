@@ -1,0 +1,25 @@
+{
+  "format": "acms.iteration-2.plan-mapping.v1",
+  "generatedAt": "2026-11-07T10:40:00Z",
+  "source": {
+    "receiptPath": "docs/iteration-2-autonomy-sources/manager-plan-receipt.json",
+    "receiptSha256": "49e0eeaf5f37db6ed15eb2d992e1628d4953471ac2f56189d657c79f74147b07",
+    "managerAttemptId": "attempt_f56471ca-fd7c-48f2-815c-5f921ac1f1bd",
+    "planTaskId": "task_760e3e7e-a013-4299-8b94-9394c41f1f49",
+    "goalId": "goal_a50f7722-7856-4f98-a303-2a8c17af36bc",
+    "note": "原始回执由负责人 attempt 产生；此映射由 #16 执行员整理，仅证明历史对应关系，不代表调度器自动创建可以充当负责人决定。"
+  },
+  "nodes": [
+    { "key": "requirements", "title": "核对三个 issue，固定接口、选模与协调验收契约", "taskId": "task_4314019d-436b-4785-aea5-258cbf8006a0", "idSource": "acms-context-snapshot", "statusAtMapping": "succeeded" },
+    { "key": "agent_api", "title": "#15：交付可信、版本化的外部智能体接口", "taskId": "task_ab7105f7-1f5d-4775-9752-9088b3543044", "idSource": "acms-context-snapshot", "statusAtMapping": "succeeded" },
+    { "key": "model_preferences", "title": "#5：实现有序模型倾向与可解释的自动选择", "taskId": "task_bec5ae18-2b18-4f35-a791-f52d0542903e", "idSource": "acms-context-snapshot", "statusAtMapping": "succeeded" },
+    { "key": "autonomous_coordination", "title": "#16：补齐负责人协调闭环与决策归因证据", "taskId": "task_4cff3086-8c6e-43e0-9cf9-ed2b0a0fffe3", "idSource": "acms-context-snapshot", "statusAtMapping": "running" },
+    { "key": "release_candidate", "title": "形成完整候选版本，完成回归与最终独立审查", "taskId": "task_5f526a54-6871-4fe7-9425-c43c0b3b1bde", "idSource": "contract-document-section-3.10", "statusAtMapping": "referenced-not-in-context-snapshot" },
+    { "key": "release_verification", "title": "交接真实发布并核验 agent 接口与自主执行闭环", "taskId": "task_f956028a-14d8-4eaf-b64f-8cabafb4ca55", "idSource": "contract-document-section-3.10", "statusAtMapping": "referenced-not-in-context-snapshot" }
+  ],
+  "caveats": [
+    "release_candidate 与 release_verification 的任务 ID 来自 docs/iteration-2-contract.md 第 3.10 节，当前协作快照未包含，状态未核实。",
+    "历史规划任务与子任务的 task.created 事件在本轮修复前 actor 为 scheduler；不得把本映射当作负责人归因事件。",
+    "部署后真实负责人协调需由 ACMS 管理角色产生并由发布验收核对。"
+  ]
+}

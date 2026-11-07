@@ -50,12 +50,14 @@
     "test": "node --test --test-concurrency=1 test/*.test.js packages/codex-runtime/test/*.test.mjs",
     "check": "node scripts/check.mjs",
     "demo": "node scripts/demo.mjs",
+    "agent": "node scripts/acms-agent.mjs",
     "test:ui": "node scripts/ui-test.mjs",
     "test:usability": "node scripts/usability-test.mjs",
     "test:structure": "node scripts/structure-test.mjs",
     "test:empty-models": "node scripts/empty-models-test.mjs",
     "test:pairing-ui": "node scripts/pairing-ui-test.mjs",
     "test:budget-ui": "node scripts/budget-ui-test.mjs",
+    "test:model-preferences-ui": "node scripts/model-preferences-ui-test.mjs",
     "package": "npm run build && npm pack"
   },
   "devDependencies": {

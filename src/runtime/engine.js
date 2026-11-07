@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
+import { selectionBlocked } from '../core/model-selection.js';
+import { acceptPlanFlow } from '../core/plan-ledger.js';
+import { acceptReviewFlow } from './review-flow.js';
+import { completeCoordination, coordinateExecutionLimit, scheduleRepairFlow } from '../core/coordination.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
@@ -111,7 +115,7 @@ export class Engine {
       let free = p.maxConcurrent - active.length - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
-      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review'].includes(b.kind) - ['plan', 'review'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
+      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
         if (active.some(a => a.taskId === task.id)) continue;
@@ -170,7 +174,10 @@ export class Engine {
         attempt = this.store.put('attempts', { ...attempt, status: 'running' });
         this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
       });
-      activation = await this.adapter.start({ task, attempt, agent: this.store.require('agents', attempt.agentId), prompt: promptFor(this.company, task, attempt), signal: controller.signal, onAccepted: () => this.conversations?.accepted(attempt) });
+      const agent = this.store.require('agents', attempt.agentId);
+      let modelContext;
+      if (agent.role === 'manager') { try { modelContext = await this.adapter.modelContext?.(task.requirements); } catch (e) { this.lastError = '无法读取模型候选：' + e.message; } }
+      activation = await this.adapter.start({ task, attempt, agent, prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal, onAccepted: () => this.conversations?.accepted(attempt) });
       this.store.transaction(() => {
         this.fenced();
         for (const notificationId of attempt.notificationIds ?? []) {
@@ -236,7 +243,7 @@ export class Engine {
   async accept(attempt, output, signal) {
     this.fenced(); let task = this.store.require('tasks', attempt.taskId);
     assert(task.activeAttemptId === attempt.id && task.generation === attempt.taskGeneration && !task.stopRequested, 'STALE_RESULT', 'Result belongs to an obsolete attempt or contract');
-    assert(['blocked', 'planned', 'decomposed', 'reviewed', 'completed', 'managed'].includes(output.outcome), 'INVALID_RESULT', 'Execution returned an unknown outcome');
+    assert(['blocked', 'planned', 'decomposed', 'reviewed', 'completed', 'managed', 'coordinated'].includes(output.outcome), 'INVALID_RESULT', 'Execution returned an unknown outcome');
     if (output.outcome === 'managed') {
       assert(attempt.role === 'manager' && task.kind !== 'review', 'FORBIDDEN', 'Only an assigned manager can continue management');
       const turns = task.managementGeneration === task.generation ? task.managementTurns ?? 0 : 0;
@@ -251,7 +258,7 @@ export class Engine {
       return;
     }
     if (output.actions !== undefined) {
-      assert(output.outcome === 'blocked' || (task.kind === 'plan' ? ['planned', 'decomposed'].includes(output.outcome) : task.kind === 'review' ? output.outcome === 'reviewed' : ['completed', 'decomposed'].includes(output.outcome)), 'INVALID_RESULT', 'Management actions must accompany a valid outcome for this task');
+      assert(output.outcome === 'blocked' || (task.kind === 'plan' ? ['planned', 'decomposed'].includes(output.outcome) : task.kind === 'review' ? output.outcome === 'reviewed' : task.kind === 'coordination' ? ['coordinated', 'planned'].includes(output.outcome) : ['completed', 'decomposed'].includes(output.outcome)), 'INVALID_RESULT', 'Management actions must accompany a valid outcome for this task');
       assert(attempt.role === 'manager', 'FORBIDDEN', 'Only a manager can submit management actions');
       this.company.runActions({ kind: 'agent', id: attempt.agentId, goalId: task.goalId, grants: attempt.grants }, { taskId: task.id, generation: task.generation, batchId: output.actionBatchId ?? 'default', actions: output.actions });
       task = this.store.require('tasks', task.id);
@@ -267,12 +274,13 @@ export class Engine {
         }
         if (output.kind === 'technical' && task.attempts < this.company.policy().maxAttempts) {
           this.store.put('tasks', { ...task, status: 'ready', feedback: output.reason, retryAt: Date.now() + 1000 * task.attempts }); this.store.event('task.retry.scheduled', task.id, {}, SYSTEM);
-        } else if (output.kind === 'technical' && !task.repairOf && task.kind !== 'review') this.scheduleRepair(task, output.reason);
+        } else if (output.kind === 'technical' && !task.repairOf && task.kind !== 'review' && task.kind !== 'coordination') this.scheduleRepair(task, output.reason);
         else this.block(task, output.kind ?? 'human', output.reason, output.question ?? '需要补充哪些信息才能继续？');
       });
       return;
     }
-    if (task.kind === 'plan' || output.outcome === 'decomposed') { this.acceptPlan(task, attempt, output); return; }
+    if (output.outcome === 'coordinated') { assert(task.kind === 'coordination', 'INVALID_RESULT', 'Only a coordination task can be coordinated'); completeCoordination(this, task, attempt, output); return; }
+    if (task.kind === 'plan' || task.kind === 'coordination' || output.outcome === 'decomposed') { this.acceptPlan(task, attempt, output); return; }
     if (task.kind === 'review') { await this.acceptReview(task, attempt, output); return; }
     assert(output.outcome === 'completed', 'INVALID_RESULT', 'Execution did not submit a completed result');
     const collected = await this.workspaces.collect(task, { ...attempt, signal }, output.artifacts ?? []);
@@ -291,25 +299,7 @@ export class Engine {
       this.nextStage(task);
     });
   }
-  acceptPlan(task, attempt, output) {
-    assert(['planned', 'decomposed'].includes(output.outcome), 'INVALID_PLAN', 'Planner must return a structured plan');
-    const nodes = output.tasks; assert(Array.isArray(nodes) && nodes.length > 0 && nodes.length <= 30, 'INVALID_PLAN', 'Plan must contain 1–30 tasks');
-    const keys = new Set(nodes.map(n => n.key)); assert(keys.size === nodes.length && nodes.every(n => typeof n.key === 'string'), 'INVALID_PLAN', 'Plan keys must be unique');
-    const ordered = []; const visiting = new Set(); const visited = new Set();
-    const visit = key => { assert(!visiting.has(key), 'DEPENDENCY_CYCLE', 'Plan contains a cycle'); if (visited.has(key)) return; visiting.add(key); const node = nodes.find(n => n.key === key); assert(node, 'INVALID_PLAN', 'Unknown dependency'); for (const d of node.dependencies ?? []) visit(d); visiting.delete(key); visited.add(key); ordered.push(node); }; keys.forEach(visit);
-    this.store.transaction(() => {
-      const map = new Map();
-      for (const node of ordered) {
-        const child = this.company.createTask({ title: node.title, description: node.description, acceptance: node.acceptance, longLived: node.longLived === true, priority: node.priority ?? 50, goalId: task.goalId, kind: 'work', parentId: task.id, workflowSnapshot: task.workflowSnapshot, dependencies: (node.dependencies ?? []).map(k => map.get(k)) }, SYSTEM);
-        map.set(node.key, child.id);
-      }
-      this.finishAttempt(attempt, 'completed', output.summary);
-      if (task.kind === 'plan') this.store.put('tasks', { ...task, status: 'succeeded', summary: output.summary ?? '' });
-      else this.store.put('tasks', { ...task, status: 'blocked', dependencies: [...task.dependencies, ...map.values()], blocker: { kind: 'children', resolutionTaskIds: [...map.values()] } });
-      const goal = this.store.require('goals', task.goalId); this.store.put('goals', { ...goal, status: 'active' });
-      this.store.event('plan.accepted', task.id, { tasks: [...map.values()] }, SYSTEM);
-    });
-  }
+  acceptPlan(task, attempt, output) { return acceptPlanFlow(this, task, attempt, output); }
   nextStage(task) {
     const nextIndex = task.stageIndex + 1; const step = task.workflowSnapshot.steps[nextIndex];
     if (!step) { this.store.put('tasks', { ...task, status: 'integrating' }); this.queueIntegration(task.id); return; }
@@ -320,36 +310,8 @@ export class Engine {
       this.store.event('review.queued', review.id, { taskId: task.id, reviewerId: reviewer.id, artifactHash: task.artifactHash }, SYSTEM);
     }
   }
-  scheduleRepair(task, reason) {
-    this.store.transaction(() => {
-      if ((task.repairs ?? 0) >= this.company.policy().maxReworks) { this.block(task, 'repair_limit', reason, '自动修复已达到上限，需要补充方向。'); return; }
-      const repair = this.company.createTask({ goalId: task.goalId, kind: 'repair', title: `解阻：${task.title}`, description: `诊断并解决以下技术阻塞。输出可应用的修复文件或修复说明，原任务会自动读取交付物后继续。\n问题：${reason}\n原任务：${task.description}`, acceptance: '给出可验证的故障原因和具体修复交付物，并通过独立审查。', parentId: task.id, checkIds: [], workflowSnapshot: task.workflowSnapshot }, SYSTEM);
-      this.store.put('tasks', { ...repair, repairOf: task.id });
-      this.store.put('tasks', { ...task, status: 'blocked', stageIndex: 0, attempts: 0, repairs: (task.repairs ?? 0) + 1, dependencies: [...task.dependencies, repair.id], blocker: { kind: 'technical', reason, resolutionTaskIds: [repair.id] } });
-      this.store.event('repair.queued', repair.id, { taskId: task.id, reason }, SYSTEM);
-    });
-  }
-  async acceptReview(review, attempt, output) {
-    assert(output.outcome === 'reviewed' && ['approve', 'changes_requested'].includes(output.decision), 'INVALID_REVIEW', 'Reviewer must return a decision');
-    let source = this.store.require('tasks', review.reviewOf);
-    assert(source.status === 'reviewing' && source.artifactHash === review.reviewArtifactHash, 'STALE_REVIEW', 'Review targets an obsolete artifact version');
-    assert(attempt.agentId !== source.lastAuthorId, 'SELF_REVIEW', 'Author cannot approve their own work');
-    const unchanged = await this.workspaces.unchanged(source, source.artifactIds);
-    assert(unchanged, 'ARTIFACT_CHANGED', 'Reviewed files changed after checks');
-    this.store.transaction(() => {
-      source = this.store.require('tasks', source.id); assert(source.status === 'reviewing' && !source.stopRequested, 'STALE_REVIEW', 'Source task was paused during review');
-      this.finishAttempt(attempt, 'completed', output.summary);
-      this.store.put('tasks', { ...review, status: 'succeeded', summary: output.summary ?? '' });
-      this.store.put('verifications', { id: id('verification'), taskId: source.id, attemptId: attempt.id, artifactHash: source.artifactHash, kind: 'review', reviewerId: attempt.agentId, passed: output.decision === 'approve', summary: output.summary, findings: output.findings ?? [] });
-      if (output.decision === 'approve') this.nextStage(source);
-      else {
-        const reworks = source.reworks + 1; const exhausted = reworks > Math.min(source.workflowSnapshot.maxReworks, this.company.policy().maxReworks);
-        this.store.put('tasks', { ...source, status: exhausted ? 'blocked' : 'ready', stageIndex: 0, reworks, feedback: [output.summary, ...(output.findings ?? [])].filter(Boolean).join('\n'), ...(exhausted ? { blocker: { kind: 'review_limit', reason: '审查返工次数已达到上限' } } : {}) });
-        if (exhausted) this.block(this.store.require('tasks', source.id), 'review_limit', '连续返工未通过审查', '请调整范围或提供方向后继续。');
-      }
-      this.store.event('review.decided', review.id, { taskId: source.id, decision: output.decision }, SYSTEM);
-    });
-  }
+  scheduleRepair(task, reason) { return scheduleRepairFlow(this, task, reason); }
+  async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
   queueIntegration(taskId) {
     this.integration = this.integration.then(async () => {
       if (this.closing) return;
@@ -404,17 +366,26 @@ export class Engine {
         this.store.event('attempt.owner.steered', attempt.id, { taskId: task.id }, OWNER);
         return;
       }
+      if (selectionBlocked(error) && !stopped && !this.closing) {
+        this.store.put('attempts', { ...this.store.require('attempts', attempt.id), selection: error.details.selection });
+        this.block(task, 'model-selection', '没有可用执行候选：' + error.message, '请在模型偏好或执行人员绑定中调整候选后恢复任务。选择阻塞代码：' + (error.details.selection.blocked?.code ?? 'NO_ELIGIBLE_CANDIDATE'));
+        return;
+      }
       const retry = !stopped && !this.closing && task.attempts < this.company.policy().maxAttempts;
       this.store.put('tasks', { ...task, status: stopped ?? (this.closing ? 'paused' : retry ? 'ready' : 'failed'), resumeOnStart: this.closing && !stopped, stopRequested: null, feedback: `${error.code ?? 'EXECUTION_FAILED'}: ${error.message}`, retryAt: retry ? Date.now() + 1000 * task.attempts : null });
       this.store.event('attempt.failed', attempt.id, { taskId: task.id, code: error.code, message: error.message, retry }, SYSTEM);
       if (!retry && !stopped && !this.closing && !task.repairOf && task.kind === 'work') this.scheduleRepair(this.store.require('tasks', task.id), error.message);
+      else if (!retry && !stopped && !this.closing && task.kind === 'repair') this.coordinateFailure(this.store.require('tasks', task.id), error.message);
       else if (!retry && !stopped && !this.closing) this.block(this.store.require('tasks', task.id), 'execution', error.message, '自动重试已用完，请补充执行条件后恢复此分支。');
     });
   }
+  coordinateFailure(task, reason) { return coordinateExecutionLimit(this, task, reason); }
   async stop() {
-    this.closing = true; clearInterval(this.timer); this.store.events.off('event', this.listener);
+    this.closing = true;
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.listener) { this.store.events.off('event', this.listener); this.listener = null; }
     for (const entry of this.live.values()) entry.controller.abort(new Error('ACMS is stopping'));
     await Promise.allSettled([...this.live.values()].map(e => e.promise)); await this.integration;
-    await this.adapter.close?.(); this.store.releaseLease(this.owner);
+    try { await this.adapter.close?.(); } finally { this.store.releaseLease(this.owner); }
   }
 }

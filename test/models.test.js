@@ -103,7 +103,73 @@ test('paired model metadata stays local; only explicit probe runs the external p
   let calls = 0; adapter.paired = { list: () => [{ id: 'paired:fixture', name: 'Fixture runtime', model: 'gpt-fixture', persistent: true, reasoningEffort: 'high' }], run: async (_id, input) => { calls++; assert.equal(input.mode, 'probe'); assert.equal(input.contextKey, null); return { reasoningEffort: 'xhigh', output: 'OK' }; } };
   const input = { provider: 'paired:fixture', model: 'gpt-fixture' };
   const details = await adapter.modelDetails(input); assert.equal(details.reasoning.effective, 'high'); assert.equal(calls, 0);
-  const catalog = await adapter.modelCatalog(); const external = catalog.models.find(m => m.id === 'gpt-fixture').routes[0]; assert.equal(external.origin, 'external'); assert.equal(external.inheritsParentContext, false);
+  const catalog = await adapter.modelCatalog(); const external = catalog.models.find(m => m.id === 'gpt-fixture').routes[0]; assert.equal(external.origin, 'external'); assert.equal(external.inheritsParentContext, null, 'external inheritance is undeclared, not false'); assert.equal(external.continuity, 'supported');
   const result = await adapter.probeModel(input); assert.equal(calls, 1); assert.equal(result.reasoning.effective, 'xhigh');
   await assert.rejects(adapter.choose({ ...input, reasoningEffort: 'low' }), { code: 'REASONING_UNSUPPORTED' });
+});
+
+test("task route requirements drive model details and activation from one selection", async t => {
+  const { adapter, services, requests } = setup();
+  const store = new Store(":memory:"); t.after(() => store.close()); adapter.company.store = store;
+  services.agentDefaultModel.currentSelection = () => ({ provider: "deepseek", model: "m1", reasoningEffort: "low" });
+  services.llm.listModels = async provider => [
+    { id: "m1", provider, name: "M1", reasoning: { efforts: [{ id: "low", name: "Low" }, { id: "max", name: "Max" }], defaultEffort: "low" } },
+    { id: "m2", provider, name: "M2", reasoning: { efforts: [{ id: "low", name: "Low" }, { id: "max", name: "Max" }], defaultEffort: "max" } }
+  ];
+  services.llm.resolveModelInfo = async (provider, model) => ({ reasoning: { efforts: [{ id: "low", name: "Low" }, { id: "max", name: "Max" }], defaultEffort: model === "m2" ? "max" : "low" } });
+  store.transaction(() => store.put("attempts", { id: "route-choice", taskId: "t", goalId: "g", agentId: "a", kind: "work", status: "preparing", contextKey: "ctx", startedAt: new Date().toISOString(), taskGeneration: 1 }));
+  const activation = await adapter.start({ agent: { provider: "auto", model: "" }, task: { workspace: { path: "." }, requirements: { model: "m2" } }, attempt: { id: "route-choice", contextKey: "ctx" }, prompt: "work", signal: new AbortController().signal });
+  await activation.result; await activation.dispose();
+  assert.deepEqual(requests[0].request.agentOptions, { provider: "deepseek", model: "m2", reasoningEffort: "max" });
+  const saved = store.get("attempts", "route-choice");
+  assert.equal(saved.selection.chosen.model, "m2");
+  assert.equal(saved.selection.chosen.reasoningEffort, "max");
+  assert.equal(saved.model, "m2");
+  assert.equal(saved.reasoningEffort, "max");
+  assert.equal(activation.reasoningEffort, "max");
+});
+test("task reasoning requirement is propagated through an explicit binding", async t => {
+  const { adapter, services, requests } = setup();
+  const store = new Store(":memory:"); t.after(() => store.close()); adapter.company.store = store;
+  services.llm.listModels = async provider => [{ id: "deepseek-flash", provider, name: "Flash", reasoning: { efforts: [{ id: "low" }, { id: "max" }], defaultEffort: "low" } }];
+  services.llm.resolveModelInfo = async () => ({ reasoning: { efforts: [{ id: "low" }, { id: "max" }], defaultEffort: "low" } });
+  store.transaction(() => store.put("attempts", { id: "depth-choice", taskId: "t", goalId: "g", agentId: "a", kind: "work", status: "preparing", contextKey: "ctx", startedAt: new Date().toISOString(), taskGeneration: 1 }));
+  const activation = await adapter.start({ agent: { provider: "spawn", model: "deepseek-flash" }, task: { workspace: { path: "." }, requirements: { reasoningEffort: "max" } }, attempt: { id: "depth-choice", contextKey: "ctx" }, prompt: "work", signal: new AbortController().signal });
+  await activation.result; await activation.dispose();
+  assert.equal(requests[0].request.agentOptions.reasoningEffort, "max");
+  const saved = store.get("attempts", "depth-choice");
+  assert.equal(saved.selection.binding.mode, "explicit");
+  assert.equal(saved.selection.chosen.reasoningEffort, "max");
+  assert.equal(saved.reasoningEffort, "max");
+});
+test("unknown external reasoning depth blocks before launch and is not replaced by a preference", async t => {
+  const { adapter } = setup();
+  const store = new Store(":memory:"); t.after(() => store.close()); adapter.company.store = store;
+  store.transaction(() => store.put("modelPreferences", { id: "model", order: [{ id: "pref_ok", model: "deepseek-flash", provider: "spawn" }], updatedBy: { kind: "owner", id: "owner" } }));
+  let calls = 0;
+  adapter.paired = { list: () => [{ id: "paired:x", name: "X", model: "gpt-x", persistent: true, reasoningEffort: null, probeSupported: false }], run: async () => { calls++; throw new Error("must not launch"); } };
+  store.transaction(() => store.put("attempts", { id: "unknown-depth", taskId: "t", goalId: "g", agentId: "a", kind: "work", status: "preparing", contextKey: "ctx", startedAt: new Date().toISOString(), taskGeneration: 1 }));
+  await assert.rejects(adapter.start({ agent: { provider: "paired:x", model: "gpt-x", reasoningEffort: "max" }, task: { workspace: { path: "." } }, attempt: { id: "unknown-depth", contextKey: "ctx" }, prompt: "work", signal: new AbortController().signal }), error => {
+    assert.equal(error.code, "MODEL_UNAVAILABLE");
+    assert.equal(error.details.selection.chosen, null);
+    assert.equal(error.details.selection.blocked.code, "EXPLICIT_BINDING_UNAVAILABLE");
+    assert(error.details.selection.fallbacks.some(f => f.reason === "capability_unknown" && f.model === "gpt-x"));
+    return true;
+  });
+  assert.equal(calls, 0);
+  assert.equal(adapter.activations.size, 0);
+  assert.equal(store.get("attempts", "unknown-depth").selection, undefined);
+});
+test("unsupported internal reasoning depth blocks before activation", async t => {
+  const { adapter, services, requests } = setup();
+  const store = new Store(":memory:"); t.after(() => store.close()); adapter.company.store = store;
+  services.llm.resolveModelInfo = async () => ({ reasoning: { efforts: [{ id: "low" }], defaultEffort: "low" } });
+  store.transaction(() => store.put("attempts", { id: "bad-depth", taskId: "t", goalId: "g", agentId: "a", kind: "work", status: "preparing", contextKey: "ctx", startedAt: new Date().toISOString(), taskGeneration: 1 }));
+  await assert.rejects(adapter.start({ agent: { provider: "spawn", model: "deepseek-flash", reasoningEffort: "max" }, task: { workspace: { path: "." } }, attempt: { id: "bad-depth", contextKey: "ctx" }, prompt: "work", signal: new AbortController().signal }), error => {
+    assert.equal(error.code, "MODEL_UNAVAILABLE");
+    assert.equal(error.details.selection.blocked.code, "EXPLICIT_BINDING_UNAVAILABLE");
+    assert(error.details.selection.fallbacks.some(f => f.reason === "route_mismatch"));
+    return true;
+  });
+  assert.equal(requests.length, 0);
 });

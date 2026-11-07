@@ -1,0 +1,182 @@
+# 返工回归的失败证据（修复前）
+ 
+方法：临时把 src/adapters/dsh.js 与 src/core/model-selection.js 还原为上一交付的 HEAD 版本，运行本轮新增回归测试；6 项新测试全部失败，退出码 1。随后恢复修复版本，同一命令 32 项全部通过（见 targeted-tests.txt）。
+ 
+命令：node --test test/model-selection.test.js test/models.test.js
+ 
+---
+ 
+✔ preference order, later entry and stable default (3.0483ms)
+✔ same model keeps distinct entrance semantics (0.3953ms)
+✔ authorization is not widened by preferences (0.4115ms)
+✔ explicit binding wins and never silently falls back (0.2929ms)
+✔ required capabilities reject unknown while optional unknown stays eligible (0.274ms)
+✔ continuity preferred sorts soft matches but explicit preference still wins (0.156ms)
+✔ no eligible candidates block instead of guessing (0.1624ms)
+✔ buildCandidates keeps undeclared continuity unknown (0.2003ms)
+✔ adapter applies preference, persists the selection and reports it (5.8006ms)
+✔ viewing preferences and selecting routes never probes a model (1.1213ms)
+✔ adapter explicit binding beats preference and a missing binding does not fall back (1.1789ms)
+✔ adapter policy still filters a preferred model (0.8228ms)
+✔ adapter applies continuity preference without overriding explicit user preference (1.2889ms)
+✔ adapter blocks when the only authorized route has unknown required capability (0.7419ms)
+✔ adapter exposes modelContext candidates and preferences consistently (1.6895ms)
+✔ engine blocks a task without retry when no model candidate is eligible (191.5629ms)
+✖ required reasoning depth is reported and unknown external depth fails closed (0.8307ms)
+✖ internal depth is resolved before activation instead of being trusted (0.2096ms)
+✔ native live messages use the real parent and exact child; independent chat streams text without tools (6.6243ms)
+✔ model catalog deduplicates real model IDs and keeps separate executor/backend routes (0.5333ms)
+✔ unsupported providers are rejected; native model carries exact LLM route (1.4875ms)
+✔ automatic selection respects model/provider restrictions including unsupported fixed models without explicit model (0.7693ms)
+✔ unavailable catalogs never infer unsupported providers (0.3107ms)
+✔ unregistered role editors require reselection instead of guessing removed model identities (0.2907ms)
+✔ model capabilities distinguish source, task continuity and parent inheritance (0.2519ms)
+✔ native reasoning metadata is validated and passed to the actual activation (1.5038ms)
+✔ connectivity checks make a real route call, retain failure reasons, disable failed defaults, and can recover (2.8073ms)
+✔ paired model metadata stays local; only explicit probe runs the external process (1.4244ms)
+✖ task route requirements drive model details and activation from one selection (2.0866ms)
+✖ task reasoning requirement is propagated through an explicit binding (1.1847ms)
+✖ unknown external reasoning depth blocks before launch and is not replaced by a preference (1.3994ms)
+✖ unsupported internal reasoning depth blocks before activation (1.1956ms)
+ℹ tests 32
+ℹ suites 0
+ℹ pass 26
+ℹ fail 6
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 282.3379
+
+✖ failing tests:
+
+test at test\model-selection.test.js:196:1
+✖ required reasoning depth is reported and unknown external depth fails closed (0.8307ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'low' !== 'max'
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/model-selection.test.js:201:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'low',
+    expected: 'max',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\model-selection.test.js:208:1
+✖ internal depth is resolved before activation instead of being trusted (0.2096ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  null !== 'max'
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/model-selection.test.js:212:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)
+      at Test.postRun (node:internal/test_runner/test:1542:19)
+      at Test.run (node:internal/test_runner/test:1467:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: 'max',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\models.test.js:111:1
+✖ task route requirements drive model details and activation from one selection (2.0866ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+      model: 'm2',
+      provider: 'deepseek',
+  +   reasoningEffort: 'low'
+  -   reasoningEffort: 'max'
+    }
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/models.test.js:123:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { provider: 'deepseek', model: 'm2', reasoningEffort: 'low' },
+    expected: { provider: 'deepseek', model: 'm2', reasoningEffort: 'max' },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at test\models.test.js:131:1
+✖ task reasoning requirement is propagated through an explicit binding (1.1847ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'low' !== 'max'
+  
+      at TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/models.test.js:139:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'low',
+    expected: 'max',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\models.test.js:145:1
+✖ unknown external reasoning depth blocks before launch and is not replaced by a preference (1.3994ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - 'MODEL_UNAVAILABLE'
+  
+      at Object.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/models.test.js:153:12)
+      at expectedException (node:assert:578:17)
+      at expectsError (node:assert:703:21)
+      at strict.rejects (node:assert:769:3)
+      at async TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/models.test.js:152:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: 'MODEL_UNAVAILABLE',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\models.test.js:163:1
+✖ unsupported internal reasoning depth blocks before activation (1.1956ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'REASONING_UNSUPPORTED'
+  - 'MODEL_UNAVAILABLE'
+  
+      at Object.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/models.test.js:169:12)
+      at expectedException (node:assert:578:17)
+      at expectsError (node:assert:703:21)
+      at strict.rejects (node:assert:769:3)
+      at async TestContext.<anonymous> (file:///C:/Users/Administrator/.dsh/acms/workspaces/task_bec5ae18-2b18-4f35-a791-f52d0542903e/test/models.test.js:168:3)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'REASONING_UNSUPPORTED',
+    expected: 'MODEL_UNAVAILABLE',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+STDERR:
+
+EXIT: 1

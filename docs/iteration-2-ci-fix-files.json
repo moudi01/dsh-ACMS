@@ -1,0 +1,25 @@
+{
+  "generatedAt": "2026-11-07T15:00:56.345Z",
+  "base": "178987ad4337a499f925d4377de44a3b5f11d550",
+  "prHead": "3aa5c996ad1beb539950397cd32383ee73412508",
+  "prTree": "72ced9318a1c1d7a24fdfd9a30300a9a46d6ca4a",
+  "files": {
+    "docs/external-agent-onboarding.md": {
+      "bytes": 9081,
+      "sha256": "86f61ea0e63f0476f6a543c7ad07f78968e62f5555f1a922a9c604ee04d19a6a"
+    },
+    "test/external-onboarding-doc.test.js": {
+      "bytes": 5388,
+      "sha256": "ecd43f34bd6ad897330261b5556a68da3a45600e223b1da71d75811f866a5e0e"
+    },
+    "docs/iteration-2-release-report.md": {
+      "bytes": 3740,
+      "sha256": "c54adec3cdbe1e188a3b661135f495558d225a4bc0a2d907166d81a46a2711a2"
+    },
+    "docs/iteration-2-release-handoff.md": {
+      "bytes": 21219,
+      "sha256": "3904cdfd78248690485b2b9533b1db94564db6d9564edbb126f56bfe9a71d14f"
+    }
+  },
+  "note": "Delta hashes for the local v9 CI-fix candidate; the frozen pre-fix manifests are not rewritten."
+}

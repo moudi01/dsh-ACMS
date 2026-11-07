@@ -1,0 +1,1 @@
+Hierarchy, scoped navigation, permanent trash deletion, model pairing, manual-only probes and internal-only parent context passed.

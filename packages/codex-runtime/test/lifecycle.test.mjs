@@ -29,7 +29,7 @@ function fixture(t) {
   };
   t.after(() => {
     for (const child of children) assert.notEqual(child.exitCode === null && child.signalCode === null, true, 'owned child must be reaped');
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 });
   });
   return {
     root, stateFile, children,
