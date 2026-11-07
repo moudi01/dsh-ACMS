@@ -71,11 +71,15 @@ test('pausing an active task aborts its execution and never marks success', asyn
 });
 test('unknown prior execution is reconciled instead of blindly dispatched', async t => {
   const f = await fixture(t); const task = f.task();
-  f.store.transaction(() => { f.store.put('tasks', { ...task, status: 'running', activeAttemptId: 'prior' }); f.store.put('attempts', { id: 'prior', taskId: task.id, goalId: task.goalId, status: 'running', agentId: task.agentId, startedAt: new Date().toISOString(), childId: 'old-child' }); });
+  f.store.transaction(() => { f.store.put('tasks', { ...task, status: 'running', activeAttemptId: 'prior' }); f.store.put('attempts', { id: 'prior', taskId: task.id, goalId: task.goalId, taskGeneration: task.generation, status: 'running', agentId: task.agentId, startedAt: new Date().toISOString(), childId: 'old-child' }); });
   f.adapter.reconcile = async () => ({ status: 'unknown', reason: 'Cannot prove old process stopped' });
   await f.start(); await new Promise(r => setTimeout(r, 80));
   assert.equal(f.adapter.calls.length, 0); assert.equal(f.store.require('tasks', task.id).status, 'reconciling');
   f.command('task.reconcile', { id: task.id, confirmedStopped: true, evidence: 'Confirmed old process exit and inspected workspace.' });
+  await until(() => !f.store.require('tasks', task.id).recoveryRequested);
+  assert.equal(f.adapter.calls.length, 0); assert.equal(f.store.require('attempts', 'prior').cleanupPending, true);
+  f.adapter.reconcile = async () => ({ status: 'stopped', cleanupConfirmed: true, reason: 'Explicit test adapter cleanup receipt' });
+  f.command('task.reconcile', { id: task.id });
   await until(() => f.store.require('tasks', task.id).status === 'succeeded');
 });
 test('reviewer cannot approve files modified after verification', async t => {

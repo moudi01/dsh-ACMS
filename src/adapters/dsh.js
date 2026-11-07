@@ -4,6 +4,7 @@ import path from 'node:path';
 import { assert, parseResult, digest, OWNER } from '../core/util.js';
 import { inside } from '../runtime/workspaces.js';
 import { PairedRuntimes } from './paired.js';
+import { unknownExecution } from '../runtime/execution-receipt.js';
 
 export class DshAdapter {
   constructor(ctx, company, dataDir, options = {}) { this.ctx = ctx; this.company = company; this.dataDir = dataDir; this.parent = null; this.creatingParent = null; this.activations = new Map(); this.metadata = new Map(); this.diagnostics = new Map(); this.activeProbes = 0; this.paired = options.paired ?? new PairedRuntimes(company, dataDir, { spawn: spec => ctx.subprocess.spawn(spec) }); }
@@ -82,7 +83,7 @@ export class DshAdapter {
     const active = this.company.store?.list('attempts').filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending).length ?? 0;
     assert(active + (this.activeChats ?? 0) < this.company.policy().maxConcurrent, 'ACTIVE_LIMIT', '执行资源已满，请等待任务结束后再检测');
     this.activeProbes++;
-    let result; const started = Date.now();
+    let result, cleanupPending = false; const started = Date.now();
     try {
       const provider = await this.choose(input, { ignoreHealth: true });
       input = { ...input, provider: provider.name, llmProvider: provider.llmProvider ?? '', model: provider.model };
@@ -99,9 +100,10 @@ export class DshAdapter {
       }, signal);
       result = { ...result, status: 'available', reason: '实际模型请求已成功完成' };
     } catch (e) {
+      cleanupPending = e.cleanupUncertain === true;
       if (signal?.aborted || this.closing || e.code === 'PAIRED_PROBE_UNSUPPORTED') throw e;
       result = { status: 'unavailable', reason: diagnosticMessage(e), code: String(e.code ?? 'MODEL_CHECK_FAILED') };
-    } finally { this.activeProbes--; }
+    } finally { if (!cleanupPending) this.activeProbes--; }
     result = { ...result, id: this.healthKey(input), checkedAt: new Date().toISOString(), latencyMs: Date.now() - started };
     if (this.company.store) this.company.store.transaction(() => { this.company.store.put('modelHealth', result); this.company.store.event('model.checked', result.id, { status: result.status }, OWNER); });
     return result;
@@ -137,7 +139,14 @@ export class DshAdapter {
   async start({ task, attempt, agent, prompt, signal, onAccepted }) {
     const provider = await this.choose(agent);
     if (provider.origin === 'external') {
-      const result = this.paired.run(provider.name, { mode: 'task', attemptId: attempt.id, cwd: task.workspace.path, contextKey: attempt.contextKey, prompt, onAccepted }, signal).then(r => {
+      const input = { mode: 'task', attemptId: attempt.id, generation: attempt.taskGeneration, kind: task.kind, cwd: task.workspace.path, contextKey: attempt.contextKey, prompt, onAccepted };
+      input.execution = this.paired.execution(provider.name, input);
+      // Commit the selected route and exact run/session keys before any launch.
+      this.company.store.transaction(() => {
+        const saved = this.company.store.require('attempts', attempt.id);
+        this.company.store.put('attempts', { ...saved, provider: provider.name, model: provider.model, kind: task.kind, execution: input.execution });
+      });
+      const result = this.paired.run(provider.name, input, signal).then(r => {
         if (this.company.store) this.company.store.transaction(() => { const saved = this.company.store.get('attempts', attempt.id); if (saved) this.company.store.put('attempts', { ...saved, reasoningEffort: r.reasoningEffort ?? null }); });
         return r.output;
       });
@@ -194,11 +203,11 @@ export class DshAdapter {
     assert(finished, 'CHAT_MODEL', '模型连接提前结束'); return text;
   }
   async reconcile(attempt) {
+    if (attempt.provider?.startsWith('paired:')) return this.paired.readProgress(attempt);
     const state = await this.readProgress(attempt);
-    if (state?.attemptId === attempt.id && state.status === 'idle' && !state.locked) {
-      if (state.lastStatus === 'completed' && state.terminalResult?.stopReason === 'completed') return { status: 'completed', finishedAt: state.completedAt ?? state.updatedAt, result: parseResult(state.terminalResult.structured ?? state.terminalResult.output?.filter(b => b.type === 'text').map(b => b.text).join('\n')) };
-      if (['aborted', 'cancelled', 'error', 'failed', 'timeout'].includes(state.lastStatus)) return { status: 'stopped', reason: `Provider confirmed cleanup: ${state.lastStatus}` };
-    }
+    // Legacy DSH summaries do not certify the complete ACMS execution identity
+    // or descendant cleanup. Never turn an idle session into permission to retry.
+    if (state?.reason) return unknownExecution(state.reason, state.code);
     if (!attempt.childId) return { status: 'unknown', reason: 'Startup may have been accepted before the child ID was saved. Inspect the previous run before retrying.' };
     try {
       const entries = await this.ctx.subagents.listDescendants(attempt.parentId);
@@ -209,6 +218,7 @@ export class DshAdapter {
     } catch { return { status: 'unknown', reason: 'Previous DSH activation cannot be authoritatively inspected' }; }
   }
   async readProgress(attempt) {
+    if (attempt.provider?.startsWith('paired:')) return this.paired.readProgress(attempt);
     const provider = this.ctx.subagents.providers.get(attempt.provider);
     const stateFile = provider?.config?.stateFile;
     if (!stateFile) return null;
@@ -218,12 +228,16 @@ export class DshAdapter {
       const summaryPath = path.resolve(directory, entry.summaryFile); assert(inside(directory, summaryPath), 'PROGRESS_PATH', 'Provider summary escapes its state directory');
       const summary = JSON.parse(await fs.readFile(summaryPath, 'utf8'));
       let locked = true; try { await fs.access(summaryPath.replace(/\.summary\.json$/, '.lock')); } catch (e) { if (e.code === 'ENOENT') locked = false; }
+      const i = summary.executionIdentity;
+      if (!i || i.provider !== attempt.provider || i.model !== attempt.model || i.attemptId !== attempt.id || i.contextKey !== attempt.contextKey || i.generation !== attempt.taskGeneration || i.kind !== attempt.kind) return unknownExecution('DSH 状态未提供可校验的完整执行身份', 'RECOVERY_IDENTITY');
       return { ...summary, locked };
     } catch { return null; }
   }
   async progress(attempt) {
     const s = await this.readProgress(attempt); if (!s || (s.attemptId && s.attemptId !== attempt.id)) return null;
-    return { threadId: s.threadId, turnId: s.turnId, status: s.status, lastStatus: s.lastStatus, lastSnippet: s.lastSnippet, toolCalls: s.toolCalls, tokenUsage: s.turnTokenUsage, updatedAt: s.updatedAt };
+    // Persist the same JSON shape that is compared on the next scheduler tick;
+    // undefined properties would otherwise trigger a self-waking update loop.
+    return Object.fromEntries(Object.entries({ threadId: s.threadId, turnId: s.turnId, status: s.status, lastStatus: s.lastStatus, lastSnippet: s.lastSnippet, toolCalls: s.toolCalls, tokenUsage: s.tokenUsage ?? s.turnTokenUsage, updatedAt: s.updatedAt, reason: s.reason, code: s.code, actions: s.actions }).filter(([, value]) => value !== undefined));
   }
   async close() { this.closing = true; for (const d of this.diagnostics.values()) d.controller.abort(new Error('ACMS closing')); await Promise.allSettled([...this.diagnostics.values()].map(d => d.promise)); await Promise.allSettled([...this.activations.values()].map(a => a.dispose())); await this.parent?.dispose(); }
 }

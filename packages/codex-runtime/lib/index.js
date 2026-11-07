@@ -233,6 +233,7 @@ var CodexAppServerWire = class {
     const response = object(await this.guarded(this.transport.request(method, params, signal), signal), method + " response");
     const thread = object(response.thread, method + " thread");
     const id = string(thread.id, method + " thread id");
+    if (response.model !== undefined && response.model !== this.model) throw new Error("codex-runtime: server returned a different model");
     if (thread.ephemeral === true) throw new Error("codex-runtime: server returned an ephemeral thread");
     if (previous && id !== previous) throw new Error("codex-runtime: resume returned a different thread id");
     this.threadId = id;
@@ -646,8 +647,9 @@ function textTask(prompt) {
 * @param wire - private app-server protocol connection.
 * @param child - shared-service handle that owns the managed range.
 */
-async function disposeCodexChild(wire, child) {
+async function disposeCodexChild(wire, child, graceMs = 5000) {
 	wire.close();
+	if (child.cleanup) { await cleanupDeadline(child.cleanup(), graceMs); return; }
 	let outcome;
 	child.done.then((value) => {
 		outcome = value;
@@ -655,17 +657,27 @@ async function disposeCodexChild(wire, child) {
 	try {
 		child.stdin?.end();
 	} catch {}
-	child.terminate();
 	try {
-		await child.waitForExit();
+		child.terminate();
+		await cleanupDeadline((async () => {
+			if (await child.waitForExit(AbortSignal.timeout(graceMs)) !== true) throw new Error('process exit was not confirmed');
+			await child.done;
+		})(), graceMs);
 	} catch (error) {
-		throw new CodexRunFailure({
+		throw Object.assign(new CodexRunFailure({
 			stage: "teardown",
 			category: "unknown",
 			outcome
-		}, thrown(error));
+		}, thrown(error)), { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' });
 	}
-	await child.done.catch(() => {});
+}
+async function cleanupDeadline(pending, ms) {
+	let timer;
+	try { return await Promise.race([pending, new Promise((_, reject) => {
+		timer = setTimeout(() => reject(Object.assign(new Error('Codex process cleanup deadline exceeded'), { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' })), ms);
+	})]); }
+	catch (error) { throw Object.assign(error, { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' }); }
+	finally { clearTimeout(timer); }
 }
 /**
 * Start the real `codex app-server --stdio` child and publish its one-shot run.
@@ -678,7 +690,7 @@ async function startCodexRun(request, spec) {
 	if (request.signal.aborted) throw new Error("subagent-codex: request was aborted before app-server startup");
 	let child;
 	try {
-		child = spec.spawn({
+		child = await spec.spawn({
 			argv: spec.argv ?? codexAppServerArgv(spec.codexBin),
 			cwd: spec.cwd,
 			stdio: {
@@ -690,10 +702,11 @@ async function startCodexRun(request, spec) {
 			env: spec.env
 		});
 	} catch (error) {
-		throw new CodexRunFailure({
+		if (error.cleanupUncertain) spec.store.quarantine(error.message);
+		throw Object.assign(new CodexRunFailure({
 			stage: "initialize",
 			category: "unknown"
-		}, thrown(error));
+		}, thrown(error)), error.cleanupUncertain ? { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' } : {});
 	}
 	const wire = new CodexAppServerWire(child.stdout, child.stdin, spec.permissionMode, spec.model, spec.store, spec);
 	const onStderr = (chunk) => {
@@ -707,7 +720,7 @@ async function startCodexRun(request, spec) {
 	child.stderr?.on("error", onStderrError);
 	const disposeProcess = async () => {
 		try {
-			await disposeCodexChild(wire, child);
+			await disposeCodexChild(wire, child, spec.disposeGraceMs);
 			await new Promise((resolve) => {
 				setImmediate(resolve);
 			});
@@ -765,7 +778,8 @@ async function startCodexRun(request, spec) {
 			await disposeProcess();
 		} catch (disposeError) {
 			const cleanupFailure = thrown(disposeError);
-			throw new AggregateError([failure, cleanupFailure], `${failure.message}; ${cleanupFailure.message}`);
+			spec.store.quarantine?.(cleanupFailure.message);
+			throw Object.assign(new AggregateError([failure, cleanupFailure], `${failure.message}; ${cleanupFailure.message}`), { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' });
 		}
 		if (cancelledBeforeCleanup) throw new Error("subagent-codex: request was aborted before run publication");
 		try {
@@ -851,8 +865,10 @@ async function startCodexRun(request, spec) {
       try { await disposeProcess(); }
       catch (error) { cleanupError = error; throw error; }
       finally {
-        await taggedResult;
-        await spec.store.close(cleanupError ? "teardown-failed" : spec.outcome ?? "cancelled", { failure: spec.failure ?? null });
+        if (cleanupError) spec.store.quarantine(cleanupError.message);
+        try { await cleanupDeadline(taggedResult, spec.disposeGraceMs); }
+        catch (error) { spec.store.quarantine(error.message); throw error; }
+        if (!cleanupError) await spec.store.close(spec.outcome ?? "cancelled", { failure: spec.failure ?? null, cleanupPending: false });
       }
     }
   });

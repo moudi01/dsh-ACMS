@@ -1,5 +1,5 @@
 import { assert, id, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest } from './util.js';
-import { taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-actions.js';
 import { goalSummary } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
@@ -208,8 +208,11 @@ export class Company {
   }
   controlTask(args, target, actor) {
     const task = this.store.require('tasks', args.id); assert(!TERMINAL.has(task.status), 'TASK_CLOSED', 'Task is already closed');
-    const active = this.store.list('attempts').some(a => a.taskId === task.id && ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status));
-    const saved = this.store.put('tasks', { ...task, status: active ? 'stopping' : target, resumeStatus: task.status, stopRequested: active ? target : null }, args.expectedRevision);
+    const pending = this.store.list('attempts').filter(a => a.taskId === task.id && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending));
+    const active = pending.length > 0;
+    const reconciling = task.status === 'reconciling' || pending.some(a => a.status === 'reconciling' || a.cleanupUncertain);
+    const saved = this.store.put('tasks', { ...task, status: active ? (reconciling ? 'reconciling' : 'stopping') : target, resumeStatus: task.status,
+      stopRequested: active ? target : null, recoveryRequested: active }, args.expectedRevision);
     if (target === 'cancelled') this.invalidateInteractions(task.id, '任务已取消');
     for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
     this.store.event(`task.${target}.requested`, task.id, {}, actor);
@@ -348,10 +351,12 @@ export class Company {
     }
   }
   reconcile(args, actor) {
-    this.owner(actor); assert(args.confirmedStopped === true, 'CONFIRM_STOPPED', 'Confirm that the previous executor has stopped before retrying');
-    const task = this.store.require('tasks', args.id); assert(task.status === 'reconciling', 'INVALID_TRANSITION', 'Task is not awaiting reconciliation');
-    for (const attempt of this.store.list('attempts')) if (attempt.taskId === task.id && attempt.status === 'reconciling') this.store.put('attempts', { ...attempt, status: 'interrupted', cleanupPending: false, recoveryEvidence: text(args.evidence, 'evidence') });
-    const result = this.store.put('tasks', { ...task, status: 'ready', stageIndex: task.kind === 'review' ? task.stageIndex : 0, stopRequested: null }); this.store.event('task.reconciled', task.id, { evidence: args.evidence }, actor); return result;
+    this.owner(actor);
+    const task = this.store.require('tasks', args.id); assert(canReconcileTask(task, this.store.list('attempts')), 'INVALID_TRANSITION', 'Task is not awaiting reconciliation');
+    // An operator checkbox cannot certify process ownership or recover a result.
+    // Ask the engine for another read; it alone applies a matching clean receipt.
+    const result = this.store.put('tasks', { ...task, recoveryRequested: true });
+    this.store.event('task.recovery.requested', task.id, {}, actor); return result;
   }
   snapshot() {
     const collections = ['projects', 'goals', 'tasks', 'agents', 'workflows', 'workflowHistory', 'attempts', 'artifacts', 'verifications', 'interactions', 'proposals', 'changes', 'notifications'];

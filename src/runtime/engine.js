@@ -20,25 +20,58 @@ export class Engine {
   }
   kick() { if (this.closing || this.scheduled) return; this.scheduled = true; queueMicrotask(() => { this.scheduled = false; this.tick().catch(e => { this.lastError = String(e.message); }); }); }
   fenced() { assert(this.store.ownsLease(this.owner, this.epoch), 'LEASE_LOST', 'Scheduler no longer owns the company lease'); }
-  async recover() {
-    for (const previous of this.store.list('attempts').filter(a => ACTIVE.has(a.status) || a.cleanupPending)) {
-      const fact = await this.adapter.reconcile?.(previous) ?? { status: 'unknown' };
-      if (previous.status === 'completed' && ['completed', 'stopped'].includes(fact.status)) {
-        this.store.transaction(() => { this.store.put('attempts', { ...previous, cleanupPending: false, recovery: { status: 'cleanup-confirmed' } }); this.company.releaseTemporaryAgent(previous.agentId); });
+  async recover(taskId) {
+    for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
+      let fact;
+      try { fact = await this.adapter.reconcile?.(previous) ?? { status: 'unknown', reason: '执行器未提供恢复回执' }; }
+      catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
+      this.fenced();
+      if (previous.provider?.startsWith('paired:') && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
+        fact = { status: 'unknown', reason: '配对回执未确认进程树清理', actions: ['refresh-receipt', 'inspect-execution'] };
+      }
+      if (previous.cleanupUncertain && fact.cleanupConfirmed !== true) {
+        fact.status = 'unknown'; fact.reason = previous.cleanupError || 'Prior process tree cleanup is still unconfirmed'; delete fact.result;
+      }
+      const currentTask = this.store.require('tasks', previous.taskId);
+      if (currentTask.activeAttemptId === previous.id && currentTask.generation === previous.taskGeneration && currentTask.stopRequested
+        && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed === true) {
+        // A stop intent survives host loss. A clean completed receipt also
+        // proves termination, but must not apply a result the owner has stopped.
+        this.store.transaction(() => {
+          const accepted = previous.resultAccepted || previous.status === 'completed';
+          this.finishAttempt(previous, accepted ? 'completed' : 'interrupted', previous.summary);
+          this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false, cleanupUncertain: false,
+            recovery: { status: 'stopped', reason: `已确认进程树清理，${currentTask.stopRequested === 'paused' ? '暂停' : '取消'}请求已落实。${fact.reason ?? ''}`, actions: [] } });
+          this.store.put('tasks', { ...currentTask, status: currentTask.stopRequested, stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+          this.company.releaseTemporaryAgent(previous.agentId);
+          this.store.event('attempt.stop.recovered', previous.id, { taskId: previous.taskId, status: currentTask.stopRequested }, SYSTEM);
+        });
+        continue;
+      }
+      if ((previous.status === 'completed' || previous.resultAccepted) && ['completed', 'stopped'].includes(fact.status)) {
+        let restored;
+        this.store.transaction(() => {
+          this.store.put('attempts', { ...previous, status: 'completed', cleanupPending: false, cleanupUncertain: false, recovery: { status: 'cleanup-confirmed', reason: fact.reason } });
+          const task = this.store.require('tasks', previous.taskId);
+          if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration && task.status === 'reconciling' && previous.acceptedTaskStatus) restored = this.store.put('tasks', { ...task, status: previous.acceptedTaskStatus });
+          this.company.releaseTemporaryAgent(previous.agentId);
+        });
+        if (restored?.status === 'integrating') this.queueIntegration(restored.id);
         continue;
       }
       if (fact.status === 'completed') {
         try {
           this.store.transaction(() => { this.store.put('attempts', { ...previous, recoveredFinishedAt: fact.finishedAt }); });
           await this.accept(previous, fact.result, new AbortController().signal);
-          this.store.transaction(() => { this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false }); this.company.releaseTemporaryAgent(previous.agentId); this.store.event('attempt.result.recovered', previous.id, { taskId: previous.taskId }, SYSTEM); });
+          this.store.transaction(() => { this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false, cleanupUncertain: false, recovery: { status: 'completed', reason: fact.reason } }); this.company.releaseTemporaryAgent(previous.agentId); this.store.event('attempt.result.recovered', previous.id, { taskId: previous.taskId }, SYSTEM); });
           continue;
         } catch (e) { fact.status = 'unknown'; fact.reason = `Recovered result needs inspection: ${e.message}`; delete fact.result; }
       }
       this.store.transaction(() => {
         const task = this.store.require('tasks', previous.taskId);
-        this.store.put('attempts', { ...previous, status: fact.status === 'stopped' ? 'interrupted' : 'reconciling', cleanupPending: false, recovery: fact });
-        this.store.put('tasks', { ...task, status: fact.status === 'stopped' ? (task.stopRequested ?? 'ready') : 'reconciling', stopRequested: fact.status === 'stopped' ? null : task.stopRequested });
+        const accepted = previous.resultAccepted || previous.status === 'completed';
+        this.store.put('attempts', { ...previous, resultAccepted: accepted, acceptedTaskStatus: previous.acceptedTaskStatus ?? (accepted && task.status !== 'reconciling' ? task.status : null), status: fact.status === 'stopped' ? 'interrupted' : 'reconciling', cleanupPending: fact.status !== 'stopped', cleanupUncertain: fact.status === 'stopped' ? false : previous.cleanupUncertain, recovery: fact });
+        if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration) this.store.put('tasks', { ...task, status: fact.status === 'stopped' ? (task.stopRequested ?? 'ready') : 'reconciling', stopRequested: fact.status === 'stopped' ? null : task.stopRequested });
         this.store.event('attempt.recovery', previous.id, { taskId: task.id, fact }, SYSTEM);
       });
     }
@@ -53,6 +86,12 @@ export class Engine {
     if (this.ticking || this.closing) return; this.ticking = true;
     try {
       this.fenced(); this.store.heartbeat(this.owner);
+      // A request made during final cleanup must survive until the live
+      // activation settles; recover() deliberately excludes live attempts.
+      for (const task of this.store.list('tasks').filter(t => t.recoveryRequested && ![...this.live.values()].some(entry => entry.taskId === t.id))) {
+        this.store.transaction(() => this.store.put('tasks', { ...task, recoveryRequested: false }));
+        await this.recover(task.id);
+      }
       const spent = new Map(this.store.list('goals').map(g => [g.id, goalRuntimeSpent(g, this.store.list('attempts'))]));
       for (const [attemptId, entry] of this.live) {
         const task = this.store.require('tasks', entry.taskId);
@@ -75,6 +114,7 @@ export class Engine {
       const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review'].includes(b.kind) - ['plan', 'review'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
+        if (active.some(a => a.taskId === task.id)) continue;
         const goal = this.store.require('goals', task.goalId);
         if ((spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
         if (['work', 'repair'].includes(task.kind) && ordinary >= Math.max(1, p.maxConcurrent - p.controlSlots)) continue;
@@ -112,7 +152,7 @@ export class Engine {
     });
   }
   async execute(attempt, controller) {
-    let activation; const timeout = setTimeout(() => controller.abort(new Error('Execution timeout')), this.company.policy().turnTimeoutMs);
+    let activation, cleanupFailure, recoveryFailure, deliveredResult = false; const timeout = setTimeout(() => controller.abort(new Error('Execution timeout')), this.company.policy().turnTimeoutMs);
     try {
       let task = this.store.require('tasks', attempt.taskId);
       const workspace = await this.workspaces.prepare(task, attempt);
@@ -141,24 +181,51 @@ export class Engine {
       });
       this.store.transaction(() => { this.fenced(); this.store.put('attempts', { ...this.store.require('attempts', attempt.id), childId: activation.childId, parentId: activation.parentId, provider: activation.provider ?? attempt.provider, model: activation.model ?? attempt.model, reasoningEffort: activation.reasoningEffort ?? null }); });
       if (activation.accepted !== false) this.conversations?.accepted(attempt);
-      const raw = await activation.result; controller.signal.throwIfAborted();
+      const raw = await activation.result; deliveredResult = true; controller.signal.throwIfAborted();
       const output = parseResult(raw); this.conversations?.finished(attempt, output); await this.accept(attempt, output, controller.signal);
     } catch (error) {
-      if (this.store.ownsLease(this.owner, this.epoch)) this.fail(attempt, error.cleanupUncertain ? error : controller.signal.aborted ? controller.signal.reason : error, controller.signal.aborted);
+      if (error.cleanupUncertain) cleanupFailure = error;
+      if (deliveredResult && activation?.provider?.startsWith('paired:')) recoveryFailure = Object.assign(new Error(`结果已返回，但尚未可靠入库：${error.message}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
+      // Adapter bookkeeping can fail after the receipt is committed but before
+      // activation.result resolves. Only a clean stopped receipt permits retry;
+      // otherwise retain the slot, including when progress cannot be inspected.
+      const saved = this.store.get('attempts', attempt.id);
+      if (!cleanupFailure && !recoveryFailure && saved?.execution && saved.provider?.startsWith('paired:')) {
+        let fact;
+        try { fact = await this.adapter.reconcile?.(saved); } catch {}
+        if (fact?.status !== 'stopped' || fact.cleanupConfirmed !== true) {
+          recoveryFailure = Object.assign(new Error(`执行结果尚需核对：${error.message}; ${fact?.reason ?? '无法读取可靠结束回执'}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
+        }
+      }
+      if (this.store.ownsLease(this.owner, this.epoch)) this.fail(attempt, cleanupFailure ?? recoveryFailure ?? (controller.signal.aborted ? controller.signal.reason : error), controller.signal.aborted);
     } finally {
       clearTimeout(timeout);
       // The slot is not released until the provider confirms process cleanup.
       try {
         await activation?.dispose?.();
+        if (cleanupFailure) throw cleanupFailure;
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
-          const saved = this.store.require('attempts', attempt.id); this.store.put('attempts', { ...saved, cleanupPending: false });
+          const saved = this.store.require('attempts', attempt.id);
+          if (recoveryFailure) {
+            this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, recovery: { status: 'unknown', reason: recoveryFailure.message, actions: ['refresh-receipt', 'inspect-execution'] } });
+            return;
+          }
+          this.store.put('attempts', { ...saved, cleanupPending: false });
+          const task = this.store.require('tasks', saved.taskId);
+          // Stop may arrive after acceptance while dispose is still pending.
+          // Once cleanup succeeds there is no active attempt left for recover().
+          if (task.activeAttemptId === saved.id && task.generation === saved.taskGeneration && task.stopRequested) {
+            this.store.put('tasks', { ...task, status: task.stopRequested, stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+            this.store.event('task.stop.completed', task.id, { status: task.stopRequested, attemptId: saved.id }, SYSTEM);
+          }
           this.company.releaseTemporaryAgent(saved.agentId);
         });
       } catch (e) {
         this.lastError = `Cleanup: ${e.message}`;
         this.store.transaction(() => {
-          const saved = this.store.require('attempts', attempt.id); this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, cleanupError: e.message });
-          const task = this.store.require('tasks', attempt.taskId); this.store.put('tasks', { ...task, status: 'reconciling' });
+          const saved = this.store.require('attempts', attempt.id), task = this.store.require('tasks', attempt.taskId);
+          this.store.put('attempts', { ...saved, acceptedTaskStatus: saved.acceptedTaskStatus ?? (saved.resultAccepted ? task.status : null), status: 'reconciling', cleanupPending: true, cleanupUncertain: true, cleanupError: e.message, cleanupDetails: e.cleanup ?? saved.cleanupDetails ?? null });
+          this.store.put('tasks', { ...task, status: 'reconciling' });
           this.store.event('attempt.cleanup.failed', attempt.id, { taskId: task.id }, SYSTEM);
         });
       }
@@ -190,14 +257,19 @@ export class Engine {
       task = this.store.require('tasks', task.id);
     }
     if (output.outcome === 'blocked') {
-      this.finishAttempt(attempt, 'completed', output.summary ?? output.reason);
-      if (typeof output.reversibleDefault === 'string') this.store.transaction(() => {
-        const saved = this.store.require('attempts', attempt.id); this.store.put('attempts', { ...saved, handoff: output.reversibleDefault.slice(0, 16000) });
+      // The accepted marker, handoff and business effects are one durable unit.
+      // A crash must never leave a completed attempt with a running task and no
+      // pending question (or lose the scheduled retry/repair branch).
+      this.store.transaction(() => {
+        this.finishAttempt(attempt, 'completed', output.summary ?? output.reason);
+        if (typeof output.reversibleDefault === 'string') {
+          const saved = this.store.require('attempts', attempt.id); this.store.put('attempts', { ...saved, handoff: output.reversibleDefault.slice(0, 16000) });
+        }
+        if (output.kind === 'technical' && task.attempts < this.company.policy().maxAttempts) {
+          this.store.put('tasks', { ...task, status: 'ready', feedback: output.reason, retryAt: Date.now() + 1000 * task.attempts }); this.store.event('task.retry.scheduled', task.id, {}, SYSTEM);
+        } else if (output.kind === 'technical' && !task.repairOf && task.kind !== 'review') this.scheduleRepair(task, output.reason);
+        else this.block(task, output.kind ?? 'human', output.reason, output.question ?? '需要补充哪些信息才能继续？');
       });
-      if (output.kind === 'technical' && task.attempts < this.company.policy().maxAttempts) {
-        this.store.transaction(() => { this.store.put('tasks', { ...task, status: 'ready', feedback: output.reason, retryAt: Date.now() + 1000 * task.attempts }); this.store.event('task.retry.scheduled', task.id, {}, SYSTEM); });
-      } else if (output.kind === 'technical' && !task.repairOf && task.kind !== 'review') this.scheduleRepair(task, output.reason);
-      else this.block(task, output.kind ?? 'human', output.reason, output.question ?? '需要补充哪些信息才能继续？');
       return;
     }
     if (task.kind === 'plan' || output.outcome === 'decomposed') { this.acceptPlan(task, attempt, output); return; }
@@ -298,9 +370,9 @@ export class Engine {
   finishAttempt(attempt, status, summary) {
     return this.store.transaction(() => {
       const current = this.store.require('attempts', attempt.id); if (!ACTIVE.has(current.status)) return current;
-      const elapsedMs = Math.max(0, (current.recoveredFinishedAt ? Date.parse(current.recoveredFinishedAt) : Date.now()) - Date.parse(current.startedAt));
-      const saved = this.store.put('attempts', { ...current, status, cleanupPending: true, summary: summary ?? '', finishedAt: now(), elapsedMs });
-      const goal = this.store.require('goals', current.goalId); this.store.put('goals', { ...goal, runtimeMs: goal.runtimeMs + elapsedMs });
+      const elapsedMs = Math.max(current.elapsedMs ?? 0, (current.recoveredFinishedAt ? Date.parse(current.recoveredFinishedAt) : Date.now()) - Date.parse(current.startedAt));
+      const saved = this.store.put('attempts', { ...current, status, resultAccepted: status === 'completed', cleanupPending: true, summary: summary ?? '', finishedAt: now(), elapsedMs });
+      const goal = this.store.require('goals', current.goalId); this.store.put('goals', { ...goal, runtimeMs: goal.runtimeMs + elapsedMs - (current.elapsedMs ?? 0) });
       this.store.event('attempt.finished', current.id, { taskId: current.taskId, status }, SYSTEM); return saved;
     });
   }
@@ -316,7 +388,7 @@ export class Engine {
       const task = this.store.require('tasks', attempt.taskId); const stopped = task.stopRequested;
       this.finishAttempt(attempt, aborted ? 'interrupted' : 'failed', error.message);
       if (task.activeAttemptId !== attempt.id) return;
-      if (error.cleanupUncertain) {
+      if (error.cleanupUncertain || error.recoveryRequired) {
         // A closed runner does not prove that its model/tool descendants stopped.
         // dispose retains cleanupPending; reconciliation must precede any retry.
         this.store.put('tasks', { ...task, status: 'reconciling', resumeOnStart: false, feedback: `${error.code}: ${error.message}`, retryAt: null });
