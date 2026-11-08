@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Isolate the dependency graph by project and goal (issue #24): focus the most recently active project by default, partition "全部项目" into folded, counted project/goal sections, keep per-object folding across data refreshes, and show filtered predecessors as expandable placeholders without writing task state or calling a model.
+
 - Final candidate hardening: keep the published ACL step working when the host exports a foreign PSModulePath, clean ACL fixtures without EPERM, retry transient Windows index-rename errors, correct the fs.rm retry documentation, and verify the empty-models flow by closing the pairing dialog before navigation.
 
 - Add an owner-facing external access panel to issue scoped user-agent credentials once, list redacted credentials and revoke them; document first-run onboarding and verify closed-workbench CLI use end to end.

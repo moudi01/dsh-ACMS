@@ -18,6 +18,7 @@ jobs:
       - run: npm run test:ui
       - run: npm run test:usability
       - run: npm run test:structure
+      - run: npm run test:graph-ui
       - uses: actions/upload-artifact@v4
         if: always()
         with:

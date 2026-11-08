@@ -16,11 +16,14 @@ npm run build
 npm run test:ui
 npm run test:usability
 npm run test:structure
+npm run test:graph-ui
 npm run test:pairing-ui
 npm run test:budget-ui
 ```
 
 核心测试覆盖权限、幂等命令、任务依赖、独立审查、返工、并发与预算、工作区隔离、Git 集成、进程清理和重启恢复。Codex 运行库测试使用本地模拟 app-server 验证初始化、会话续接、即时消息、错误返回、租约及子进程回收。
+
+依赖图范围投影（`test/graph.test.js`、`scripts/graph-isolation-ui-test.mjs`）使用两个项目、各自多个目标的静态夹具，验证默认聚焦、项目/目标分区与计数、折叠状态跨数据刷新保留、隐藏前置任务的可展开占位、空范围与深链接范围；并断言筛选与折叠不修改任务状态或依赖，模型调用为 0。
 
 UI 测试使用实际构建的客户端和临时服务模拟 DSH 通道，覆盖导航、模型选择、外部配对、手动检测、任务操作和阻塞回复。测试使用模拟执行器，不调用真实模型。截图及报告保存在 `test-results/`；总览截图用于 README。
 
