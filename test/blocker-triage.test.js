@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { fixture } from "./helpers.js";
+import { fixture, until } from "./helpers.js";
+import { selectRoute, selectionError } from "../src/core/model-selection.js";
 import { blockerCoordinationKey, blockerRoute } from "../src/core/blocker-policy.js";
 
 function claimCoordination(f, coordination, agentId = "manager") {
@@ -97,4 +98,51 @@ test("owner pause is never converted into a manager coordination", async t => {
   assert.equal(saved.blocker.kind, "integration");
   assert.equal(f.store.list("tasks").filter(item => item.kind === "coordination" && item.coordinationOf === task.id).length, 0);
   assert.equal(f.store.list("interactions").filter(item => item.taskId === task.id && item.status === "pending").length, 1);
+});
+
+test("goal task limit falls back to an owner blocker instead of leaving a running attempt", async t => {
+  const f = await fixture(t);
+  f.store.transaction(() => f.store.put("policy", { ...f.company.policy(), maxTasksPerGoal: 1 }));
+  f.adapter.start = async () => { throw selectionError(selectRoute({ candidates: [], policy: {} })); };
+  const task = f.task({ title: "Selection blocker at the task limit" });
+  await f.start();
+  const blocked = await until(() => { const saved = f.store.require("tasks", task.id); return saved.status === "blocked" ? saved : null; });
+  assert.equal(blocked.blocker.kind, "model-selection");
+  const attempt = await until(() => {
+    const saved = f.store.list("attempts").find(item => item.taskId === task.id);
+    return saved && saved.status === "failed" && saved.cleanupPending === false ? saved : null;
+  });
+  assert.equal(attempt.resultAccepted, false);
+  assert.equal(f.store.list("tasks").filter(item => item.kind === "coordination").length, 0);
+  const questions = f.store.list("interactions").filter(item => item.taskId === task.id && item.status === "pending");
+  assert.equal(questions.length, 1);
+  assert.equal(questions[0].kind, "model-selection");
+  assert.match(questions[0].question, /每个目标任务上限/);
+  await until(() => f.engine.live.size === 0);
+  assert.equal(f.store.list("attempts").filter(item => item.taskId === task.id && item.status === "running").length, 0);
+});
+
+test("execution-limit coordination falls back to an owner blocker at the goal task limit", async t => {
+  const f = await fixture(t);
+  f.store.transaction(() => f.store.put("policy", { ...f.company.policy(), maxTasksPerGoal: 1 }));
+  const task = f.task({ title: "Execution limit at the task limit" });
+  const saved = f.engine.coordinateFailure(f.store.require("tasks", task.id), "Synthetic execution failure");
+  assert.equal(saved.blocker.kind, "execution_limit");
+  assert.equal(f.store.list("tasks").filter(item => item.kind === "coordination").length, 0);
+  const questions = f.store.list("interactions").filter(item => item.taskId === task.id && item.status === "pending");
+  assert.equal(questions.length, 1);
+  assert.match(questions[0].question, /每个目标任务上限/);
+});
+
+test("repair-limit coordination falls back to an owner blocker at the goal task limit", async t => {
+  const f = await fixture(t);
+  f.store.transaction(() => f.store.put("policy", { ...f.company.policy(), maxTasksPerGoal: 1 }));
+  const task = f.task({ title: "Repair limit at the task limit" });
+  f.store.transaction(() => f.store.put("tasks", { ...f.store.require("tasks", task.id), repairs: f.company.policy().maxReworks }));
+  const saved = f.engine.scheduleRepair(f.store.require("tasks", task.id), "Synthetic technical failure");
+  assert.equal(saved.blocker.kind, "repair_limit");
+  assert.equal(f.store.list("tasks").filter(item => item.kind === "coordination").length, 0);
+  const questions = f.store.list("interactions").filter(item => item.taskId === task.id && item.status === "pending");
+  assert.equal(questions.length, 1);
+  assert.match(questions[0].question, /每个目标任务上限/);
 });

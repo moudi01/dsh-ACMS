@@ -1,6 +1,15 @@
 import { assert, digest, SYSTEM } from "./util.js";
 import { blockerCoordinationKey } from "./blocker-policy.js";
 
+const CAPACITY_LIMIT_CODES = new Set(["TASK_LIMIT", "AGENT_LIMIT"]);
+
+// Capacity limits are owner boundaries, not scheduler errors. If a coordination
+// task cannot be created, the caller must keep the attempt's terminal state and
+// ask the owner directly instead of rolling the failure transaction back.
+function capacityBlock(engine, task, kind, reason, question, context) {
+  return engine.blockForOwner(task, kind, reason, context + "；目标任务数已达到上限，请缩小范围或提高“每个目标任务上限”后恢复此分支。" + (question ? " 原问题：" + question : ""));
+}
+
 export function reviewCoordinationKey(reviewId) { return "review:" + reviewId; }
 export function executorCoordinationKey(taskId, generation, reasonCode) { return "executor:" + taskId + ":g" + generation + ":" + reasonCode; }
 export function feedbackHashOf(output) { return digest({ summary: output?.summary ?? "", findings: Array.isArray(output?.findings) ? output.findings : [] }); }
@@ -114,7 +123,14 @@ export function scheduleRepairFlow(engine, task, reason) {
       if (previous?.status === "succeeded") return engine.block(task, "repair_limit", reason, "自动修复与协调均已结束，请确认追加额度、调整范围或分派后再恢复此分支。");
       const manager = findManager(company, task.goalId);
       if (!canCoordinate(company, manager)) return engine.block(task, "assignment", "没有具备协调授权的负责人来处理修复上限", "请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。");
-      const coordination = createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调解阻：" + task.title, description: "自动修复达到上限，需要负责人决定返工范围、分派或依赖。\n问题：" + reason + "\n原任务：" + task.description });
+      const coordination = (() => {
+        try { return createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调解阻：" + task.title, description: "自动修复达到上限，需要负责人决定返工范围、分派或依赖。\n问题：" + reason + "\n原任务：" + task.description }); }
+        catch (error) {
+          if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
+          return null;
+        }
+      })();
+      if (!coordination) return capacityBlock(engine, task, "repair_limit", reason, "", "自动修复达到上限，但无法创建负责人协调任务");
       store.event("repair.limit", task.id, { reason, coordinationTaskId: coordination.id }, SYSTEM, { goalId: task.goalId });
       return holdSourceForCoordination(store, task, coordination);
     }
@@ -134,7 +150,14 @@ export function coordinateExecutionLimit(engine, task, reason) {
     if (previous?.status === "succeeded") return engine.block(task, "execution_limit", reason, "自动重试与协调均已结束，请确认调整范围或分派后再恢复此分支。");
     const manager = findManager(company, task.goalId);
     if (!canCoordinate(company, manager)) return engine.block(task, "assignment", "没有具备协调授权的负责人来处理执行上限", "请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。");
-    const coordination = createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调失败处理：" + task.title, description: "任务自动重试已用完，需要负责人决定返工范围、分派或依赖。\n原因：" + reason + "\n原任务：" + task.description });
+    const coordination = (() => {
+      try { return createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调失败处理：" + task.title, description: "任务自动重试已用完，需要负责人决定返工范围、分派或依赖。\n原因：" + reason + "\n原任务：" + task.description }); }
+      catch (error) {
+        if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
+        return null;
+      }
+    })();
+    if (!coordination) return capacityBlock(engine, task, "execution_limit", reason, "", "自动重试已用完，但无法创建负责人协调任务");
     store.event("execution.limit", task.id, { reason, coordinationTaskId: coordination.id }, SYSTEM, { goalId: task.goalId });
     return holdSourceForCoordination(store, task, coordination);
   });
@@ -168,11 +191,19 @@ export function coordinateBlocker(engine, task, { kind, reason, question = '' })
     if (!canCoordinate(company, manager)) {
       return engine.blockForOwner(current, 'assignment', '没有具备协调授权的负责人来处理该阻塞：' + reason, '请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。' + (question ? ' 原问题：' + question : ''));
     }
-    const coordination = createCoordination(company, current, {
-      manager, key, feedbackHash: digest({ kind, reason }), reason, blockerKind: kind,
-      title: '协调解阻：' + current.title,
-      description: '自动阻塞接管（' + kind + '）：负责人需在现有授权内决定重试、换分派、缩小范围或调整依赖；只有新增权限、必须由用户提供的材料、重大范围变化或真实总预算不足才升级给用户。\n阻塞原因：' + reason + '\n原任务：' + current.description
-    });
+    const coordination = (() => {
+      try {
+        return createCoordination(company, current, {
+          manager, key, feedbackHash: digest({ kind, reason }), reason, blockerKind: kind,
+          title: '协调解阻：' + current.title,
+          description: '自动阻塞接管（' + kind + '）：负责人需在现有授权内决定重试、换分派、缩小范围或调整依赖；只有新增权限、必须由用户提供的材料、重大范围变化或真实总预算不足才升级给用户。\n阻塞原因：' + reason + '\n原任务：' + current.description
+        });
+      } catch (error) {
+        if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
+        return null;
+      }
+    })();
+    if (!coordination) return capacityBlock(engine, current, kind, reason, question, '自动阻塞接管无法创建负责人协调任务');
     store.event('blocker.coordinated', current.id, { blockerKind: kind, route: 'manager', coordinationTaskId: coordination.id, reason }, SYSTEM, { goalId: current.goalId });
     return holdSourceForCoordination(store, current, coordination);
   });
