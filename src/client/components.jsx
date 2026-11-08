@@ -19,7 +19,7 @@ export function CollapsibleText({ text, lines = 3, className = '', label = '全�
   if (!value) return null;
   const long = value.length > threshold || value.split('\n').length > 2;
   return <div className={`acms-collapsible${open ? ' open' : ''}${className ? ` ${className}` : ''}`}>
-    <p style={{ '--acms-clamp-lines': lines }}>{value}</p>
+    <p className={long ? 'acms-collapsible-clamped' : ''} style={{ '--acms-clamp-lines': lines }}>{value}</p>
     {long && <button type="button" className="text acms-expand-btn" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? `收起${label}` : `展开${label}`}</button>}
   </div>;
 }

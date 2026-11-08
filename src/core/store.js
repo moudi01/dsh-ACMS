@@ -126,11 +126,23 @@ export class Store {
   /**
    * Latest effective business activity per entity id (ISO timestamp).
    * Uses a whitelist only, so polling/progress writes never fabricate activity.
+   * Attempt and interaction events are attributed to their task through the
+   * event body or the owning record before aggregation.
    */
   activity(types = EFFECTIVE_ACTIVITY_EVENTS) {
     const marks = types.map(() => "?").join(",");
-    const rows = this.db.prepare(`SELECT entity_id AS id, MAX(at) AS at FROM events WHERE entity_id IS NOT NULL AND type IN (${marks}) GROUP BY entity_id`).all(...types);
-    return new Map(rows.map(row => [row.id, row.at]));
+    const rows = this.db.prepare(`SELECT entity_id AS id, at, body FROM events WHERE entity_id IS NOT NULL AND type IN (${marks})`).all(...types);
+    const attemptTask = new Map(this.list("attempts").map(item => [item.id, item.taskId]));
+    const interactionTask = new Map(this.list("interactions").map(item => [item.id, item.taskId]));
+    const byEntity = new Map();
+    for (const row of rows) {
+      let taskId = null;
+      try { taskId = JSON.parse(row.body)?.taskId ?? null; } catch { taskId = null; }
+      const target = taskId ?? attemptTask.get(row.id) ?? interactionTask.get(row.id) ?? row.id;
+      const current = byEntity.get(target);
+      if (!current || String(row.at) > String(current)) byEntity.set(target, row.at);
+    }
+    return byEntity;
   }
   page(after = 0, limit = 200) {
     const entries = this.db.prepare("SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?").all(after, limit).map(r => ({ seq: r.seq, at: r.at, type: r.type, entityId: r.entity_id, actor: r.actor, ...JSON.parse(r.body) }));

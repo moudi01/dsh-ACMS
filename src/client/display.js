@@ -74,3 +74,14 @@ export function visibleCounts(items = [], completed = false) {
   const done = items.filter(isCompleted).length;
   return { total: items.length, completed: done, visible: completed ? done : items.length - done };
 }
+
+/**
+ * Verifications belonging to a task: direct evidence plus any review conclusion
+ * recorded against the task's own attempt. Review tasks store the conclusion on
+ * the reviewed task/goal and link it through `attemptId`, so filtering only by
+ * `verification.taskId` would hide it from the reviewer's detail view.
+ */
+export function verificationsForTask(task, attempts = [], verifications = []) {
+  const attemptIds = new Set(attempts.filter(attempt => attempt.taskId === task?.id).map(attempt => attempt.id));
+  return verifications.filter(verification => verification.taskId === task?.id || attemptIds.has(verification.attemptId));
+}

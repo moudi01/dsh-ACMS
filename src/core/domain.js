@@ -486,7 +486,20 @@ export class Company {
     const activity = this.store.activity();
     const latest = (...values) => values.filter(Boolean).reduce((max, value) => (!max || String(value) > String(max) ? value : max), null);
     const ownActivity = entity => latest(activity.get(entity.id), entity.createdAt);
-    data.tasks = data.tasks.map(task => ({ ...task, activityAt: ownActivity(task) }));
+    // A branch's newest descendant activity belongs to its ancestors too, with
+    // cycle protection for malformed parent/review links.
+    const children = new Map();
+    for (const task of data.tasks) { const parent = task.reviewOf || task.parentId || null; if (parent) children.set(parent, [...(children.get(parent) ?? []), task]); }
+    const memo = new Map();
+    const effectiveTaskActivity = (task, stack = new Set()) => {
+      if (memo.has(task.id)) return memo.get(task.id);
+      if (stack.has(task.id)) return ownActivity(task);
+      stack.add(task.id);
+      let value = ownActivity(task);
+      for (const child of children.get(task.id) ?? []) value = latest(value, effectiveTaskActivity(child, stack));
+      stack.delete(task.id); memo.set(task.id, value); return value;
+    };
+    data.tasks = data.tasks.map(task => ({ ...task, activityAt: effectiveTaskActivity(task) }));
     const goalActivity = new Map(data.goals.map(goal => [goal.id, data.tasks.filter(task => task.goalId === goal.id).reduce((max, task) => latest(max, task.activityAt), ownActivity(goal))]));
     data.goals = data.goals.map(g => ({ ...g, taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)) }));
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));

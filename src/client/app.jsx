@@ -5,7 +5,7 @@ import { Field, ActionButton, DirectoryField, CollapsibleText } from './componen
 import { ModelPicker, ModelsPage } from './model-picker.jsx';
 import { ProjectHierarchy, TaskPath, CompletedGoals } from './hierarchy.jsx';
 import { defaultProjectId, graphSections, graphLayout, hiddenDependencies } from './graph.js';
-import { activeViewTasks, compareActivity, completedTasks, isCompleted, orderByActivity, visibleCounts } from './display.js';
+import { activeViewTasks, compareActivity, completedTasks, isCompleted, orderByActivity, verificationsForTask, visibleCounts } from './display.js';
 import { goalSummary } from '../core/hierarchy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 import { canReconcileTask, taskDeletionReason } from '../core/task-actions.js';
@@ -98,7 +98,7 @@ export function App() {
             </section></div>
           <section className="acms-panel"><div className="acms-sectionhead"><h2>最近的执行</h2><span className="acms-muted">执行结束后会自动进入检查与交付</span></div><RunTable attempts={data.attempts.slice(-8).reverse()} data={data} select={selectTask} navigate={navigate} /></section>
         </>}
-        {tab === 'projects' && <ProjectsPage data={data} navigate={navigate} select={selectTask} open={open} scope={scope} act={safeAct} busy={busy} onGoal={(projectId, goalId) => { setScope({ projectId, goalId }); setTab('tasks'); }} />}
+        {tab === 'projects' && <ProjectsPage data={data} navigate={navigate} select={selectTask} open={open} scope={scope} act={safeAct} busy={busy} onGoal={(projectId, goalId, options = {}) => { setScope({ projectId, goalId, ...(options.completed ? { completed: true } : {}) }); setTab('tasks'); }} />}
         {tab === 'runs' && <><PageHead title="当前执行" description="点击任务查看执行详情。" /><RunTable attempts={active} data={data} select={selectTask} navigate={navigate} /></>}
         {tab === 'inbox' && <><PageHead title="待处理事项" description="只处理需要你提供材料或作出决定的分支。" />{!pending.length && <Empty title="暂无待处理事项" />}{pending.map(i => <section className="acms-panel" key={i.id}><button className="text" onClick={() => selectTask(i.taskId)}>{data.tasks.find(t => t.id === i.taskId)?.title}</button><p>{i.question}</p><button onClick={() => open('answer', i)}>查看并回复</button></section>)}</>}
         {tab === 'tasks' && <Tasks navigate={navigate} data={data} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={() => setScope({})} />}
@@ -210,7 +210,7 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
   const attempts = data.attempts.filter(a => a.taskId === task.id).reverse(); const interactions = data.interactions.filter(i => i.taskId === task.id && i.status === 'pending');
   const awaitingRecovery = canReconcileTask(task, attempts);
   const recoveryAttempt = attempts.find(a => a.cleanupPending || ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status)) ?? attempts[0];
-  const artifacts = data.artifacts.filter(a => a.taskId === task.id); const verifications = data.verifications.filter(v => v.taskId === task.id); const childTasks = data.tasks.filter(t => t.parentId === task.id);
+  const artifacts = data.artifacts.filter(a => a.taskId === task.id); const verifications = verificationsForTask(task, attempts, data.verifications); const childTasks = data.tasks.filter(t => t.parentId === task.id);
   const childButton = t => <button className="text" key={t.id} onClick={() => select(t.id)}>{t.title}</button>;
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label="任务详情"><header><span className="acms-small-id">{task.id.slice(-8).toUpperCase()}</span><button className="acms-icon-btn" onClick={close} aria-label="关闭任务详情">×</button></header><Badge status={task.status} /><h2>{task.title}</h2><TaskPath task={task} data={data} select={select} navigate={navigate} /><button className="text" onClick={() => navigate('agent', task.agentId)}>负责人：{data.agents.find(a => a.id === task.agentId)?.name ?? '已删除角色'}</button><CollapsibleText text={task.description} lines={3} label="说明" /><section><h3>下级任务（{childTasks.length}）</h3>{!childTasks.length ? <p className="acms-muted">暂无下级任务。</p> : <>{childTasks.slice(0, 8).map(childButton)}{childTasks.length > 8 && <details><summary>显示其余 {childTasks.length - 8} 项</summary>{childTasks.slice(8).map(childButton)}</details>}</>}{task.kind !== 'review' && data.goals.some(g => g.id === task.goalId && openGoal(g)) && <button onClick={() => open('task', { goalId: task.goalId, projectId: task.projectId, parentId: task.id })}>＋ 创建子任务</button>}</section><div className="acms-actions wrap">
     {task.agentId && <button onClick={() => chat(task.agentId, task.id)}>与负责人对话</button>}

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { activeViewTasks, childrenIndex, completedTasks, goalVisibleInActiveView, hasOpenDescendant, isCompleted, orderByActivity, visibleCounts } from '../src/client/display.js';
+import { activeViewTasks, childrenIndex, completedTasks, goalVisibleInActiveView, hasOpenDescendant, isCompleted, orderByActivity, verificationsForTask, visibleCounts } from '../src/client/display.js';
 
 const task = (id, status, parentId = null, extra = {}) => ({ id, status, parentId, createdAt: '2026-01-01T00:00:00.000Z', activityAt: '2026-01-01T00:00:00.000Z', ...extra });
 
@@ -25,6 +25,18 @@ test('active view keeps unfinished work and only the completed ancestors needed 
   const index = childrenIndex(tasks);
   assert.equal(hasOpenDescendant(tasks[0], index), true);
   assert.equal(hasOpenDescendant(tasks[3], index), false);
+});
+
+test('review task evidence follows the review attempt even when the conclusion targets another entity', () => {
+  const task = { id: 'review-task' };
+  const attempts = [{ id: 'review-attempt', taskId: 'review-task' }, { id: 'other-attempt', taskId: 'other-task' }];
+  const verifications = [
+    { id: 'direct', taskId: 'review-task', attemptId: 'direct-attempt' },
+    { id: 'goal-review', taskId: 'goal-id', attemptId: 'review-attempt' },
+    { id: 'task-review', taskId: 'reviewed-task', attemptId: 'review-attempt' },
+    { id: 'foreign', taskId: 'other-task', attemptId: 'other-attempt' },
+  ];
+  assert.deepEqual(verificationsForTask(task, attempts, verifications).map(item => item.id), ['direct', 'goal-review', 'task-review']);
 });
 
 test('completed taxonomy, goal visibility and counts are display-only', () => {

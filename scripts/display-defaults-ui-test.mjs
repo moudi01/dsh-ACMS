@@ -18,6 +18,7 @@ const insertEvent = (at, type, entityId, goalId) => store.db.prepare('INSERT INT
 // Long goal + long task list (goal with exactly 12 ready tasks).
 const longGoal = command('goal.create', { projectId, title: '长说明目标', description: '这是一个很长的目标说明。'.repeat(24), acceptance: '长列表与折叠文本均可验证。', plan: false });
 const longTask = command('task.create', { goalId: longGoal.id, title: '长说明任务', description: '这是一段需要默认折叠的任务说明。'.repeat(20) });
+command('task.create', { goalId: longGoal.id, title: '短文本任务', description: '验收完整内容'.repeat(20) });
 const listGoal = command('goal.create', { projectId, title: '长列表目标', description: '用于验证长列表计数。', acceptance: '可展开全部。', plan: false });
 for (let index = 1; index <= 12; index += 1) command('task.create', { goalId: listGoal.id, title: `长列表任务 ${String(index).padStart(2, '0')}` });
 
@@ -30,6 +31,10 @@ const cancelledTask = store.put('tasks', { id: 'task_cancelled_example', goalId:
 insertEvent(iso(-260000), 'task.succeeded', completedTask.id, doneGoal.id);
 insertEvent(iso(-160000), 'task.succeeded', archivedTask.id, doneGoal.id);
 insertEvent(iso(-60000), 'task.succeeded', cancelledTask.id, doneGoal.id);
+const reviewTask = store.put('tasks', { id: 'task_goal_review_example', goalId: doneGoal.id, projectId, title: '目标最终审查示例', description: '目标审查', acceptance: '审查', kind: 'review', status: 'succeeded', reviewScope: 'goal', dependencies: [], createdAt: iso(-50000), updatedAt: iso(-50000) });
+store.put('attempts', { id: 'attempt_goal_review_example', taskId: reviewTask.id, goalId: doneGoal.id, agentId: 'reviewer', role: 'reviewer', kind: 'review', status: 'completed', startedAt: iso(-50000) });
+store.put('verifications', { id: 'verification_goal_review_example', taskId: doneGoal.id, goalId: doneGoal.id, attemptId: 'attempt_goal_review_example', kind: 'goal-review', passed: true, summary: '目标审查通过示例', createdAt: iso(-50000) });
+insertEvent(iso(-50000), 'review.decided', reviewTask.id, doneGoal.id);
 
 // Activity ordering fixtures: newer effective event must sort B before A.
 const orderGoal = command('goal.create', { projectId, title: '活跃排序目标', description: '排序', acceptance: '排序', plan: false });
@@ -68,6 +73,7 @@ try {
   await expect(page.getByRole('button', { name: '已归档的交付', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '详情与证据 ↗' }).first().click();
   await expect(page.locator('.acms-drawer')).toContainText('产物与验收');
+  await expect(page.locator('.acms-drawer')).toContainText('目标审查通过示例');
   await page.getByRole('button', { name: '关闭任务详情' }).click();
   await page.getByRole('button', { name: '返回进行中', exact: false }).click();
 
@@ -104,9 +110,29 @@ try {
   expect(titles.indexOf('活动任务 B')).toBeGreaterThanOrEqual(0);
   expect(titles.indexOf('活动任务 B')).toBeLessThan(titles.indexOf('活动任务 A'));
 
-  // 8. No model calls or business writes from presentation filters.
+  // 9. Entering from a completed goal keeps the completed task view.
+  await page.getByRole('button', { name: '项目与目标', exact: true }).click();
+  await page.getByRole('button', { name: /^已完成目标（/ }).click();
+  const doneGoalRow = page.locator('.acms-completed-row').filter({ hasText: '已完成示例目标' });
+  await doneGoalRow.getByRole('button', { name: '查看任务 ↗' }).click();
+  await expect(page.locator('.acms-visible-count')).toContainText('已完成');
+  await expect(page.getByRole('button', { name: '已完成的交付', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '返回进行中', exact: false }).click();
+
+  // 10. Short text that would visually overflow is not truncated without a toggle.
+  await page.getByLabel('筛选目标').selectOption('');
+  await page.getByLabel('搜索任务').fill('短文本任务');
+  await page.getByRole('button', { name: '看板', exact: true }).click();
+  await page.getByRole('heading', { name: '短文本任务', exact: true }).click();
+  const shortParagraph = page.locator('.acms-drawer .acms-collapsible p').first();
+  const metrics = await shortParagraph.evaluate(element => ({ scroll: element.scrollHeight, client: element.clientHeight }));
+  expect(metrics.scroll).toBeLessThanOrEqual(metrics.client + 1);
+  await expect(page.locator('.acms-drawer').getByRole('button', { name: '展开说明' })).toHaveCount(0);
+  await page.getByRole('button', { name: '关闭任务详情' }).click();
+
+  // 11. No model calls or business writes from presentation filters.
   expect(server.adapter.calls.length).toBe(0);
-  const report = { passed: true, checked: ['completed hidden by default with counts', 'completed list search/status filter/details evidence', 'project/goal/task collapsed defaults', 'keyboard disclosure and refresh persistence', 'long text expand/collapse', 'long list count and expansion', 'activity ordering', 'zero model calls'], projectId, errors };
+  const report = { passed: true, checked: ['completed hidden by default with counts', 'completed list search/status filter/details evidence', 'review conclusions linked through attempt ids', 'completed-goal navigation keeps the completed view', 'short text is not truncated without a toggle', 'project/goal/task collapsed defaults', 'keyboard disclosure and refresh persistence', 'long text expand/collapse', 'long list count and expansion', 'task parent activity aggregation', 'activity ordering', 'zero model calls'], projectId, errors };
   await writeFile('test-results/ui/display-defaults-report.json', JSON.stringify(report, null, 2));
   expect(errors).toEqual([]);
   console.log(JSON.stringify(report, null, 2));

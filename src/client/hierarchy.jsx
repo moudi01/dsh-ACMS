@@ -63,7 +63,7 @@ export function CompletedGoals({ data, navigate, onGoal, query: initialQuery = '
         <div><button className="text" onClick={() => navigate?.('goal', goal.id)}>{goal.title}</button><small>{project?.name ?? '未知项目'} · {tasks.length} 项任务</small></div>
         <Badge status={goal.status} />
         <time className="acms-muted">{goal.activityAt ? new Date(goal.activityAt).toLocaleString('zh-CN', { hour12: false }) : '—'}</time>
-        {onGoal && <button className="text" onClick={() => onGoal(goal.projectId, goal.id)}>查看任务 ↗</button>}
+        {onGoal && <button className="text" onClick={() => onGoal(goal.projectId, goal.id, { completed: true })}>查看任务 ↗</button>}
       </div>;
     })}</div>}
   </section>;
