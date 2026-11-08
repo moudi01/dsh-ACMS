@@ -5,11 +5,12 @@ import path from 'node:path';
 import { fixture, until } from './helpers.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 
-test('untrusted plan nodes cannot inject internal stage state or skip independent review', async t => {
+test('untrusted plan nodes cannot inject internal state and do not gain review control', async t => {
   const f = await fixture(t, async input => input.task.kind === 'plan' ? { outcome: 'planned', tasks: [{ key: 'one', title: 'Safe child', stageIndex: 999, kind: 'repair', workflowSnapshot: { steps: [] }, reviewOf: 'foreign-task' }] } : defaultSimulation(input));
   const goal = f.command('goal.create', { title: 'Plan isolation', description: 'Make a verified artifact', acceptance: 'Independent review', projectId: f.project.id });
   await f.start(); await until(() => f.store.require('goals', goal.id).status === 'succeeded');
-  const child = f.store.list('tasks').find(t => t.kind === 'work'); assert.equal(child.reviewOf, null); assert.equal(child.workflowSnapshot.version, 1);
+  const child = f.store.list('tasks').find(t => t.kind === 'work');
+  assert.equal(child.reviewOf, null); assert.equal(child.workflowSnapshot, undefined); assert.equal(child.stageIndex, undefined);
   assert(f.adapter.calls.some(c => c.task.kind === 'review'));
 });
 test('goal runtime budget aborts live execution and only blocks its own branch', async t => {
@@ -18,21 +19,48 @@ test('goal runtime budget aborts live execution and only blocks its own branch',
   assert.equal(f.adapter.active, 0); assert.equal(f.company.policy().paused, false); assert.equal(f.store.list('artifacts').length, 0);
 });
 
-test('submission automatically wakes an independent reviewer and completes with evidence', async t => {
+test('delivery completes with automatic checks and no review unless requested', async t => {
   const f = await fixture(t); const task = f.task(); await f.start();
-  await until(() => f.store.require('tasks', task.id).status === 'succeeded');
-  const calls = f.adapter.calls; assert.equal(calls.length, 2); assert.equal(calls[1].task.kind, 'review');
-  assert.notEqual(calls[0].agent.id, calls[1].agent.id);
-  assert.equal(f.store.list('artifacts').length, 1); assert.equal(f.store.list('verifications').filter(v => v.passed).length, 2);
-  assert.equal(f.store.require('goals', f.goal.id).status, 'succeeded');
-  assert(f.store.page(0).entries.some(e => e.type === 'review.queued'));
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded' && f.store.require('goals', f.goal.id).status === 'succeeded');
+  assert.equal(f.adapter.calls.length, 1);
+  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'review').length, 0);
+  assert.equal(f.store.list('tasks').filter(t => t.kind === 'review').length, 0);
+  assert.equal(f.store.list('verifications').filter(v => v.passed).length, 1);
 });
-test('review rejection automatically reworks and sends the new version back for review', async t => {
+test('base template creates exactly one goal-level review after delivery', async t => {
+  const f = await fixture(t);
+  const goal = f.command('goal.create', { title: 'Reviewed goal', description: 'Deliver', acceptance: 'Reviewed once', projectId: f.project.id, templateId: 'base', plan: false });
+  f.task({ goalId: goal.id, title: 'Deliver reviewed file' });
+  await f.start(); await until(() => f.store.require('goals', goal.id).status === 'succeeded');
+  const reviews = f.store.list('tasks').filter(t => t.kind === 'review' && t.goalId === goal.id);
+  assert.equal(reviews.length, 1); assert.equal(reviews[0].reviewScope, 'goal');
+  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'review').length, 1);
+  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'work').length, 1);
+  assert.equal(f.store.list('verifications').filter(v => v.kind === 'goal-review' && v.passed).length, 1);
+});
+test('goal final review excludes every reviewed author', async t => {
+  const f = await fixture(t);
+  const goal = f.command('goal.create', { title: 'Self review guard', description: 'Deliver', acceptance: 'Reviewed', projectId: f.project.id, templateId: 'base', plan: false });
+  f.command('task.create', { goalId: goal.id, title: 'Work by the reviewer role', agentId: 'reviewer' });
+  await f.start(); await until(() => f.store.require('goals', goal.id).status === 'succeeded', 15000);
+  const review = f.store.list('tasks').find(t => t.kind === 'review' && t.goalId === goal.id);
+  assert.notEqual(review.agentId, 'reviewer');
+  const verification = f.store.list('verifications').find(v => v.kind === 'goal-review');
+  assert.notEqual(verification.reviewerId, 'reviewer');
+  assert.equal(verification.passed, true);
+});
+test('review rejection requests manager rework without reopening the delivered task', async t => {
   let reviews = 0;
   const f = await fixture(t, async input => input.task.kind === 'review' && ++reviews === 1 ? { outcome: 'reviewed', decision: 'changes_requested', summary: 'Add explanation', findings: ['Missing context'] } : defaultSimulation(input));
-  const task = f.task(); await f.start(); await until(() => f.store.require('tasks', task.id).status === 'succeeded');
-  assert.equal(reviews, 2); assert.equal(f.store.require('tasks', task.id).reworks, 1);
-  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'work').length, 2);
+  const goal = f.command('goal.create', { title: 'Rejected goal', description: 'Deliver', acceptance: 'Reviewed once', projectId: f.project.id, templateId: 'base', plan: false });
+  const task = f.task({ goalId: goal.id });
+  await f.start();
+  await until(() => f.store.list('tasks').some(t => t.kind === 'coordination'));
+  assert.equal(reviews, 1);
+  assert.equal(f.store.require('tasks', task.id).status, 'succeeded');
+  assert.equal(f.store.require('goals', goal.id).status, 'active');
+  assert.equal(f.store.list('tasks').find(t => t.kind === 'review').passed, false);
+  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'work').length, 1);
 });
 test('a human-input wait blocks only its branch and the answer wakes it', async t => {
   const f = await fixture(t, async input => input.task.title === 'Needs material' && !input.task.lastAnswer ? { outcome: 'blocked', kind: 'human', reason: 'Missing required source', question: 'Provide the source.' } : defaultSimulation(input));
@@ -51,7 +79,7 @@ test('concurrency includes cleanup and leaves space for control work', async t =
   const f = await fixture(t); f.adapter.delay = 80;
   for (let i = 0; i < 8; i++) f.task({ title: `Parallel ${i}` });
   await f.start(); await until(() => f.store.require('goals', f.goal.id).status === 'succeeded');
-  assert(f.adapter.maxActive <= 4); assert(f.adapter.calls.filter(c => c.task.kind === 'review').length === 8);
+  assert(f.adapter.maxActive <= 4); assert.equal(f.adapter.calls.filter(c => c.task.kind === 'review').length, 0);
 });
 test('invalid artifacts cannot bypass verification', async t => {
   const f = await fixture(t, async input => input.task.kind === 'work' ? { outcome: 'completed', summary: 'Claimed success', artifacts: [{ path: '../outside.txt' }] } : defaultSimulation(input));
@@ -82,13 +110,17 @@ test('unknown prior execution is reconciled instead of blindly dispatched', asyn
   f.command('task.reconcile', { id: task.id });
   await until(() => f.store.require('tasks', task.id).status === 'succeeded');
 });
-test('reviewer cannot approve files modified after verification', async t => {
+test('a review cannot approve files modified after delivery', async t => {
   const f = await fixture(t, async input => {
     if (input.task.kind === 'review') { await writeFile(path.join(f.store.require('tasks', input.task.reviewOf).workspace.path, 'deliverable.md'), 'Changed during review'); return { outcome: 'reviewed', decision: 'approve', summary: 'Claimed pass' }; }
     return defaultSimulation(input);
   });
-  const task = f.task(); await f.start(); await until(() => f.store.list('attempts').some(a => a.kind === 'review' && a.status === 'failed'));
-  assert.notEqual(f.store.require('tasks', task.id).status, 'succeeded');
+  const task = f.task(); await f.start();
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded');
+  f.command('review.request', { id: task.id });
+  await until(() => f.store.list('attempts').some(a => a.kind === 'review' && a.status === 'failed'));
+  assert.equal(f.store.require('tasks', task.id).status, 'succeeded');
+  assert.equal(f.store.list('verifications').filter(v => v.kind === 'review').length, 0);
 });
 
 test('archiving an unverified dependency does not release downstream execution', async t => {

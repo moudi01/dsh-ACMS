@@ -31,7 +31,7 @@ test('durable completed receipt is accepted after restart without re-running the
   f.store.transaction(() => { task = f.store.put('tasks', { ...task, workspace, status: 'running', activeAttemptId: attempt.id }); f.store.put('attempts', attempt); });
   f.adapter.reconcile = async () => ({ status: 'completed', finishedAt: new Date().toISOString(), result: { outcome: 'completed', summary: 'Recovered', artifacts: [{ path: 'output.md' }] } });
   await f.start(); await until(() => f.store.require('tasks', task.id).status === 'succeeded');
-  assert.deepEqual(f.adapter.calls.map(c => c.task.kind), ['review']);
+  assert.deepEqual(f.adapter.calls.map(c => c.task.kind), []);
   assert(f.store.page(0).entries.some(e => e.type === 'attempt.result.recovered'));
 });
 test('failed acceptance checks are retained as evidence and block independent approval', async t => {
@@ -72,9 +72,36 @@ test('a failed integration candidate opens manager coordination and leaves the s
   // integration must still leave every business file and the source commit intact.
   assert.equal((await run('git', ['status', '--porcelain'], f.source)).stdout, '?? .acms/\n');
 });
-test('workflow migration pins a new version and invalidates the old contract at a safe point', async t => {
-  const f = await fixture(t); const task = f.task(); const workflow = f.command('workflow.publish', { id: 'default', name: 'New review', steps: [{ id: 'work', name: 'Work', type: 'work' }, { id: 'review', name: 'Review', type: 'review' }] });
-  assert.equal(f.store.require('tasks', task.id).workflowSnapshot.version, 1);
-  const changed = f.command('task.migrateWorkflow', { id: task.id, workflowId: workflow.id, reason: 'New acceptance policy' });
-  assert.equal(changed.status, 'paused'); assert.equal(changed.workflowSnapshot.version, 2); assert.equal(changed.generation, 2);
+test('goal templates are pinned on creation and later versions do not change in-flight goals', async t => {
+  const f = await fixture(t);
+  const template = f.command('workflow.publish', { id: 'pin', name: 'v1', phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }] });
+  const goal = f.command('goal.create', { title: 'Pinned review', description: 'Deliver', acceptance: 'Reviewed', projectId: f.project.id, templateId: template.id, plan: false });
+  f.task({ goalId: goal.id });
+  // Republishing the same template without final review must not change the
+  // in-flight goal: it keeps the creation-time snapshot.
+  f.command('workflow.publish', { id: template.id, name: 'v2 direct', phases: [{ id: 'execute', name: '执行' }], expectedRevision: template.revision });
+  await f.start();
+  await until(() => f.store.require('goals', goal.id).status === 'succeeded', 15000);
+  assert.equal(f.store.require('goals', goal.id).templateSnapshot.version, 1);
+  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'review').length, 1);
+
+  // The reverse also holds: a goal created without final review does not gain
+  // one when a newer template version adds it.
+  const direct = f.command('workflow.publish', { id: 'direct', name: 'direct', phases: [{ id: 'execute', name: '执行' }] });
+  const plain = f.command('goal.create', { title: 'Pinned direct', description: 'Deliver', acceptance: 'Delivered', projectId: f.project.id, templateId: direct.id, plan: false });
+  f.task({ goalId: plain.id });
+  f.command('workflow.publish', { id: direct.id, name: 'with review', phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], expectedRevision: direct.revision });
+  await until(() => f.store.require('goals', plain.id).status === 'succeeded', 15000);
+  assert.equal(f.adapter.calls.filter(c => c.task.kind === 'review').length, 1);
+});
+test('template versions are pinned for new goals without rewriting existing ones', async t => {
+  const f = await fixture(t); const goal = f.goal;
+  const template = f.command('workflow.publish', { name: '带最终审查', phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }] });
+  assert.equal(template.version, 1); assert.equal(template.finalReview, true);
+  assert.equal(f.store.require('goals', goal.id).templateId, f.template.id);
+  const next = f.command('workflow.publish', { id: template.id, name: '带最终审查', phases: template.phases, expectedRevision: template.revision });
+  assert.equal(next.version, 2);
+  assert.equal(f.store.require('goals', goal.id).templateId, f.template.id);
+  const child = f.task();
+  assert.equal(child.workflowSnapshot, undefined); assert.equal(child.stageIndex, undefined);
 });

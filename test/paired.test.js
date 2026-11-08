@@ -27,12 +27,12 @@ test('pairing validates invitation, immutable preview and one-time acceptance wi
   await assert.rejects(paired.accept(invite.id, changed.fingerprint), { code: 'INVITE_EXPIRED' });
   assert(!JSON.stringify(f.company.snapshot()).includes(receipt.token));
 });
-test('paired runner performs manual probe then automatic execution and independent reviewer wake', async t => {
+test('paired runner performs manual probe then automatic execution', async t => {
   const f = await fixture(t); const { paired, invite } = await pairing(f, runner); const candidate = await paired.inspect(invite.id); await paired.accept(invite.id, candidate.fingerprint);
   const ctx = { get: () => null, subagents: { providers: new Map() } }; const adapter = new DshAdapter(ctx, f.company, f.dataDir, { paired }); f.engine.adapter = adapter;
   const probe = await adapter.probeModel({ provider: candidate.id, model: candidate.model }); assert.equal(probe.status, 'available'); assert.equal(probe.reasoning.effective, 'high');
   const task = f.task(); await f.start(); await until(() => f.store.require('tasks', task.id).status === 'succeeded');
-  const attempts = f.store.list('attempts'); assert.equal(attempts.length, 2); assert(attempts.every(a => a.provider === candidate.id)); assert.notEqual(attempts[0].contextKey, attempts[1].contextKey);
+  const attempts = f.store.list('attempts'); assert.equal(attempts.length, 1); assert(attempts.every(a => a.provider === candidate.id));
   assert.equal(await readFile(path.join(f.store.require('tasks', task.id).workspace.path, 'output.txt'), 'utf8'), 'Fixture delivery');
   assert.equal(paired.running.size, 0);
 });
@@ -58,7 +58,7 @@ test('task-only pairing registers without a probe and rejects probes before proc
   assert.equal(f.store.list('modelHealth').length, 0);
   f.engine.adapter = adapter; const task = f.task(); await f.start();
   await until(() => f.store.require('tasks', task.id).status === 'succeeded');
-  assert.equal(f.store.list('attempts').length, 2);
+  assert.equal(f.store.list('attempts').length, 1);
 });
 test('paired runner rejects wrong model responses and aborts the owned process', async t => {
   const f = await fixture(t); const bad = await pairing(f, `let input=''; for await(const b of process.stdin)input+=b; const r=JSON.parse(input);console.log(JSON.stringify({...r,model:'wrong-model',executed:true,output:'OK'}));`);

@@ -1,4 +1,4 @@
-﻿// Real HTTP + temporary SQLite + the real review state machine; the adapter is simulated.
+// Real HTTP + temporary SQLite + the real review state machine; the adapter is simulated.
 // This file exercises integration wiring only and is NOT real-model execution evidence.
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -61,6 +61,10 @@ test("GET /reviews returns real approve and changes-requested conclusions", asyn
   const task = f.task();
   await f.start();
   await until(() => f.store.require("tasks", task.id).status === "succeeded", 15000);
+  f.command("review.request", { id: task.id });
+  await until(() => f.store.list("verifications").some(v => v.kind === "review" && v.passed === false), 15000);
+  f.command("review.request", { id: task.id });
+  await until(() => f.store.list("verifications").some(v => v.kind === "review" && v.passed === true), 15000);
   const response = await get(api, "/reviews?goalId=" + encodeURIComponent(f.goal.id), token);
   assert.equal(response.status, 200);
   const value = response.body.value;

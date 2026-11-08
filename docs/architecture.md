@@ -12,8 +12,9 @@ flowchart LR
   A --> M[负责人 / 执行员 / 审查员]
   M --> W[隔离工作区]
   W --> V[产物固化 / 所有者检查]
-  V --> R[独立审查任务 / 自动唤醒]
-  R --> I[候选合并验证]
+  V --> T[可选审查子任务 / 模板最终审查]
+  V --> I[候选合并验证]
+  T --> I
   I --> P[项目或交付分支]
   D --> E[带游标的事件读取]
   E --> U
@@ -23,7 +24,7 @@ ACMS 是 `dsh-acms` host + client bundle；内置 `@acms/codex-runtime` 会话�
 
 ## 数据与事务
 
-SQLite 使用 WAL、FULL synchronous、同步短事务。文件与模型调用不放进数据库事务。核心集合：projects、goals、tasks、agents、workflows/history、attempts、artifacts、verifications、interactions。
+SQLite 使用 WAL、FULL synchronous、同步短事务。文件与模型调用不放进数据库事务。核心集合：projects、goals、tasks、agents、templates/history、workflows/history（旧阶段制数据，只读保留）、attempts、artifacts、verifications、interactions。
 
 每次写入递增实体 revision；编辑可以携带 `expectedRevision` 防止覆盖。命令的 requestId 与参数指纹一起持久化，同一请求重放返回原结果，不同参数复用同一 ID 会被拒绝。数据库事务提交后才发布事件。
 
@@ -35,9 +36,7 @@ SQLite 使用 WAL、FULL synchronous、同步短事务。文件与模型调用�
 stateDiagram-v2
   [*] --> ready
   ready --> running: 领取执行与资源
-  running --> reviewing: 文件与检查通过
-  reviewing --> ready: 审查提出具体缺陷
-  reviewing --> integrating: 末级独立审查通过
+  running --> integrating: 文件与检查通过
   integrating --> succeeded: 候选验证与交付成功
   running --> blocked: 需要材料 / 修复依赖
   blocked --> ready: 回答 / 依赖完成
@@ -47,11 +46,13 @@ stateDiagram-v2
   reconciling --> ready: 身份匹配的停止回执，且已确认清理
 ```
 
-完成执行只提交结果；不能直接写 `succeeded`。检查通过后，在同一事务中推进流程并创建 review task，下一次调度立即唤醒审查员，不需要所有者发消息。审查与原作者使用不同 agent 身份。审查员使用独立验证副本，可以创建测试临时文件；原作者工作区不在其可写根目录中。
+任务是最小执行粒度，没有阶段、没有 `reviewing` 等待态。执行完成只提交结果；检查通过后进入集成并交付。审查是独立子任务（`kind=review`），由用户按需添加，或由目标模板在交付时自动创建一次；它读取交付物快照、验收标准和自动检查结果，不读取执行过程。审查与原作者使用不同 agent 身份，并使用独立验证副本。
 
-交付物复制到按内容标识的 blob，记录大小和哈希；Git 变更集额外固定所有修改文件的哈希。审查前后检查版本一致。源码文本在受限大小内随审查合同提供，宿主检查结果单独提供。审查失败返回实现阶段；工具环境失败要求报告 technical blocker，重试审查而非虚构交付缺陷。
+目标模板（`templates`）是版本化的目标级方案，基础模板为「拆分 → 执行 → 最终审查」。目标在创建时固定模板快照（`templateSnapshot`），之后发布新版本不会改变在途目标的审查策略。含最终审查的模板会在所有非审查任务交付后创建一次总体审查；不含审查的模板在交付后直接完成，记录“按用户配置未审查”。模板属于所有者边界。
 
-流程版本在创建任务时固定。发布新版本不改变在途合同。所有者可在安全状态显式迁移任务，递增 generation、废弃旧审查并暂停；恢复后重新执行与验收。
+旧阶段制数据的自动迁移在 `Engine.start` 取得调度租约之后、恢复执行之前进行：逐条核对旧 attempt 的执行回执，只有确认清理的才归档并释放名额；无法确认时阻止启动且不改数据，旧宿主持有租约时也不会先迁移。
+
+交付物复制到按内容标识的 blob，记录大小和哈希；Git 变更集额外固定所有修改文件的哈希。审查前后检查版本一致。审查失败不重开被审任务：写入失败证据并生成负责人协调任务，目标恢复 active，由负责人决定返工范围。返工次数按目标/交付链累计；达到上限或没有可用负责人时，改为创建一个可回复的阻塞协调任务（所有者门控），恢复负责人后由调度器自动接续。审查员必须不是任何被审成果的作者，创建与受理时都会校验。工具环境失败要求报告 technical blocker，重试审查而非虚构交付缺陷。
 
 ## 阻塞分级与负责人接管
 
@@ -61,7 +62,7 @@ stateDiagram-v2
 
 ## 公司治理与资源
 
-所有者控制目标、项目路径、可执行检查、provider/model 白名单、并发和预算。管理角色可以在授权目标内创建任务、调整依赖/分工、管理角色与发布工作流，不能扩大所有者边界。原生工具身份由 live activation 推导；不会接受模型传入的身份字符串。
+所有者控制目标、项目路径、可执行检查、目标模板、provider/model 白名单、并发和预算。管理角色可以在授权目标内创建任务、调整依赖/分工、管理角色，但不能发布目标模板或改变审查选择，也不能扩大所有者边界。原生工具身份由 live activation 推导；不会接受模型传入的身份字符串。
 
 默认最大 4 个 AI 执行，其中协调预留 1 个，普通执行最多 3 个。同一 agent 同时只接一个任务。释放资源必须等 provider 清理确认；未知执行与待清理执行仍占资源。内置 Codex 的 ACMS 模式禁用原生 multi_agent 功能，任务拆分统一返回调度器管理。
 

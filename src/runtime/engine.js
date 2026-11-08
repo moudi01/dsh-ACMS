@@ -4,7 +4,8 @@ import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
-import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, scheduleRepairFlow } from '../core/coordination.js';
+import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow } from '../core/coordination.js';
+import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 
@@ -18,15 +19,25 @@ export class Engine {
   async start() {
     this.closing = false;
     this.epoch = this.store.acquireLease(this.owner);
-    try { this.conversations?.recover(); await this.recover(); } catch (e) { this.store.releaseLease(this.owner); throw e; }
+    try {
+      // Exclusive migration: the lease is held and the scheduler is not running
+      // yet. Unconfirmed legacy processes block startup instead of being
+      // silently released.
+      this.legacyMigration = await migrateLegacyForEngine({ store: this.store, adapter: this.adapter, dataDir: this.workspaces.dataDir });
+      this.conversations?.recover(); await this.recover();
+    } catch (e) { this.store.releaseLease(this.owner); throw e; }
     this.listener = () => this.kick(); this.store.events.on('event', this.listener);
     this.timer = setInterval(() => this.kick(), this.intervalMs); this.timer.unref?.(); this.kick();
-    for (const task of this.store.list('tasks')) if (task.status === 'integrating') this.queueIntegration(task.id);
+    for (const task of this.store.list('tasks')) if (task.status === 'integrating' && !task.legacyBatch && !task.workflowSnapshot) this.queueIntegration(task.id);
   }
   kick() { if (this.closing || this.scheduled) return; this.scheduled = true; queueMicrotask(() => { this.scheduled = false; this.tick().catch(e => { this.lastError = String(e.message); }); }); }
   fenced() { assert(this.store.ownsLease(this.owner, this.epoch), 'LEASE_LOST', 'Scheduler no longer owns the company lease'); }
   async recover(taskId) {
-    for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
+    for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !a.legacyBatch && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
+      const legacyTask = this.store.get('tasks', previous.taskId);
+      // Stage-model tasks are backed up and isolated; never reconcile, accept or
+      // re-dispatch them under the atomic task model.
+      if (legacyTask?.legacyBatch || legacyTask?.workflowSnapshot) continue;
       let fact;
       try { fact = await this.adapter.reconcile?.(previous) ?? { status: 'unknown', reason: '执行器未提供恢复回执' }; }
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
@@ -112,21 +123,32 @@ export class Engine {
       if (this.company.policy().paused) return;
       this.refreshReadiness();
       const p = this.company.policy();
-      const active = this.store.list('attempts').filter(a => ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id));
+      const active = this.store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id)));
       let free = p.maxConcurrent - active.length - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
-      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
+      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
         if (active.some(a => a.taskId === task.id)) continue;
         const goal = this.store.require('goals', task.goalId);
         if ((spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
         if (['work', 'repair'].includes(task.kind) && ordinary >= Math.max(1, p.maxConcurrent - p.controlSlots)) continue;
-        if (busyAgents.has(task.agentId)) continue;
-        const agent = this.store.require('agents', task.agentId); if (agent.status !== 'available') { this.block(task, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。'); continue; }
-        const attempt = this.claim(task, agent);
-        free--; busyAgents.add(agent.id); if (['work', 'repair'].includes(task.kind)) ordinary++;
+        let claimed = task;
+        // An owner rework gate may exist without a manager. The owner answers
+        // the blocker first; the next tick assigns whichever manager is now
+        // available, or asks again without touching the delivered task.
+        if (!claimed.agentId) {
+          const manager = claimed.kind === 'coordination' ? findManager(this.company, claimed.goalId) : null;
+          // Binding a coordinator is a dispatch decision: it must hold the
+          // permissions the coordination result will be accepted against.
+          if (!manager || !canCoordinate(this.company, manager)) { this.block(claimed, 'assignment', '没有具备协调授权的负责人（需要 task.create 与 task.retry）', '请恢复或创建负责人并确认其拥有 task.create 与 task.retry 授权，然后恢复此待办。'); continue; }
+          claimed = this.store.put('tasks', { ...claimed, agentId: manager.id });
+        }
+        if (busyAgents.has(claimed.agentId)) continue;
+        const agent = this.store.require('agents', claimed.agentId); if (agent.status !== 'available') { this.block(claimed, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。'); continue; }
+        const attempt = this.claim(claimed, agent);
+        free--; busyAgents.add(agent.id); if (['work', 'repair'].includes(claimed.kind)) ordinary++;
         const controller = new AbortController(); const entry = { taskId: task.id, controller, promise: null };
         this.live.set(attempt.id, entry);
         entry.promise = this.execute(attempt, controller).catch(e => { this.lastError = String(e.message); }).finally(() => { this.live.delete(attempt.id); this.kick(); });
@@ -295,22 +317,12 @@ export class Engine {
     assert(checksPassed, 'CHECK_FAILED', `Configured acceptance checks failed: ${collected.checks.filter(c => !c.passed).map(c => `${c.id}: ${c.stderr || c.stdout || c.code}`).join('\n').slice(0, 6000)}`, { checks: collected.checks });
     this.store.transaction(() => {
       task = this.store.require('tasks', task.id);
-      task = this.store.put('tasks', { ...task, artifactIds: collected.artifacts.map(a => a.id), artifactHash: collected.hash, changeSet: collected.changeSet, summary: output.summary ?? '', status: 'reviewing', lastAuthorId: attempt.agentId });
+      task = this.store.put('tasks', { ...task, artifactIds: collected.artifacts.map(a => a.id), artifactHash: collected.hash, changeSet: collected.changeSet, summary: output.summary ?? '', status: 'integrating', lastAuthorId: attempt.agentId });
       this.finishAttempt(attempt, 'completed', output.summary);
-      this.nextStage(task);
+      this.queueIntegration(task.id);
     });
   }
   acceptPlan(task, attempt, output) { return acceptPlanFlow(this, task, attempt, output); }
-  nextStage(task) {
-    const nextIndex = task.stageIndex + 1; const step = task.workflowSnapshot.steps[nextIndex];
-    if (!step) { this.store.put('tasks', { ...task, status: 'integrating' }); this.queueIntegration(task.id); return; }
-    task = this.store.put('tasks', { ...task, stageIndex: nextIndex, status: step.type === 'review' ? 'reviewing' : 'ready' });
-    if (step.type === 'review') {
-      const reviewer = this.store.list('agents').find(a => a.role === 'reviewer' && a.status === 'available' && a.id !== task.lastAuthorId) ?? this.company.temporaryAgent(task.goalId, 'reviewer');
-      const review = this.company.createTask({ goalId: task.goalId, kind: 'review', title: `审查：${task.title}`, description: `阶段：${step.name}。独立核对交付物、检查结果和验收标准。`, acceptance: task.acceptance, parentId: task.id, reviewOf: task.id, reviewArtifactHash: task.artifactHash, agentId: reviewer.id, workflowSnapshot: task.workflowSnapshot, requiresArtifacts: false, checkIds: [] }, SYSTEM);
-      this.store.event('review.queued', review.id, { taskId: task.id, reviewerId: reviewer.id, artifactHash: task.artifactHash }, SYSTEM);
-    }
-  }
   scheduleRepair(task, reason) { return scheduleRepairFlow(this, task, reason); }
   async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
   queueIntegration(taskId) {

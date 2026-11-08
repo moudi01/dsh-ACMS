@@ -72,7 +72,7 @@ test('editing a running task stops obsolete execution before the revised run and
   const work = f.adapter.calls.filter(c => c.task.id === task.id); assert.equal(work.length, 2);
   assert.equal(work[1].task.title, 'Revised task'); assert.match(work[1].prompt, /changeNotifications/);
   assert.equal(f.store.list('attempts').find(a => a.id === work[0].attempt.id).status, 'interrupted');
-  assert.equal(f.store.list('verifications').filter(v => v.taskId === task.id && v.kind === 'review').length, 1);
+  assert.equal(f.store.list('verifications').filter(v => v.taskId === task.id && v.kind === 'review').length, 0);
 });
 
 test('completed task editing requires an available assignee and invalidates the old acceptance', async t => {
@@ -85,7 +85,7 @@ test('completed task editing requires an available assignee and invalidates the 
   assert.equal(f.store.require('goals', task.goalId).status, 'active');
   await until(() => f.store.require('tasks', task.id).status === 'succeeded');
   assert.equal(f.adapter.calls.filter(c => c.task.id === task.id).length, 2);
-  assert.equal(f.store.list('verifications').filter(v => v.taskId === task.id && v.kind === 'review').length, 2);
+  assert.equal(f.store.list('verifications').filter(v => v.taskId === task.id && v.kind === 'review').length, 0);
 });
 
 test('an edit during preparation never starts the obsolete model call', async t => {

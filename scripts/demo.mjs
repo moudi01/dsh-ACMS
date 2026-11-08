@@ -20,5 +20,5 @@ try {
   await engine.start(); const deadline = Date.now() + 15000;
   while (store.require('goals', goal.id).status !== 'succeeded' && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
   if (store.require('goals', goal.id).status !== 'succeeded') throw new Error(`Demo did not complete: ${engine.lastError ?? JSON.stringify(store.list('tasks').map(t => ({ title: t.title, status: t.status, feedback: t.feedback })))}`);
-  console.log(JSON.stringify({ mode: 'simulation', result: 'passed', artifacts: store.list('artifacts').length, reviews: store.list('verifications').filter(v => v.kind === 'review').length, dataDir }, null, 2));
+  console.log(JSON.stringify({ mode: 'simulation', result: 'passed', artifacts: store.list('artifacts').length, reviews: store.list('verifications').filter(v => v.kind === 'review' || v.kind === 'goal-review').length, dataDir }, null, 2));
 } finally { await engine.stop(); store.close(); }

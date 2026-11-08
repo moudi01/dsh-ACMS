@@ -17,10 +17,13 @@ export async function fixture(t, handler = defaultSimulation) {
   const engine = new Engine(company, adapter, workspaces, { intervalMs: 20 });
   const command = (name, args = {}, principal = OWNER, requestId = randomUUID()) => company.command(principal, requestId, name, args);
   const project = command('project.save', { name: 'Fixture', repoRoot: source, mode: 'copy', checks: [] });
-  const goal = command('goal.create', { title: 'Fixture goal', description: 'Create verified test files.', acceptance: 'Files exist and independent review passes.', projectId: project.id, plan: false });
+  // The default fixture goal delivers without review: review is an explicit,
+  // user-requested sub-task, so ordinary scheduling tests should not need one.
+  const template = command('workflow.publish', { id: 'fixture-direct', name: '直接交付', phases: [{ id: 'execute', name: '执行' }] });
+  const goal = command('goal.create', { title: 'Fixture goal', description: 'Create verified test files.', acceptance: 'Files exist and independent review passes.', projectId: project.id, templateId: template.id, plan: false });
   let started = false;
   t.after(async () => { if (started) await engine.stop(); store.close(); const absolute = path.resolve(root); if (!inside(path.resolve(tmpdir()), absolute) || !path.basename(absolute).startsWith('acms-test-')) throw new Error('Refusing unsafe fixture cleanup'); await rm(absolute, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 }); });
-  return { root, source, dataDir, store, company, workspaces, adapter, engine, project, goal, command,
+  return { root, source, dataDir, store, company, workspaces, adapter, engine, project, goal, template, command,
     task: (args = {}) => command('task.create', { goalId: goal.id, title: 'Deliver a file', description: 'Create a useful output file.', acceptance: 'Output exists and has content.', ...args }),
     start: async () => { await engine.start(); started = true; },
   };

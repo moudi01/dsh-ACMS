@@ -21,7 +21,7 @@ test('graceful company pause lets the active attempt finish and holds all new wo
   for (let i=0;i<5;i++) await f.engine.tick();
   assert.equal(f.store.list('attempts').length,1);
   assert.equal(f.store.require('tasks',queued.id).status,'ready');
-  assert.equal(f.store.list('tasks').find(t=>t.reviewOf===task.id).status,'ready');
+  assert.equal(f.store.list('tasks').filter(t=>t.kind==='review').length,0);
   f.command('company.resume');
   await until(() => [task,queued].every(t=>f.store.require('tasks',t.id).status==='succeeded'));
   assert.equal(f.company.policy().pauseMode,null);
