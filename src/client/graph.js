@@ -95,6 +95,12 @@ export function graphSections({ projects = [], goals = [], tasks = [], projectId
   }
   sections = sections.filter(section => section.tasks.length);
   sections.sort((a, b) => sectionActivity(b) - sectionActivity(a) || a.key.localeCompare(b.key));
+  const projectGoalIds = new Set(goals.filter(item => item.projectId === projectId).map(item => item.id));
+  const canvasKeyOf = record => {
+    if (!record) return null;
+    if (mode === 'goals') return projectGoalIds.has(record.goalId) && record.projectId === projectId ? `goal:${record.goalId}` : 'goal:unknown';
+    return `goal:${record.goalId}`;
+  };
   const canvasKeys = new Map();
   for (const section of sections) {
     section.counts = scopeCounts(section.tasks);
@@ -111,10 +117,12 @@ export function graphSections({ projects = [], goals = [], tasks = [], projectId
   const knownById = new Map(knownTasks.map(task => [task.id, task]));
   const crossScope = [];
   for (const section of sections) for (const task of section.tasks) for (const dependencyId of task.dependencies ?? []) {
-    const owner = canvasKeys.get(dependencyId);
-    if (owner === canvasKeys.get(task.id)) continue;
-    if (!owner) continue;
-    crossScope.push({ taskId: task.id, taskTitle: task.title, dependencyId, dependencyTitle: knownById.get(dependencyId)?.title ?? null, section: canvasKeys.get(task.id), dependencySection: owner });
+    const dependency = knownById.get(dependencyId);
+    if (!dependency) continue;
+    const current = canvasKeys.get(task.id) ?? canvasKeyOf(task);
+    const owner = canvasKeyOf(dependency);
+    if (!owner || owner === current) continue;
+    crossScope.push({ taskId: task.id, taskTitle: task.title, dependencyId, dependencyTitle: dependency.title ?? null, section: current, dependencySection: owner });
   }
   const scopeLabel = goalId
     ? `项目：${project?.name ?? '未知项目'} · 目标：${goal?.title ?? '未知目标'}`

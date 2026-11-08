@@ -104,6 +104,22 @@ test('graphSections reports cross-scope dependencies instead of drawing them', (
   );
 });
 
+test('cross-scope detection survives filters that hide the other side', () => {
+  const all = [task('a1', 'p1', 'g1'), task('b1', 'p2', 'g2', { dependencies: ['a1'] })];
+  const projects = [project('p1'), project('p2')];
+  const goals = [goal('g1', 'p1'), goal('g2', 'p2')];
+  const full = graphSections({ projects, goals, tasks: all, knownTasks: all });
+  assert.equal(full.crossScope.length, 1);
+  for (const filters of [{ projectId: 'p2' }, { goalId: 'g2' }]) {
+    const filtered = graphSections({ projects, goals, tasks: [all[1]], knownTasks: all, ...filters });
+    assert.equal(filtered.crossScope.length, 1, JSON.stringify(filters));
+    assert.equal(filtered.crossScope[0].dependencyId, 'a1');
+  }
+  const sameGoal = [task('t1', 'p1', 'g1'), task('t2', 'p1', 'g1', { dependencies: ['t1'] })];
+  const hiddenOnly = graphSections({ projects, goals, tasks: [sameGoal[1]], knownTasks: sameGoal, projectId: 'p1' });
+  assert.equal(hiddenOnly.crossScope.length, 0);
+});
+
 test('hiddenDependencies surfaces filtered predecessors once, with titles when known', () => {
   const known = [task('t1', 'p1', 'g1', { title: '基础任务' }), task('t2', 'p1', 'g1', { dependencies: ['t1', 't1'], title: '依赖任务' })];
   const hidden = hiddenDependencies([known[1]], known);

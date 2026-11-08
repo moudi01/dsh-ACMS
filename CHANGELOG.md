@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Isolate the dependency graph by project and goal (issue #24): focus the most recently active project by default, partition "全部项目" into folded, counted project/goal sections, keep per-object folding across data refreshes, and show filtered predecessors as expandable placeholders without writing task state or calling a model.
+- Address #24 review findings: creation dialogs inherit the focused project and goal, a single remaining partition keeps its section and folded state, and cross-scope dependencies stay reported even when filters hide the other side.
 
 - Final candidate hardening: keep the published ACL step working when the host exports a foreign PSModulePath, clean ACL fixtures without EPERM, retry transient Windows index-rename errors, correct the fs.rm retry documentation, and verify the empty-models flow by closing the pairing dialog before navigation.
 

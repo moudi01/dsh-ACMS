@@ -61,6 +61,16 @@ try {
   await expect(section('A 目标一')).toContainText('2 项任务');
   await page.screenshot({ path: 'test-results/ui/graph-focus.png', fullPage: true });
 
+  // 1b. Create actions inherit the focused project/goal instead of the first array item.
+  await page.getByRole('button', { name: '＋ 新建任务', exact: true }).click();
+  const taskDialog = page.getByRole('dialog');
+  await expect(taskDialog.getByLabel('授权目标')).toHaveValue(goalA1.id);
+  await taskDialog.getByRole('button', { name: '取消', exact: true }).click();
+  await page.getByRole('button', { name: '＋ 新建目标', exact: true }).click();
+  const goalDialog = page.getByRole('dialog');
+  await expect(goalDialog.getByLabel('所属项目')).toHaveValue(projectA.id);
+  await goalDialog.getByRole('button', { name: '取消', exact: true }).click();
+
   // 2. "全部项目" partitions by project with counts and is folded by default.
   await page.getByLabel('筛选项目').selectOption('');
   await expect(page.locator('.acms-graph-section')).toHaveCount(2);
@@ -96,9 +106,28 @@ try {
   await expect(nodes(page)).toHaveCount(1);
   await expect(section('B 目标二')).toContainText('B3 第二目标任务');
 
+  // 5b. Filtering down to the folded section keeps the section, its title and its folded state.
+  await page.getByLabel('搜索任务').fill('B1 基线');
+  await expect(page.locator('.acms-graph-section')).toHaveCount(1);
+  await expect(section('B 目标一')).toContainText('B 目标一');
+  await expect(nodes(page)).toHaveCount(0);
+  expect(await openState(section('B 目标一'))).toBe(false);
+  await section('B 目标一').locator('summary').click();
+  await expect(nodes(page)).toHaveCount(1);
+  await page.getByLabel('搜索任务').fill('');
+
   // 6. Per-object state: project A stays expanded after switching scopes.
   await page.getByLabel('筛选项目').selectOption('');
   expect(await openState(section('隔离测试项目 A'))).toBe(true);
+
+  // 6b. A single matching project partition is still a section, not a bypass of folding.
+  await section('隔离测试项目 A').locator('summary').click();
+  await page.getByLabel('搜索任务').fill('A1 基线');
+  await expect(page.locator('.acms-graph-section')).toHaveCount(1);
+  expect(await openState(section('隔离测试项目 A'))).toBe(false);
+  await expect(nodes(page)).toHaveCount(0);
+  await page.getByLabel('搜索任务').fill('');
+  await expect(page.locator('.acms-graph-section')).toHaveCount(2);
 
   // 7. A goal scope renders a single canvas without any project section.
   await page.getByLabel('筛选项目').selectOption(projectB.id);
