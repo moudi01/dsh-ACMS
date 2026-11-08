@@ -56,9 +56,17 @@ test('reviewed Git delivery is validated in an isolated candidate then fast-forw
   assert((await readFile(path.join(f.source, 'deliverable.md'), 'utf8')).length > 0);
   assert(saved.changeSet.some(c => c.path === 'deliverable.md'));
 });
-test('a failed integration candidate leaves the source project commit unchanged', async t => {
+test('a failed integration candidate opens manager coordination and leaves the source project commit unchanged', async t => {
   const f = await fixture(t); const before = await gitProject(f, [{ id: 'integration-regression', command: 'node', args: ['-e', "process.exit(process.cwd().includes('integration')?1:0)"] }]);
-  const task = f.task(); await f.start(); await until(() => f.store.require('tasks', task.id).blocker?.kind === 'integration', 20000);
+  const task = f.task(); await f.start();
+  const routed = await until(() => f.store.page(0, 1000).entries.find(entry => entry.type === 'blocker.coordinated' && entry.blockerKind === 'integration'), 20000);
+  assert.equal(routed.route, 'manager');
+  const coordinations = f.store.list('tasks').filter(item => item.kind === 'coordination' && item.coordinationOf === task.id);
+  assert.equal(coordinations.length, 1);
+  assert.equal(coordinations[0].agentId, 'manager');
+  // After the manager decision the same blocker is handed to the owner instead of looping.
+  const blocked = await until(() => { const saved = f.store.require('tasks', task.id); return saved.blocker?.kind === 'integration' ? saved : null; }, 20000);
+  assert.equal(f.store.list('tasks').filter(item => item.kind === 'coordination' && item.coordinationOf === task.id).length, 1);
   assert.equal((await run('git', ['rev-parse', 'HEAD'], f.source)).stdout, before);
   // Project registration now creates host-owned collaboration metadata. A failed
   // integration must still leave every business file and the source commit intact.

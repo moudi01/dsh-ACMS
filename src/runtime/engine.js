@@ -4,7 +4,8 @@ import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
-import { completeCoordination, coordinateExecutionLimit, scheduleRepairFlow } from '../core/coordination.js';
+import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, scheduleRepairFlow } from '../core/coordination.js';
+import { blockerRoute } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
@@ -340,10 +341,21 @@ export class Engine {
   }
   block(task, kind, reason, question) {
     return this.store.transaction(() => {
-      task = this.store.require('tasks', task.id); this.store.put('tasks', { ...task, status: 'blocked', blocker: { kind, reason } });
-      if (!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending')) this.store.put('interactions', { id: id('interaction'), taskId: task.id, goalId: task.goalId, taskGeneration: task.generation, kind, reason, question, status: 'pending' });
-      this.store.event('task.blocked', task.id, { kind, reason }, SYSTEM);
+      task = this.store.require('tasks', task.id);
+      if (blockerRoute(task, kind) === 'manager') return this.coordinateBlocker(task, { kind, reason, question });
+      return this.blockForOwner(task, kind, reason, question);
     });
+  }
+  coordinateBlocker(task, options) { return coordinateBlocker(this, task, options); }
+  blockForOwner(task, kind, reason, question) {
+    task = this.store.require('tasks', task.id);
+    // A coordination decision may adjust a paused task, but it must never turn the
+    // owner pause into work. Owner-facing blocks keep the pause status untouched.
+    const paused = task.status === 'paused';
+    this.store.put('tasks', { ...task, status: paused ? 'paused' : 'blocked', blocker: { kind, reason } });
+    if (!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending')) this.store.put('interactions', { id: id('interaction'), taskId: task.id, goalId: task.goalId, taskGeneration: task.generation, kind, reason, question, status: 'pending' });
+    this.store.event('task.blocked', task.id, { kind, reason, route: 'owner' }, SYSTEM);
+    return this.store.require('tasks', task.id);
   }
   fail(attempt, error, aborted) {
     this.store.transaction(() => {

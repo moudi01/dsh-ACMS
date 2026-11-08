@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { DshAdapter } from "../src/adapters/dsh.js";
 import { Store } from "../src/core/store.js";
 import { buildCandidates, makeCandidate, selectRoute, selectionError } from "../src/core/model-selection.js";
@@ -175,22 +176,29 @@ test("adapter exposes modelContext candidates and preferences consistently", asy
   const chosen = await adapter.choose({ provider: "auto", model: "" });
   assert.equal(chosen.name, "paired:x"); assert.equal(chosen.model, "gpt-x");
 });
-test("engine blocks a task without retry when no model candidate is eligible", async t => {
+test("engine hands a model-selection blocker to the manager instead of asking the user", async t => {
   const f = await fixture(t);
   const unhealthy = candidate("m1", "spawn", 0, { health: { status: "unavailable" } });
   const error = selectionError(selectRoute({ candidates: [unhealthy], policy: {} }));
-  f.adapter.start = async () => { throw error; };
   const task = f.task();
-  await f.start();
-  const blocked = await until(() => { const saved = f.store.get("tasks", task.id); return saved?.status === "blocked" ? saved : null; });
-  assert.equal(blocked.blocker.kind, "model-selection");
-  const interaction = f.store.list("interactions").find(i => i.taskId === task.id && i.status === "pending");
-  assert.equal(interaction.kind, "model-selection");
-  const attempts = f.store.list("attempts").filter(a => a.taskId === task.id);
+  const attempt = { id: randomUUID(), taskId: task.id, goalId: f.goal.id, agentId: task.agentId, role: "worker", kind: "work", taskGeneration: task.generation, grants: [], status: "running", startedAt: new Date().toISOString() };
+  f.store.transaction(() => { f.store.put("attempts", attempt); f.store.put("tasks", { ...f.store.require("tasks", task.id), status: "running", activeAttemptId: attempt.id }); });
+  await f.engine.fail(attempt, error, false);
+  const blocked = f.store.require("tasks", task.id);
+  assert.equal(blocked.blocker.kind, "coordination");
+  const coordinations = f.store.list("tasks").filter(item => item.kind === "coordination" && item.coordinationOf === task.id);
+  assert.equal(coordinations.length, 1);
+  assert.equal(coordinations[0].agentId, "manager");
+  assert.equal(coordinations[0].origin.blockerKind, "model-selection");
+  assert.equal(f.store.list("interactions").filter(item => item.taskId === task.id && item.status === "pending").length, 0);
+  const attempts = f.store.list("attempts").filter(item => item.taskId === task.id);
   assert.equal(attempts.length, 1);
   assert.equal(attempts[0].selection.blocked.code, "NO_ELIGIBLE_CANDIDATE");
-  await new Promise(resolve => setTimeout(resolve, 150));
-  assert.equal(f.store.list("attempts").filter(a => a.taskId === task.id).length, 1);
+  const events = f.store.page(0, 1000).entries;
+  assert(events.some(event => event.type === "blocker.coordinated" && event.blockerKind === "model-selection" && event.route === "manager"));
+  // Repeating the same blocker while the manager is still deciding must not duplicate work.
+  f.engine.block(f.store.require("tasks", task.id), "model-selection", error.message, "retry?");
+  assert.equal(f.store.list("tasks").filter(item => item.kind === "coordination" && item.coordinationOf === task.id).length, 1);
 });
 
 test("required reasoning depth is reported and unknown external depth fails closed", () => {
