@@ -1,4 +1,4 @@
-import { assert, id, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest } from './util.js';
+import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest } from './util.js';
 import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-actions.js';
 import { goalSummary } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
@@ -262,17 +262,31 @@ export class Company {
   reviewRequest(args, actor) {
     this.owner(actor);
     if (args.scope === 'goal' || args.goalId) {
-      const goal = this.store.require('goals', args.goalId);
+      const goalId = args.goalId ?? args.id;
+      const goal = this.store.require('goals', goalId);
       assert(!goal.legacyBatch, 'LEGACY_TASK', '旧目标已备份隔离，不能添加审查');
       assert(goal.status !== 'deleted', 'ENTITY_DELETED', '目标已删除');
       const deliveryHash = this.deliveryHash(goal.id);
+      const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewScope === 'goal' && task.goalId === goal.id && task.deliveryHash === deliveryHash && task.status !== 'deleted' && !TERMINAL.has(task.status));
+      if (active) {
+        this.store.event('review.request.reused', active.id, { goalId: goal.id, deliveryHash, requestedBy: actor.id ?? actor.kind }, actor, { goalId: goal.id });
+        return active;
+      }
+      const targets = this.store.list('tasks').filter(task => task.goalId === goal.id && task.kind === 'work' && task.status === 'succeeded' && !task.legacyBatch && !task.workflowSnapshot);
+      assert(targets.length > 0, 'NO_DELIVERABLE', '目标还没有已交付成果，不能发起最终审查');
       const review = this.createGoalReview(goal, deliveryHash);
+      this.store.event('review.requested', review.id, { goalId: goal.id, scope: 'goal', deliveryHash, reviewerId: review.agentId }, actor, { goalId: goal.id });
       return review;
     }
     const source = this.store.require('tasks', args.id);
     assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
     assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
     assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
+    const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewOf === source.id && task.reviewArtifactHash === source.artifactHash && task.status !== 'deleted' && !TERMINAL.has(task.status));
+    if (active) {
+      this.store.event('review.request.reused', active.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, requestedBy: actor.id ?? actor.kind }, actor, { goalId: source.goalId });
+      return active;
+    }
     const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);    const review = this.createTask({
       goalId: source.goalId, kind: 'review', title: `审查：${source.title}`,
       description: '审查已交付成果。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
@@ -317,8 +331,9 @@ export class Company {
     const pending = this.store.list('attempts').filter(a => a.taskId === task.id && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending));
     const active = pending.length > 0;
     const reconciling = task.status === 'reconciling' || pending.some(a => a.status === 'reconciling' || a.cleanupUncertain);
+    const cancellation = target === 'cancelled' ? { cancelledAt: now(), cancelledBy: actor?.kind === 'owner' ? 'owner' : actor?.id ?? 'system', cancelReason: typeof args.reason === 'string' ? args.reason : null } : {};
     const saved = this.store.put('tasks', { ...task, status: active ? (reconciling ? 'reconciling' : 'stopping') : target, resumeStatus: task.status,
-      stopRequested: active ? target : null, recoveryRequested: active }, args.expectedRevision);
+      stopRequested: active ? target : null, recoveryRequested: active, ...cancellation }, args.expectedRevision);
     if (target === 'cancelled') this.invalidateInteractions(task.id, '任务已取消');
     for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
     this.store.event(`task.${target}.requested`, task.id, args.reason ? { reason: args.reason } : {}, actor);
@@ -506,8 +521,24 @@ export class Company {
       stack.delete(task.id); memo.set(task.id, value); return value;
     };
     data.tasks = data.tasks.map(task => ({ ...task, activityAt: effectiveTaskActivity(task) }));
+    // Review state is bound to the current delivery: historical reviews for an
+    // older artifact/delivery must never override the current version, and a
+    // later edit (e.g. cancelling an old review) must not reorder it.
+    const reviewTasks = data.tasks.filter(task => task.kind === 'review');
+    const byCreationDesc = (a, b) => (Date.parse(b.createdAt ?? '') || 0) - (Date.parse(a.createdAt ?? '') || 0) || (b.revision ?? 0) - (a.revision ?? 0) || String(b.id).localeCompare(String(a.id));
+    const representative = reviews => reviews.slice().sort(byCreationDesc)[0] ?? null;
+    const deliveryHashes = new Map(data.goals.map(goal => [goal.id, this.deliveryHash(goal.id)]));
+    const reviewSummary = review => review ? ({ id: review.id, status: review.status, passed: review.passed ?? null, reviewScope: review.reviewScope ?? null, createdAt: review.createdAt, updatedAt: review.updatedAt, cancelledAt: review.cancelledAt ?? null, cancelledBy: review.cancelledBy ?? null, cancelReason: review.cancelReason ?? null, deliveryHash: review.deliveryHash ?? null, artifactHash: review.reviewArtifactHash ?? null }) : null;
+    data.tasks = data.tasks.map(task => {
+      const current = reviewTasks.filter(review => review.reviewOf === task.id && review.reviewArtifactHash === task.artifactHash);
+      return { ...task, reviewSummary: reviewSummary(representative(current)) };
+    });
     const goalActivity = new Map(data.goals.map(goal => [goal.id, data.tasks.filter(task => task.goalId === goal.id).reduce((max, task) => latest(max, task.activityAt), ownActivity(goal))]));
-    data.goals = data.goals.map(g => ({ ...g, taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)) }));
+    data.goals = data.goals.map(g => {
+      const reviews = reviewTasks.filter(review => review.reviewScope === 'goal' && review.goalId === g.id);
+      const current = reviews.filter(review => review.deliveryHash === deliveryHashes.get(g.id));
+      return { ...g, taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
+    });
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));
     data.modelPreferences = sanitizePreferences(this.store.get("modelPreferences", "model"));
     data.agentCredentials = data.agentCredentials.map(credentialSnapshot);

@@ -89,3 +89,13 @@
 .acms-completed-row time{font-size:12px;white-space:nowrap}
 .acms-evidence .acms-verification{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--acms-line)}
 @media(max-width:720px){.acms-completed-row{grid-template-columns:minmax(0,1fr) auto;gap:8px}.acms-completed-row>time,.acms-completed-row>span.acms-muted{display:none}}
+
+/* Issue #20: review cancellation state and rebuild entry. */
+.acms-review-state{border:1px solid var(--acms-line);border-radius:10px;padding:14px;margin-top:16px;display:grid;gap:8px;background:var(--acms-panel)}
+.acms-review-state h3{margin:0}
+.acms-review-state p{margin:0!important}
+.acms-review-state .acms-tag{margin-right:6px}
+.acms-review-history{margin-top:8px;border-top:1px solid var(--acms-line);padding-top:8px}
+.acms-review-history summary{cursor:pointer;color:var(--acms-muted);font-size:12px}
+.acms-review-history-row{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:4px 0;font-size:12px}
+.acms-review-history-row small{color:var(--acms-muted)}
