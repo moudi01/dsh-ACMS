@@ -1,7 +1,7 @@
-import { assert, digest, SYSTEM } from "./util.js";
+import { assert, digest, now, SYSTEM } from "./util.js";
 import { blockerCoordinationKey } from "./blocker-policy.js";
 
-const CAPACITY_LIMIT_CODES = new Set(["TASK_LIMIT", "AGENT_LIMIT"]);
+export const CAPACITY_LIMIT_CODES = new Set(["TASK_LIMIT", "AGENT_LIMIT"]);
 
 // Capacity limits are owner boundaries, not scheduler errors. If a coordination
 // task cannot be created, the caller must keep the attempt's terminal state and
@@ -11,6 +11,22 @@ function capacityBlock(engine, task, kind, reason, question, context) {
 }
 
 export function reviewCoordinationKey(reviewId) { return "review:" + reviewId; }
+export function timeBoxCoordinationKey(goalId, boxMs) { return `timebox:${goalId}:${boxMs}`; }
+
+/**
+ * Manager finished the time-box wrap-up decision. Ordinary dispatch may resume
+ * for this goal; the hard runtime cap is untouched. Missing/no-op for any other
+ * coordination keeps the helper safe to call unconditionally.
+ */
+export function releaseTimeBox(store, coordination, actor = SYSTEM) {
+  const goal = coordination?.goalId ? store.get("goals", coordination.goalId) : null;
+  if (!goal?.timeBox || goal.timeBox.releasedAt) return goal;
+  if (goal.timeBox.coordinationTaskId && goal.timeBox.coordinationTaskId !== coordination.id) return goal;
+  if (goal.timeBox.key && coordination.coordinationKey && goal.timeBox.key !== coordination.coordinationKey) return goal;
+  const saved = store.put("goals", { ...goal, timeBox: { ...goal.timeBox, releasedAt: now(), releasedBy: actor?.id ?? actor?.kind ?? "system" } });
+  store.event("goal.timebox.released", goal.id, { coordinationTaskId: coordination.id, releasedBy: actor?.id ?? null }, actor ?? SYSTEM, { goalId: goal.id });
+  return saved;
+}
 export function executorCoordinationKey(taskId, generation, reasonCode) { return "executor:" + taskId + ":g" + generation + ":" + reasonCode; }
 export function feedbackHashOf(output) { return digest({ summary: output?.summary ?? "", findings: Array.isArray(output?.findings) ? output.findings : [] }); }
 
@@ -217,8 +233,14 @@ export function completeCoordination(engine, task, attempt, output) {
     const source = current.coordinationOf ? store.get("tasks", current.coordinationOf) : null;
     engine.finishAttempt(attempt, "completed", output.summary);
     const saved = store.put("tasks", { ...current, status: "succeeded", summary: output.summary ?? "", decision: { kind: "manager-decision", by: attempt.agentId, basis: output.summary ?? "", sourceTaskId: current.coordinationOf ?? null } });
-    if (source) releaseCoordinatedSource(engine, saved);
     const actor = { kind: "agent", id: attempt.agentId, goalId: task.goalId, grants: attempt.grants };
+    if (source) releaseCoordinatedSource(engine, saved);
+    if (current.origin?.kind === "timebox") {
+      releaseTimeBox(store, saved, actor);
+      // The last ordinary task may have finished while this coordination was
+      // still open; release is the only remaining event, so recompute delivery.
+      company.refreshGoal(task.goalId);
+    }
     store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf ?? null, decision: { kind: "manager-decision", by: attempt.agentId, basis: output.summary ?? "" } }, actor, { goalId: task.goalId });
     return saved;
   });

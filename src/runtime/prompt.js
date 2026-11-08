@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
 
 export function promptFor(company, task, attempt, options = {}) {
   const goal = company.store.require('goals', task.goalId); const agent = company.store.require('agents', attempt.agentId);
@@ -35,7 +36,7 @@ export function promptFor(company, task, attempt, options = {}) {
     ...(agent.role === "manager" && options.modelContext ? { modelContext: options.modelContext } : {}),
     ...(source ? { review: { scope: 'task', task: source.title, acceptance: source.acceptance, artifacts, sourceEvidence, allChangedFiles: source.changeSet, expectedHash: task.reviewArtifactHash, checks: company.store.list('verifications').filter(v => v.taskId === source.id).at(-1) } } : task.reviewScope === 'goal' ? { review: goalReviewEvidence(company, task, goal) } : {}),
   };
-  const coordinationMode = '负责人协调返工：阅读 CONTRACT.coordination、goalConstraints、goalTasks、plans、decisionLog 与 rework，在现有授权内独立决定。返回 {~Q~outcome~Q~:~Q~coordinated~Q~,~Q~summary~Q~:~Q~决定与理由~Q~} 表示直接恢复返工；返回 {~Q~outcome~Q~:~Q~planned~Q~,~Q~rationale~Q~:~Q~...~Q~,~Q~summary~Q~:~Q~...~Q~,~Q~tasks~Q~:[...]} 表示重新拆分返工任务；返回 {~Q~outcome~Q~:~Q~managed~Q~,~Q~actionBatchId~Q~:~Q~...~Q~,~Q~summary~Q~:~Q~...~Q~,~Q~actions~Q~:[...]} 用现有命令调整分派、依赖或重试，之后 ACMS 会再唤醒你。不得扩大权限、不得创建新的协调任务、不得替用户回答阻塞。仅在缺少授权或重大范围决策时返回 {~Q~outcome~Q~:~Q~blocked~Q~,~Q~kind~Q~:~Q~human~Q~,~Q~reason~Q~:~Q~...~Q~,~Q~question~Q~:~Q~...~Q~,~Q~reversibleDefault~Q~:~Q~...~Q~}。'.replaceAll('~Q~', String.fromCharCode(34));
+  const coordinationMode = '负责人协调返工：阅读 CONTRACT.coordination、goalConstraints、goalTasks、plans、decisionLog 与 rework，在现有授权内独立决定。返回 {~Q~outcome~Q~:~Q~coordinated~Q~,~Q~summary~Q~:~Q~决定与理由~Q~} 表示直接恢复返工；返回 {~Q~outcome~Q~:~Q~planned~Q~,~Q~rationale~Q~:~Q~...~Q~,~Q~summary~Q~:~Q~...~Q~,~Q~tasks~Q~:[...]} 表示重新拆分返工任务；返回 {~Q~outcome~Q~:~Q~managed~Q~,~Q~actionBatchId~Q~:~Q~...~Q~,~Q~summary~Q~:~Q~...~Q~,~Q~actions~Q~:[...]} 用现有命令调整分派、依赖或重试，之后 ACMS 会再唤醒你。不得扩大权限、不得创建新的协调任务、不得替用户回答阻塞。若 CONTRACT.budget.timeBox 存在，先保存检查点并决定收尾、缩小范围或调整分派，不要自动追加预算。仅在缺少授权或重大范围决策时返回 {~Q~outcome~Q~:~Q~blocked~Q~,~Q~kind~Q~:~Q~human~Q~,~Q~reason~Q~:~Q~...~Q~,~Q~question~Q~:~Q~...~Q~,~Q~reversibleDefault~Q~:~Q~...~Q~}。'.replaceAll('~Q~', String.fromCharCode(34));
   const modes = task.kind === 'coordination' ? coordinationMode : task.kind === 'plan' ? `Return {"outcome":"planned","summary":"...","tasks":[{"key":"one","title":"...","description":"...","acceptance":"...","dependencies":[],"longLived":false}]}. Dependencies reference keys in this plan. Create a small acyclic plan inside the authorized goal. Do not perform implementation during planning. Every task must have concrete deliverables and independent acceptance criteria.`
     : task.kind === 'review' ? `Independently inspect the delivered artifacts and automatic check evidence against the acceptance criteria. Judge the delivered outcome only: do not review the work process, the author's report or the conversation history. For a goal-level review, evaluate every listed target. Do not edit deliverables or implement fixes. Return {"outcome":"reviewed","decision":"approve" or "changes_requested","summary":"...","findings":["specific evidence"]}. Approve only when the delivered version meets the contract. If your execution tools or sandbox fail, return {"outcome":"blocked","kind":"technical","reason":"specific environment failure"} so ACMS retries the review. Reserve changes_requested for an actual deliverable defect, not a broken reviewer environment.`
     : `Do the actual work inside the isolated workspace. Return {"outcome":"completed","summary":"...","artifacts":[{"path":"relative/path","title":"..."}]}. Deliver actual files, not only a final message. Do not change the source project outside this workspace. Do not write ACMS metadata, policy, credentials or database. Do not spawn background processes that outlive this run. If division of work is needed, return {"outcome":"decomposed","tasks":[{"key":"...","title":"...","description":"...","acceptance":"...","dependencies":[]}]} instead of spawning unmanaged agents. If truly blocked, return {"outcome":"blocked","kind":"technical" or "human","reason":"...","question":"...","reversibleDefault":"optional safe default already used"}. Solve reversible decisions autonomously. Missing permissions or unique required material require a human interaction, not invented answers.`;
@@ -78,6 +79,13 @@ function buildManagerExtras(company, goal, task) {
     goalTasks: tasks.map(t => ({ id: t.id, title: t.title, kind: t.kind, status: t.status, agentId: t.agentId ?? null, parentId: t.parentId ?? null, dependencies: t.dependencies ?? [], reworks: t.reworks ?? 0, coordinationKey: t.coordinationKey ?? null, origin: t.origin ?? null })),
     coordination: source ? { sourceTaskId: source.id, sourceTitle: source.title, sourceStatus: source.status, sourceFeedback: source.feedback ?? null, sourceAgentId: source.agentId ?? null, sourceDependencies: source.dependencies ?? [], reviewTaskId: task.reviewTaskId ?? null, reviewRound: task.reviewRound ?? null, feedbackHash: task.feedbackHash ?? null, coordinationKey: task.coordinationKey ?? null, rework: { reworks: source.reworks ?? 0, maxReworks: company.policy().maxReworks } } : null,
     rework: { feedback: (source ?? task).feedback ?? null, reworks: (source ?? task).reworks ?? 0, maxReworks: company.policy().maxReworks },
-    effectiveGrants: company.effectiveGrants({ id: task.agentId }).join(", ")
+    effectiveGrants: company.effectiveGrants({ id: task.agentId }).join(", "),
+    budget: {
+      usedMs: goalRuntimeSpent(goal, store.list("attempts")),
+      hardLimitMs: goalRuntimeLimit(goal, company.policy()),
+      timeBoxLimitMs: goalTimeBoxLimit(goal, company.policy()),
+      reserveMs: company.policy().timeBoxReserveMs ?? 0,
+      timeBox: goal.timeBox ?? null,
+    },
   };
 }

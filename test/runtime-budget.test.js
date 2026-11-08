@@ -3,6 +3,17 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { fixture, until } from './helpers.js';
 import { OWNER } from '../src/core/util.js';
+import { goalTimeBoxLimit } from '../src/core/runtime-budget.js';
+
+test('time box limit keeps efficiency box, extension and wrap-up reserve separate', () => {
+  const base = { maxGoalRuntimeMs: 1000, goalTimeBoxMs: 600, timeBoxReserveMs: 100 };
+  assert.equal(goalTimeBoxLimit({}, base), 600);
+  assert.equal(goalTimeBoxLimit({ runtimeExtraMs: 200 }, base), 800);
+  assert.equal(goalTimeBoxLimit({}, { maxGoalRuntimeMs: 1000, goalTimeBoxMs: 0, timeBoxReserveMs: 100 }), 900);
+  assert.equal(goalTimeBoxLimit({}, { maxGoalRuntimeMs: 1000, goalTimeBoxMs: 0, timeBoxReserveMs: 0 }), null);
+  assert.equal(goalTimeBoxLimit({ runtimeExtraMs: 120000 }, { maxGoalRuntimeMs: 1000, goalTimeBoxMs: 0, timeBoxReserveMs: 0 }), null);
+  assert.equal(goalTimeBoxLimit({}, { maxGoalRuntimeMs: 1000, goalTimeBoxMs: 5000, timeBoxReserveMs: 0 }), 1000);
+});
 
 function exhaust(f, goal = f.goal) {
   f.store.transaction(() => f.store.put('goals', { ...goal, runtimeMs: f.company.policy().maxGoalRuntimeMs + 1000 }));
