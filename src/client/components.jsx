@@ -9,6 +9,20 @@ export function ActionButton({ reason = '', compact = false, children, ...props 
   const id = useId();
   return <span className="acms-action-control"><button {...props} disabled={!!reason} title={reason || props.title} aria-describedby={reason ? id : undefined}>{children}</button>{reason && <small id={id} className={compact ? 'acms-visually-hidden' : 'acms-disabled-reason'}>{reason}</small>}</span>;
 }
+/**
+ * Bounded text summary with an accessible expand/collapse control. Disclosure
+ * state is local to the text itself, so a data refresh never force-closes it.
+ */
+export function CollapsibleText({ text, lines = 3, className = '', label = '全文', threshold = 140 }) {
+  const [open, setOpen] = useState(false);
+  const value = String(text ?? '').trim();
+  if (!value) return null;
+  const long = value.length > threshold || value.split('\n').length > 2;
+  return <div className={`acms-collapsible${open ? ' open' : ''}${className ? ` ${className}` : ''}`}>
+    <p style={{ '--acms-clamp-lines': lines }}>{value}</p>
+    {long && <button type="button" className="text acms-expand-btn" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? `收起${label}` : `展开${label}`}</button>}
+  </div>;
+}
 export function DirectoryField({ value = '', onChange, label = '项目目录', hint = '可直接粘贴完整路径，或点击选择目录。' }) {
   const [listing, setListing] = useState(null); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const input = useRef();
   const browse = async directory => { setBusy(true); setError(''); try { setListing(await api.directories(directory)); } catch (e) { setError(`无法浏览目录：${e.message}`); } finally { setBusy(false); } };

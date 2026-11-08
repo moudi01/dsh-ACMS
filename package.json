@@ -55,6 +55,7 @@
     "test:usability": "node scripts/usability-test.mjs",
     "test:structure": "node scripts/structure-test.mjs",
     "test:graph-ui": "node scripts/graph-isolation-ui-test.mjs",
+    "test:display": "node scripts/display-defaults-ui-test.mjs",
     "test:empty-models": "node scripts/empty-models-test.mjs",
     "test:pairing-ui": "node scripts/pairing-ui-test.mjs",
     "test:budget-ui": "node scripts/budget-ui-test.mjs",

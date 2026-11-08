@@ -171,7 +171,11 @@ try {
 
   // 10. Deep links resolve to the same scope and the same single-canvas rule.
   await page.getByRole('button', { name: '公司总览', exact: true }).click();
-  await page.locator('.acms-goal-group').filter({ hasText: 'B 目标一' }).getByRole('button', { name: '查看此目标的任务 →' }).click();
+  const projectGroup = page.locator('.acms-project-group').filter({ hasText: '隔离测试项目 B' });
+  await projectGroup.locator('summary').first().click({ position: { x: 8, y: 8 } });
+  const goalGroup = page.locator('.acms-goal-group').filter({ hasText: 'B 目标一' });
+  await goalGroup.locator('summary').first().click({ position: { x: 8, y: 8 } });
+  await goalGroup.getByRole('button', { name: '查看此目标的任务 →' }).click();
   await expect(page.getByLabel('筛选项目')).toHaveValue(projectB.id);
   await expect(page.getByLabel('筛选目标')).toHaveValue(goalB1.id);
   await page.getByRole('button', { name: '依赖图', exact: true }).click();
