@@ -1,4 +1,5 @@
 import { assert, digest, SYSTEM } from "./util.js";
+import { blockerCoordinationKey } from "./blocker-policy.js";
 
 export function reviewCoordinationKey(reviewId) { return "review:" + reviewId; }
 export function executorCoordinationKey(taskId, generation, reasonCode) { return "executor:" + taskId + ":g" + generation + ":" + reasonCode; }
@@ -56,11 +57,11 @@ export function createCoordination(company, source, options = {}) {
     goalId: source.goalId, kind: "coordination", title: options.title ?? ("协调返工：" + source.title), description,
     acceptance: options.acceptance ?? "负责人独立核查反馈，在现有授权内决定返工、解阻、依赖与分派调整，并给出可追溯的协调结果。",
     parentId: options.parentId ?? source.id, agentId: manager.id, priority: options.priority ?? 80,
-    origin: { kind: "scheduler", decidedBy: null, createdBy: "scheduler", basis: options.reason ?? "执行或审查反馈需要负责人协调" },
+    origin: { kind: "scheduler", decidedBy: null, createdBy: "scheduler", basis: options.reason ?? "执行或审查反馈需要负责人协调", ...(options.blockerKind ? { blockerKind: options.blockerKind } : {}) },
     coordinationOf: source.id, coordinationKey: key, reviewTaskId: options.reviewTaskId ?? null,
     reviewRound: options.reviewRound ?? null, feedbackHash: hash
   }, SYSTEM);
-  store.event("coordination.created", task.id, { sourceTaskId: source.id, coordinationKey: key, reviewTaskId: options.reviewTaskId ?? null, reviewRound: options.reviewRound ?? null, feedbackHash: hash, reason: options.reason ?? null, decision: { kind: "scheduler-action", by: "scheduler", basis: "反馈到达时由调度器创建协调入口；协调决定必须由负责人提交" } }, SYSTEM, { goalId: source.goalId });
+  store.event("coordination.created", task.id, { sourceTaskId: source.id, coordinationKey: key, reviewTaskId: options.reviewTaskId ?? null, reviewRound: options.reviewRound ?? null, feedbackHash: hash, reason: options.reason ?? null, blockerKind: options.blockerKind ?? null, decision: { kind: "scheduler-action", by: "scheduler", basis: "反馈到达时由调度器创建协调入口；协调决定必须由负责人提交" } }, SYSTEM, { goalId: source.goalId });
   return task;
 }
 
@@ -136,6 +137,44 @@ export function coordinateExecutionLimit(engine, task, reason) {
     const coordination = createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调失败处理：" + task.title, description: "任务自动重试已用完，需要负责人决定返工范围、分派或依赖。\n原因：" + reason + "\n原任务：" + task.description });
     store.event("execution.limit", task.id, { reason, coordinationTaskId: coordination.id }, SYSTEM, { goalId: task.goalId });
     return holdSourceForCoordination(store, task, coordination);
+  });
+}
+
+/**
+ * Route a recoverable blocker to the goal manager instead of asking the owner.
+ * One coordination entry per (task generation, blocker kind); a repeated blocker
+ * reuses the open entry, and a recurrence after the manager already decided is
+ * handed back to the owner rather than looping automation.
+ */
+export function coordinateBlocker(engine, task, { kind, reason, question = '' }) {
+  const { company, store } = engine;
+  return store.transaction(() => {
+    const current = store.require('tasks', task.id);
+    // Pause, stop, terminal state and coordination tasks keep the previous owner path.
+    if (current.kind === 'coordination' || current.stopRequested || ['paused', 'cancelled', 'archived', 'succeeded', 'deleted'].includes(current.status)) {
+      return engine.blockForOwner(current, kind, reason, question);
+    }
+    const key = blockerCoordinationKey(current, kind);
+    const coordinations = store.list('tasks').filter(t => t.kind === 'coordination' && t.coordinationOf === current.id && t.status !== 'deleted');
+    const open = coordinations.find(t => !['succeeded', 'cancelled'].includes(t.status));
+    if (open) {
+      store.event('blocker.coordinated', current.id, { blockerKind: kind, route: 'manager', coordinationTaskId: open.id, reason, reused: true }, SYSTEM, { goalId: current.goalId });
+      return holdSourceForCoordination(store, current, open);
+    }
+    if (coordinations.some(t => t.coordinationKey === key && t.status === 'succeeded')) {
+      return engine.blockForOwner(current, kind, reason, '本代任务的同类阻塞已由负责人处理过，自动接管已停止；请确认范围、分派或权限后恢复此分支。' + (question ? ' 原问题：' + question : ''));
+    }
+    const manager = findManager(company, current.goalId);
+    if (!canCoordinate(company, manager)) {
+      return engine.blockForOwner(current, 'assignment', '没有具备协调授权的负责人来处理该阻塞：' + reason, '请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。' + (question ? ' 原问题：' + question : ''));
+    }
+    const coordination = createCoordination(company, current, {
+      manager, key, feedbackHash: digest({ kind, reason }), reason, blockerKind: kind,
+      title: '协调解阻：' + current.title,
+      description: '自动阻塞接管（' + kind + '）：负责人需在现有授权内决定重试、换分派、缩小范围或调整依赖；只有新增权限、必须由用户提供的材料、重大范围变化或真实总预算不足才升级给用户。\n阻塞原因：' + reason + '\n原任务：' + current.description
+    });
+    store.event('blocker.coordinated', current.id, { blockerKind: kind, route: 'manager', coordinationTaskId: coordination.id, reason }, SYSTEM, { goalId: current.goalId });
+    return holdSourceForCoordination(store, current, coordination);
   });
 }
 

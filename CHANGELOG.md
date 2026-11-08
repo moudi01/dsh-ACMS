@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Route recoverable blockers to the project manager (issue #16): review-environment failures, retry exhaustion, model-selection gaps and integration conflicts now open or reuse one idempotent manager coordination task instead of a user question. Owner gates (new permissions, required material, major scope changes, real budget shortfalls, pause/cancel, and blockers the manager already decided) and audit events (`blocker.coordinated`, `task.blocked` route) are preserved.
 - Isolate the dependency graph by project and goal (issue #24): focus the most recently active project by default, partition "全部项目" into folded, counted project/goal sections, keep per-object folding across data refreshes, and show filtered predecessors as expandable placeholders without writing task state or calling a model.
 - Address #24 review findings: creation dialogs inherit the focused project and goal, a single remaining partition keeps its section and folded state, cross-scope dependencies stay reported even when filters hide the other side, and task creation is disabled with guidance when the focused project has no open goal (an empty goal selection blocks submit instead of sending an unbound value).
 
