@@ -272,6 +272,32 @@ test("coordinated result re-checks manager role and current grants", async t => 
   assert.equal(f.store.require("tasks", task.id).status, "blocked");
 });
 
+test("owner gate does not dispatch a manager without coordination grants", async t => {
+  const f = await fixture(t, async input => {
+    if (input.task.kind === "review") return { outcome: "reviewed", decision: "changes_requested", summary: "需要返工", findings: ["缺少说明"] };
+    if (input.task.kind === "coordination") return { outcome: "coordinated", summary: "协调完成" };
+    return defaultSimulation(input);
+  });
+  f.command("agent.save", { id: "manager", grants: ["task.create"] });
+  const task = f.task({ title: "Gate permission check" });
+  await f.start();
+  await until(() => f.store.require("tasks", task.id).status === "succeeded", 15000);
+  f.command("review.request", { id: task.id });
+  const gate = await until(() => f.store.list("tasks").find(x => x.kind === "coordination" && x.origin?.kind === "owner-rework-gate"), 15000);
+  const callsBefore = f.adapter.calls.length;
+  f.command("interaction.answer", { id: f.store.list("interactions").find(i => i.taskId === gate.id && i.status === "pending").id, answer: "先用现有授权处理" });
+  // The manager lacks task.retry, so the scheduler must ask again instead of
+  // starting a model call that can never be accepted.
+  await until(() => f.store.list("interactions").some(i => i.taskId === gate.id && i.status === "pending"), 15000);
+  assert.equal(f.adapter.calls.length, callsBefore);
+  assert.equal(f.store.list("attempts").some(a => a.kind === "coordination"), false);
+  assert.equal(f.store.require("tasks", gate.id).status, "blocked");
+  // Granting the permission lets the same gate continue.
+  f.command("agent.save", { id: "manager", grants: ["task.create", "task.retry"] });
+  f.command("interaction.answer", { id: f.store.list("interactions").find(i => i.taskId === gate.id && i.status === "pending").id, answer: "负责人已恢复授权" });
+  await until(() => f.store.require("tasks", gate.id).status === "succeeded", 15000);
+});
+
 test("coordination fallback ignores managers dedicated to another goal", async t => {
   const f = await fixture(t, async input => {
     if (input.task.kind === "review") return { outcome: "reviewed", decision: "changes_requested", summary: "需要返工", findings: ["跨目标检查"] };

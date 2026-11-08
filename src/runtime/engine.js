@@ -4,7 +4,8 @@ import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
-import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, findManager, scheduleRepairFlow } from '../core/coordination.js';
+import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow } from '../core/coordination.js';
+import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 
@@ -18,7 +19,13 @@ export class Engine {
   async start() {
     this.closing = false;
     this.epoch = this.store.acquireLease(this.owner);
-    try { this.conversations?.recover(); await this.recover(); } catch (e) { this.store.releaseLease(this.owner); throw e; }
+    try {
+      // Exclusive migration: the lease is held and the scheduler is not running
+      // yet. Unconfirmed legacy processes block startup instead of being
+      // silently released.
+      this.legacyMigration = await migrateLegacyForEngine({ store: this.store, adapter: this.adapter, dataDir: this.workspaces.dataDir });
+      this.conversations?.recover(); await this.recover();
+    } catch (e) { this.store.releaseLease(this.owner); throw e; }
     this.listener = () => this.kick(); this.store.events.on('event', this.listener);
     this.timer = setInterval(() => this.kick(), this.intervalMs); this.timer.unref?.(); this.kick();
     for (const task of this.store.list('tasks')) if (task.status === 'integrating' && !task.legacyBatch && !task.workflowSnapshot) this.queueIntegration(task.id);
@@ -133,7 +140,9 @@ export class Engine {
         // available, or asks again without touching the delivered task.
         if (!claimed.agentId) {
           const manager = claimed.kind === 'coordination' ? findManager(this.company, claimed.goalId) : null;
-          if (!manager) { this.block(claimed, 'assignment', '没有可用的负责人来协调返工或解阻', '请创建或恢复目标负责人（需 task.create 与 task.retry 授权），然后恢复此待办。'); continue; }
+          // Binding a coordinator is a dispatch decision: it must hold the
+          // permissions the coordination result will be accepted against.
+          if (!manager || !canCoordinate(this.company, manager)) { this.block(claimed, 'assignment', '没有具备协调授权的负责人（需要 task.create 与 task.retry）', '请恢复或创建负责人并确认其拥有 task.create 与 task.retry 授权，然后恢复此待办。'); continue; }
           claimed = this.store.put('tasks', { ...claimed, agentId: manager.id });
         }
         if (busyAgents.has(claimed.agentId)) continue;

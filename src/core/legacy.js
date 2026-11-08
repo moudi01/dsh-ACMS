@@ -26,13 +26,42 @@ export const LEGACY_COLLECTIONS = [
 const ACTIVE_ATTEMPT = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
-export function migrateLegacy(store, { dataDir } = {}) {
+export function migrateLegacy(store, { dataDir, attemptFacts = {} } = {}) {
   const legacyTaskIds = new Set(store.list('tasks').filter(t => t.workflowSnapshot && !t.legacyBatch).map(t => t.id));
   if (!legacyTaskIds.size) return null;
   if (legacyExportState(store)) return { skipped: true, reason: 'already-exported', tasks: legacyTaskIds.size };
-  // The host calls this before the scheduler starts, so attempts left
-  // "running" by a stopped host are stale rather than live executions.
-  return exportLegacy(store, { dataDir, apply: true, force: true });
+  // Manual/owner-authorized path: attempts without a confirmed stop receipt are
+  // archived as unknown. Only use this after stopping the old host and
+  // explicitly accepting the remaining uncertainty (`--force`).
+  return exportLegacy(store, { dataDir, apply: true, force: true, attemptFacts });
+}
+
+/**
+ * Automatic startup migration (runs after the scheduler lease is acquired and
+ * before recovery). It never releases a legacy attempt whose process tree was
+ * not proven stopped: if any receipt is unconfirmed it throws without touching
+ * the database, so the new scheduler cannot start and the old data stays
+ * available for manual resolution.
+ */
+export async function migrateLegacyForEngine({ store, adapter, dataDir }) {
+  const legacyTaskIds = new Set(store.list('tasks').filter(t => t.workflowSnapshot && !t.legacyBatch).map(t => t.id));
+  if (!legacyTaskIds.size) return null;
+  if (legacyExportState(store)) return { skipped: true, reason: 'already-exported', tasks: legacyTaskIds.size };
+  const attempts = store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE_ATTEMPT.has(a.status) || a.cleanupPending) && legacyTaskIds.has(a.taskId));
+  const attemptFacts = {}; const unresolved = [];
+  for (const attempt of attempts) {
+    let fact;
+    try { fact = await adapter.reconcile?.(attempt) ?? { status: 'unknown', reason: '执行器未提供恢复回执' }; }
+    catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}` }; }
+    if (['stopped', 'completed'].includes(fact.status) && fact.cleanupConfirmed === true) attemptFacts[attempt.id] = fact;
+    else unresolved.push({ id: attempt.id, taskId: attempt.taskId, status: fact.status ?? 'unknown', reason: fact.reason ?? '无法确认旧执行已停止' });
+  }
+  if (unresolved.length) {
+    const error = new Error(`LEGACY_EXECUTION_UNCONFIRMED: ${unresolved.length} 条旧执行无法确认已停止；未修改数据，也未启用新调度。请确认或清理旧进程后重试；若明确接受未确认状态，请先停止旧宿主，再运行 node scripts/legacy-export.mjs --data-dir <dataDir> --apply --force。`);
+    error.code = 'LEGACY_EXECUTION_UNCONFIRMED'; error.details = { unresolved };
+    throw error;
+  }
+  return exportLegacy(store, { dataDir, apply: true, force: true, attemptFacts });
 }
 
 export function legacyExportState(store) {
@@ -51,7 +80,7 @@ function activeAttempts(store) {
 }
 
 export function exportLegacy(store, options = {}) {
-  const { dataDir, apply = false, force = false, now = () => new Date().toISOString() } = options;
+  const { dataDir, apply = false, force = false, attemptFacts = {}, now = () => new Date().toISOString() } = options;
   if (!dataDir) throw new Error('exportLegacy requires dataDir');
   const previous = legacyExportState(store);
   if (previous && !force) return { skipped: true, reason: 'already-exported', ...previous };
@@ -104,11 +133,22 @@ export function exportLegacy(store, options = {}) {
       // ran the old process and cannot prove its tree exited.
       const legacyAttempts = store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE_ATTEMPT.has(a.status) || a.cleanupPending));
       for (const attempt of legacyAttempts) {
-        store.put('attempts', {
-          ...attempt, legacyBatch: batchId, legacyStatus: attempt.status, legacyCleanupUncertain: true,
-          status: 'unknown', cleanupPending: false, cleanupUncertain: true,
-          recovery: { status: 'legacy-archived', reason: '旧阶段制执行随任务归档；迁移未重新核对进程树是否停止' },
-        });
+        const fact = attemptFacts[attempt.id];
+        const confirmed = fact && ['stopped', 'completed'].includes(fact.status) && fact.cleanupConfirmed === true;
+        if (confirmed) {
+          store.put('attempts', {
+            ...attempt, legacyBatch: batchId, legacyStatus: attempt.status,
+            status: fact.status === 'completed' ? 'completed' : 'stopped',
+            cleanupPending: false, cleanupUncertain: false,
+            recovery: { status: 'cleanup-confirmed', reason: fact.reason ?? '迁移前核对到旧执行已停止并确认清理' },
+          });
+        } else {
+          store.put('attempts', {
+            ...attempt, legacyBatch: batchId, legacyStatus: attempt.status, legacyCleanupUncertain: true,
+            status: 'unknown', cleanupPending: false, cleanupUncertain: true,
+            recovery: { status: 'legacy-archived', reason: '旧阶段制执行随任务归档；迁移未重新核对进程树是否停止' },
+          });
+        }
       }
       const retiredAgents = [];
       for (const agentId of new Set(legacyAttempts.map(a => a.agentId).filter(Boolean))) {

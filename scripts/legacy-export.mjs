@@ -6,9 +6,11 @@
  *   node scripts/legacy-export.mjs --data-dir C:\Users\me\.dsh\acms            # backup only
  *   node scripts/legacy-export.mjs --data-dir C:\Users\me\.dsh\acms --apply    # backup + isolate
  *
- * `--apply` archives existing tasks/goals and records the batch in meta so the
- * new task model ignores them. Nothing is deleted; restore from the exported
- * `company.db` when needed.
+ * `--apply` archives existing tasks/goals. It refuses while an attempt is still
+ * active; pass `--force` only after stopping the old host and accepting that its
+ * process tree could not be confirmed stopped. The automatic startup migration
+ * inside Engine.start is stricter: it reconciles every legacy attempt and blocks
+ * startup when any cleanup cannot be confirmed, without modifying the database.
  */
 import os from 'node:os';
 import path from 'node:path';

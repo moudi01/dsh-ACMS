@@ -56,7 +56,9 @@ node scripts/legacy-export.mjs --data-dir <dataDir>            # 只备份，不
 node scripts/legacy-export.mjs --data-dir <dataDir> --apply    # 备份后归档旧任务/目标
 ```
 
-备份写入 `<dataDir>/legacy/legacy-<时间戳>/`，包含一致性数据库快照 `company.db`、逻辑导出 `entities.json` 和 SHA256 清单 `manifest.json`。`--apply` 会把旧任务与目标标记为 `legacyBatch` 并归档，使其不参与新调度和目标完成计算，历史状态与证据不被改写。仍处于 running/reconciling 的旧 attempt 会保留原状态标记，改写为 `unknown` 并记录清理不确定性，但不再占用并发名额；迁移不会声称旧进程树已停止。存在活动执行时默认拒绝隔离；确认可停后可用 `--force`。日后恢复使用同一批次的 `company.db`，不要手工改运行数据库。
+备份写入 `<dataDir>/legacy/legacy-<时间戳>/`，包含一致性数据库快照 `company.db`、逻辑导出 `entities.json` 和 SHA256 清单 `manifest.json`。`--apply` 会把旧任务与目标标记为 `legacyBatch` 并归档，使其不参与新调度和目标完成计算，历史状态与证据不被改写。
+
+自动迁移在宿主启动时、拿到调度租约之后、恢复执行之前进行：先对旧 attempt 逐条调用执行器恢复回执，只有确认 `cleanupConfirmed` 的才归档并释放名额；任何执行无法确认停止时**不修改数据库并阻止新调度启动**，保留旧数据供人工处理。此时请停止旧宿主、确认或清理旧进程后重试；若明确接受未确认状态，可运行 `node scripts/legacy-export.mjs --data-dir <dataDir> --apply --force`。另一宿主持有调度租约时不会先迁移再报错。日后恢复使用同一批次的 `company.db`，不要手工改运行数据库。
 
 ## 运行数据
 
