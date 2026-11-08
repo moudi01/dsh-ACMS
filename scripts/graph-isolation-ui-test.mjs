@@ -71,6 +71,23 @@ try {
   await expect(goalDialog.getByLabel('所属项目')).toHaveValue(projectA.id);
   await goalDialog.getByRole('button', { name: '取消', exact: true }).click();
 
+  // 1c. No open goal in the focused project: creation is disabled with guidance.
+  await page.getByLabel('筛选项目').selectOption(projectEmpty.id);
+  await expect(page.getByRole('button', { name: '＋ 新建任务', exact: true })).toBeDisabled();
+  await expect(page.getByText('当前项目没有进行中的目标；请先新建目标，再创建任务。')).toBeVisible();
+  await page.getByLabel('筛选项目').selectOption('');
+  await expect(page.getByRole('button', { name: '＋ 新建任务', exact: true })).toBeEnabled();
+
+  // 1d. An empty goal selection blocks submit instead of sending an unbound value.
+  await page.getByLabel('筛选项目').selectOption(projectA.id);
+  await page.getByRole('button', { name: '＋ 新建任务', exact: true }).click();
+  const guardedDialog = page.getByRole('dialog');
+  await expect(guardedDialog.getByLabel('授权目标')).toHaveValue(goalA1.id);
+  await guardedDialog.getByLabel('授权目标').selectOption('');
+  await expect(guardedDialog.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
+  await expect(guardedDialog.getByText('请先选择授权目标，任务必须归属于目标。')).toBeVisible();
+  await guardedDialog.getByRole('button', { name: '取消', exact: true }).click();
+
   // 2. "全部项目" partitions by project with counts and is folded by default.
   await page.getByLabel('筛选项目').selectOption('');
   await expect(page.locator('.acms-graph-section')).toHaveCount(2);
