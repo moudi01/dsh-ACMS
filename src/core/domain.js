@@ -14,7 +14,7 @@ export class Company {
   constructor(store) {
     this.store = store;
     if (!store.get('policy', 'company')) store.transaction(() => {
-      store.put('policy', { id: 'company', name: 'ACMS', maxConcurrent: 4, controlSlots: 1, maxTasksPerGoal: 80, maxTemporaryAgents: 24, maxAttempts: 3, maxReworks: 2, turnTimeoutMs: 1200000, maxGoalRuntimeMs: 14400000, paused: false, allowedProviders: [], allowedModels: [], allowedProjectRoots: [], maxArtifactBytes: 16777216 });
+      store.put('policy', { id: 'company', name: 'ACMS', maxConcurrent: 4, controlSlots: 1, maxTasksPerGoal: 80, maxTemporaryAgents: 24, maxAttempts: 3, maxReworks: 2, turnTimeoutMs: 1200000, maxGoalRuntimeMs: 14400000, goalTimeBoxMs: 0, timeBoxReserveMs: 0, paused: false, allowedProviders: [], allowedModels: [], allowedProjectRoots: [], maxArtifactBytes: 16777216 });
       for (const role of ['manager', 'reviewer']) store.put('agents', { id: role, name: role === 'manager' ? '项目负责人' : '质量审查员', role, provider: 'auto', model: '', temporary: false, status: 'available', grants: GRANTS[role], description: role === 'manager' ? '规划、协调、解决阻塞，在已授权目标内组织工作。' : '独立检查交付物及证据，不代替作者实现任务。' });
       store.event('company.created', 'company', {}, OWNER);
     });
@@ -23,7 +23,12 @@ export class Company {
   ensureTemplates() {
     if (!this.store.get('templates', BASE_TEMPLATE.id)) this.store.put('templates', { ...BASE_TEMPLATE });
   }
-  policy() { return this.store.require('policy', 'company'); }
+  policy() {
+    const policy = this.store.require('policy', 'company');
+    // Old installations predate the time-box fields; normalize on read so the
+    // settings form and submissions always see a complete 0-defaulted policy.
+    return { ...policy, goalTimeBoxMs: policy.goalTimeBoxMs ?? 0, timeBoxReserveMs: policy.timeBoxReserveMs ?? 0 };
+  }
   runActions(actor, batch) { return runActionBatch(this, actor, batch); }
   effectiveGrants(actor) {
     const current = this.store.require('agents', actor.id).grants;
@@ -98,12 +103,13 @@ export class Company {
   owner(actor) { assert(actor.kind === 'owner' || actor.kind === 'system', 'OWNER_REQUIRED', 'Only the owner may change this boundary'); }
   updatePolicy(args, actor) {
     this.owner(actor); const p = this.policy();
-    const allowed = ['maxConcurrent', 'controlSlots', 'maxTasksPerGoal', 'maxTemporaryAgents', 'maxAttempts', 'maxReworks', 'turnTimeoutMs', 'maxGoalRuntimeMs', 'maxArtifactBytes', 'allowedProviders', 'allowedModels', 'allowedProjectRoots'];
+    const allowed = ['maxConcurrent', 'controlSlots', 'maxTasksPerGoal', 'maxTemporaryAgents', 'maxAttempts', 'maxReworks', 'turnTimeoutMs', 'maxGoalRuntimeMs', 'goalTimeBoxMs', 'timeBoxReserveMs', 'maxArtifactBytes', 'allowedProviders', 'allowedModels', 'allowedProjectRoots'];
     const patch = {}; for (const k of Object.keys(args.patch ?? {})) { assert(allowed.includes(k), 'INVALID_INPUT', `Unknown policy field ${k}`); patch[k] = args.patch[k]; }
     const next = { ...p, ...patch };
     integer(next.maxConcurrent, 'maxConcurrent', 1, 32); integer(next.controlSlots, 'controlSlots', 0, next.maxConcurrent);
     for (const k of ['maxTasksPerGoal', 'maxTemporaryAgents', 'maxAttempts', 'maxReworks']) integer(next[k], k, 1, 1000);
     for (const k of ['turnTimeoutMs', 'maxGoalRuntimeMs', 'maxArtifactBytes']) integer(next[k], k, 1000, 2147483647);
+    for (const k of ['goalTimeBoxMs', 'timeBoxReserveMs']) integer(next[k] ?? 0, k, 0, 2147483647);
     for (const k of ['allowedProviders', 'allowedModels', 'allowedProjectRoots']) assert(Array.isArray(next[k]) && next[k].every(x => typeof x === 'string' && x.length > 0), 'INVALID_INPUT', `${k} must be strings`);
     const active = this.store.list('attempts').filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending);
     assert(next.maxConcurrent >= active.length, 'ACTIVE_LIMIT', 'Pause active work before reducing the limit below current usage');
@@ -428,7 +434,7 @@ export class Company {
       assert(additionalRuntimeMs > 0 || used < limit, 'GOAL_BUDGET_EXHAUSTED', '目标累计执行额度仍已用完。请填写追加额度，或先增加公司目标基础额度；修改单次执行时限或仅回复“继续”不能解除此阻塞。');
       if (additionalRuntimeMs) {
         const nextLimit = integer(Math.max(used, limit) + additionalRuntimeMs, 'goalRuntimeLimit', 1000, 2147483647);
-        this.store.put('goals', { ...goal, runtimeExtraMs: nextLimit - policy.maxGoalRuntimeMs });
+        this.store.put('goals', { ...goal, runtimeExtraMs: nextLimit - policy.maxGoalRuntimeMs, timeBox: null });
         this.store.event('goal.runtime.extended', goal.id, { interactionId: interaction.id, additionalRuntimeMs, previousLimitMs: limit, nextLimitMs: nextLimit, usedMs: used }, actor);
       }
     }

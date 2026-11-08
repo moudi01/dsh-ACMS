@@ -4,10 +4,10 @@ import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
-import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow } from '../core/coordination.js';
+import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow, timeBoxCoordinationKey, CAPACITY_LIMIT_CODES } from '../core/coordination.js';
 import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute } from '../core/blocker-policy.js';
-import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
+import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 export class Engine {
@@ -123,6 +123,17 @@ export class Engine {
       if (this.company.policy().paused) return;
       this.refreshReadiness();
       const p = this.company.policy();
+      // Efficiency time box (issue #7): notify the manager once per box without
+      // creating a budget interaction. Hard-cap handling stays below.
+      for (const goal of this.store.list('goals')) {
+        if (['succeeded', 'cancelled', 'archived', 'deleted'].includes(goal.status)) continue;
+        const hardLimit = goalRuntimeLimit(goal, p);
+        const used = spent.get(goal.id) ?? goal.runtimeMs ?? 0;
+        if (used >= hardLimit) continue;
+        const boxLimit = goalTimeBoxLimit(goal, p);
+        if (!boxLimit || used < boxLimit) continue;
+        this.ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, p);
+      }
       const active = this.store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id)));
       let free = p.maxConcurrent - active.length - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
@@ -133,6 +144,10 @@ export class Engine {
         if (active.some(a => a.taskId === task.id)) continue;
         const goal = this.store.require('goals', task.goalId);
         if ((spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
+        // While the time-box decision is open, only control work (coordination,
+        // review) may proceed; ordinary work waits for the manager's wrap-up.
+        const boxLimit = goalTimeBoxLimit(goal, p);
+        if (boxLimit && !goal.timeBox?.releasedAt && ['work', 'repair', 'plan'].includes(task.kind) && (spent.get(goal.id) ?? goal.runtimeMs ?? 0) >= boxLimit) continue;
         if (['work', 'repair'].includes(task.kind) && ordinary >= Math.max(1, p.maxConcurrent - p.controlSlots)) continue;
         let claimed = task;
         // An owner rework gate may exist without a manager. The owner answers
@@ -154,6 +169,92 @@ export class Engine {
         entry.promise = this.execute(attempt, controller).catch(e => { this.lastError = String(e.message); }).finally(() => { this.live.delete(attempt.id); this.kick(); });
       }
     } finally { this.ticking = false; }
+  }
+  timeBoxCheckpoint(goal) {
+    const tasks = this.store.list('tasks').filter(task => task.goalId === goal.id && task.status !== 'deleted');
+    const taskIds = new Set(tasks.map(task => task.id));
+    return {
+      at: now(), goalRuntimeMs: goal.runtimeMs ?? 0,
+      tasks: tasks.map(task => ({ id: task.id, title: task.title, kind: task.kind, status: task.status })),
+      artifacts: this.store.list('artifacts').filter(artifact => taskIds.has(artifact.taskId)).length,
+      attempts: this.store.list('attempts').filter(attempt => attempt.goalId === goal.id).length,
+    };
+  }
+  ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, policy) {
+    return this.store.transaction(() => {
+    const key = timeBoxCoordinationKey(goal.id, boxLimit);
+    const existing = this.store.list('tasks').find(task => task.kind === 'coordination' && task.coordinationKey === key && task.status !== 'deleted');
+    if (existing) {
+      if (goal.timeBox?.key === key && (goal.timeBox.coordinationTaskId === existing.id || goal.timeBox.releasedAt)) return existing;
+      this.store.put('goals', { ...this.store.require('goals', goal.id), timeBox: { ...(goal.timeBox ?? {}), key, boxMs: boxLimit, warnedAt: existing.createdAt ?? now(), coordinationTaskId: existing.id, releasedAt: null } });
+      return existing;
+    }
+    if (goal.timeBox?.key === key && goal.timeBox.capacityBlocked) {
+      const usedSlots = this.store.list('tasks').filter(task => task.goalId === goal.id && task.status !== 'deleted').length;
+      if (usedSlots >= this.company.policy().maxTasksPerGoal) {
+        // The warning may have fired while every task was running, leaving no
+        // task to attach the owner question to. Retry the entry as soon as a
+        // task becomes attachable (e.g. after a failed attempt goes back to ready).
+        this.ensureCapacityOwnerEntry(this.store.require('goals', goal.id), {
+          key, used, hardLimit, boxLimit, checkpoint: this.timeBoxCheckpoint(goal),
+          message: goal.timeBox.capacityMessage ?? '时间盒收尾任务创建失败',
+        });
+        return null;
+      }
+    }
+    const manager = findManager(this.company, goal.id);
+    const usable = manager && canCoordinate(this.company, manager);
+    const checkpoint = this.timeBoxCheckpoint(goal);
+    const question = '时间盒到点，但没有具备协调授权的负责人来安排收尾；请恢复负责人（需 task.create 与 task.retry）后回复。';
+    let task;
+    try {
+      task = this.company.createTask({
+        goalId: goal.id, kind: 'coordination', title: `时间盒收尾：${goal.title}`,
+        description: [
+          '目标执行已到达效率时间盒（不等于成本硬上限）。请保存检查点并决定收尾：缩小范围、调整分派、停止新增非必要工作或安排剩余工作。',
+          `已用执行时间：${used} ms；效率时间盒：${boxLimit} ms；成本硬上限：${hardLimit} ms；收尾预留：${policy.timeBoxReserveMs ?? 0} ms。`,
+          '不要自动追加预算，也不要绕过硬上限、暂停、清理占位或权限边界。',
+          `检查点：${checkpoint.tasks.length} 个任务，${checkpoint.artifacts} 份产物，${checkpoint.attempts} 次执行。`,
+        ].join('\n'),
+        acceptance: '负责人给出收尾决定并保留检查点；不自动新增预算交互。',
+        agentId: usable ? manager.id : null, priority: 90,
+        origin: { kind: 'timebox', decidedBy: null, createdBy: 'scheduler', basis: '时间盒到点' },
+        coordinationKey: key, coordinationOf: null,
+      }, SYSTEM);
+    } catch (error) {
+      if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
+      // A full goal must not abort the whole tick: keep a recoverable owner entry
+      // and let other goals keep scheduling.
+      this.store.put('goals', { ...this.store.require('goals', goal.id), timeBox: { key, boxMs: boxLimit, warnedAt: now(), coordinationTaskId: null, releasedAt: null, capacityBlocked: true, capacityMessage: error.message, checkpoint } });
+      this.ensureCapacityOwnerEntry(this.store.require('goals', goal.id), { key, used, hardLimit, boxLimit, checkpoint, message: error.message });
+      return null;
+    }
+    if (!usable) {
+      this.store.put('tasks', { ...task, status: 'blocked', blocker: { kind: 'assignment', reason: '时间盒到点但没有可用负责人', question } });
+      this.store.put('interactions', { id: id('interaction'), taskId: task.id, goalId: goal.id, taskGeneration: task.generation, kind: 'assignment', reason: '时间盒到点但没有可用负责人', question, status: 'pending' });
+    }
+    this.store.put('goals', { ...this.store.require('goals', goal.id), timeBox: { key, boxMs: boxLimit, warnedAt: now(), coordinationTaskId: task.id, releasedAt: null, checkpoint } });
+    this.store.event('goal.timebox.warning', goal.id, { coordinationTaskId: task.id, key, usedMs: used, hardLimitMs: hardLimit, boxLimitMs: boxLimit, reserveMs: policy.timeBoxReserveMs ?? 0, checkpoint }, SYSTEM, { goalId: goal.id });
+    return task;
+    });
+  }
+  ensureCapacityOwnerEntry(goal, context) {
+    const interactions = this.store.list('interactions');
+    if (interactions.some(item => item.goalId === goal.id && item.kind === 'capacity' && item.status === 'pending')) return true;
+    const attachable = this.store.list('tasks').filter(task => task.goalId === goal.id && !['succeeded', 'cancelled', 'archived', 'deleted', 'running', 'preparing', 'integrating', 'reconciling', 'stopping'].includes(task.status));
+    const target = attachable.find(task => task.status === 'ready') ?? attachable[0];
+    if (!target) return false;
+    const timeBox = goal.timeBox ?? {};
+    const changed = timeBox.capacityBlocked !== true || timeBox.capacityBlockedTaskId !== target.id || timeBox.capacityMessage !== context.message;
+    // Preserve any existing owner question: replace or duplicate it only when it
+    // is a capacity question, and never re-emit events for an unchanged entry.
+    const existingPending = interactions.find(item => item.taskId === target.id && item.status === 'pending');
+    if (!existingPending) this.block(target, 'capacity', '时间盒到点，但目标已达任务上限：' + context.message, '请提高“每个目标任务上限”或缩小范围后恢复此分支。');
+    if (!changed) return true;
+    const current = this.store.require('goals', goal.id);
+    this.store.put('goals', { ...current, timeBox: { ...(current.timeBox ?? {}), capacityBlocked: true, capacityMessage: context.message, capacityBlockedTaskId: target.id } });
+    this.store.event('goal.timebox.blocked', goal.id, { key: context.key, usedMs: context.used, hardLimitMs: context.hardLimit, boxLimitMs: context.boxLimit, reason: 'capacity', message: context.message, checkpoint: context.checkpoint, taskId: target.id, ...(existingPending ? { existingInteractionId: existingPending.id } : {}) }, SYSTEM, { goalId: goal.id });
+    return true;
   }
   refreshReadiness() {
     this.store.transaction(() => {
