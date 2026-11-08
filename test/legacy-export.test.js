@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { fixture } from './helpers.js';
+import { fixture, until } from './helpers.js';
 import { exportLegacy, legacyExportState, migrateLegacy } from '../src/core/legacy.js';
 
 const sha256 = file => createHash('sha256').update(readFileSync(file)).digest('hex');
@@ -70,6 +70,33 @@ test('startup migration archives stage-model rows before scheduling', async t =>
   await f.start();
   await new Promise(r => setTimeout(r, 120));
   assert.equal(f.adapter.calls.length, 0);
+});
+
+test('startup migration releases legacy attempts without claiming they stopped', async t => {
+  const f = await fixture(t);
+  const task = f.task({ title: 'Legacy running work' });
+  f.store.transaction(() => {
+    f.store.put('tasks', { ...f.store.require('tasks', task.id), workflowSnapshot: { id: 'default', steps: [], version: 1 }, status: 'running', activeAttemptId: 'old-0' });
+    for (let i = 0; i < 4; i++) f.store.put('attempts', { id: `old-${i}`, taskId: task.id, goalId: task.goalId, agentId: task.agentId, taskGeneration: 1, role: 'worker', status: 'running', startedAt: new Date().toISOString() });
+  });
+  let reconcileCalls = 0; const original = f.adapter.reconcile.bind(f.adapter);
+  f.adapter.reconcile = async input => { reconcileCalls++; return original(input); };
+  const migrated = migrateLegacy(f.store, { dataDir: f.dataDir });
+  for (let i = 0; i < 4; i++) {
+    const attempt = f.store.require('attempts', `old-${i}`);
+    assert.equal(attempt.legacyBatch, migrated.batchId);
+    assert.equal(attempt.status, 'unknown');
+    assert.equal(attempt.cleanupPending, false);
+    assert.equal(attempt.cleanupUncertain, true);
+  }
+  assert.equal(f.store.require('tasks', task.id).status, 'archived');
+  // Free slots: fresh work runs immediately and no legacy attempt is reconciled.
+  const goal = f.command('goal.create', { title: 'After migration', description: 'Deliver', acceptance: 'Delivered', projectId: f.project.id, templateId: f.template.id, plan: false });
+  const fresh = f.task({ goalId: goal.id, title: 'Fresh work' });
+  await f.start();
+  await until(() => f.store.require('tasks', fresh.id).status === 'succeeded', 15000);
+  assert.equal(f.adapter.calls.length, 1);
+  assert.equal(reconcileCalls, 0);
 });
 
 test('legacy export refuses to isolate while an attempt is active', async t => {

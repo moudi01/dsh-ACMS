@@ -38,6 +38,17 @@ test('base template creates exactly one goal-level review after delivery', async
   assert.equal(f.adapter.calls.filter(c => c.task.kind === 'work').length, 1);
   assert.equal(f.store.list('verifications').filter(v => v.kind === 'goal-review' && v.passed).length, 1);
 });
+test('goal final review excludes every reviewed author', async t => {
+  const f = await fixture(t);
+  const goal = f.command('goal.create', { title: 'Self review guard', description: 'Deliver', acceptance: 'Reviewed', projectId: f.project.id, templateId: 'base', plan: false });
+  f.command('task.create', { goalId: goal.id, title: 'Work by the reviewer role', agentId: 'reviewer' });
+  await f.start(); await until(() => f.store.require('goals', goal.id).status === 'succeeded', 15000);
+  const review = f.store.list('tasks').find(t => t.kind === 'review' && t.goalId === goal.id);
+  assert.notEqual(review.agentId, 'reviewer');
+  const verification = f.store.list('verifications').find(v => v.kind === 'goal-review');
+  assert.notEqual(verification.reviewerId, 'reviewer');
+  assert.equal(verification.passed, true);
+});
 test('review rejection requests manager rework without reopening the delivered task', async t => {
   let reviews = 0;
   const f = await fixture(t, async input => input.task.kind === 'review' && ++reviews === 1 ? { outcome: 'reviewed', decision: 'changes_requested', summary: 'Add explanation', findings: ['Missing context'] } : defaultSimulation(input));

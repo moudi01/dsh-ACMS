@@ -27,9 +27,9 @@ const ACTIVE_ATTEMPT = new Set(['preparing', 'running', 'cancelling', 'reconcili
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
 export function migrateLegacy(store, { dataDir } = {}) {
-  const legacyTasks = store.list('tasks').filter(t => t.status !== 'deleted' && !t.legacyBatch && t.workflowSnapshot);
-  if (!legacyTasks.length) return null;
-  if (legacyExportState(store)) return { skipped: true, reason: 'already-exported', tasks: legacyTasks.length };
+  const legacyTaskIds = new Set(store.list('tasks').filter(t => t.workflowSnapshot && !t.legacyBatch).map(t => t.id));
+  if (!legacyTaskIds.size) return null;
+  if (legacyExportState(store)) return { skipped: true, reason: 'already-exported', tasks: legacyTaskIds.size };
   // The host calls this before the scheduler starts, so attempts left
   // "running" by a stopped host are stale rather than live executions.
   return exportLegacy(store, { dataDir, apply: true, force: true });
@@ -99,10 +99,30 @@ export function exportLegacy(store, options = {}) {
       for (const goal of goals) {
         store.put('goals', { ...goal, legacyBatch: batchId, legacyPreviousStatus: goal.status, status: 'archived' });
       }
+      // Stage-model attempts keep their evidence but stop owning scheduler
+      // slots. They are marked unknown rather than "stopped": migration never
+      // ran the old process and cannot prove its tree exited.
+      const legacyAttempts = store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE_ATTEMPT.has(a.status) || a.cleanupPending));
+      for (const attempt of legacyAttempts) {
+        store.put('attempts', {
+          ...attempt, legacyBatch: batchId, legacyStatus: attempt.status, legacyCleanupUncertain: true,
+          status: 'unknown', cleanupPending: false, cleanupUncertain: true,
+          recovery: { status: 'legacy-archived', reason: '旧阶段制执行随任务归档；迁移未重新核对进程树是否停止' },
+        });
+      }
+      const retiredAgents = [];
+      for (const agentId of new Set(legacyAttempts.map(a => a.agentId).filter(Boolean))) {
+        const agent = store.get('agents', agentId);
+        if (!agent?.temporary || agent.status !== 'available') continue;
+        const held = store.list('tasks').some(t => t.agentId === agentId && !['succeeded', 'cancelled', 'archived', 'deleted'].includes(t.status));
+        if (held) continue;
+        store.put('agents', { ...agent, status: 'retired' });
+        retiredAgents.push(agentId);
+      }
       store.db.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
         .run(LEGACY_META_KEY, JSON.stringify({ batchId, dir, exportedAt }));
-      store.event('legacy.exported', batchId, { batchId, dir, tasks: tasks.length, goals: goals.length }, { kind: 'system', id: 'scheduler' });
-      appliedCounts = { tasks: tasks.length, goals: goals.length };
+      store.event('legacy.exported', batchId, { batchId, dir, tasks: tasks.length, goals: goals.length, attempts: legacyAttempts.length, retiredAgents: retiredAgents.length }, { kind: 'system', id: 'scheduler' });
+      appliedCounts = { tasks: tasks.length, goals: goals.length, attempts: legacyAttempts.length, retiredAgents: retiredAgents.length };
     });
   }
 

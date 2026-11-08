@@ -148,7 +148,7 @@ export class Company {
     assert(this.store.require("projects", args.projectId).status !== "deleted", "ENTITY_DELETED", "请先恢复项目");
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const constraints = options.constraints ?? [];
-    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, status: args.plan === false ? "active" : "planning", runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
+    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
     if (args.plan !== false) { const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId); assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色'); this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description, kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM); }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }
@@ -209,7 +209,7 @@ export class Company {
     if (!tasks.length) status = 'empty';
     else if (!complete) status = tasks.some(t => t.kind === 'plan' && !TERMINAL.has(t.status)) ? 'planning' : 'active';
     else {
-      const template = this.store.get('templates', goal.templateId ?? 'base');
+      const template = goal.templateSnapshot ?? this.store.get('templates', goal.templateId ?? 'base');
       if (!template?.finalReview) status = 'succeeded';
       else {
         const deliveryHash = this.deliveryHash(goalId);
@@ -234,12 +234,14 @@ export class Company {
   latestGoalReview(goalId) {
     return this.store.list('tasks').filter(t => t.goalId === goalId && t.kind === 'review' && t.reviewScope === 'goal' && t.status !== 'deleted').at(-1) ?? null;
   }
-  reviewerFor(goalId, lastAuthorId) {
-    return this.store.list('agents').find(a => a.role === 'reviewer' && a.status === 'available' && a.id !== lastAuthorId) ?? this.temporaryAgent(goalId, 'reviewer');
+  reviewerFor(goalId, excluded = []) {
+    const skip = new Set((Array.isArray(excluded) ? excluded : [excluded]).filter(Boolean));
+    return this.store.list('agents').find(a => a.role === 'reviewer' && a.status === 'available' && !skip.has(a.id)) ?? this.temporaryAgent(goalId, 'reviewer');
   }
   createGoalReview(goal, deliveryHash) {
     const targets = this.store.list('tasks').filter(t => t.goalId === goal.id && t.kind === 'work' && t.status === 'succeeded' && !t.legacyBatch && !t.workflowSnapshot);
-    const reviewer = this.reviewerFor(goal.id, null);
+    // A reviewer must not have authored any reviewed deliverable.
+    const reviewer = this.reviewerFor(goal.id, targets.map(t => t.lastAuthorId));
     const review = this.createTask({
       goalId: goal.id, kind: 'review', title: `最终审查：${goal.title}`,
       description: '按目标模板对目标整体交付成果做一次最终审查。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
@@ -265,8 +267,7 @@ export class Company {
     assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
     assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
     assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
-    const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);
-    const review = this.createTask({
+    const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);    const review = this.createTask({
       goalId: source.goalId, kind: 'review', title: `审查：${source.title}`,
       description: '审查已交付成果。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
       acceptance: source.acceptance, parentId: source.id, reviewOf: source.id,

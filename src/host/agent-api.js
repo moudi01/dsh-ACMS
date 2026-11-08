@@ -193,7 +193,7 @@ function resolveGoal(company, credential, goalIdParam, command) {
 }
 
 function goalView(goal) {
-  return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, templateId: goal.templateId ?? 'base', constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
+  return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, templateId: goal.templateId ?? 'base', templateVersion: goal.templateSnapshot?.version ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
 }
 function projectView(project) {
   return { id: project.id, name: project.name, repoRoot: project.repoRoot, mode: project.mode, checks: project.checks ?? [], autoMerge: project.autoMerge === true, status: project.status, source: project.source ?? null, createdAt: project.createdAt, updatedAt: project.updatedAt };

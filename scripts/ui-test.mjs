@@ -24,7 +24,7 @@ try {
   await expect(page.getByRole('button', { name: '继续执行', exact: true })).toBeDisabled();
   await expect(page.getByText('请先回复下方待处理的问题，再继续执行。')).toBeVisible();
   await expect(page.getByRole('heading', { name: '目标模板' })).toBeVisible();
-  await expect(page.getByText('拆分与执行', { exact: true })).toBeVisible();
+  await expect(page.getByText('基础模板', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '关闭任务详情' }).click();
   await page.getByRole('button', { name: '组织管理', exact: true }).click(); await page.getByRole('button', { name: '＋ 创建角色' }).click();
   await page.getByLabel('角色名称', { exact: true }).fill('文档协调员');

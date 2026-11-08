@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 
 export function promptFor(company, task, attempt, options = {}) {
   const goal = company.store.require('goals', task.goalId); const agent = company.store.require('agents', attempt.agentId);
-  const template = company.store.get('templates', goal.templateId ?? 'base');
+  const template = goal.templateSnapshot ?? company.store.get('templates', goal.templateId ?? 'base');
   const related = task.dependencies.map(id => company.store.require('tasks', id));
   const inputs = related.flatMap(t => t.artifactIds.map(id => company.store.require('artifacts', id))).map(a => ({ path: a.blob, originalPath: a.path, title: a.title, hash: a.hash }));
   const source = task.reviewOf ? company.store.require('tasks', task.reviewOf) : null;

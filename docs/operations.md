@@ -56,7 +56,7 @@ node scripts/legacy-export.mjs --data-dir <dataDir>            # 只备份，不
 node scripts/legacy-export.mjs --data-dir <dataDir> --apply    # 备份后归档旧任务/目标
 ```
 
-备份写入 `<dataDir>/legacy/legacy-<时间戳>/`，包含一致性数据库快照 `company.db`、逻辑导出 `entities.json` 和 SHA256 清单 `manifest.json`。`--apply` 会把旧任务与目标标记为 `legacyBatch` 并归档，使其不参与新调度和目标完成计算，历史状态与证据不被改写。存在活动执行时默认拒绝隔离；确认可停后可用 `--force`。日后恢复使用同一批次的 `company.db`，不要手工改运行数据库。
+备份写入 `<dataDir>/legacy/legacy-<时间戳>/`，包含一致性数据库快照 `company.db`、逻辑导出 `entities.json` 和 SHA256 清单 `manifest.json`。`--apply` 会把旧任务与目标标记为 `legacyBatch` 并归档，使其不参与新调度和目标完成计算，历史状态与证据不被改写。仍处于 running/reconciling 的旧 attempt 会保留原状态标记，改写为 `unknown` 并记录清理不确定性，但不再占用并发名额；迁移不会声称旧进程树已停止。存在活动执行时默认拒绝隔离；确认可停后可用 `--force`。日后恢复使用同一批次的 `company.db`，不要手工改运行数据库。
 
 ## 运行数据
 

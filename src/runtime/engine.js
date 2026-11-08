@@ -4,7 +4,7 @@ import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
-import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, scheduleRepairFlow } from '../core/coordination.js';
+import { completeCoordination, coordinateBlocker, coordinateExecutionLimit, findManager, scheduleRepairFlow } from '../core/coordination.js';
 import { blockerRoute } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 
@@ -26,7 +26,7 @@ export class Engine {
   kick() { if (this.closing || this.scheduled) return; this.scheduled = true; queueMicrotask(() => { this.scheduled = false; this.tick().catch(e => { this.lastError = String(e.message); }); }); }
   fenced() { assert(this.store.ownsLease(this.owner, this.epoch), 'LEASE_LOST', 'Scheduler no longer owns the company lease'); }
   async recover(taskId) {
-    for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
+    for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !a.legacyBatch && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
       const legacyTask = this.store.get('tasks', previous.taskId);
       // Stage-model tasks are backed up and isolated; never reconcile, accept or
       // re-dispatch them under the atomic task model.
@@ -116,7 +116,7 @@ export class Engine {
       if (this.company.policy().paused) return;
       this.refreshReadiness();
       const p = this.company.policy();
-      const active = this.store.list('attempts').filter(a => ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id));
+      const active = this.store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id)));
       let free = p.maxConcurrent - active.length - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
@@ -127,10 +127,19 @@ export class Engine {
         const goal = this.store.require('goals', task.goalId);
         if ((spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
         if (['work', 'repair'].includes(task.kind) && ordinary >= Math.max(1, p.maxConcurrent - p.controlSlots)) continue;
-        if (busyAgents.has(task.agentId)) continue;
-        const agent = this.store.require('agents', task.agentId); if (agent.status !== 'available') { this.block(task, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。'); continue; }
-        const attempt = this.claim(task, agent);
-        free--; busyAgents.add(agent.id); if (['work', 'repair'].includes(task.kind)) ordinary++;
+        let claimed = task;
+        // An owner rework gate may exist without a manager. The owner answers
+        // the blocker first; the next tick assigns whichever manager is now
+        // available, or asks again without touching the delivered task.
+        if (!claimed.agentId) {
+          const manager = claimed.kind === 'coordination' ? findManager(this.company, claimed.goalId) : null;
+          if (!manager) { this.block(claimed, 'assignment', '没有可用的负责人来协调返工或解阻', '请创建或恢复目标负责人（需 task.create 与 task.retry 授权），然后恢复此待办。'); continue; }
+          claimed = this.store.put('tasks', { ...claimed, agentId: manager.id });
+        }
+        if (busyAgents.has(claimed.agentId)) continue;
+        const agent = this.store.require('agents', claimed.agentId); if (agent.status !== 'available') { this.block(claimed, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。'); continue; }
+        const attempt = this.claim(claimed, agent);
+        free--; busyAgents.add(agent.id); if (['work', 'repair'].includes(claimed.kind)) ordinary++;
         const controller = new AbortController(); const entry = { taskId: task.id, controller, promise: null };
         this.live.set(attempt.id, entry);
         entry.promise = this.execute(attempt, controller).catch(e => { this.lastError = String(e.message); }).finally(() => { this.live.delete(attempt.id); this.kick(); });

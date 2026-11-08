@@ -295,11 +295,20 @@ test("coordination fallback ignores managers dedicated to another goal", async t
   await f.start();
   await until(() => f.store.require("tasks", reviewTarget.id).status === "succeeded", 15000);
   f.command("review.request", { id: reviewTarget.id });
-  await until(() => f.store.list("interactions").some(i => i.taskId === reviewTarget.id && i.status === "pending"), 15000);
+  const gate = await until(() => f.store.list("tasks").find(t => t.kind === "coordination" && t.coordinationOf === reviewTarget.id && t.origin?.kind === "owner-rework-gate"), 15000);
+  const interaction = await until(() => f.store.list("interactions").find(i => i.taskId === gate.id && i.status === "pending"), 15000);
   const reviewed = f.store.require("tasks", reviewTarget.id);
   assert.equal(reviewed.status, "succeeded");
   assert.equal(reviewed.reworks, 1);
-  assert.equal(f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === reviewTarget.id).length, 0);
+  assert.equal(gate.status, "blocked");
+  assert.equal(gate.agentId, null);
+  assert.equal(f.store.list("tasks").some(t => t.agentId === otherManager.id), false);
+  // The pending decision lives on a blocked coordination entity, so it is
+  // answerable; restoring the manager lets the scheduler pick it up.
+  f.command("agent.save", { id: "manager", status: "available" });
+  f.command("interaction.answer", { id: interaction.id, answer: "恢复负责人后由负责人决定返工范围" });
+  await until(() => f.store.require("tasks", gate.id).status === "succeeded", 15000);
+  assert.equal(f.store.require("tasks", reviewTarget.id).status, "succeeded");
 });
 
 test("review rework ceiling is recorded without reopening the delivered task", async t => {
@@ -321,7 +330,37 @@ test("review rework ceiling is recorded without reopening the delivered task", a
   assert.equal(source.reworks, 3);
   assert.equal(source.reviewLimitExceeded, true);
   assert.equal(reviews, 3);
-  assert.equal(f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id).length, 3);
+  const gates = f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id && t.origin?.kind === "owner-rework-gate");
+  assert.equal(gates.length, 1);
+  assert.equal(gates[0].status, "blocked");
+  assert(f.store.list("interactions").some(i => i.taskId === gates[0].id && i.status === "pending"));
+  assert.equal(f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id && t.origin?.kind !== "owner-rework-gate").length, 2);
+});
+
+test("goal final review accumulates rework rounds and stops at the ceiling", async t => {
+  let reviews = 0; let coordinations = 0;
+  const f = await fixture(t, async input => {
+    if (input.task.kind === "review" && input.task.reviewScope === "goal") { reviews++; return { outcome: "reviewed", decision: "changes_requested", summary: "Reject " + reviews, findings: ["Finding " + reviews] }; }
+    if (input.task.kind === "coordination") { coordinations++; return { outcome: "planned", rationale: "返工", summary: "拆出一个返工任务", tasks: [{ key: "fix", title: "返工 " + coordinations, description: "修复审查发现", acceptance: "修复完成", dependencies: [] }] }; }
+    return defaultSimulation(input);
+  });
+  f.command("policy.update", { patch: { maxReworks: 1 } });
+  const goal = f.command("goal.create", { title: "Goal rework ceiling", description: "Deliver", acceptance: "Reviewed", projectId: f.project.id, templateId: "base", plan: false });
+  f.task({ goalId: goal.id, title: "Initial delivery" });
+  await f.start();
+  const gate = await until(() => f.store.list("tasks").find(t => t.kind === "coordination" && t.origin?.kind === "owner-rework-gate" && t.goalId === goal.id), 25000);
+  const current = f.store.require("goals", goal.id);
+  assert.equal(current.reworks, 2);
+  assert.equal(current.status, "active");
+  assert.equal(reviews, 2);
+  assert.equal(coordinations, 1);
+  assert.equal(gate.status, "blocked");
+  assert(f.store.list("interactions").some(i => i.taskId === gate.id && i.status === "pending"));
+  // The owner decision is answerable; it does not reopen the delivered tasks.
+  const gateInteraction = f.store.list("interactions").find(i => i.taskId === gate.id && i.status === "pending");
+  f.command("interaction.answer", { id: gateInteraction.id, answer: "不追加额度，先由负责人缩小范围" });
+  assert.notEqual(f.store.require("tasks", gate.id).status, "blocked");
+  assert.equal(f.store.list("tasks").filter(t => t.kind === "work" && t.status === "succeeded" && t.goalId === goal.id).length >= 1, true);
 });
 
 test("coordination result cannot release a source already beyond the rework ceiling", async t => {
