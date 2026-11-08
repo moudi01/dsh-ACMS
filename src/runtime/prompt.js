@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 
 export function promptFor(company, task, attempt, options = {}) {
   const goal = company.store.require('goals', task.goalId); const agent = company.store.require('agents', attempt.agentId);
+  const template = company.store.get('templates', goal.templateId ?? 'base');
   const related = task.dependencies.map(id => company.store.require('tasks', id));
   const inputs = related.flatMap(t => t.artifactIds.map(id => company.store.require('artifacts', id))).map(a => ({ path: a.blob, originalPath: a.path, title: a.title, hash: a.hash }));
   const source = task.reviewOf ? company.store.require('tasks', task.reviewOf) : null;
@@ -14,8 +15,8 @@ export function promptFor(company, task, attempt, options = {}) {
   });
   const managerExtras = agent.role === "manager" ? buildManagerExtras(company, goal, task) : {};
   const contract = {
-    attemptId: attempt.id, goal: { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance },
-    task: { id: task.id, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind },
+    attemptId: attempt.id, goal: { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, template: template ? { id: template.id, name: template.name, phases: template.phases } : null },
+    task: { id: task.id, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind, reviewScope: task.reviewScope ?? null },
     role: { id: agent.id, name: agent.name, description: agent.description, grants: company.effectiveGrants({ id: agent.id, grants: attempt.grants }) }, workspace: task.workspace?.path,
     changeNotifications: (attempt.notificationIds ?? []).map(id => company.store.require('notifications', id)),
     ownerConversation: (attempt.conversationMessageIds ?? []).map(id => { const m = company.store.require('conversationMessages', id); return { id, text: m.text, at: m.createdAt }; }),
@@ -32,14 +33,25 @@ export function promptFor(company, task, attempt, options = {}) {
     } } : {}),
     ownerChecks: task.checksSnapshot ?? [],
     ...(agent.role === "manager" && options.modelContext ? { modelContext: options.modelContext } : {}),
-    ...(source ? { review: { task: source.title, acceptance: source.acceptance, artifacts, sourceEvidence, allChangedFiles: source.changeSet, expectedHash: task.reviewArtifactHash, checks: company.store.list('verifications').filter(v => v.taskId === source.id).at(-1) } } : {}),
+    ...(source ? { review: { scope: 'task', task: source.title, acceptance: source.acceptance, artifacts, sourceEvidence, allChangedFiles: source.changeSet, expectedHash: task.reviewArtifactHash, checks: company.store.list('verifications').filter(v => v.taskId === source.id).at(-1) } } : task.reviewScope === 'goal' ? { review: goalReviewEvidence(company, task, goal) } : {}),
   };
   const coordinationMode = '负责人协调返工：阅读 CONTRACT.coordination、goalConstraints、goalTasks、plans、decisionLog 与 rework，在现有授权内独立决定。返回 {~Q~outcome~Q~:~Q~coordinated~Q~,~Q~summary~Q~:~Q~决定与理由~Q~} 表示直接恢复返工；返回 {~Q~outcome~Q~:~Q~planned~Q~,~Q~rationale~Q~:~Q~...~Q~,~Q~summary~Q~:~Q~...~Q~,~Q~tasks~Q~:[...]} 表示重新拆分返工任务；返回 {~Q~outcome~Q~:~Q~managed~Q~,~Q~actionBatchId~Q~:~Q~...~Q~,~Q~summary~Q~:~Q~...~Q~,~Q~actions~Q~:[...]} 用现有命令调整分派、依赖或重试，之后 ACMS 会再唤醒你。不得扩大权限、不得创建新的协调任务、不得替用户回答阻塞。仅在缺少授权或重大范围决策时返回 {~Q~outcome~Q~:~Q~blocked~Q~,~Q~kind~Q~:~Q~human~Q~,~Q~reason~Q~:~Q~...~Q~,~Q~question~Q~:~Q~...~Q~,~Q~reversibleDefault~Q~:~Q~...~Q~}。'.replaceAll('~Q~', String.fromCharCode(34));
   const modes = task.kind === 'coordination' ? coordinationMode : task.kind === 'plan' ? `Return {"outcome":"planned","summary":"...","tasks":[{"key":"one","title":"...","description":"...","acceptance":"...","dependencies":[],"longLived":false}]}. Dependencies reference keys in this plan. Create a small acyclic plan inside the authorized goal. Do not perform implementation during planning. Every task must have concrete deliverables and independent acceptance criteria.`
-    : task.kind === 'review' ? `Independently inspect the supplied files and checks against the acceptance criteria. Do not edit deliverables or implement fixes. Return {"outcome":"reviewed","decision":"approve" or "changes_requested","summary":"...","findings":["specific evidence"]}. Approve only when the submitted version meets the contract. The task cannot be approved merely because its author reports success. If your execution tools or sandbox fail, return {"outcome":"blocked","kind":"technical","reason":"specific environment failure"} so ACMS retries the review. Reserve changes_requested for an actual deliverable defect, not a broken reviewer environment.`
+    : task.kind === 'review' ? `Independently inspect the delivered artifacts and automatic check evidence against the acceptance criteria. Judge the delivered outcome only: do not review the work process, the author's report or the conversation history. For a goal-level review, evaluate every listed target. Do not edit deliverables or implement fixes. Return {"outcome":"reviewed","decision":"approve" or "changes_requested","summary":"...","findings":["specific evidence"]}. Approve only when the delivered version meets the contract. If your execution tools or sandbox fail, return {"outcome":"blocked","kind":"technical","reason":"specific environment failure"} so ACMS retries the review. Reserve changes_requested for an actual deliverable defect, not a broken reviewer environment.`
     : `Do the actual work inside the isolated workspace. Return {"outcome":"completed","summary":"...","artifacts":[{"path":"relative/path","title":"..."}]}. Deliver actual files, not only a final message. Do not change the source project outside this workspace. Do not write ACMS metadata, policy, credentials or database. Do not spawn background processes that outlive this run. If division of work is needed, return {"outcome":"decomposed","tasks":[{"key":"...","title":"...","description":"...","acceptance":"...","dependencies":[]}]} instead of spawning unmanaged agents. If truly blocked, return {"outcome":"blocked","kind":"technical" or "human","reason":"...","question":"...","reversibleDefault":"optional safe default already used"}. Solve reversible decisions autonomously. Missing permissions or unique required material require a human interaction, not invented answers.`;
   const management = agent.role === 'manager' ? `To manage and receive actual results, return {"outcome":"managed","actionBatchId":"stable-purpose-v1","summary":"...","actions":[{"command":"agent.save","args":{"name":"Worker","role":"worker","grants":[],"temporary":true}},{"command":"task.create","args":{"goalId":"${goal.id}","parentId":"${task.id}","agentId":"$actions[0].id","title":"Concrete work","description":"...","acceptance":"..."}}]}. Use only commands in role.grants. Each batch must contain 1–10 actions. Supply dependencies directly in task.create using earlier action IDs when possible, or split larger changes into bounded continuation batches. Batch actions run atomically in order; a whole string $actions[0].id references an EARLIER action's returned ID. Do not invent IDs. ACMS commits the batch, automatically wakes you again, and supplies actual results in CONTRACT.managementResults. On that next turn use those IDs to finish your work and deliver files, or submit a different necessary batch (maximum four continuation turns). Reuse the SAME actionBatchId and identical actions on retries: this returns the same IDs without duplicate roles/tasks. Never resubmit committed work with a new ID. A failed batch has no effects; correct the reported error. agent.save may grant only your current effective permissions and the new role's ceiling; workers must have grants: []. Owner policy and new business goals cannot be changed. Select the execution provider/model authorized in your task; do not access ACMS database or credentials. CONTRACT.modelContext lists authorized candidates, their declared capabilities and the owner model preference order. Explicit bindings win; preferences never widen authorization; unknown capabilities must not be treated as supported.` : '';
   return `ACMS_ATTEMPT_ID=${attempt.id}\nYou are working inside ACMS (Agent Company Management System). Follow the assigned scope and role. Do not create a new business goal or widen permissions. All scheduling and subagent creation is managed by ACMS. Output exactly one JSON object as your final answer, without a Markdown fence.\n${modes}\n${management}\nCONTRACT:\n${JSON.stringify(contract, null, 2)}`;
+}
+
+function goalReviewEvidence(company, task, goal) {
+  const store = company.store;
+  const targets = (task.reviewTargets ?? []).map(target => {
+    const row = store.require('tasks', target.id);
+    const artifacts = (row.artifactIds ?? []).map(id => store.require('artifacts', id));
+    const checks = store.list('verifications').filter(v => v.taskId === row.id && v.kind === 'checks').at(-1) ?? null;
+    return { taskId: row.id, title: row.title, acceptance: row.acceptance, summary: row.summary ?? '', artifacts: artifacts.map(a => ({ path: a.path, title: a.title, hash: a.hash })), checks };
+  });
+  return { scope: 'goal', goal: goal.title, acceptance: goal.acceptance, deliveryHash: task.deliveryHash, targets };
 }
 
 function buildManagerExtras(company, goal, task) {
@@ -64,8 +76,8 @@ function buildManagerExtras(company, goal, task) {
     plans,
     decisionLog,
     goalTasks: tasks.map(t => ({ id: t.id, title: t.title, kind: t.kind, status: t.status, agentId: t.agentId ?? null, parentId: t.parentId ?? null, dependencies: t.dependencies ?? [], reworks: t.reworks ?? 0, coordinationKey: t.coordinationKey ?? null, origin: t.origin ?? null })),
-    coordination: source ? { sourceTaskId: source.id, sourceTitle: source.title, sourceStatus: source.status, sourceFeedback: source.feedback ?? null, sourceAgentId: source.agentId ?? null, sourceDependencies: source.dependencies ?? [], reviewTaskId: task.reviewTaskId ?? null, reviewRound: task.reviewRound ?? null, feedbackHash: task.feedbackHash ?? null, coordinationKey: task.coordinationKey ?? null, rework: { reworks: source.reworks ?? 0, maxReworks: Math.min(source.workflowSnapshot?.maxReworks ?? 0, company.policy().maxReworks) } } : null,
-    rework: { feedback: (source ?? task).feedback ?? null, reworks: (source ?? task).reworks ?? 0, maxReworks: Math.min((source ?? task).workflowSnapshot?.maxReworks ?? 0, company.policy().maxReworks) },
+    coordination: source ? { sourceTaskId: source.id, sourceTitle: source.title, sourceStatus: source.status, sourceFeedback: source.feedback ?? null, sourceAgentId: source.agentId ?? null, sourceDependencies: source.dependencies ?? [], reviewTaskId: task.reviewTaskId ?? null, reviewRound: task.reviewRound ?? null, feedbackHash: task.feedbackHash ?? null, coordinationKey: task.coordinationKey ?? null, rework: { reworks: source.reworks ?? 0, maxReworks: company.policy().maxReworks } } : null,
+    rework: { feedback: (source ?? task).feedback ?? null, reworks: (source ?? task).reworks ?? 0, maxReworks: company.policy().maxReworks },
     effectiveGrants: company.effectiveGrants({ id: task.agentId }).join(", ")
   };
 }

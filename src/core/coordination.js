@@ -134,9 +134,9 @@ export function scheduleRepairFlow(engine, task, reason) {
       store.event("repair.limit", task.id, { reason, coordinationTaskId: coordination.id }, SYSTEM, { goalId: task.goalId });
       return holdSourceForCoordination(store, task, coordination);
     }
-    const repair = company.createTask({ goalId: task.goalId, kind: "repair", title: "解阻：" + task.title, description: "诊断并解决以下技术阻塞。输出可应用的修复文件或修复说明，原任务会自动读取交付物后继续。\n问题：" + reason + "\n原任务：" + task.description, acceptance: "给出可验证的故障原因和具体修复交付物，并通过独立审查。", parentId: task.id, checkIds: [], workflowSnapshot: task.workflowSnapshot, origin: { kind: "scheduler", decidedBy: null, createdBy: "scheduler", basis: "自动解阻" } }, SYSTEM);
+    const repair = company.createTask({ goalId: task.goalId, kind: "repair", title: "解阻：" + task.title, description: "诊断并解决以下技术阻塞。输出可应用的修复文件或修复说明，原任务会自动读取交付物后继续。\n问题：" + reason + "\n原任务：" + task.description, acceptance: "给出可验证的故障原因和具体修复交付物；交付成果可由用户按需添加审查。", parentId: task.id, checkIds: [], origin: { kind: "scheduler", decidedBy: null, createdBy: "scheduler", basis: "自动解阻" } }, SYSTEM);
     store.put("tasks", { ...repair, repairOf: task.id });
-    store.put("tasks", { ...task, status: "blocked", stageIndex: 0, attempts: 0, repairs: (task.repairs ?? 0) + 1, dependencies: [...task.dependencies, repair.id], blocker: { kind: "technical", reason, resolutionTaskIds: [repair.id] } });
+    store.put("tasks", { ...task, status: "blocked", attempts: 0, repairs: (task.repairs ?? 0) + 1, dependencies: [...task.dependencies, repair.id], blocker: { kind: "technical", reason, resolutionTaskIds: [repair.id] } });
     store.event("repair.queued", repair.id, { taskId: task.id, reason }, SYSTEM);
     return repair;
   });

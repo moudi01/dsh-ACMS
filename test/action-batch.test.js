@@ -101,5 +101,5 @@ test('external-style manager receives results on automatic wakeup and completes 
   assert.equal(managerTurns, 2); assert.equal(f.store.list('actionBatches').length, 1);
   assert.equal(f.store.require('tasks', received[1].id).parentId, root.id);
   assert.equal(f.store.require('tasks', received[1].id).status, 'succeeded');
-  assert.equal(f.store.list('verifications').filter(v => v.kind === 'review' && v.passed).length, 2);
+  assert.equal(f.store.list('verifications').filter(v => v.kind === 'review').length, 0);
 });

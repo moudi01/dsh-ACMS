@@ -21,12 +21,16 @@ export class Engine {
     try { this.conversations?.recover(); await this.recover(); } catch (e) { this.store.releaseLease(this.owner); throw e; }
     this.listener = () => this.kick(); this.store.events.on('event', this.listener);
     this.timer = setInterval(() => this.kick(), this.intervalMs); this.timer.unref?.(); this.kick();
-    for (const task of this.store.list('tasks')) if (task.status === 'integrating') this.queueIntegration(task.id);
+    for (const task of this.store.list('tasks')) if (task.status === 'integrating' && !task.legacyBatch && !task.workflowSnapshot) this.queueIntegration(task.id);
   }
   kick() { if (this.closing || this.scheduled) return; this.scheduled = true; queueMicrotask(() => { this.scheduled = false; this.tick().catch(e => { this.lastError = String(e.message); }); }); }
   fenced() { assert(this.store.ownsLease(this.owner, this.epoch), 'LEASE_LOST', 'Scheduler no longer owns the company lease'); }
   async recover(taskId) {
     for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
+      const legacyTask = this.store.get('tasks', previous.taskId);
+      // Stage-model tasks are backed up and isolated; never reconcile, accept or
+      // re-dispatch them under the atomic task model.
+      if (legacyTask?.legacyBatch || legacyTask?.workflowSnapshot) continue;
       let fact;
       try { fact = await this.adapter.reconcile?.(previous) ?? { status: 'unknown', reason: '执行器未提供恢复回执' }; }
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
@@ -116,7 +120,7 @@ export class Engine {
       let free = p.maxConcurrent - active.length - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
-      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
+      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
         if (active.some(a => a.taskId === task.id)) continue;
@@ -295,22 +299,12 @@ export class Engine {
     assert(checksPassed, 'CHECK_FAILED', `Configured acceptance checks failed: ${collected.checks.filter(c => !c.passed).map(c => `${c.id}: ${c.stderr || c.stdout || c.code}`).join('\n').slice(0, 6000)}`, { checks: collected.checks });
     this.store.transaction(() => {
       task = this.store.require('tasks', task.id);
-      task = this.store.put('tasks', { ...task, artifactIds: collected.artifacts.map(a => a.id), artifactHash: collected.hash, changeSet: collected.changeSet, summary: output.summary ?? '', status: 'reviewing', lastAuthorId: attempt.agentId });
+      task = this.store.put('tasks', { ...task, artifactIds: collected.artifacts.map(a => a.id), artifactHash: collected.hash, changeSet: collected.changeSet, summary: output.summary ?? '', status: 'integrating', lastAuthorId: attempt.agentId });
       this.finishAttempt(attempt, 'completed', output.summary);
-      this.nextStage(task);
+      this.queueIntegration(task.id);
     });
   }
   acceptPlan(task, attempt, output) { return acceptPlanFlow(this, task, attempt, output); }
-  nextStage(task) {
-    const nextIndex = task.stageIndex + 1; const step = task.workflowSnapshot.steps[nextIndex];
-    if (!step) { this.store.put('tasks', { ...task, status: 'integrating' }); this.queueIntegration(task.id); return; }
-    task = this.store.put('tasks', { ...task, stageIndex: nextIndex, status: step.type === 'review' ? 'reviewing' : 'ready' });
-    if (step.type === 'review') {
-      const reviewer = this.store.list('agents').find(a => a.role === 'reviewer' && a.status === 'available' && a.id !== task.lastAuthorId) ?? this.company.temporaryAgent(task.goalId, 'reviewer');
-      const review = this.company.createTask({ goalId: task.goalId, kind: 'review', title: `审查：${task.title}`, description: `阶段：${step.name}。独立核对交付物、检查结果和验收标准。`, acceptance: task.acceptance, parentId: task.id, reviewOf: task.id, reviewArtifactHash: task.artifactHash, agentId: reviewer.id, workflowSnapshot: task.workflowSnapshot, requiresArtifacts: false, checkIds: [] }, SYSTEM);
-      this.store.event('review.queued', review.id, { taskId: task.id, reviewerId: reviewer.id, artifactHash: task.artifactHash }, SYSTEM);
-    }
-  }
   scheduleRepair(task, reason) { return scheduleRepairFlow(this, task, reason); }
   async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
   queueIntegration(taskId) {

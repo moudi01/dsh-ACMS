@@ -193,13 +193,13 @@ function resolveGoal(company, credential, goalIdParam, command) {
 }
 
 function goalView(goal) {
-  return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, workflowId: goal.workflowId ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
+  return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, templateId: goal.templateId ?? 'base', constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
 }
 function projectView(project) {
   return { id: project.id, name: project.name, repoRoot: project.repoRoot, mode: project.mode, checks: project.checks ?? [], autoMerge: project.autoMerge === true, status: project.status, source: project.source ?? null, createdAt: project.createdAt, updatedAt: project.updatedAt };
 }
 function taskView(task) {
-  return { id: task.id, goalId: task.goalId, projectId: task.projectId, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind, status: task.status, agentId: task.agentId, parentId: task.parentId ?? null, dependencies: [...(task.dependencies ?? [])], stageIndex: task.stageIndex, attemptCount: task.attempts ?? 0, blocker: task.blocker ?? null, lastAnswer: task.lastAnswer ?? null, artifactHash: task.artifactHash ?? null, reviewOf: task.reviewOf ?? null, feedback: task.feedback ?? null, requiresArtifacts: task.requiresArtifacts !== false, createdAt: task.createdAt, updatedAt: task.updatedAt };
+  return { id: task.id, goalId: task.goalId, projectId: task.projectId, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind, status: task.status, agentId: task.agentId, parentId: task.parentId ?? null, dependencies: [...(task.dependencies ?? [])], reviewScope: task.reviewScope ?? null, passed: task.passed ?? null, attemptCount: task.attempts ?? 0, blocker: task.blocker ?? null, lastAnswer: task.lastAnswer ?? null, artifactHash: task.artifactHash ?? null, reviewOf: task.reviewOf ?? null, feedback: task.feedback ?? null, requiresArtifacts: task.requiresArtifacts !== false, createdAt: task.createdAt, updatedAt: task.updatedAt };
 }
 function attemptView(attempt) {
   return { id: attempt.id, taskId: attempt.taskId, agentId: attempt.agentId, status: attempt.status, model: attempt.model ?? null, provider: attempt.provider ?? null, llmProvider: attempt.llmProvider ?? null, selection: attempt.selection ?? null, startedAt: attempt.startedAt ?? null, finishedAt: attempt.finishedAt ?? null, summary: attempt.summary ?? null };

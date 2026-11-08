@@ -16,20 +16,15 @@ try {
   await expect(page.getByRole('heading', { name: '任务工作台', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '依赖图', exact: true }).click(); await expect(page.locator('.acms-graph-node').first()).toBeVisible();
   await page.screenshot({ path: 'test-results/ui/graph.png', fullPage: true });
-  await page.getByRole('button', { name: '工作流程', exact: true }).click(); await page.getByRole('button', { name: '编辑并发布新版本' }).click();
-  await page.getByLabel('流程名称', { exact: true }).fill('执行、复核与交付'); await page.getByLabel('变更说明', { exact: true }).fill('UI contract test');
-  await page.getByRole('button', { name: '保存', exact: true }).click(); await expect(page.locator('dialog')).toHaveCount(0); await expect(page.getByText('版本 2 · 最多返工 2 次')).toBeVisible();
+  await page.getByRole('button', { name: '目标模板', exact: true }).click(); await page.getByRole('button', { name: '编辑并发布新版本' }).click();
+  await page.getByLabel('模板名称', { exact: true }).fill('拆分与执行'); await page.getByLabel('变更说明', { exact: true }).fill('UI contract test');
+  await page.getByRole('button', { name: '保存', exact: true }).click(); await expect(page.locator('dialog')).toHaveCount(0); await expect(page.getByText('版本 2 · 含最终审查')).toBeVisible();
   await page.getByRole('button', { name: '任务工作台', exact: true }).click(); await page.getByRole('button', { name: '看板', exact: true }).click();
   await page.getByRole('heading', { name: '确认品牌素材', exact: true }).click();
   await expect(page.getByRole('button', { name: '继续执行', exact: true })).toBeDisabled();
   await expect(page.getByText('请先回复下方待处理的问题，再继续执行。')).toBeVisible();
-  await page.getByRole('button', { name: '更换工作流', exact: true }).click();
-  await page.getByLabel('迁移原因').fill('Use independently reviewed v2 workflow');
-  await page.getByRole('button', { name: '保存', exact: true }).click(); await expect(page.locator('dialog')).toHaveCount(0);
-  await expect(page.getByText('执行、复核与交付 · v2')).toBeVisible();
-  await expect(page.getByRole('button', { name: '继续执行', exact: true })).toBeEnabled();
-  await page.getByRole('button', { name: '继续执行', exact: true }).click();
-  await expect(page.getByText('请先回复下方待处理的问题，再继续执行。')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '目标模板' })).toBeVisible();
+  await expect(page.getByText('拆分与执行', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '关闭任务详情' }).click();
   await page.getByRole('button', { name: '组织管理', exact: true }).click(); await page.getByRole('button', { name: '＋ 创建角色' }).click();
   await page.getByLabel('角色名称', { exact: true }).fill('文档协调员');
@@ -76,6 +71,6 @@ try {
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth); if (overflow) throw new Error('Mobile viewport has page-level horizontal overflow');
   await page.getByRole('button', { name: '公司设置', exact: true }).click(); await page.getByRole('button', { name: '编辑边界', exact: true }).click();
   await expect(page.getByRole('dialog')).toBeVisible(); await page.keyboard.press('Escape'); await expect(page.locator('dialog')).toHaveCount(0);
-  const report = { passed: true, mode: 'isolated DSH client-loader/host-route harness with simulation provider', checked: ['actual DSH loader bundle', 'dashboard', 'task dependency graph', 'workflow version publish and explicit task migration', 'real model-name selection and saved binding', 'model list without unsupported executors or filters; parent inheritance for internal models', 'reasoning selection and persistence', 'failed model diagnostics disable saving with reason; successful retry recovers', 'task deletion and restore', 'disabled task actions explain why', 'human answer and automatic wake', 'dark theme', '390px responsive layout', 'dialog Escape', 'no uncaught browser errors'], screenshots: ['docs/images/overview.png', 'test-results/ui/graph.png', 'test-results/ui/model-diagnostics.png', 'test-results/ui/dark.png', 'test-results/ui/mobile.png'] };
+  const report = { passed: true, mode: 'isolated DSH client-loader/host-route harness with simulation provider', checked: ['actual DSH loader bundle', 'dashboard', 'task dependency graph', 'goal template version publish and task detail template display', 'real model-name selection and saved binding', 'model list without unsupported executors or filters; parent inheritance for internal models', 'reasoning selection and persistence', 'failed model diagnostics disable saving with reason; successful retry recovers', 'task deletion and restore', 'disabled task actions explain why', 'human answer and automatic wake', 'dark theme', '390px responsive layout', 'dialog Escape', 'no uncaught browser errors'], screenshots: ['docs/images/overview.png', 'test-results/ui/graph.png', 'test-results/ui/model-diagnostics.png', 'test-results/ui/dark.png', 'test-results/ui/mobile.png'] };
   await writeFile('test-results/ui/report.json', JSON.stringify(report, null, 2)); console.log(JSON.stringify(report, null, 2));
 } catch (e) { console.error('Browser errors:', errors); await page.screenshot({ path: 'test-results/ui/failure.png', fullPage: true }); throw e; } finally { await browser.close(); await server.close(); }

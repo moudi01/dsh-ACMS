@@ -7,17 +7,21 @@ import { deleteEntity, restoreEntity, recordChange, restartForChange } from './e
 import { goalRuntimeLimit, goalRuntimeSpent } from './runtime-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 
-const BASE_STEPS = [{ id: 'execute', type: 'work', name: '执行', role: 'worker' }, { id: 'review', type: 'review', name: '独立审查', role: 'reviewer' }];
-const GRANTS = { manager: ['task.create', 'task.edit', 'task.dependencies', 'agent.save', 'workflow.publish', 'task.retry'], worker: [], reviewer: [] };
+const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
+const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
+const GRANTS = { manager: ['task.create', 'task.edit', 'task.dependencies', 'agent.save', 'task.retry'], worker: [], reviewer: [] };
 export class Company {
   constructor(store) {
     this.store = store;
     if (!store.get('policy', 'company')) store.transaction(() => {
       store.put('policy', { id: 'company', name: 'ACMS', maxConcurrent: 4, controlSlots: 1, maxTasksPerGoal: 80, maxTemporaryAgents: 24, maxAttempts: 3, maxReworks: 2, turnTimeoutMs: 1200000, maxGoalRuntimeMs: 14400000, paused: false, allowedProviders: [], allowedModels: [], allowedProjectRoots: [], maxArtifactBytes: 16777216 });
       for (const role of ['manager', 'reviewer']) store.put('agents', { id: role, name: role === 'manager' ? '项目负责人' : '质量审查员', role, provider: 'auto', model: '', temporary: false, status: 'available', grants: GRANTS[role], description: role === 'manager' ? '规划、协调、解决阻塞，在已授权目标内组织工作。' : '独立检查交付物及证据，不代替作者实现任务。' });
-      store.put('workflows', { id: 'default', name: '执行与独立验收', version: 1, steps: BASE_STEPS, maxReworks: 2, published: true });
       store.event('company.created', 'company', {}, OWNER);
     });
+    this.ensureTemplates();
+  }
+  ensureTemplates() {
+    if (!this.store.get('templates', BASE_TEMPLATE.id)) this.store.put('templates', { ...BASE_TEMPLATE });
   }
   policy() { return this.store.require('policy', 'company'); }
   runActions(actor, batch) { return runActionBatch(this, actor, batch); }
@@ -68,7 +72,7 @@ export class Company {
         'task.retry': () => this.resumeTask(args, actor, true),
         'agent.save': () => this.saveAgent(args, actor),
         'workflow.publish': () => this.publishWorkflow(args, actor),
-        'task.migrateWorkflow': () => this.migrateWorkflow(args, actor),
+        'review.request': () => this.reviewRequest(args, actor),
         'policy.update': () => this.updatePolicy(args, actor),
         'company.pause': () => this.setPaused(true, actor, args.afterCurrent === true),
         'company.resume': () => this.setPaused(false, actor),
@@ -142,22 +146,26 @@ export class Company {
   createGoal(args, actor) { this.owner(actor); return this.createGoalRecord(args, actor); }
   createGoalRecord(args, actor, options = {}) {
     assert(this.store.require("projects", args.projectId).status !== "deleted", "ENTITY_DELETED", "请先恢复项目");
-    const workflow = this.store.require('workflows', args.workflowId ?? 'default');
+    const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const constraints = options.constraints ?? [];
-    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, workflowId: workflow.id, status: args.plan === false ? "active" : "planning", runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
+    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, status: args.plan === false ? "active" : "planning", runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
     if (args.plan !== false) { const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId); assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色'); this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description, kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM); }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }
   createTask(args, actor = SYSTEM, options = {}) {
-    const goal = this.store.require('goals', args.goalId); assert(!['succeeded', 'cancelled', 'archived', 'deleted'].includes(goal.status), 'GOAL_CLOSED', 'Goal is closed');
+    const goal = this.store.require('goals', args.goalId);
+    assert(!goal.legacyBatch, 'LEGACY_GOAL', '该目标已按旧阶段制数据归档，请恢复或新建目标后再派工');
+    const kind = args.kind ?? 'work';
+    // A review may still be requested after delivery; it is evidence, not a
+    // reopened work item, so it does not resurrect a closed goal.
+    assert(!['succeeded', 'cancelled', 'archived', 'deleted'].includes(goal.status) || (actor.kind === 'system' && kind === 'review'), 'GOAL_CLOSED', 'Goal is closed');
     assert(this.store.require('projects', goal.projectId).status !== 'deleted', 'ENTITY_DELETED', '请先恢复项目');
     const p = this.policy();
     assert(this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length < p.maxTasksPerGoal, 'TASK_LIMIT', 'Goal task limit reached');
-    const kind = args.kind ?? 'work'; assert(['work', 'plan', 'repair', 'review', 'coordination'].includes(kind), 'INVALID_INPUT', 'Invalid task kind');
+    assert(['work', 'plan', 'repair', 'review', 'coordination'].includes(kind), 'INVALID_INPUT', 'Invalid task kind');
     assert(actor.kind === 'system' || kind === 'work', 'SYSTEM_TASK', 'Internal task kinds are created by the engine');
-    if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);
+    if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'reviewScope', 'reviewTargets', 'deliveryHash', 'requestedBy', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);
     integer(args.priority ?? 50, 'priority', 0, 100);
-    const workflow = clone(args.workflowSnapshot ?? this.store.require('workflows', args.workflowId ?? goal.workflowId));
     const deps = [...new Set(args.dependencies ?? [])];
     for (const dep of deps) assert(this.store.require('tasks', dep).goalId === goal.id && this.store.require('tasks', dep).status !== 'deleted', 'SCOPE_DENIED', 'Dependencies must belong to the same goal and not be deleted');
     if (args.parentId) assert(this.store.require('tasks', args.parentId).goalId === goal.id && this.store.require('tasks', args.parentId).status !== 'deleted', 'SCOPE_DENIED', 'Parent must belong to the same goal and not be deleted');
@@ -168,7 +176,8 @@ export class Company {
       id: id('task'), goalId: goal.id, projectId: goal.projectId, title: text(args.title, 'title', 300), description: text(args.description ?? args.title, 'description'),
       acceptance: text(args.acceptance ?? goal.acceptance, 'acceptance'), kind, agentId, dependencies: deps, parentId: args.parentId ?? null,
       reviewOf: args.reviewOf ?? null, reviewArtifactHash: args.reviewArtifactHash ?? null, status: deps.length ? 'blocked' : 'ready',
-      workflowSnapshot: workflow, stageIndex: args.stageIndex ?? 0, generation: 1, attempts: 0, reworks: 0, priority: args.priority ?? 50,
+      reviewScope: args.reviewScope ?? null, reviewTargets: args.reviewTargets ?? null, deliveryHash: args.deliveryHash ?? null, requestedBy: args.requestedBy ?? null,
+      generation: 1, attempts: 0, reworks: 0, priority: args.priority ?? 50,
       longLived: args.longLived ?? false, requiresArtifacts: ['work', 'repair'].includes(kind),
       requirements: kind === 'review' ? { ...normalizeRequirements(args.requirements), isolation: 'independent-review' } : normalizeRequirements(args.requirements),
       origin: args.origin ?? null, coordinationOf: args.coordinationOf ?? null, coordinationKey: args.coordinationKey ?? null, reviewTaskId: args.reviewTaskId ?? null, reviewRound: args.reviewRound ?? null, feedbackHash: args.feedbackHash ?? null,
@@ -192,12 +201,80 @@ export class Company {
     this.store.put('agents', { ...agent, status: 'retired' }); this.store.event('agent.released', agent.id, { reason: '没有待执行任务或活动执行' }, actor);
   }
   refreshGoal(goalId, actor = SYSTEM) {
-    const goal = this.store.require('goals', goalId); if (['cancelled', 'archived', 'deleted'].includes(goal.status)) return goal;
-    const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted');
+    const goal = this.store.require('goals', goalId);
+    if (['cancelled', 'archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
+    const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot);
     const complete = tasks.some(t => t.kind === 'work') && tasks.every(t => ['succeeded', 'archived'].includes(t.status));
-    const status = complete ? 'succeeded' : !tasks.length ? 'empty' : tasks.some(t => t.kind === 'plan' && !TERMINAL.has(t.status)) ? 'planning' : 'active';
+    let status;
+    if (!tasks.length) status = 'empty';
+    else if (!complete) status = tasks.some(t => t.kind === 'plan' && !TERMINAL.has(t.status)) ? 'planning' : 'active';
+    else {
+      const template = this.store.get('templates', goal.templateId ?? 'base');
+      if (!template?.finalReview) status = 'succeeded';
+      else {
+        const deliveryHash = this.deliveryHash(goalId);
+        const review = this.latestGoalReview(goalId);
+        if (!review || review.deliveryHash !== deliveryHash) {
+          if (!review || TERMINAL.has(review.status)) this.createGoalReview(goal, deliveryHash);
+          status = 'active';
+        } else status = review.status === 'succeeded' && review.passed === true ? 'succeeded' : 'active';
+      }
+    }
     if (status === goal.status) return goal;
-    const saved = this.store.put('goals', { ...goal, status }); this.store.event(complete ? 'goal.succeeded' : 'goal.status.changed', goalId, { from: goal.status, status }, actor); return saved;
+    const saved = this.store.put('goals', { ...goal, status });
+    this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, { from: goal.status, status }, actor);
+    return saved;
+  }
+  deliveryHash(goalId) {
+    const rows = this.store.list('tasks')
+      .filter(t => t.goalId === goalId && t.kind === 'work' && t.status === 'succeeded' && !t.legacyBatch && !t.workflowSnapshot)
+      .map(t => `${t.id}:${t.artifactHash ?? ''}`).sort();
+    return digest(rows.join('|'));
+  }
+  latestGoalReview(goalId) {
+    return this.store.list('tasks').filter(t => t.goalId === goalId && t.kind === 'review' && t.reviewScope === 'goal' && t.status !== 'deleted').at(-1) ?? null;
+  }
+  reviewerFor(goalId, lastAuthorId) {
+    return this.store.list('agents').find(a => a.role === 'reviewer' && a.status === 'available' && a.id !== lastAuthorId) ?? this.temporaryAgent(goalId, 'reviewer');
+  }
+  createGoalReview(goal, deliveryHash) {
+    const targets = this.store.list('tasks').filter(t => t.goalId === goal.id && t.kind === 'work' && t.status === 'succeeded' && !t.legacyBatch && !t.workflowSnapshot);
+    const reviewer = this.reviewerFor(goal.id, null);
+    const review = this.createTask({
+      goalId: goal.id, kind: 'review', title: `最终审查：${goal.title}`,
+      description: '按目标模板对目标整体交付成果做一次最终审查。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
+      acceptance: goal.acceptance, agentId: reviewer.id, requiresArtifacts: false,
+      reviewScope: 'goal', deliveryHash,
+      reviewTargets: targets.map(t => ({ id: t.id, title: t.title, artifactHash: t.artifactHash, artifactIds: t.artifactIds ?? [] })),
+      origin: { kind: 'template', decidedBy: null, createdBy: 'scheduler', basis: '目标模板最终审查' },
+    }, SYSTEM);
+    this.store.event('review.queued', review.id, { goalId: goal.id, scope: 'goal', reviewerId: reviewer.id, deliveryHash, targets: targets.map(t => t.id) }, SYSTEM);
+    return review;
+  }
+  reviewRequest(args, actor) {
+    this.owner(actor);
+    if (args.scope === 'goal' || args.goalId) {
+      const goal = this.store.require('goals', args.goalId);
+      assert(!goal.legacyBatch, 'LEGACY_TASK', '旧目标已备份隔离，不能添加审查');
+      assert(goal.status !== 'deleted', 'ENTITY_DELETED', '目标已删除');
+      const deliveryHash = this.deliveryHash(goal.id);
+      const review = this.createGoalReview(goal, deliveryHash);
+      return review;
+    }
+    const source = this.store.require('tasks', args.id);
+    assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
+    assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
+    assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
+    const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);
+    const review = this.createTask({
+      goalId: source.goalId, kind: 'review', title: `审查：${source.title}`,
+      description: '审查已交付成果。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
+      acceptance: source.acceptance, parentId: source.id, reviewOf: source.id,
+      reviewArtifactHash: source.artifactHash, agentId: reviewer.id, requiresArtifacts: false,
+      reviewScope: 'task', origin: { kind: 'owner-review-request', decidedBy: null, createdBy: actor.kind, basis: '用户添加审查' },
+    }, SYSTEM, { trustedOrigin: true });
+    this.store.event('review.requested', review.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, reviewerId: reviewer.id }, actor, { goalId: source.goalId });
+    return review;
   }
   editTask(args, actor) {
     const task = this.store.require('tasks', args.id); assert(task.kind !== 'review', 'SYSTEM_TASK', '审查任务使用执行任务的固定验收合同，请编辑对应执行任务');
@@ -290,7 +367,7 @@ export class Company {
     assert(['paused', 'blocked', ...(retry ? ['failed'] : [])].includes(task.status), 'INVALID_TRANSITION', 'Task cannot resume in its current state');
     assert(!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending'), 'WAITING_INPUT', 'Answer the pending interaction first');
     for (const review of this.store.list('tasks')) if (review.reviewOf === task.id && !TERMINAL.has(review.status)) this.controlTask({ id: review.id }, 'cancelled', actor);
-    const saved = this.store.put('tasks', { ...task, status: 'ready', stopRequested: null, stageIndex: task.kind === 'review' ? task.stageIndex : 0, ...(retry ? { attempts: 0 } : {}) }, args.expectedRevision);
+    const saved = this.store.put('tasks', { ...task, status: 'ready', stopRequested: null, ...(retry ? { attempts: 0 } : {}) }, args.expectedRevision);
     this.store.event('task.resumed', task.id, {}, actor); return saved;
   }
   saveAgent(args, actor) {
@@ -320,25 +397,22 @@ export class Company {
     this.store.event('agent.saved', saved.id, {}, actor); return this.store.require('agents', saved.id);
   }
   publishWorkflow(args, actor) {
-    const previous = args.id ? this.store.get('workflows', args.id) : null;
-    const steps = args.steps ?? previous?.steps;
-    assert(Array.isArray(steps) && steps.length >= 2 && steps.length <= 12, 'INVALID_INPUT', 'Workflow needs 2–12 stages');
-    assert(steps[0].type === 'work' && steps.at(-1).type === 'review' && steps.some(s => s.type === 'review'), 'VERIFICATION_REQUIRED', 'Workflow must start with work and end with independent review');
-    assert(new Set(steps.map(s => s.id)).size === steps.length, 'INVALID_INPUT', 'Stage IDs must be unique');
-    for (const s of steps) { text(s.id, 'stage.id', 100); text(s.name, 'stage.name', 100); assert(['work', 'review'].includes(s.type), 'INVALID_INPUT', 'Stage type must be work or review'); }
-    const next = { id: previous?.id ?? id('workflow'), name: text(args.name ?? previous?.name, 'name', 200), steps: clone(steps), version: (previous?.version ?? 0) + 1, maxReworks: integer(args.maxReworks ?? previous?.maxReworks ?? 2, 'maxReworks', 1, this.policy().maxReworks), published: true };
-    if (previous) this.store.put('workflowHistory', { ...previous, id: `${previous.id}:${previous.version}` });
-    const saved = this.store.put('workflows', next, args.expectedRevision); this.store.event('workflow.published', saved.id, { version: saved.version, reason: args.reason ?? '' }, actor); return saved;
-  }
-  migrateWorkflow(args, actor) {
-    this.owner(actor); const task = this.store.require('tasks', args.id);
-    assert(['paused', 'blocked', 'ready', 'failed'].includes(task.status) && task.kind !== 'review', 'TASK_ACTIVE', 'Pause implementation before migrating its workflow');
-    assert(!this.store.list('attempts').some(a => a.taskId === task.id && (['preparing', 'running', 'reconciling'].includes(a.status) || a.cleanupPending)), 'TASK_ACTIVE', 'Wait for executor cleanup before migration');
-    const workflow = this.store.require('workflows', args.workflowId ?? task.workflowSnapshot.id);
-    for (const review of this.store.list('tasks')) if (review.reviewOf === task.id && !TERMINAL.has(review.status)) this.controlTask({ id: review.id }, 'cancelled', actor);
-    const saved = this.store.put('tasks', { ...task, workflowSnapshot: clone(workflow), stageIndex: 0, generation: task.generation + 1, status: 'paused' }, args.expectedRevision);
-    this.invalidateInteractions(task.id, '工作流已更新，旧问题失效');
-    this.store.event('task.workflow.migrated', task.id, { from: task.workflowSnapshot.version, to: workflow.version, reason: text(args.reason, 'reason') }, actor); return saved;
+    // A template describes how a whole goal is implemented. It is an owner
+    // boundary: the person who chooses the review policy must not have it
+    // silently changed by the manager agent.
+    this.owner(actor);
+    const previous = args.id ? this.store.get('templates', args.id) : null;
+    const phases = args.phases ?? previous?.phases;
+    assert(Array.isArray(phases) && phases.length >= 1 && phases.length <= 6, 'INVALID_INPUT', 'Template needs 1–6 phases');
+    assert(phases.every(p => p && PHASE_IDS.has(p.id)), 'INVALID_INPUT', 'Phase must be plan, execute or final-review');
+    assert(new Set(phases.map(p => p.id)).size === phases.length, 'INVALID_INPUT', 'Phase IDs must be unique');
+    assert(phases.some(p => p.id === 'execute'), 'INVALID_INPUT', 'Template must contain an execute phase');
+    const normalized = phases.map(p => ({ id: p.id, name: text(p.name ?? p.id, 'phase.name', 100) }));
+    const next = { id: previous?.id ?? id('template'), name: text(args.name ?? previous?.name, 'name', 200), phases: clone(normalized), version: (previous?.version ?? 0) + 1, finalReview: normalized.some(p => p.id === 'final-review'), published: true };
+    if (previous) this.store.put('templateHistory', { ...previous, id: `${previous.id}:${previous.version}` });
+    const saved = this.store.put('templates', next, args.expectedRevision);
+    this.store.event('template.published', saved.id, { version: saved.version, phases: saved.phases, finalReview: saved.finalReview, reason: args.reason ?? '' }, actor);
+    return saved;
   }
   answer(args, actor) {
     if (actor.kind === "user-agent") assertUserAgentAnswer(this, args, actor); else this.owner(actor);
@@ -358,7 +432,7 @@ export class Company {
       }
     }
     const saved = this.store.put('interactions', { ...interaction, status: 'answered', answer: text(args.answer, 'answer'), ...(additionalRuntimeMs ? { additionalRuntimeMs } : {}) }, args.expectedRevision);
-    this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : 'ready', stageIndex: interaction.kind === 'budget' || task.kind === 'review' ? task.stageIndex : 0, lastAnswer: saved.answer, blocker: null, attempts: 0, retryAt: null });
+    this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : 'ready', lastAnswer: saved.answer, blocker: null, attempts: 0, retryAt: null });
     if (interaction.kind === 'budget') this.releaseBudgetWaits(task.goalId, saved.id, actor);
     this.store.event('interaction.answered', interaction.id, { taskId: task.id }, actor); return saved;
   }
@@ -397,7 +471,7 @@ export class Company {
     return sanitizePreferences(saved);
   }
   snapshot() {
-    const collections = ["projects", "goals", "tasks", "agents", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "actionBatches", "agentCredentials"];
+    const collections = ["projects", "goals", "tasks", "agents", "templates", "templateHistory", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "actionBatches", "agentCredentials"];
     const data = Object.fromEntries(collections.map(c => [c, this.store.list(c)]));
     data.entityTrash = ['project', 'goal', 'agent'].flatMap(kind => data[`${kind}s`].filter(e => e.status === 'deleted' && e.deletion?.rootId === e.id).map(e => ({ ...e, entityKind: kind })));
     for (const c of ['projects', 'goals', 'agents']) data[c] = data[c].filter(e => e.status !== 'deleted');

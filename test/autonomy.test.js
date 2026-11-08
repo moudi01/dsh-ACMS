@@ -67,20 +67,21 @@ test("plan replay is idempotent and conflicting replay is rejected", async t => 
   assert.throws(() => f.engine.acceptPlan(f.store.require("tasks", task.id), f.store.require("attempts", attempt.id), changed), { code: "PLAN_CONFLICT" });
 });
 
-test("review feedback wakes the manager and rework resumes only after coordination", async t => {
+test("review feedback wakes the manager and records a rework decision", async t => {
   let reviews = 0; let coordinationContract = null;
   const f = await fixture(t, async input => {
-    if (input.task.kind === "review") { reviews++; return reviews === 1 ? { outcome: "reviewed", decision: "changes_requested", summary: "Add explanation", findings: ["Missing context"] } : { outcome: "reviewed", decision: "approve", summary: "Now complete", findings: [] }; }
+    if (input.task.kind === "review") { reviews++; return { outcome: "reviewed", decision: "changes_requested", summary: "Add explanation", findings: ["Missing context"] }; }
     if (input.task.kind === "coordination") { coordinationContract = contractOf(input); return { outcome: "coordinated", summary: "保留原分派并恢复返工" }; }
     return defaultSimulation(input);
   });
   const task = f.task();
   await f.start();
   await until(() => f.store.require("tasks", task.id).status === "succeeded", 12000);
-  assert.equal(reviews, 2);
+  f.command("review.request", { id: task.id });
+  await until(() => coordinationContract, 12000);
+  assert.equal(reviews, 1);
   const coordinations = f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id);
   assert.equal(coordinations.length, 1);
-  assert.equal(coordinations[0].status, "succeeded");
   assert.match(coordinations[0].coordinationKey, /^review:/);
   assert.equal(coordinations[0].reviewRound, 1);
   assert.equal(coordinations[0].feedbackHash.length, 64);
@@ -89,16 +90,16 @@ test("review feedback wakes the manager and rework resumes only after coordinati
   assert.deepEqual(coordinationContract.goalConstraints, []);
   assert.equal(coordinationContract.rework.reworks, 1);
   assert(Array.isArray(coordinationContract.goalTasks));
+  // Rejection records evidence and opens coordination; it never reopens the
+  // delivered task or reruns the worker.
+  assert.equal(f.store.require("tasks", task.id).status, "succeeded");
+  assert.equal(f.store.require("tasks", task.id).reworks, 1);
   const attempts = f.store.list("attempts");
-  const work = attempts.filter(a => a.kind === "work");
-  const review = attempts.filter(a => a.kind === "review");
-  const coordination = attempts.filter(a => a.kind === "coordination");
-  assert.equal(work.length, 2);
-  assert.equal(review.length, 2);
-  assert.equal(coordination.length, 1);
-  assert.notEqual(work[0].contextKey, review[0].contextKey);
-  assert.notEqual(review[0].contextKey, coordination[0].contextKey);
-  assert.equal(f.store.require("tasks", review[0].taskId).requirements.isolation, "independent-review");
+  assert.equal(attempts.filter(a => a.kind === "work").length, 1);
+  assert.equal(attempts.filter(a => a.kind === "review").length, 1);
+  assert.equal(attempts.filter(a => a.kind === "coordination").length, 1);
+  assert.notEqual(attempts.find(a => a.kind === "work").contextKey, attempts.find(a => a.kind === "review").contextKey);
+  assert.equal(f.store.require("tasks", attempts.find(a => a.kind === "review").taskId).requirements.isolation, "independent-review");
   assert(f.adapter.maxActive <= f.company.policy().maxConcurrent);
   const decided = f.store.page(0, 1000).entries.filter(e => e.type === "coordination.decided");
   assert.equal(decided.length, 1);
@@ -108,22 +109,26 @@ test("review feedback wakes the manager and rework resumes only after coordinati
   assert.equal(queued.decision.kind, "scheduler-action");
 });
 
-test("two review rejections in one generation create two coordination tasks", async t => {
-  let reviews = 0;
+test("each user-requested review rejection creates its own coordination task", async t => {
   const f = await fixture(t, async input => {
-    if (input.task.kind === "review") { reviews++; return reviews <= 2 ? { outcome: "reviewed", decision: "changes_requested", summary: "Reject " + reviews, findings: ["Finding " + reviews] } : { outcome: "reviewed", decision: "approve", summary: "Accepted", findings: [] }; }
+    if (input.task.kind === "review") return { outcome: "reviewed", decision: "changes_requested", summary: "Reject", findings: ["Finding"] };
     if (input.task.kind === "coordination") return { outcome: "coordinated", summary: "恢复返工" };
     return defaultSimulation(input);
   });
   const task = f.task();
   await f.start();
-  await until(() => f.store.require("tasks", task.id).status === "succeeded", 15000);
+  await until(() => f.store.require("tasks", task.id).status === "succeeded", 12000);
+  for (const count of [1, 2]) {
+    f.command("review.request", { id: task.id });
+    await until(() => f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id).length === count, 12000);
+  }
   const coordinations = f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id);
   assert.equal(coordinations.length, 2);
   assert.notEqual(coordinations[0].coordinationKey, coordinations[1].coordinationKey);
   assert.deepEqual(coordinations.map(c => c.reviewRound), [1, 2]);
   assert.equal(f.store.require("tasks", task.id).reworks, 2);
-  assert.equal(reviews, 3);
+  assert.equal(f.store.require("tasks", task.id).status, "succeeded");
+  assert.equal(f.store.list("tasks").filter(t => t.kind === "review" && t.goalId === f.goal.id).length, 2);
 });
 
 test("coordination keys deduplicate replay and reject changed feedback", async t => {
@@ -258,7 +263,7 @@ test("coordinated result re-checks manager role and current grants", async t => 
   assert.equal(f.store.require("tasks", task.id).status, "blocked");
   assert.equal(f.store.require("tasks", coordination.id).status, "running");
 
-  f.command("agent.save", { id: "manager", grants: ["task.create", "task.edit", "task.dependencies", "agent.save", "workflow.publish", "task.retry"] });
+  f.command("agent.save", { id: "manager", grants: ["task.create", "task.edit", "task.dependencies", "agent.save", "task.retry"] });
   const worker = f.command("agent.save", { name: "Zero grant worker", role: "worker", grants: [] });
   f.store.transaction(() => f.store.put("tasks", { ...f.store.require("tasks", coordination.id), agentId: worker.id, status: "ready", activeAttemptId: null }));
   const workerAttempt = claimCoordination(f, f.store.require("tasks", coordination.id), worker.id, "worker");
@@ -288,14 +293,16 @@ test("coordination fallback ignores managers dedicated to another goal", async t
 
   const reviewTarget = f.task({ title: "No qualified manager review" });
   await f.start();
-  await until(() => { const current = f.store.require("tasks", reviewTarget.id); return current.status === "blocked" && current.reworks === 1; }, 15000);
+  await until(() => f.store.require("tasks", reviewTarget.id).status === "succeeded", 15000);
+  f.command("review.request", { id: reviewTarget.id });
+  await until(() => f.store.list("interactions").some(i => i.taskId === reviewTarget.id && i.status === "pending"), 15000);
   const reviewed = f.store.require("tasks", reviewTarget.id);
-  assert.equal(reviewed.blocker.kind, "assignment");
+  assert.equal(reviewed.status, "succeeded");
+  assert.equal(reviewed.reworks, 1);
   assert.equal(f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === reviewTarget.id).length, 0);
-  assert(f.store.list("interactions").some(i => i.taskId === reviewTarget.id && i.status === "pending"));
 });
 
-test("review rework ceiling blocks for the user instead of opening another coordination", async t => {
+test("review rework ceiling is recorded without reopening the delivered task", async t => {
   let reviews = 0;
   const f = await fixture(t, async input => {
     if (input.task.kind === "review") { reviews++; return { outcome: "reviewed", decision: "changes_requested", summary: "Reject " + reviews, findings: ["Finding " + reviews] }; }
@@ -304,13 +311,17 @@ test("review rework ceiling blocks for the user instead of opening another coord
   });
   const task = f.task({ title: "Rework ceiling" });
   await f.start();
-  await until(() => { const current = f.store.require("tasks", task.id); return current.status === "blocked" && current.reviewLimitExceeded === true; }, 15000);
+  await until(() => f.store.require("tasks", task.id).status === "succeeded", 15000);
+  for (const count of [1, 2, 3]) {
+    f.command("review.request", { id: task.id });
+    await until(() => f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id).length === count, 15000);
+  }
   const source = f.store.require("tasks", task.id);
+  assert.equal(source.status, "succeeded");
   assert.equal(source.reworks, 3);
-  assert.equal(source.blocker.kind, "reworks");
+  assert.equal(source.reviewLimitExceeded, true);
   assert.equal(reviews, 3);
-  assert.equal(f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id).length, 2);
-  assert(f.store.list("interactions").some(i => i.taskId === task.id && i.status === "pending"));
+  assert.equal(f.store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === task.id).length, 3);
 });
 
 test("coordination result cannot release a source already beyond the rework ceiling", async t => {

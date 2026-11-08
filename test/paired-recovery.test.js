@@ -228,7 +228,7 @@ for (const protocol of ['runner', 'codex-app-server']) for (const persistent of 
   const adapter = new DshAdapter({ subagents: { providers: new Map() } }, f.company, f.dataDir);
   f.adapter.reconcile = old => adapter.reconcile(old);
   await f.start(); await until(() => f.store.require('tasks', task.id).status === 'succeeded');
-  assert.deepEqual(f.adapter.calls.map(c => c.task.kind), ['review']);
+  assert.deepEqual(f.adapter.calls.map(c => c.task.kind), []);
   assert.equal(await readFile(calls, 'utf8'), count);
   assert.equal(f.store.require('attempts', a.id).recovery.status, 'completed');
 });

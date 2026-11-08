@@ -64,7 +64,7 @@ export function restartForChange(company, task, { direct = false } = {}) {
   for (const review of store.list('tasks').filter(r => r.reviewOf === task.id && !TERMINAL.has(r.status))) company.controlTask({ id: review.id }, 'cancelled', { kind: 'system', id: 'scheduler' });
   const held = ['paused', 'blocked'].includes(task.status);
   const status = active ? 'stopping' : held ? task.status : !direct && TERMINAL.has(task.status) ? task.status : 'ready';
-  const saved = store.put('tasks', { ...task, status, stopRequested: active ? 'ready' : null, generation: task.generation + 1, stageIndex: 0, attempts: 0, reworks: 0, retryAt: null, resumeOnStart: false, contractChangedAt: now() });
+  const saved = store.put('tasks', { ...task, status, stopRequested: active ? 'ready' : null, generation: task.generation + 1, attempts: 0, reworks: 0, retryAt: null, resumeOnStart: false, contractChangedAt: now() });
   // A retained owner question remains valid for a global contract change.
   for (const interaction of store.list('interactions').filter(i => i.taskId === task.id && i.status === 'pending')) store.put('interactions', { ...interaction, taskGeneration: saved.generation });
   return saved;

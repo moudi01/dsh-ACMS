@@ -12,7 +12,7 @@ test('manager creates a zero-grant worker, assigns its returned ID, and work com
  assert(audit.some(e=>e.type==='task.created'&&e.entityId===task.id&&e.actor==='manager'));
  await f.start();await until(()=>f.store.require('tasks',task.id).status==='succeeded');
  assert(f.store.list('attempts').some(a=>a.agentId===worker.id&&a.status==='completed'));
- assert(f.store.list('verifications').some(v=>v.taskId===task.id&&v.kind==='review'&&v.passed));
+ assert(f.store.list('verifications').some(v=>v.taskId===task.id&&v.kind==='checks'&&v.passed));
 });
 
 test('worker cannot create agents, assign or edit tasks, or change company policy', async t => {

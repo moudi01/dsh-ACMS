@@ -3,6 +3,7 @@ import os from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { Store } from '../core/store.js';
 import { Company } from '../core/domain.js';
+import { migrateLegacy } from '../core/legacy.js';
 import { Engine } from '../runtime/engine.js';
 import { Conversations } from '../runtime/conversations.js';
 import { WorkspaceManager } from '../runtime/workspaces.js';
@@ -17,6 +18,10 @@ export async function apply(ctx, config = {}) {
   const dataDir = path.resolve(config.dataDir ?? process.env.ACMS_DATA_DIR ?? path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'acms'));
   mkdirSync(dataDir, { recursive: true });
   const store = new Store(path.join(dataDir, 'company.db')); const company = new Company(store);
+  // Stage-based rows are backed up and archived before the scheduler starts, so
+  // the atomic task model never reconciles or dispatches them.
+  const legacyMigration = migrateLegacy(store, { dataDir });
+  if (legacyMigration && !legacyMigration.skipped) ctx.logger?.info?.(`ACMS legacy export: ${legacyMigration.dir}`);
   const workspaces = new WorkspaceManager(dataDir, company); const adapter = new DshAdapter(ctx, company, dataDir); const engine = new Engine(company, adapter, workspaces);
   const conversations = new Conversations(company, engine, adapter, dataDir);
   const runtime = { dataDir, company, workspaces, adapter, engine, conversations };

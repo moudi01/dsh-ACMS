@@ -45,6 +45,9 @@ export class WorkspaceManager {
     return root;
   }
   async prepare(task, attempt) {
+    // A goal-level review has no single author workspace: materialize the
+    // immutable artifact blobs of every delivered task into a fresh copy.
+    if (task.reviewScope === 'goal') return this.prepareGoalReview(task);
     if (task.reviewOf) {
       if (task.workspace?.mode === 'review-copy') { await fs.access(task.workspace.path); return task.workspace; }
       const sourceTask = this.company.store.require('tasks', task.reviewOf);
@@ -67,6 +70,22 @@ export class WorkspaceManager {
       return !(await fs.lstat(item)).isSymbolicLink();
     } });
     return syncCollaboration(this.company, project, task, { path: destination, source, mode: 'copy' });
+  }
+  async prepareGoalReview(task) {
+    if (task.workspace?.mode === 'review-copy') { await fs.access(task.workspace.path); return task.workspace; }
+    const destination = path.join(this.dataDir, 'reviews', task.id);
+    await fs.mkdir(destination, { recursive: true });
+    for (const [index, target] of (task.reviewTargets ?? []).entries()) {
+      const source = this.company.store.require('tasks', target.id);
+      for (const artifactId of source.artifactIds ?? []) {
+        const artifact = this.company.store.require('artifacts', artifactId);
+        const file = path.resolve(destination, String(index + 1), artifact.path);
+        assert(inside(destination, file), 'ARTIFACT_PATH', 'Artifact escapes the review workspace');
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.copyFile(artifact.blob, file);
+      }
+    }
+    return { path: destination, mode: 'review-copy', reviewScope: 'goal', artifactHash: task.deliveryHash };
   }
   async safeFile(workspace, relative) {
     assert(typeof relative === 'string' && relative.length > 0 && !path.isAbsolute(relative), 'ARTIFACT_PATH', 'Artifact paths must be relative to the isolated workspace');
