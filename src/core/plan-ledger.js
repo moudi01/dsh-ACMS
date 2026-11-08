@@ -1,5 +1,5 @@
 import { assert, digest, now, SYSTEM } from "./util.js";
-import { coordinationAuthority, releaseCoordinatedSource } from "./coordination.js";
+import { coordinationAuthority, releaseCoordinatedSource, releaseTimeBox } from "./coordination.js";
 
 function orderNodes(nodes) {
   assert(Array.isArray(nodes) && nodes.length > 0 && nodes.length <= 30, "INVALID_PLAN", "Plan must contain 1-30 tasks");
@@ -93,6 +93,7 @@ export function acceptPlanFlow(engine, task, attempt, output) {
       const reworkTasks = records.map(r => r.taskId);
       const saved = store.put("tasks", { ...store.require("tasks", task.id), status: "succeeded", summary: output.summary ?? "", decision: { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "", sourceTaskId: task.coordinationOf } });
       releaseCoordinatedSource(engine, saved, { reworkTasks });
+      if (task.origin?.kind === "timebox") { releaseTimeBox(store, saved, actor); company.refreshGoal(task.goalId); }
       store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf, planId, tasks: reworkTasks, decision: { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "" } }, actor, { goalId: task.goalId });
     } else {
       if (task.kind === "plan") store.put("tasks", { ...store.require("tasks", task.id), status: "succeeded", summary: output.summary ?? "" });
