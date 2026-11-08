@@ -480,7 +480,29 @@ export class Company {
     data.trash = data.tasks.filter(t => t.status === 'deleted' && t.deletion?.batchId === t.id).map(t => ({ ...t, purgeReason: taskPurgeReason(t, data.tasks, data.attempts) }));
     data.tasks = data.tasks.filter(t => !deleted.has(t.id));
     for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) data[c] = data[c].filter(item => !deleted.has(item.taskId));
-    data.goals = data.goals.map(g => ({ ...g, taskSummary: goalSummary(g, data.tasks) }));
+    // Presentation-only activity projection for issue #17. Parents inherit the
+    // newest effective descendant activity; unknown history falls back to the
+    // record's own creation time instead of inventing a new timestamp.
+    const activity = this.store.activity();
+    const latest = (...values) => values.filter(Boolean).reduce((max, value) => (!max || String(value) > String(max) ? value : max), null);
+    const ownActivity = entity => latest(activity.get(entity.id), entity.createdAt);
+    // A branch's newest descendant activity belongs to its ancestors too, with
+    // cycle protection for malformed parent/review links.
+    const children = new Map();
+    for (const task of data.tasks) { const parent = task.reviewOf || task.parentId || null; if (parent) children.set(parent, [...(children.get(parent) ?? []), task]); }
+    const memo = new Map();
+    const effectiveTaskActivity = (task, stack = new Set()) => {
+      if (memo.has(task.id)) return memo.get(task.id);
+      if (stack.has(task.id)) return ownActivity(task);
+      stack.add(task.id);
+      let value = ownActivity(task);
+      for (const child of children.get(task.id) ?? []) value = latest(value, effectiveTaskActivity(child, stack));
+      stack.delete(task.id); memo.set(task.id, value); return value;
+    };
+    data.tasks = data.tasks.map(task => ({ ...task, activityAt: effectiveTaskActivity(task) }));
+    const goalActivity = new Map(data.goals.map(goal => [goal.id, data.tasks.filter(task => task.goalId === goal.id).reduce((max, task) => latest(max, task.activityAt), ownActivity(goal))]));
+    data.goals = data.goals.map(g => ({ ...g, taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)) }));
+    data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));
     data.modelPreferences = sanitizePreferences(this.store.get("modelPreferences", "model"));
     data.agentCredentials = data.agentCredentials.map(credentialSnapshot);
     return { ...data, policy: this.policy(), cursor: this.store.cursor() };

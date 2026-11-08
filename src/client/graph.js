@@ -13,7 +13,7 @@ const blockedStatus = new Set(['blocked', 'failed', 'paused', 'stopping']);
 
 /** Latest stored business activity of one record (fallback 0 when unknown). */
 export function activityAt(item) {
-  const time = Date.parse(item?.updatedAt ?? item?.createdAt ?? '');
+  const time = Date.parse(item?.activityAt ?? item?.updatedAt ?? item?.createdAt ?? '');
   return Number.isFinite(time) ? time : 0;
 }
 

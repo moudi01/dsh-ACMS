@@ -19,12 +19,21 @@ const errors = []; const diagnostics = []; page.on('pageerror', e => errors.push
 try {
   await mkdir('test-results/ui', { recursive: true }); await page.goto(server.url);
   await expect(page.getByLabel('项目目标层级')).toContainText('层级演示项目');
+  const expand = async title => { const button = page.getByRole('button', { name: new RegExp(`“${title}”的子任务`) }); if (await button.getAttribute('aria-expanded') !== 'true') await button.click(); };
+  const projectGroup = page.locator('.acms-project-group').filter({ hasText: '层级演示项目' });
+  await projectGroup.locator('summary').first().click({ position: { x: 8, y: 8 } });
   const group = page.locator('.acms-goal-group').filter({ hasText: '清楚的交付目标' });
-  await expect(group.locator('.acms-task-tree>li>ul>li>ul')).toContainText('下一级任务');
+  await group.locator('summary').first().click({ position: { x: 8, y: 8 } });
+  await expect(group.locator('.acms-task-tree')).toContainText('父任务示例');
+  await expand('父任务示例'); await expand('子任务示例');
+  await expect(group.locator('.acms-task-tree')).toContainText('下一级任务');
   await expect(page.getByText(deleted.title, { exact: true })).toHaveCount(0);
-  await expect(page.locator('.acms-goal-group').filter({ hasText: emptyGoal.title })).toContainText('暂无任务');
+  const emptyGroup = page.locator('.acms-goal-group').filter({ hasText: emptyGoal.title });
+  await emptyGroup.locator('summary').first().click({ position: { x: 8, y: 8 } });
+  await expect(emptyGroup).toContainText('暂无任务');
   await group.getByRole('button', { name: '查看此目标的任务 →' }).click();
   await expect(page.getByLabel('筛选目标')).toHaveValue(goal.id); await expect(page.getByLabel('筛选项目')).toHaveValue(project.id);
+  await expand('父任务示例'); await expand('子任务示例');
   await page.getByRole('button', { name: /子任务 下一级任务/ }).click();
   await expect(page.getByLabel('任务详情').getByLabel('任务归属')).toContainText('父任务：父任务示例');
   await expect(page.getByLabel('任务详情').getByLabel('任务归属')).toContainText('父任务：子任务示例');

@@ -6,6 +6,21 @@ import { asBusyError, assert, digest, now } from "./util.js";
 
 export const SCHEMA_VERSION = "2";
 
+/**
+ * Events that count as effective business activity for issue #17 ordering.
+ * Progress pings, heartbeats, notifications and other polling-adjacent writes
+ * stay out so they can never bump a project, goal or task to the top.
+ */
+export const EFFECTIVE_ACTIVITY_EVENTS = [
+  "project.saved", "goal.created", "goal.status.changed", "goal.succeeded", "goal.reopened", "goal.runtime.extended",
+  "task.created", "task.changed", "task.dependencies", "task.blocked", "task.resumed", "task.retry.scheduled",
+  "task.stop.completed", "task.succeeded", "task.restored", "task.deleted", "task.purged",
+  "attempt.claimed", "attempt.starting", "attempt.finished", "attempt.failed", "attempt.recovery", "attempt.result.recovered",
+  "review.queued", "review.requested", "review.decided", "review.rework.requested", "review.rework.limit", "review.rework.gate",
+  "coordination.created", "coordination.decided", "blocker.coordinated",
+  "interaction.answered",
+];
+
 export class Store {
   constructor(filename) {
     this.filename = filename;
@@ -30,6 +45,7 @@ export class Store {
     if (!columns.includes("principal_kind")) this.db.exec("ALTER TABLE events ADD COLUMN principal_kind TEXT");
     if (!columns.includes("on_behalf_of")) this.db.exec("ALTER TABLE events ADD COLUMN on_behalf_of TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS events_goal_seq ON events(goal_id, seq)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS events_entity_at ON events(entity_id, at)");
     if (version && version.value === "1") this.migrateEvents();
     this.db.prepare("INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run("schema", SCHEMA_VERSION);
   }
@@ -106,6 +122,27 @@ export class Store {
     const r = this.db.prepare("INSERT INTO events(at,type,entity_id,goal_id,actor,principal_kind,on_behalf_of,body) VALUES (?,?,?,?,?,?,?,?)").run(at, type, entityId, goalId, principal, principalKind, onBehalfOf, JSON.stringify(body));
     const event = { seq: Number(r.lastInsertRowid), at, type, entityId, goalId, actor: principal, principalKind, onBehalfOf: actor?.kind === "user-agent" ? actor.onBehalfOf ?? null : null, ...body };
     this.pending.push(event); return event;
+  }
+  /**
+   * Latest effective business activity per entity id (ISO timestamp).
+   * Uses a whitelist only, so polling/progress writes never fabricate activity.
+   * Attempt and interaction events are attributed to their task through the
+   * event body or the owning record before aggregation.
+   */
+  activity(types = EFFECTIVE_ACTIVITY_EVENTS) {
+    const marks = types.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT entity_id AS id, at, body FROM events WHERE entity_id IS NOT NULL AND type IN (${marks})`).all(...types);
+    const attemptTask = new Map(this.list("attempts").map(item => [item.id, item.taskId]));
+    const interactionTask = new Map(this.list("interactions").map(item => [item.id, item.taskId]));
+    const byEntity = new Map();
+    for (const row of rows) {
+      let taskId = null;
+      try { taskId = JSON.parse(row.body)?.taskId ?? null; } catch { taskId = null; }
+      const target = taskId ?? attemptTask.get(row.id) ?? interactionTask.get(row.id) ?? row.id;
+      const current = byEntity.get(target);
+      if (!current || String(row.at) > String(current)) byEntity.set(target, row.at);
+    }
+    return byEntity;
   }
   page(after = 0, limit = 200) {
     const entries = this.db.prepare("SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?").all(after, limit).map(r => ({ seq: r.seq, at: r.at, type: r.type, entityId: r.entity_id, actor: r.actor, ...JSON.parse(r.body) }));

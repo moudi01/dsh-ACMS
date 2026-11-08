@@ -10,6 +10,8 @@ page.on('pageerror', e => errors.push(e.message));
 await mkdir('test-results/ui', { recursive: true }); await mkdir('docs/images', { recursive: true });
 try {
   await page.goto(server.url); await expect(page.getByRole('heading', { name: '让工作持续向前。' })).toBeVisible();
+  await page.locator('.acms-project-group').first().locator('summary').first().click({ position: { x: 8, y: 8 } });
+  await page.locator('.acms-goal-group').first().locator('summary').first().click({ position: { x: 8, y: 8 } });
   await expect(page.getByRole('heading', { name: '确认品牌素材', exact: true })).toBeVisible();
   await page.screenshot({ path: 'docs/images/overview.png', fullPage: true });
   await page.getByRole('button', { name: '任务工作台', exact: true }).click(); await page.getByRole('button', { name: '看板', exact: true }).click();
@@ -52,7 +54,7 @@ try {
   const owner = { kind: 'owner', id: 'owner' }; const issueCommand = (name, args) => server.company.command(owner, crypto.randomUUID(), name, args);
   const deleteGoal = issueCommand('goal.create', { title: 'Delete fixture', description: 'Fixture', acceptance: 'Fixture', projectId: server.company.snapshot().projects[0].id, plan: false });
   const deleteTask = issueCommand('task.create', { title: '可删除的任务', goalId: deleteGoal.id }); issueCommand('task.cancel', { id: deleteTask.id });
-  await page.getByRole('button', { name: '任务工作台', exact: true }).click(); await page.getByRole('button', { name: '看板', exact: true }).click(); await page.getByRole('heading', { name: '可删除的任务', exact: true }).click();
+  await page.getByRole('button', { name: '任务工作台', exact: true }).click(); await page.getByRole('button', { name: /^已完成（/ }).click(); await page.getByRole('button', { name: '可删除的任务', exact: true }).click();
   await page.getByRole('button', { name: '删除任务', exact: true }).click(); await page.getByRole('button', { name: '移入回收站', exact: true }).click();
   await expect(page.locator('dialog')).toHaveCount(0); await expect(page.getByRole('heading', { name: '可删除的任务', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '回收站（1）', exact: true }).click(); await expect(page.getByRole('heading', { name: '可删除的任务', exact: true })).toBeVisible();
