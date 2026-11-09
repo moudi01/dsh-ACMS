@@ -42,4 +42,14 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const result = await outcome; if (result.error) throw result.error;
   assert.equal(result.value.output.summary, '方向已调整'); assert.equal(paired.running.size, 0);
   assert.equal(paired.canSteer('attempt-live'), false); assert(children.every(c => c.exitCode !== null || c.signalCode !== null));
+
+  let dispatchChecks = 0, deniedAccepted = false;
+  await assert.rejects(paired.run(candidate.id, { mode: 'task', cwd: f.source, contextKey: 'denied', attemptId: 'attempt-denied',
+    prompt: 'No turn should start', onAccepted: () => { deniedAccepted = true; }, beforeDispatch: () => {
+      if (++dispatchChecks === 2) throw Object.assign(new Error('Policy changed'), { code: 'ROUTE_PREFLIGHT_STALE' });
+    } }, AbortSignal.timeout(8000)), { code: 'ROUTE_PREFLIGHT_STALE' });
+  assert.equal(dispatchChecks, 2);
+  assert.equal(deniedAccepted, false);
+  assert.equal(paired.running.size, 0);
+  assert(children.every(c => c.exitCode !== null || c.signalCode !== null));
 });

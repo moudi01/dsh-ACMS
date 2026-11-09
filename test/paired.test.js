@@ -37,6 +37,25 @@ test('paired runner performs manual probe then automatic execution', async t => 
   assert.equal(paired.running.size, 0);
 });
 
+test('paired runner rechecks authorization before sending the model request', async t => {
+  const f = await fixture(t);
+  const { paired, invite } = await pairing(f, runner);
+  const model = await paired.inspect(invite.id);
+  await paired.accept(invite.id, model.fingerprint);
+  let checks = 0, accepted = false;
+  const input = { mode: 'task', cwd: f.source, attemptId: 'denied-runner', contextKey: 'fixture', generation: 1, kind: 'work',
+    prompt: 'No model request should be sent', onAccepted: () => { accepted = true; }, beforeDispatch: () => {
+      if (++checks === 2) throw Object.assign(new Error('Policy changed'), { code: 'ROUTE_PREFLIGHT_STALE' });
+    } };
+  const execution = paired.execution(model.id, input);
+  await assert.rejects(paired.run(model.id, input, AbortSignal.timeout(8000)), { code: 'ROUTE_PREFLIGHT_STALE' });
+  assert.equal(checks, 2);
+  assert.equal(accepted, false);
+  const fact = paired.readProgress({ id: input.attemptId, provider: model.id, model: model.model, contextKey: input.contextKey, taskGeneration: 1, kind: 'work', execution });
+  assert.equal(fact.status, 'stopped');
+  assert.equal(fact.cleanupConfirmed, true);
+});
+
 test('task-only pairing registers without a probe and rejects probes before process startup', async t => {
   const f = await fixture(t); const p = await pairing(f, runner);
   const receipt = { ...p.receipt, probeSupported: false, probeReason: 'Runtime has no verified all-tools-off mode' };

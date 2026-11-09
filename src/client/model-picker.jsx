@@ -10,6 +10,7 @@ export function ModelPicker({ form, setForm, data, onCheck }) {
   const binding = selected && { model, provider: selected.provider, llmProvider: selected.llmProvider || '', reasoningEffort: form.reasoningEffort || '' };
   const key = JSON.stringify(binding); const current = useRef(key); current.current = key;
   const [result, setResult] = useState(null); const [error, setError] = useState(''); const [checking, setChecking] = useState(false);
+  const [environment, setEnvironment] = useState(null); const [reading, setReading] = useState(false);
   const checked = result && result.key === key ? result.value : null;
   const health = checked ?? selected?.health ?? { status: 'untested', reason: '尚未执行实际连通性检测' };
   const reasoning = checked?.reasoning ?? selected?.health?.reasoning ?? selected?.reasoning;
@@ -17,6 +18,15 @@ export function ModelPicker({ form, setForm, data, onCheck }) {
   useEffect(() => { setForm(f => ({ ...f, modelBlockReason: reason })); }, [reason]);
   const bind = (model, route) => { setError(''); setForm(f => ({ ...f, model, provider: route.provider, llmProvider: route.llmProvider || '', reasoningEffort: '', modelBlockReason: '' })); };
   const check = async () => { const submitted = key; onCheck?.(); setChecking(true); setError(''); try { const value = await api.modelCheck(binding); if (current.current === submitted) setResult({ key: submitted, value }); } catch(e) { if (current.current === submitted) setError(e.message); } finally { setChecking(false); } };
+  const readEnvironment = async () => {
+    const submitted = key; setReading(true); setError('');
+    try {
+      const value = await api.modelDetails(binding);
+      if (current.current === submitted) setEnvironment({ key: submitted, report: value.environment });
+    } catch (error) {
+      if (current.current === submitted) setError(error.message);
+    } finally { setReading(false); }
+  };
   const rows = catalog.models.flatMap(m => m.routes.filter((r, i, all) => r.origin === 'external' || all.findIndex(x => x.origin === 'internal' && x.llmProvider === r.llmProvider) === i).map(r => ({ id: m.id, route: r })));
   const active = data.attempts.filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending).length;
   const noCheck = checking ? '正在检测，最长等待 45 秒' : !selected ? '请先选择模型' : selected.probeSupported === false ? `此运行环境暂不支持无工具检测：${selected.probeReason}` : data.runtime.activeProbes ? '已有模型检测正在进行' : active >= data.policy.maxConcurrent ? '执行资源已满，请等待任务结束' : '';
@@ -29,7 +39,10 @@ export function ModelPicker({ form, setForm, data, onCheck }) {
     {selected.origin === 'internal' && <Field label="父代理上下文" hint="继承的是 ACMS 调度父代理，不是当前 DSH 聊天。"><div><label className="acms-checkbox"><input type="checkbox" checked={!!selected.inheritsParentContext} disabled={!sibling(!selected.inheritsParentContext)} onChange={e => bind(model, sibling(e.target.checked))} />继承父代理上下文</label>{!sibling(!selected.inheritsParentContext) && <small>当前 DSH 仅提供这一种上下文方式。</small>}</div></Field>}
     <Field label="思考深度" hint={reasoning?.effective ? reasoning.source : '当前深度未知。点击检测后读取，打开页面不会自动检测。'}>{reasoning?.selectable ? <select value={form.reasoningEffort || ''} onChange={e => setForm(f => ({ ...f, reasoningEffort: e.target.value }))}><option value="">跟随配置（{reasoning.configured ?? reasoning.effective ?? '服务默认'}）</option>{reasoning.efforts.map(e => <option key={e.id} value={e.id}>{e.name} ({e.id})</option>)}</select> : <input readOnly value={form.reasoningEffort || reasoning?.effective || '尚未读取'} />}</Field>
     <div className={`acms-model-health ${health.status}`} role="status"><b>{checking ? '正在检测…' : healthLabel(health.status)}</b><span>{health.reason}</span>{health.checkedAt && <small>{new Date(health.checkedAt).toLocaleString('zh-CN')} · {health.latencyMs} ms</small>}</div></div> : <p className="acms-field-error">{reason}</p>}
-  <ActionButton type="button" reason={noCheck} onClick={check}>{checking ? '检测中…' : '检测模型连通性'}</ActionButton><p className="acms-sectionnote">仅点击按钮时发送真实简短请求并读取配置，可能消耗少量额度。检测结果有效期 10 分钟。</p>{error && <p className="acms-field-error" role="alert">{error}</p>}</section>;
+  <ActionButton type="button" reason={noCheck} onClick={check}>{checking ? '检测中…' : '检测模型连通性'}</ActionButton><p className="acms-sectionnote">仅点击连通性检测时发送真实简短请求，可能消耗少量额度。检测结果有效期 10 分钟。</p>
+  {selected && <><ActionButton type="button" reason={reading ? '正在读取环境' : ''} onClick={readEnvironment}>读取执行环境</ActionButton>
+    {environment?.key === key && <EnvironmentFacts report={environment.report} modelHealth={health} />}</>}
+  {error && <p className="acms-field-error" role="alert">{error}</p>}</section>;
 }
 
 export function ModelPreferencesPanel({ data, refresh }) {
@@ -67,4 +80,29 @@ export function ModelsPage({ data, refresh }) {
   {candidate && <div className="acms-pairing-candidate"><h3>核对运行配置</h3><dl className="acms-definition"><dt>模型</dt><dd>{candidate.model}</dd><dt>目标 agent</dt><dd>{candidate.name}</dd><dt>执行文件</dt><dd><code>{candidate.command}</code></dd><dt>固定参数</dt><dd><code>{JSON.stringify(candidate.args)}</code></dd><dt>上下文</dt><dd>{candidate.persistent ? '按任务续接' : '每次新建'}</dd><dt>思考深度</dt><dd>{candidate.reasoningEffort || '未知'}（配置声明，尚未验证）</dd><dt>无工具检测</dt><dd>{candidate.probeSupported === false ? `暂不支持：${candidate.probeReason}` : '待用户手动检测'}</dd></dl><p>登记不会启动模型；分配任务后，ACMS 将启动上述本机程序。</p><ActionButton className="primary" reason={busy ? '正在处理，请稍候' : ''} onClick={() => run(async () => { await api.pairing({ action: 'accept', id: invite.id, fingerprint: candidate.fingerprint }); await refresh(); setForm({ provider: candidate.id, model: candidate.model }); setPairingOpen(false); setInvite(null); setCandidate(null); setMessage('已添加外部模型，尚未进行连通性检测'); })}>确认添加模型</ActionButton></div>}</> : <><p>{busy ? '正在生成配对邀请…' : '配对邀请尚未生成。'}</p><ActionButton reason={busy ? '正在处理，请稍候' : ''} onClick={createInvitation}>重试生成邀请</ActionButton></>}</div></dialog>}
   <section className="acms-panel acms-preferences-panel"><ModelPreferencesPanel data={data} refresh={refresh} /></section>
   <section className="acms-panel"><ModelPicker form={form} setForm={setForm} data={data} onCheck={() => setMessage('')} /></section></>;
+}
+
+const states = { available: '已确认', missing: '缺失', denied: '拒绝', unknown: '未知', untested: '未检测', unavailable: '实测失败' };
+const duration = ms => ms == null ? '未知' : (ms / 1000).toLocaleString('zh-CN') + ' 秒';
+
+export function EnvironmentFacts({ report, modelHealth }) {
+  const runtime = report?.runtime ?? report;
+  const limits = runtime?.limits;
+  const host = [...(report?.host?.directories ?? []), ...(report?.host?.programs ?? []), ...(report?.host?.packages ?? [])];
+  return <dl className="acms-definition">
+    <dt>执行入口</dt><dd>{states[runtime?.entry] ?? '未知'}</dd>
+    <dt>工具挂载</dt><dd>{states[runtime?.mounted] ?? '未知'}{runtime?.tools?.length ? ' · ' + runtime.tools.join('、') : ''}</dd>
+    <dt>工具授权</dt><dd>{states[runtime?.authorization] ?? '未知'}</dd>
+    <dt>模型实测</dt><dd>{states[modelHealth?.status ?? runtime?.modelVerification?.status] ?? '未知'}</dd>
+    {host.map(item => <React.Fragment key={item.subject}><dt>{item.subject}</dt><dd>{states[item.status] ?? '未知'}</dd></React.Fragment>)}
+    {limits && <>
+      <dt>公司单次时限</dt><dd>{duration(limits.companyMs)}</dd>
+      <dt>runner 总时限</dt><dd>{duration(limits.runnerMs)}{limits.runnerSource === 'declared' ? '（配对声明）' : limits.runnerSource === 'acms' ? '（ACMS 配置）' : ''}</dd>
+      <dt>runner 空闲时限</dt><dd>{duration(limits.idleMs)}</dd>
+      <dt>runner 清理时限</dt><dd>{duration(limits.runnerCleanupMs)}</dd>
+      <dt>ACMS 清理时限</dt><dd>{duration(limits.hostCleanupMs)}{limits.disposeMs !== limits.hostCleanupMs ? '，外层等待 ' + duration(limits.disposeMs) : ''}</dd>
+      <dt>{limits.effectiveLimitKnown ? '生效总时限' : '已知总时限上界'}</dt><dd>{duration(limits.effectiveTotalMs)}{limits.runnerMs != null && limits.runnerMs < limits.companyMs ? '（runner 先到期）' : ''}</dd>
+      {limits.idleMs != null && <><dt>最早可触发超时</dt><dd>{duration(limits.earliestKnownTimeoutMs)}（空闲时限仅在持续空闲时生效）</dd></>}
+    </>}
+  </dl>;
 }

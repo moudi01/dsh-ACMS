@@ -1,9 +1,9 @@
-import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest } from './util.js';
+import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest, packageName } from './util.js';
 import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-actions.js';
 import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
 import { canCoordinate, findManager } from './coordination.js';
 import { executionOccupancy } from './execution-capacity.js';
-import { goalSummary } from './hierarchy.js';
+import { goalSummary, taskSettledForGoal } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
@@ -133,6 +133,8 @@ export class Company {
     for (const c of checks) {
       text(c.id, 'check.id', 100); text(c.command, 'check.command', 4096);
       assert(Array.isArray(c.args) && c.args.every(v => typeof v === 'string'), 'INVALID_INPUT', 'Check arguments must be an array');
+      assert(c.requiredPackages === undefined || (Array.isArray(c.requiredPackages) && c.requiredPackages.length <= 20 &&
+        c.requiredPackages.every(value => typeof value === 'string' && packageName.test(value))), 'INVALID_INPUT', 'requiredPackages must contain valid Node package names');
     }
     const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false, ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
@@ -268,7 +270,7 @@ export class Company {
     const goal = this.store.require('goals', goalId);
     if (['cancelled', 'archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
     const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
-    const complete = tasks.some(t => t.kind === 'work') && tasks.every(t => ['succeeded', 'archived'].includes(t.status));
+    const complete = tasks.some(t => t.kind === 'work') && tasks.every(taskSettledForGoal);
     let status;
     if (goal.contractChange?.status === 'pending') status = 'active';
     else if (!tasks.length) status = 'empty';
@@ -455,6 +457,11 @@ export class Company {
     assert(actor.kind !== 'agent' || task.status !== 'paused', 'OWNER_REQUIRED', '仅用户可恢复主动暂停的任务');
     assert(['paused', 'blocked', ...(retry ? ['failed'] : [])].includes(task.status), 'INVALID_TRANSITION', 'Task cannot resume in its current state');
     assert(!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending'), 'WAITING_INPUT', 'Answer the pending interaction first');
+    if (task.environmentBlock) {
+      const saved = this.store.put('tasks', { ...task, status: 'ready', stopRequested: null }, args.expectedRevision);
+      this.store.event('task.environment.recheck.requested', task.id, {}, actor);
+      return saved;
+    }
     const integrationPending = task.integrationPending ?? (task.resumeStatus === 'integrating' || (task.blocker?.kind === 'integration' && !!task.artifactHash));
     for (const review of this.store.list('tasks')) if (!integrationPending && review.reviewOf === task.id && !TERMINAL.has(review.status)) this.controlTask({ id: review.id }, 'cancelled', actor);
     const saved = this.store.put('tasks', { ...task, status: 'ready', integrationPending, stopRequested: null, ...(retry ? { attempts: 0 } : {}) }, args.expectedRevision);

@@ -3,6 +3,9 @@ import { assert, digest, id } from "./util.js";
 export const SELECTOR_VERSION = "1";
 export const MAX_PREFERENCES = 20;
 export const MAX_CANDIDATES = 50;
+export function modelPolicyFingerprint(policy = {}) {
+  return "sha256:" + digest({ allowedProviders: policy.allowedProviders ?? [], allowedModels: policy.allowedModels ?? [] });
+}
 export const FALLBACK_REASONS = Object.freeze(["unauthorized_provider", "unauthorized_model", "provider_unavailable", "health_unavailable", "capability_mismatch", "capability_unknown", "route_mismatch", "preference_model_absent", "explicit_binding_absent"]);
 export const BLOCKED_CODES = Object.freeze(["EXPLICIT_BINDING_UNAVAILABLE", "NO_AUTHORIZED_PROVIDER", "NO_ELIGIBLE_CANDIDATE", "CAPABILITY_UNKNOWN"]);
 const REQUIREMENT_MODES = Object.freeze({ continuity: ["required", "preferred", "none"], runningMessages: ["required", "optional", "none"], tools: ["required", "optional", "none"], sandbox: ["required", "optional", "none"], verified: ["required", "optional", "none"] });
@@ -239,7 +242,7 @@ export function selectRoute({ candidates = [], preferences = { order: [], revisi
     fallbacks: limitedFallbacks,
     truncated: { considered: considered.length > MAX_CANDIDATES, fallbacks: fallbacks.length > MAX_CANDIDATES },
     blocked,
-    policyFingerprint: "sha256:" + digest({ allowedProviders: policy.allowedProviders ?? [], allowedModels: policy.allowedModels ?? [] }),
+    policyFingerprint: modelPolicyFingerprint(policy),
     preferencesRevision: preferences.revision ?? 0,
     taskRequirements: normalizedRequirements,
     decidedAt: new Date().toISOString()

@@ -14,6 +14,10 @@ public static class AcmsOwnedJob {
     // Startup configuration is sent over the already connected private pipe.
     // Base64 fields avoid shell quoting and keep task content out of argv/env.
     public static void Main(string[] args) {
+        if (args.Length == 2 && args[0] == "--directory-access") {
+            CheckDirectories(args[1]);
+            return;
+        }
         using (var pipe = new NamedPipeClientStream(".", args[0], PipeDirection.InOut, PipeOptions.Asynchronous)) {
             pipe.Connect(10000);
             using (var reader = new StreamReader(pipe))
@@ -27,6 +31,18 @@ public static class AcmsOwnedJob {
                 for (int i=0; i<count; i++) argv[i] = Encoding.UTF8.GetString(Convert.FromBase64String(reader.ReadLine()));
                 Run(argv[0], argv, cwd, runMs, cleanupMs, receipt, reader, writer);
             }
+        }
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateFile(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    static void CheckDirectories(string input) {
+        foreach (string item in Encoding.UTF8.GetString(Convert.FromBase64String(input)).Split('\0')) {
+            // OPEN_EXISTING with BACKUP_SEMANTICS opens a directory handle.
+            // Request list/traverse and, if needed, add-file/add-directory rights.
+            uint access = item[0] == 'w' ? 39u : 33u;
+            IntPtr handle = CreateFile(item.Substring(1), access, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+            if (handle == new IntPtr(-1)) Console.WriteLine(Marshal.GetLastWin32Error());
+            else { CloseHandle(handle); Console.WriteLine(0); }
         }
     }
     [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS { public ulong a,b,c,d,e,f; }

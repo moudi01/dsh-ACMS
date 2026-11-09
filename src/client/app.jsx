@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { api } from './api.js';
 import { initialModelBinding, modelName } from './models.js';
 import { Field, ActionButton, DirectoryField, CollapsibleText } from './components.jsx';
-import { ModelPicker, ModelsPage } from './model-picker.jsx';
+import { ModelPicker, ModelsPage, EnvironmentFacts } from './model-picker.jsx';
 import { ProjectHierarchy, TaskPath, CompletedGoals } from './hierarchy.jsx';
 import { defaultProjectId, graphSections, graphLayout, hiddenDependencies } from './graph.js';
 import { activeViewTasks, compareActivity, completedTasks, isCompleted, orderByActivity, verificationsForTask, visibleCounts } from './display.js';
@@ -224,6 +224,18 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : taskDeletionReason(task, data.tasks, data.attempts)} onClick={() => open('deleteTask', task)}>删除任务</ActionButton></div><section><h3>验收标准</h3><CollapsibleText text={task.acceptance} lines={3} label="验收标准" /></section><section><h3>依赖关系</h3>{task.dependencies.length ? task.dependencies.map(id => <div className="acms-dep" key={id}><Badge status={data.tasks.find(t => t.id === id)?.status} /><button className="text" onClick={() => select(id)}>{data.tasks.find(t => t.id === id)?.title}</button></div>) : <p className="acms-muted">无前置依赖</p>}{['ready', 'blocked', 'paused'].includes(task.status) && <button onClick={() => open('dependencies', task)}>调整依赖</button>}</section>
     <section className="acms-evidence"><h3>产物与验收（{artifacts.length}）</h3>{!artifacts.length && !verifications.length ? <p className="acms-muted">尚无产物或验收记录。</p> : <>{artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}{verifications.slice(-6).reverse().map(verification => <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} /><span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span><small>{verification.summary ?? ''}</small></div>)}</>}</section>
     {task.feedback && <section><h3>最近反馈</h3><p className="acms-preserve">{task.feedback}</p></section>}
+    {task.environmentBlock && <section className="acms-alert"><h3>等待执行环境恢复</h3>
+      <ul>{task.environmentBlock.failures.map(failure => <li key={failure.fingerprint}>
+        <strong>{failure.reason}</strong><p>{failure.recovery}</p><small>错误指纹 <code>{failure.fingerprint.slice(0, 12)}</code></small>
+      </li>)}</ul>
+      {task.environmentBlock.handoffId && <button className="text" onClick={() => select(task.environmentBlock.handoffId)}>查看负责人待办</button>}
+      <details><summary>环境版本 {task.environmentBlock.report.version.slice(0, 12)}</summary><EnvironmentFacts report={task.environmentBlock.report} /></details>
+      <a href={'/api/acms/environment?id=' + encodeURIComponent(task.id)} download="acms-environment.json">导出环境诊断</a>
+    </section>}
+    {task.blocker?.kind === 'environment-handoff' && <section className="acms-alert"><h3>执行环境待办</h3>
+      <p>{task.blocker.reason}</p><p>可直接处理缺项。需要负责人执行协调时，可手动继续此待办。</p>
+    </section>}
+    {!task.environmentBlock && attempts[0]?.environment && <details><summary>最近执行环境</summary><EnvironmentFacts report={attempts[0].environment} /></details>}
     {awaitingRecovery && <section className="acms-alert"><h3>执行待核对</h3><p className="acms-preserve">{recoveryAttempt?.recovery?.reason || recoveryAttempt?.cleanupError || '尚无可靠结束回执，资源占位继续保留。'}</p>{task.stopRequested && <p>已请求{task.stopRequested === 'paused' ? '暂停' : '取消'}，确认执行停止且进程树清理后生效。</p>}<p>可重新读取回执，或检查该执行的日志和工作副本。只有身份匹配且已确认进程树清理的回执才能恢复结果或落实停止请求；没有停止请求且确认无完整结果时才允许重试。状态未知时不会重新调用模型。</p></section>}
     {attempts[0]?.progress && <section><h3>最近执行进度</h3><p className="acms-preserve">{attempts[0].progress.lastSnippet?.slice(-4000) || attempts[0].progress.reason || '正在工作…'}</p><small>{attempts[0].progress.toolCalls ?? 0} 次工具调用 · {date(attempts[0].progress.updatedAt)}</small></section>}
     {interactions.map(i => <section className="acms-alert" key={i.id}><h3>需要补充信息</h3><p>{i.reason}</p><p>{i.question}</p><button onClick={() => open('answer', i)}>回复并继续</button></section>)}

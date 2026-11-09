@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn } from 'node:child_process';
+import { execFile, spawn as nodeSpawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -64,6 +64,18 @@ async function nativeHelper() {
     }
   })().catch(error => { helper = undefined; throw error; });
   return helper;
+}
+
+export async function windowsDirectoryAccess(entries) {
+  const executable = await nativeHelper();
+  const input = entries.map(({ path, write }) => (write ? 'w' : 'r') + path).join('\0');
+  return new Promise((resolve, reject) => {
+    execFile(executable, ['--directory-access', Buffer.from(input).toString('base64')],
+      { windowsHide: true, timeout: 3000, maxBuffer: 4096 }, (error, stdout) => {
+        if (error) reject(error);
+        else resolve(stdout.trim().split(/\r?\n/).map(Number));
+      });
+  });
 }
 
 /**
