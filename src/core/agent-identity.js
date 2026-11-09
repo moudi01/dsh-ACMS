@@ -2,9 +2,10 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { assert, clone } from "./util.js";
 
 export const TOKEN_MARKER = "acms_ag_";
-export const EXTERNAL_COMMANDS = ["goal.submit", "status.read", "events.read", "interaction.answer", "task.pause", "task.resume", "project.create"];
+export const GOAL_CONTROL_COMMANDS = ["goal.pause", "goal.resume", "goal.cancel"];
+export const EXTERNAL_COMMANDS = ["goal.submit", "status.read", "events.read", "interaction.answer", "task.pause", "task.resume", "project.create", ...GOAL_CONTROL_COMMANDS];
 export const READ_COMMANDS = ["status.read", "events.read"];
-export const WRITE_COMMANDS = ["goal.submit", "interaction.answer", "task.pause", "task.resume", "project.create"];
+export const WRITE_COMMANDS = ["goal.submit", "interaction.answer", "task.pause", "task.resume", "project.create", ...GOAL_CONTROL_COMMANDS];
 export const DEFAULT_COMMANDS = ["goal.submit", "status.read", "events.read", "interaction.answer"];
 export const GOVERNED_COMMANDS = ["task.pause", "task.resume", "project.create"];
 

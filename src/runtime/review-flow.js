@@ -32,7 +32,7 @@ async function acceptTaskReview(engine, review, attempt, output, store) {
   assert(unchanged, "ARTIFACT_CHANGED", "Reviewed files changed after delivery");
 
   store.transaction(() => {
-    const currentReview = engine.currentAttemptTask(attempt);
+    const currentReview = engine.currentAttemptTask(attempt, true);
     source = store.require("tasks", source.id);
     assert(source.status === "succeeded" && matchesTaskReview(review, source), "STALE_REVIEW", "Deliverable changed during review");
     engine.finishAttempt(attempt, "completed", output.summary);
@@ -62,7 +62,7 @@ function acceptGoalReview(engine, review, attempt, output) {
     assert(current.lastAuthorId !== attempt.agentId, "SELF_REVIEW", "Author cannot approve their own work");
   }
   store.transaction(() => {
-    engine.currentAttemptTask(attempt);
+    engine.currentAttemptTask(attempt, true);
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...review, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
     store.put("verifications", { id: id("verification"), taskId: goal.id, goalId: goal.id, attemptId: attempt.id, artifactHash: review.deliveryHash,

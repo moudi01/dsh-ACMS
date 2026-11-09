@@ -119,10 +119,10 @@ test('Git inspection retains its own cleanup hold across refresh and restart', a
   assert.equal(f.adapter.calls.length, 0);
 });
 
-for (const stop of ['task.pause', 'task.cancel', 'company.pause']) test(`${stop} stops a real candidate check and verifies its process tree`, windows, async t => {
+for (const stop of ['task.pause', 'task.cancel', 'company.pause', 'goal.pause', 'goal.cancel']) test(`${stop} stops a real candidate check and verifies its process tree`, windows, async t => {
   const { f, task, before, pids, release } = await checkingFixture(t);
-  const cancelled = stop === 'task.cancel';
-  f.command(stop, stop === 'company.pause' ? {} : { id: task.id });
+  const cancelled = stop.endsWith('.cancel');
+  f.command(stop, stop === 'company.pause' ? {} : { id: stop.startsWith('goal.') ? task.goalId : task.id });
   const stopping = current(f, task);
   assert.equal(stopping.status, 'stopping');
   assert.equal(canReconcileTask(stopping, []), true);
@@ -140,6 +140,13 @@ for (const stop of ['task.pause', 'task.cancel', 'company.pause']) test(`${stop}
     assert.equal(current(f, task).artifactHash, task.artifactHash);
     assert.equal(records(f)[1].phase, 'completed');
   }
+  if (stop === 'goal.pause') {
+    await writeFile(release, '');
+    f.command('goal.resume', { id: task.goalId });
+    await until(() => current(f, task).status === 'succeeded', 15000);
+    assert.equal(current(f, task).artifactHash, task.artifactHash);
+  }
+  if (stop === 'goal.cancel') assert.equal(f.store.require('goals', task.goalId).status, 'cancelled');
   assert.equal(f.adapter.calls.length, 0);
 });
 
@@ -151,6 +158,18 @@ test('graceful company pause lets the current candidate finish and holds the nex
   await until(() => current(f, task).status === 'succeeded', 15000);
   assert.equal(current(f, queued).status, 'integrating');
   assert.deepEqual(records(f).map(row => row.taskId), [task.id]);
+  assert.equal(f.adapter.calls.length, 0);
+});
+
+test('graceful goal pause lets an admitted candidate finish and holds the next delivery', windows, async t => {
+  const { f, task, release } = await checkingFixture(t);
+  const queued = await pending(f);
+  f.command('goal.pause', { id: task.goalId, afterCurrent: true });
+  await writeFile(release, '');
+  await until(() => current(f, task).status === 'succeeded', 15000);
+  assert.equal(current(f, queued).status, 'integrating');
+  assert.deepEqual(records(f).map(row => row.taskId), [task.id]);
+  assert.equal(f.company.snapshot().goals.find(goal => goal.id === task.goalId).controlSummary.phase, 'paused');
   assert.equal(f.adapter.calls.length, 0);
 });
 
@@ -208,14 +227,14 @@ test('lease loss aborts the candidate and a successor resumes from verified clea
   assert.equal(f.adapter.calls.length, 0);
 });
 
-test('cancel after the real fast-forward records the applied commit and the stop request', windows, async t => {
+for (const stop of ['task.cancel', 'goal.cancel']) test(`${stop} after the real fast-forward records the applied commit and the stop request`, windows, async t => {
   const f = await fixture(t);
   await gitProject(f);
   const task = await pending(f);
   const integrate = f.workspaces.integrate.bind(f.workspaces);
   f.workspaces.integrate = async (...args) => {
     const result = await integrate(...args);
-    f.command('task.cancel', { id: task.id });
+    f.command(stop, { id: stop === 'goal.cancel' ? task.goalId : task.id });
     return result;
   };
   await f.start();
@@ -223,6 +242,7 @@ test('cancel after the real fast-forward records the applied commit and the stop
   assert.equal(current(f, task).integration.integratedCommit, await head(f));
   assert.equal(current(f, task).integration.stopRequested, 'cancelled');
   assert(f.store.page(0, 1000).entries.some(e => e.type === 'integration.completed' && e.stopRequested === 'cancelled'));
+  if (stop === 'goal.cancel') assert.equal(f.store.require('goals', task.goalId).status, 'cancelled');
   assert.equal(f.adapter.calls.length, 0);
 });
 

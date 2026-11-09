@@ -435,6 +435,35 @@ test("answers pending interactions without crossing budget boundaries", async t 
   assert.equal(again.body.error.code, "ALREADY_ANSWERED");
 });
 
+test("goal controls require explicit scope and revision, replay once, and audit the external actor", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "goal.pause", "goal.resume", "goal.cancel"] });
+  const ungranted = f.credential({ goalIds: [f.goal.id] });
+  const sameProject = f.owner("goal.create", { title: "Other goal in same project", description: "Fixture", acceptance: "Fixture", projectId: f.project.id, plan: false });
+  const post = (goal, action, token, key, body) => f.call("/goals/" + goal.id + "/" + action, { method: "POST", token, key, body });
+  const data = { expectedRevision: f.goal.revision, afterCurrent: true, reason: "Checkpoint" };
+  assert.equal((await post(f.goal, "pause", ungranted.token, "missing-grant-01", data)).body.error.code, "FORBIDDEN");
+  assert.equal((await post(sameProject, "pause", c.token, "outside-scope-01", data)).body.error.code, "SCOPE_DENIED");
+  assert.equal((await post(f.goal, "pause", c.token, "stale-revision-01", { ...data, expectedRevision: f.goal.revision + 1 })).body.error.code, "CONFLICT");
+  assert.equal((await post(f.goal, "pause", c.token, "missing-revision-01", {})).status, 400);
+  const paused = await post(f.goal, "pause", c.token, "goal-pause-0001", data);
+  assert.equal(paused.status, 200);
+  assert.equal(paused.body.value.executionControl.mode, "after-current");
+  const replay = await post(f.goal, "pause", c.token, "goal-pause-0001", data);
+  assert.equal(replay.body.replayed, true);
+  assert.deepEqual(replay.body.value, paused.body.value);
+  const audit = f.store.pageScoped({ goalIds: [f.goal.id] }).entries.filter(e => e.type === "goal.paused");
+  assert.equal(audit.length, 1);
+  assert.deepEqual(audit[0].actor, { kind: "user-agent", id: c.credential.id });
+  const resumed = await post(f.goal, "resume", c.token, "goal-resume-0001", { expectedRevision: paused.body.value.revision });
+  assert.equal(resumed.body.value.executionControl, null);
+  const cancelled = await post(f.goal, "cancel", c.token, "goal-cancel-0001", { expectedRevision: resumed.body.value.revision });
+  assert.equal(cancelled.body.value.status, "cancelled");
+  assert.equal((await post(f.goal, "resume", c.token, "goal-resume-0002", { expectedRevision: cancelled.body.value.revision })).status, 409);
+  assert.equal(f.store.require("goals", sameProject.id).executionControl, undefined);
+  assert.equal(f.calls.probeModel, 0);
+});
+
 test("pauses and resumes tasks within authorization", async t => {
   const f = await apiFixture(t);
   const c = f.credential({ goalIds: [f.goal.id], commands: CONTROL_COMMANDS });

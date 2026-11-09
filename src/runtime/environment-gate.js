@@ -2,6 +2,7 @@ import { digest, now, SYSTEM } from '../core/util.js';
 import { ignoresBlocker } from '../core/blocker-policy.js';
 import { matchesGoalContract } from '../core/goal-contract.js';
 import { ENVIRONMENT_RECOVERED_REASON } from '../core/hierarchy.js';
+import { goalStopped } from '../core/goal-control.js';
 import { inspectHost } from './preflight.js';
 
 export async function inspectEnvironment(engine, task, agent, previous, route) {
@@ -110,7 +111,7 @@ export async function refreshEnvironmentGates(engine) {
     if (!task.environmentBlock || !['ready', 'blocked'].includes(task.status) || (!poll && task.status !== 'ready') ||
         ignoresBlocker(task) || task.contractObsolete || [...engine.live.values()].some(entry => entry.taskId === task.id)) continue;
     const goal = store.require('goals', task.goalId);
-    if (!matchesGoalContract(goal, task) || goal.contractChange?.status === 'pending') continue;
+    if (goalStopped(goal) || !matchesGoalContract(goal, task) || goal.contractChange?.status === 'pending') continue;
     const agent = store.get('agents', task.agentId);
     if (!agent || agent.status !== 'available') continue;
     let observed;
@@ -122,7 +123,7 @@ export async function refreshEnvironmentGates(engine) {
     engine.fenced();
     store.transaction(() => {
       const current = store.require('tasks', task.id);
-      if (current.revision !== task.revision || engine.company.policy().paused || engine.closing) return;
+      if (current.revision !== task.revision || engine.company.policy().paused || engine.closing || goalStopped(store.get('goals', task.goalId))) return;
       const previous = task.environmentBlock;
       const unresolved = previous.failures.filter(failure => !verifiedAfter(failure, previous, observed.report));
       const failures = [...new Map([...unresolved, ...observed.failures].map(f => [f.fingerprint, f])).values()];

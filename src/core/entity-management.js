@@ -1,4 +1,5 @@
 import { assert, id, now, digest, TERMINAL } from './util.js';
+import { discardDeferredResult } from './goal-control.js';
 
 const collections = { project: 'projects', goal: 'goals', agent: 'agents' };
 import { entityTasks, entityDeletionReason, isLiveAttempt } from './entity-actions.js';
@@ -28,7 +29,8 @@ export function restoreEntity(company, kind, args, actor) {
   for (const c of [collection, ...(kind === 'project' ? ['goals', 'tasks'] : kind === 'goal' ? ['tasks'] : [])]) for (const item of store.list(c).filter(x => x.status === 'deleted' && x.deletion?.batchId === batch)) {
     const previous = item.deletion.previousStatus;
     const status = c === 'tasks' ? (['succeeded', 'cancelled', 'archived'].includes(previous) ? previous : 'paused') : previous;
-    store.put(c, { ...item, status, deletion: null, ...(c === 'tasks' ? { stopRequested: null, activeAttemptId: null, resumeOnStart: false } : {}) }, c === collection && item.id === entity.id ? args.expectedRevision : undefined);
+    if (c === 'tasks') discardDeferredResult(store, item.activeAttemptId);
+    store.put(c, { ...item, status, deletion: null, ...(c === 'tasks' ? { stopRequested: null, activeAttemptId: null, goalPauseId: null, resumeOnStart: false } : {}) }, c === collection && item.id === entity.id ? args.expectedRevision : undefined);
   }
   store.event(`${kind}.restored`, entity.id, { batchId: batch }, actor);
   return store.require(collection, entity.id);
@@ -61,6 +63,7 @@ export function restartForChange(company, task, { direct = false } = {}) {
   const attempts = store.list('attempts').filter(a => a.taskId === task.id && isLiveAttempt(a));
   assert(!attempts.some(a => a.cleanupPending && !['preparing', 'running'].includes(a.status)), 'TASK_ACTIVE', '执行资源正在清理，请稍候再编辑。');
   const active = attempts.length > 0;
+  discardDeferredResult(store, task.activeAttemptId);
   for (const review of store.list('tasks').filter(r => r.reviewOf === task.id && !TERMINAL.has(r.status))) company.controlTask({ id: review.id }, 'cancelled', { kind: 'system', id: 'scheduler' });
   const held = ['paused', 'blocked'].includes(task.status);
   const status = active ? 'stopping' : held ? task.status : !direct && TERMINAL.has(task.status) ? task.status : 'ready';
