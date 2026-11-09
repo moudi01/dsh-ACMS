@@ -1,8 +1,10 @@
 // Stopping does not mean the old execution has been observed to stop. Keep
 // receipt refresh available for persisted stop intents without a live host.
+export const integrationPending = record => ['preparing', 'checking', 'applying', 'reconciling'].includes(record.phase);
+
 export function canReconcileTask(task, attempts) {
-  return task.status === 'reconciling' || (task.status === 'stopping' && attempts.some(a => a.taskId === task.id
-    && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending)));
+  return task.status === 'reconciling' || (task.status === 'stopping' && (!!task.activeIntegrationId || attempts.some(a => a.taskId === task.id
+    && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending))));
 }
 
 export function taskDeletionReason(task, tasks, attempts) {

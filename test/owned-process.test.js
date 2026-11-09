@@ -20,7 +20,8 @@ function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { if 
 async function treeRun(t, mode) {
   const cwd = await mkdtemp(path.join(tmpdir(), 'acms-owned-test-'));
   const file = path.join(cwd, 'pids.jsonl'); let pids = [];
-  const run = await startOwnedProcess({ argv: [process.execPath, tree, file, mode], cwd, runMs: 10000 });
+  const receipt = path.join(cwd, 'cleanup.json');
+  const run = await startOwnedProcess({ argv: [process.execPath, tree, file, mode], cwd, runMs: 10000, cleanupReceipt: receipt });
   run.stdout.resume(); run.stderr.resume(); run.stdin.end();
   t.after(async () => {
     await run.cleanup().catch(() => {});
@@ -32,17 +33,18 @@ async function treeRun(t, mode) {
     try { pids = (await readFile(file, 'utf8')).trim().split('\n').map(s => JSON.parse(s).pid); return pids.length === 3; }
     catch (e) { if (e.code !== 'ENOENT' && !(e instanceof SyntaxError)) throw e; }
   });
-  return { run, pids };
+  return { run, pids, receipt };
 }
 
 test('private Windows job kills real detached child and grandchild; unrelated process survives', windows, async t => {
   const other = spawnNode({ argv: [process.execPath, '-e', 'setTimeout(()=>{},10000)'] });
   t.after(async () => { other.terminate(); await other.done; });
   let otherEnded = false; other.done.finally(() => { otherEnded = true; });
-  const { run, pids } = await treeRun(t, 'hold');
+  const { run, pids, receipt } = await treeRun(t, 'hold');
   const before = Date.now(); await run.cleanup();
   assert(Date.now() - before < 6000);
   assert.equal((await run.done).cleanup.confirmed, true);
+  assert.equal(JSON.parse(await readFile(receipt, 'utf8')).confirmed, true);
   assert(pids.every(pid => !alive(pid))); assert.equal(otherEnded, false);
 });
 

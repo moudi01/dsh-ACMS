@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { runContained } from './host-command.js';
 import { AcmsError, assert, digest } from '../core/util.js';
 import { publishCollaboration, syncCollaboration, verifyCollaboration, isCollaborationPath } from './collaboration.js';
 
@@ -29,11 +29,11 @@ export async function run(command, args, cwd, { signal, timeout = 120000, maxOut
     if (signal?.aborted) terminate();
   });
 }
-async function git(args, cwd, options) { const r = await run('git', args, cwd, options); assert(r.code === 0, 'GIT_ERROR', r.stderr || r.stdout || 'Git operation failed', { args }); return r.stdout.trim(); }
+async function git(args, cwd, options, invoke = run) { const r = await invoke('git', args, cwd, options); assert(r.code === 0 && !r.timedOut, 'GIT_ERROR', r.stderr || r.stdout || 'Git operation failed', { args }); return r.stdout.trim(); }
 export class WorkspaceManager {
   constructor(dataDir, company) { this.dataDir = dataDir; this.company = company; }
   async publishProject(project) { await this.validateProject(project); return publishCollaboration(this.company, project); }
-  async validateProject(project) {
+  async validateProject(project, invoke = run) {
     const root = await fs.realpath(project.repoRoot); const stat = await fs.stat(root); assert(stat.isDirectory(), 'PROJECT_PATH', 'Project root must be a directory');
     const permitted = this.company.policy().allowedProjectRoots;
     if (permitted.length) {
@@ -41,7 +41,7 @@ export class WorkspaceManager {
       assert(allowed, 'PROJECT_PATH_DENIED', 'Project lies outside the owner-approved roots');
     }
     assert(!inside(root, this.dataDir), 'RECURSIVE_WORKSPACE', 'ACMS data must be stored outside the source project');
-    if (project.mode === 'git') await git(['rev-parse', '--show-toplevel'], root);
+    if (project.mode === 'git') await git(['rev-parse', '--show-toplevel'], root, undefined, invoke);
     return root;
   }
   async prepare(task, attempt) {
@@ -118,11 +118,11 @@ export class WorkspaceManager {
     const changeSet = await this.captureChanges(task);
     return { artifacts, checks: checkResults, changeSet, hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash })), changeSet }) };
   }
-  async captureChanges(task) {
+  async captureChanges(task, invoke = run) {
     if (task.workspace.mode !== 'git') return null;
     const cwd = task.workspace.path;
-    const tracked = await git(['diff', '--name-only', '-z', task.workspace.baseCommit ?? 'HEAD', '--'], cwd);
-    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'], cwd);
+    const tracked = await git(['diff', '--name-only', '-z', task.workspace.baseCommit ?? 'HEAD', '--'], cwd, undefined, invoke);
+    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'], cwd, undefined, invoke);
     const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n)))].sort();
     assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
     const files = [];
@@ -132,48 +132,98 @@ export class WorkspaceManager {
     }
     return files;
   }
-  async unchanged(task, artifactIds) {
+  async unchanged(task, artifactIds, invoke = run) {
     try { await verifyCollaboration(task.workspace); } catch { return false; }
     for (const artifactId of artifactIds) {
       const a = this.company.store.require('artifacts', artifactId);
       try { const bytes = await fs.readFile(await this.safeFile(task.workspace.path, a.path)); if (digest(bytes.toString('base64')) !== a.hash) return false; } catch { return false; }
     }
-    if (task.changeSet && digest(await this.captureChanges(task)) !== digest(task.changeSet)) return false;
+    if (task.changeSet && digest(await this.captureChanges(task, invoke)) !== digest(task.changeSet)) return false;
     return true;
   }
-  async integrate(task, isCurrent = () => true) {
+  async integrationTarget(root, invoke) {
+    const ref = await invoke('git', ['symbolic-ref', '-q', 'HEAD'], root);
+    assert(!ref.timedOut && [0, 1].includes(ref.code), 'GIT_ERROR', ref.stderr || 'Unable to read target ref');
+    const targetRef = ref.code === 0 ? ref.stdout.trim() : 'HEAD';
+    const targetHead = await git(['rev-parse', '--verify', 'HEAD'], root, undefined, invoke);
+    const targetStatus = await git(['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain', '--', '.', ':(exclude).acms'], root, undefined, invoke);
+    return { targetRef, targetHead, targetStatus };
+  }
+  assertIntegrationTarget(record, executable) {
+    // Run immediately before handing the final command to the supervisor.
+    // Optional locks and fsmonitor are disabled for this read-only guard.
+    const invoke = args => {
+      const result = spawnSync(executable, ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args], {
+        cwd: record.targetRoot, encoding: 'utf8', windowsHide: true, timeout: 2000,
+      });
+      assert(!result.error && [0, ...(args[0] === 'symbolic-ref' ? [1] : [])].includes(result.status),
+        'GIT_ERROR', result.error?.message || result.stderr || 'Unable to verify the final target');
+      return result.stdout.trim();
+    };
+    const status = invoke(['status', '--porcelain', '--', '.', ':(exclude).acms']);
+    const head = invoke(['rev-parse', '--verify', 'HEAD']);
+    const ref = invoke(['symbolic-ref', '-q', 'HEAD']) || 'HEAD';
+    assert(ref === record.targetRef && head === record.targetHead && !status, 'TARGET_CHANGED', 'Source changed before the final Git command', { actualHead: head });
+  }
+  async integrate(task, isCurrent, execution) {
     const project = this.company.store.require('projects', task.projectId);
     if (!project.autoMerge) return { status: 'available', path: task.workspace.path, branch: task.workspace.branch };
     assert(task.workspace.mode === 'git', 'INTEGRATION_REQUIRED', 'Automatic integration requires a Git project');
-    assert(await this.unchanged(task, task.artifactIds), 'ARTIFACT_CHANGED', 'Artifact changed after review');
-    const targetHead = await git(['rev-parse', 'HEAD'], project.repoRoot);
-    const targetStatus = await git(['status', '--porcelain', '--', '.', ':(exclude).acms'], project.repoRoot);
+    const invoke = execution.run;
+    const getGit = (args, cwd) => git(args, cwd, undefined, invoke);
+    const targetRoot = await this.validateProject(project, invoke);
+    assert(await fs.realpath(await getGit(['rev-parse', '--show-toplevel'], targetRoot)) === targetRoot,
+      'PROJECT_PATH_DENIED', 'Automatic integration requires the approved Git repository root');
+    assert(await this.unchanged(task, task.artifactIds, invoke), 'ARTIFACT_CHANGED', 'Artifact changed after review');
+    const { targetHead, targetRef, targetStatus } = await this.integrationTarget(targetRoot, invoke);
+    execution.checkpoint({ targetRoot, targetHead, targetRef });
     const withEvidence = (error, facts = {}) => Object.assign(error, { integrationEvidence: { code: error.code ?? null, targetHead, ...facts } });
-    assert(isCurrent(), 'STALE_INTEGRATION', 'Integration was stopped or replaced');
     if (targetStatus) throw withEvidence(new AcmsError('TARGET_DIRTY', 'Source project has uncommitted changes; integration is blocked'), { statusHash: digest(targetStatus) });
-    await git(['add', '--all', '--', '.', ':(exclude).acms'], task.workspace.path);
-    const changes = await git(['diff', '--cached', '--name-only'], task.workspace.path);
-    if (changes) await git(['-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost', 'commit', '-m', `ACMS: ${task.title.replace(/[\r\n]/g, ' ')}`], task.workspace.path);
-    const commit = await git(['rev-parse', 'HEAD'], task.workspace.path);
-    const candidate = path.join(this.dataDir, 'integration', `${task.id}-${randomUUID()}`);
+    await getGit(['add', '--all', '--', '.', ':(exclude).acms'], task.workspace.path);
+    const changes = await getGit(['diff', '--cached', '--name-only'], task.workspace.path);
+    if (changes) await getGit(['-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost', 'commit', '-m', `ACMS: ${task.title.replace(/[\r\n]/g, ' ')}`], task.workspace.path);
+    const commit = await getGit(['rev-parse', 'HEAD'], task.workspace.path);
+    const candidate = path.join(this.dataDir, 'integration', execution.id);
     await fs.mkdir(path.dirname(candidate), { recursive: true });
-    await git(['worktree', 'add', '--detach', candidate, targetHead], project.repoRoot);
+    await getGit(['worktree', 'add', '--detach', candidate, targetHead], targetRoot);
     try {
-      const result = await run('git', ['-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost', 'merge', '--no-edit', '--no-ff', commit], candidate);
-      assert(result.code === 0, 'MERGE_CONFLICT', 'Integration conflict in isolated candidate; source was not changed', { output: result.stderr || result.stdout, candidate });
+      const result = await invoke('git', ['-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost', 'merge', '--no-edit', '--no-ff', '-m', 'ACMS integration ' + execution.id, commit], candidate);
+      assert(result.code === 0 && !result.timedOut, 'MERGE_CONFLICT', 'Integration conflict in isolated candidate; source was not changed', { output: result.stderr || result.stdout, candidate });
+      const integratedCommit = await getGit(['rev-parse', 'HEAD'], candidate);
+      execution.checkpoint({ phase: 'checking', commit, candidate, integratedCommit });
       const checks = [];
-      for (const check of project.checks) { const r = await run(check.command, check.args, candidate, { timeout: check.timeoutMs ?? 120000 }); checks.push({ id: check.id, passed: r.code === 0 && !r.timedOut, ...r }); }
+      for (const check of project.checks) {
+        const r = await invoke(check.command, check.args, candidate, { timeout: check.timeoutMs ?? 120000 });
+        checks.push({ id: check.id, passed: r.code === 0 && !r.timedOut, ...r });
+      }
       assert(checks.every(c => c.passed), 'INTEGRATION_CHECK_FAILED', 'Candidate integration failed checks; source was not changed', { checks, commit, candidate });
-      assert((await git(['diff', '--name-only', 'HEAD'], candidate)) === '', 'CHECK_MODIFIED_CODE', 'Acceptance checks modified tracked files in the integration candidate');
-      const actualHead = await git(['rev-parse', 'HEAD'], project.repoRoot);
-      assert((await git(['status', '--porcelain', '--', '.', ':(exclude).acms'], project.repoRoot)) === '' && actualHead === targetHead, 'TARGET_CHANGED', 'Source changed while validating integration; merge was not applied', { actualHead });
-      const integratedCommit = await git(['rev-parse', 'HEAD'], candidate);
+      assert(await getGit(['rev-parse', 'HEAD'], candidate) === integratedCommit &&
+        (await getGit(['diff', '--name-only', 'HEAD'], candidate)) === '', 'CHECK_MODIFIED_CODE', 'Acceptance checks modified the integration candidate');
+      const actualRoot = await this.validateProject(this.company.store.require('projects', task.projectId), invoke);
+      const actual = await this.integrationTarget(targetRoot, invoke);
+      assert(actualRoot === targetRoot && !actual.targetStatus && actual.targetHead === targetHead && actual.targetRef === targetRef,
+        'TARGET_CHANGED', 'Source changed while validating integration; merge was not applied', { actualHead: actual.targetHead });
       assert(isCurrent(), 'STALE_INTEGRATION', 'Integration was stopped or replaced');
-      await git(['merge', '--ff-only', integratedCommit], project.repoRoot);
-      return { status: 'merged', commit, integratedCommit, checks, candidate };
+      if (integratedCommit !== targetHead) await execution.apply(checks, targetRoot, integratedCommit);
+      return { status: 'merged', commit, integratedCommit, targetRef, checks, candidate };
     } catch (error) {
       throw withEvidence(error, { commit, actualHead: error.details?.actualHead ?? null,
         checks: error.details?.checks?.filter(c => !c.passed).map(c => ({ id: c.id, code: c.code })) ?? [] });
     }
+  }
+  async inspectIntegration(record) {
+    const { targetRoot, targetHead, targetRef, integratedCommit, commit, checks, candidate } = record;
+    const invoke = (command, args, cwd) => runContained(command, args, cwd, { timeout: 5000 });
+    const observed = await invoke('git', ['rev-parse', '--verify', targetRef], targetRoot);
+    assert(observed.code === 0 && !observed.timedOut, 'GIT_ERROR', observed.stderr || 'Unable to verify the integration target');
+    const actualHead = observed.stdout.trim();
+    const ancestry = await invoke('git', ['merge-base', '--is-ancestor', integratedCommit, actualHead], targetRoot);
+    assert(!ancestry.timedOut && [0, 1].includes(ancestry.code), 'GIT_ERROR', ancestry.stderr || 'Unable to verify the candidate commit');
+    const reflog = ancestry.code === 0 ? '' : await git(['reflog', 'show', '--format=%H', '-n', '1000', targetRef], targetRoot, undefined, invoke);
+    if (ancestry.code === 0 || reflog.split(/\r?\n/).includes(integratedCommit)) {
+      return { status: 'merged', proof: ancestry.code === 0 ? 'target-history' : 'target-reflog', actualHead, targetRef, commit, integratedCommit, checks, candidate };
+    }
+    const actual = await this.integrationTarget(targetRoot, invoke);
+    return { status: actual.targetRef === targetRef && actual.targetHead === targetHead && !actual.targetStatus ? 'unchanged' : 'unknown', actualHead, targetRef };
   }
 }

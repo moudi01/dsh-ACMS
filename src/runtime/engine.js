@@ -5,6 +5,8 @@ import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
 import { completeCoordination, coordinationAuthority, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow, timeBoxCoordinationKey, CAPACITY_LIMIT_CODES } from '../core/coordination.js';
+import { executeIntegration, interruptIntegration, recoverIntegrations, refreshIntegrationReceipts } from './integration.js';
+import { integrationPending } from '../core/task-actions.js';
 import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute, ignoresBlocker } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
@@ -24,9 +26,9 @@ export class Engine {
       // yet. Unconfirmed legacy processes block startup instead of being
       // silently released.
       this.legacyMigration = await migrateLegacyForEngine({ store: this.store, adapter: this.adapter, dataDir: this.workspaces.dataDir });
-      this.conversations?.recover(); await this.recover();
+      this.conversations?.recover(); await this.recover(); await recoverIntegrations(this);
     } catch (e) { this.store.releaseLease(this.owner); throw e; }
-    this.listener = () => this.kick(); this.store.events.on('event', this.listener);
+    this.listener = () => { interruptIntegration(this); this.kick(); }; this.store.events.on('event', this.listener);
     this.timer = setInterval(() => this.kick(), this.intervalMs); this.timer.unref?.(); this.kick();
   }
   kick() { if (this.closing || this.scheduled) return; this.scheduled = true; queueMicrotask(() => { this.scheduled = false; this.tick().catch(e => { this.lastError = String(e.message); }); }); }
@@ -98,13 +100,16 @@ export class Engine {
   async tick() {
     if (this.ticking || this.closing) return; this.ticking = true;
     try {
+      interruptIntegration(this);
       this.fenced(); this.store.heartbeat(this.owner);
       // A request made during final cleanup must survive until the live
       // activation settles; recover() deliberately excludes live attempts.
-      for (const task of this.store.list('tasks').filter(t => t.recoveryRequested && ![...this.live.values()].some(entry => entry.taskId === t.id))) {
+      for (const task of this.store.list('tasks').filter(t => t.recoveryRequested && this.activeIntegration?.taskId !== t.id && ![...this.live.values()].some(entry => entry.taskId === t.id))) {
         this.store.transaction(() => this.store.put('tasks', { ...task, recoveryRequested: false }));
         await this.recover(task.id);
+        await recoverIntegrations(this, task.id);
       }
+      await refreshIntegrationReceipts(this);
       const spent = new Map(this.store.list('goals').map(g => [g.id, goalRuntimeSpent(g, this.store.list('attempts'))]));
       for (const [attemptId, entry] of this.live) {
         const task = this.store.require('tasks', entry.taskId);
@@ -132,10 +137,13 @@ export class Engine {
         this.ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, p);
       }
       const active = this.store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id)));
-      for (const task of this.store.list('tasks')) {
-        if (task.status === 'integrating' && !ignoresBlocker(task) && !active.some(a => a.taskId === task.id)) this.queueIntegration(task.id);
+      const occupiedIntegrations = this.store.list('integrations').filter(integrationPending).length;
+      let free = p.maxConcurrent - active.length - occupiedIntegrations - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
+      let integrationQueued = occupiedIntegrations > 0 || this.queuedIntegrations.size > 0;
+      if (!integrationQueued) {
+        const waiting = this.store.list('tasks').find(t => t.status === 'integrating' && !ignoresBlocker(t) && !active.some(a => a.taskId === t.id));
+        if (waiting) { this.queueIntegration(waiting.id); integrationQueued = true; free--; }
       }
-      let free = p.maxConcurrent - active.length - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
       const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
@@ -158,7 +166,7 @@ export class Engine {
             this.store.put('tasks', { ...task, status: 'integrating' });
             this.store.event('task.integration.resumed', task.id, { artifactHash: task.artifactHash }, SYSTEM);
           });
-          this.queueIntegration(task.id);
+          if (!integrationQueued) { this.queueIntegration(task.id); integrationQueued = true; free--; }
           continue;
         }
         if (['work', 'repair'].includes(task.kind) && ordinary >= Math.max(1, p.maxConcurrent - p.controlSlots)) continue;
@@ -488,36 +496,9 @@ export class Engine {
   queueIntegration(taskId) {
     if (this.queuedIntegrations.has(taskId)) return;
     this.queuedIntegrations.add(taskId);
-    this.integration = this.integration.then(async () => {
-      if (this.closing || this.company.policy().paused) return;
-      const task = this.store.require('tasks', taskId);
-      if (task.status !== 'integrating' || ignoresBlocker(task)) return;
-      const goal = this.store.require('goals', task.goalId);
-      if (goalRuntimeSpent(goal, this.store.list('attempts')) >= goalRuntimeLimit(goal, this.company.policy())) {
-        this.block(task, 'budget', '目标累计执行时间额度已用完', '请追加目标执行时间额度后继续。');
-        return;
-      }
-      const isCurrent = () => {
-        this.fenced();
-        const current = this.store.require('tasks', taskId);
-        return current.status === 'integrating' && !ignoresBlocker(current) && current.generation === task.generation &&
-          current.revision === task.revision;
-      };
-      let integration;
-      try {
-        integration = await this.workspaces.integrate(task, isCurrent);
-      } catch (error) {
-        if (isCurrent()) this.block(task, 'integration', error.message, '请解决目标工作区冲突或集成检查问题后恢复。', error.integrationEvidence);
-        return;
-      }
-      if (!isCurrent()) return;
-      this.store.transaction(() => {
-        const saved = this.store.put('tasks', { ...task, status: 'succeeded', integrationPending: false, integration });
-        this.company.releaseTemporaryAgent(saved.agentId);
-        this.store.event('task.succeeded', saved.id, { integration, artifactHash: saved.artifactHash }, SYSTEM);
-        this.updateGoal(saved.goalId);
-      });
-    }).catch(e => { this.lastError = e.message; }).finally(() => this.queuedIntegrations.delete(taskId));
+    this.integration = this.integration.then(() => executeIntegration(this, taskId))
+      .catch(error => { this.lastError = error.message; })
+      .finally(() => { this.queuedIntegrations.delete(taskId); this.kick(); });
   }
   updateGoal(goalId) {
     return this.company.refreshGoal(goalId);
@@ -614,6 +595,7 @@ export class Engine {
   coordinateFailure(task, reason, evidence) { return coordinateExecutionLimit(this, task, reason, evidence); }
   async stop() {
     this.closing = true;
+    interruptIntegration(this);
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this.listener) { this.store.events.off('event', this.listener); this.listener = null; }
     for (const entry of this.live.values()) entry.controller.abort(new Error('ACMS is stopping'));

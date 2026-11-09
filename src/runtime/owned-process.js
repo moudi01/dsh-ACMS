@@ -107,12 +107,14 @@ export async function startOwnedProcess(spec, options = {}) {
         } catch { final.reject(cleanupError('invalid control receipt')); }
       }
     });
-    socket.write([Buffer.from(spec.cwd).toString('base64'), spec.runMs ?? 3600000, Math.max(50, cleanupMs - 500), spec.argv.length, ...spec.argv.map(a => Buffer.from(a).toString('base64'))].join('\n') + '\n');
+    socket.write([Buffer.from(spec.cwd).toString('base64'), spec.runMs ?? 3600000, Math.max(50, cleanupMs - 500),
+      Buffer.from(spec.cleanupReceipt ?? '').toString('base64'), spec.argv.length, ...spec.argv.map(a => Buffer.from(a).toString('base64'))].join('\n') + '\n');
     if (cleanup) socket.write('stop\n');
   });
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(`\\\\.\\pipe\\${pipeName}`, resolve); });
     options.signal?.throwIfAborted();
+    options.beforeStart?.();
     processHandle = (options.spawn ?? spawnNode)({ ...spec,
       argv: [executable, pipeName],
     });

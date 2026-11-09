@@ -1,10 +1,11 @@
+import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Store } from '../src/core/store.js';
 import { Company } from '../src/core/domain.js';
-import { WorkspaceManager, inside } from '../src/runtime/workspaces.js';
+import { WorkspaceManager, inside, run } from '../src/runtime/workspaces.js';
 import { Engine } from '../src/runtime/engine.js';
 import { SimulatedAdapter, defaultSimulation } from '../src/adapters/simulated.js';
 import { OWNER } from '../src/core/util.js';
@@ -32,4 +33,12 @@ export async function until(predicate, timeout = 8000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const value = await predicate(); if (value) return value; await new Promise(r => setTimeout(r, 15)); }
   throw new Error('Condition not reached within test deadline');
+}
+
+export async function gitProject(f, checks = []) {
+  for (const args of [['init', '-b', 'main'], ['add', '.'], ['-c', 'user.name=ACMS Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'Initial fixture']]) {
+    const result = await run('git', args, f.source); assert.equal(result.code, 0, result.stderr);
+  }
+  f.command('project.save', { id: f.project.id, mode: 'git', autoMerge: true, checks });
+  return (await run('git', ['rev-parse', 'HEAD'], f.source)).stdout;
 }

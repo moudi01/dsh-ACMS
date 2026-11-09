@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { writeFile, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { defaultSimulation } from '../src/adapters/simulated.js';
-import { fixture, until } from './helpers.js';
+import { fixture, gitProject, until } from './helpers.js';
 import { run } from '../src/runtime/workspaces.js';
 
 test('reviewer gets its own writable verification copy while the original delivery stays unchanged', async t => {
@@ -42,14 +42,7 @@ test('failed acceptance checks are retained as evidence and block independent ap
   const check = f.store.list('verifications')[0].checks[0]; assert.equal(check.code, 2); assert.match(check.stderr, /Owner check rejected/);
   assert(!f.adapter.calls.some(c => c.task.kind === 'review'));
 });
-async function gitProject(f, checks = []) {
-  for (const args of [['init', '-b', 'main'], ['add', '.'], ['-c', 'user.name=ACMS Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'Initial fixture']]) {
-    const result = await run('git', args, f.source); assert.equal(result.code, 0, result.stderr);
-  }
-  f.command('project.save', { id: f.project.id, mode: 'git', autoMerge: true, checks });
-  return (await run('git', ['rev-parse', 'HEAD'], f.source)).stdout;
-}
-test('reviewed Git delivery is validated in an isolated candidate then fast-forwarded', async t => {
+test('reviewed Git delivery is validated in an isolated candidate then fast-forwarded', { skip: process.platform !== 'win32' }, async t => {
   const f = await fixture(t); const before = await gitProject(f); const task = f.task(); await f.start();
   await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
   const saved = f.store.require('tasks', task.id); assert.equal(saved.integration.status, 'merged');
@@ -57,7 +50,7 @@ test('reviewed Git delivery is validated in an isolated candidate then fast-forw
   assert((await readFile(path.join(f.source, 'deliverable.md'), 'utf8')).length > 0);
   assert(saved.changeSet.some(c => c.path === 'deliverable.md'));
 });
-test('a failed integration candidate opens manager coordination and leaves the source project commit unchanged', async t => {
+test('a failed integration candidate opens manager coordination and leaves the source project commit unchanged', { skip: process.platform !== 'win32' }, async t => {
   const f = await fixture(t); const before = await gitProject(f, [{ id: 'integration-regression', command: 'node', args: ['-e', "process.exit(process.cwd().includes('integration')?1:0)"] }]);
   const task = f.task(); await f.start();
   const routed = await until(() => f.store.page(0, 1000).entries.find(entry => entry.type === 'blocker.coordinated' && entry.blockerKind === 'integration'), 20000);
@@ -108,7 +101,7 @@ test('template versions are pinned for new goals without rewriting existing ones
 });
 
 
-test('coordinated Git integration uses the existing worktree, artifacts and checks', async t => {
+test('coordinated Git integration uses the existing worktree, artifacts and checks', { skip: process.platform !== 'win32' }, async t => {
   let checkpoint;
   const f = await fixture(t, async input => {
     if (input.task.kind === 'coordination') {
