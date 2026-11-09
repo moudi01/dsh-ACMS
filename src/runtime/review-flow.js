@@ -1,4 +1,5 @@
 import { reworkDetails } from "../core/rework.js";
+import { contractVersion, deliveryGeneration, matchesTaskReview, taskContractVersion } from "../core/goal-contract.js";
 import { assert, id, SYSTEM } from "../core/util.js";
 import { canCoordinate, createCoordination, feedbackHashOf, findManager, reviewCoordinationKey } from "../core/coordination.js";
 
@@ -25,25 +26,23 @@ async function acceptTaskReview(engine, review, attempt, output, store) {
   const { workspaces } = engine;
   let source = store.require("tasks", review.reviewOf);
   assert(source.status === "succeeded", "STALE_REVIEW", "Only a delivered task can be reviewed");
-  assert(source.artifactHash === review.reviewArtifactHash, "STALE_REVIEW", "Review targets an obsolete deliverable version");
+  assert(matchesTaskReview(review, source), "STALE_REVIEW", "Review targets an obsolete deliverable version");
   assert(attempt.agentId !== source.lastAuthorId, "SELF_REVIEW", "Author cannot approve their own work");
   const unchanged = await workspaces.unchanged(source, source.artifactIds);
   assert(unchanged, "ARTIFACT_CHANGED", "Reviewed files changed after delivery");
 
   store.transaction(() => {
-    engine.fenced();
-    const currentReview = store.require("tasks", review.id);
-    assert(currentReview.generation === attempt.taskGeneration && currentReview.activeAttemptId === attempt.id &&
-      !currentReview.stopRequested && ["running", "reconciling"].includes(currentReview.status),
-      "STALE_REVIEW", "Review was stopped or replaced while checking the deliverable");
+    const currentReview = engine.currentAttemptTask(attempt);
     source = store.require("tasks", source.id);
-    assert(source.status === "succeeded" && source.artifactHash === review.reviewArtifactHash, "STALE_REVIEW", "Deliverable changed during review");
+    assert(source.status === "succeeded" && matchesTaskReview(review, source), "STALE_REVIEW", "Deliverable changed during review");
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...currentReview, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
-    store.put("verifications", { id: id("verification"), taskId: source.id, goalId: source.goalId, attemptId: attempt.id, artifactHash: source.artifactHash, kind: "review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [], ...(output.rework ? { rework: output.rework } : {}) });
+    store.put("verifications", { id: id("verification"), taskId: source.id, goalId: source.goalId, attemptId: attempt.id, artifactHash: source.artifactHash,
+      goalContractVersion: taskContractVersion(source), taskGeneration: deliveryGeneration(source),
+      kind: "review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [], ...(output.rework ? { rework: output.rework } : {}) });
     const actor = { kind: "agent", id: attempt.agentId, goalId: source.goalId };
     store.event("review.decided", review.id, { taskId: source.id, scope: "task", decision: output.decision, artifactHash: source.artifactHash }, actor, { goalId: source.goalId });
-    if (output.decision === "approve") return;
+    if (output.decision === "approve" || store.require("goals", source.goalId).supersededTaskIds?.includes(source.id)) return;
     requestRework(engine, source, review, attempt, output, { feedbackHash: feedbackHashOf(output) });
   });
 }
@@ -51,17 +50,23 @@ async function acceptTaskReview(engine, review, attempt, output, store) {
 function acceptGoalReview(engine, review, attempt, output) {
   const { company, store } = engine;
   const goal = store.require("goals", review.goalId);
+  assert(goal.contractChange?.status !== 'pending' && review.deliveryHash === company.deliveryHash(goal.id),
+    "STALE_REVIEW", "Goal contract or delivery changed after the final review was requested");
   for (const target of review.reviewTargets ?? []) {
     const current = store.require("tasks", target.id);
-    assert(current.status === "succeeded" && current.artifactHash === target.artifactHash, "STALE_REVIEW", "Goal deliverable changed after the final review was requested");
+    assert(current.status === "succeeded" && current.artifactHash === target.artifactHash &&
+      deliveryGeneration(current) === (target.deliveryGeneration ?? 1) && taskContractVersion(current) === (target.goalContractVersion ?? 1),
+    "STALE_REVIEW", "Goal deliverable changed after the final review was requested");
     // Checked again at acceptance time, not only when the review was created:
     // a reviewer must not have authored any reviewed deliverable.
     assert(current.lastAuthorId !== attempt.agentId, "SELF_REVIEW", "Author cannot approve their own work");
   }
   store.transaction(() => {
+    engine.currentAttemptTask(attempt);
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...review, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
-    store.put("verifications", { id: id("verification"), taskId: goal.id, goalId: goal.id, attemptId: attempt.id, artifactHash: review.deliveryHash, kind: "goal-review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [], ...(output.rework ? { rework: output.rework } : {}) });
+    store.put("verifications", { id: id("verification"), taskId: goal.id, goalId: goal.id, attemptId: attempt.id, artifactHash: review.deliveryHash,
+      goalContractVersion: contractVersion(goal), kind: "goal-review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [], ...(output.rework ? { rework: output.rework } : {}) });
     const actor = { kind: "agent", id: attempt.agentId, goalId: goal.id };
     store.event("review.decided", review.id, { goalId: goal.id, scope: "goal", decision: output.decision, deliveryHash: review.deliveryHash }, actor, { goalId: goal.id });
     if (output.decision !== "approve") {

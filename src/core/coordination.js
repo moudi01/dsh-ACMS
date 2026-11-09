@@ -1,4 +1,5 @@
 import { reworkDetails } from "./rework.js";
+import { completeGoalContract } from "./goal-contract.js";
 import { assert, digest, now, SYSTEM } from "./util.js";
 import { blockerCoordinationKey, ignoresBlocker } from "./blocker-policy.js";
 
@@ -232,13 +233,15 @@ export function completeCoordination(engine, task, attempt, output) {
     const source = current.coordinationOf ? store.get("tasks", current.coordinationOf) : null;
     assert(output.resume === undefined || output.resume === "work", "INVALID_RESULT", "Omit resume to keep the current checkpoint, or use work to revise the deliverable");
     const rework = reworkDetails(output.rework) ?? source?.reworkDetails ?? null;
+    const actor = { kind: "agent", id: attempt.agentId, goalId: task.goalId, grants: attempt.grants };
+    const contractAssessment = completeGoalContract(company, current, output, actor);
     const decision = { kind: "manager-decision", by: attempt.agentId, basis: output.summary ?? "",
-      sourceTaskId: current.coordinationOf ?? null, rework, resume: output.resume ?? "checkpoint" };
+      sourceTaskId: current.coordinationOf ?? null, rework, resume: output.resume ?? "checkpoint", ...(contractAssessment ? { contractAssessment } : {}) };
     engine.finishAttempt(attempt, "completed", output.summary);
     const saved = store.put("tasks", { ...current, status: "succeeded", summary: output.summary ?? "", decision });
-    const actor = { kind: "agent", id: attempt.agentId, goalId: task.goalId, grants: attempt.grants };
     store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf ?? null, decision }, actor, { goalId: task.goalId });
     if (source) releaseCoordinatedSource(engine, saved, { reviseDeliverable: output.resume === "work" });
+    if (contractAssessment) company.refreshGoal(task.goalId);
     if (current.origin?.kind === "timebox") {
       releaseTimeBox(store, saved, actor);
       // The last ordinary task may have finished while this coordination was

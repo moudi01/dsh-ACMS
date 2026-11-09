@@ -48,6 +48,7 @@ export async function apply(ctx, config = {}) {
     execute: async (input, exec) => {
       const attempt = store.list('attempts').find(a => a.childId === exec.agent?.id && a.status === 'running');
       assert(attempt, 'UNAUTHORIZED', 'This session is not an active ACMS assignment');
+      engine.currentAttemptTask(attempt);
       assert(attempt.grants.includes(input.command), 'FORBIDDEN', 'Command exceeds this execution’s captured grants');
       return JSON.stringify(company.command({ kind: 'agent', id: attempt.agentId, goalId: attempt.goalId, grants: attempt.grants }, input.requestId, input.command, input.args));
     } });

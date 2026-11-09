@@ -47,6 +47,29 @@ test("GET /status returns persisted model preferences identical to the UI snapsh
   assert.equal(f.adapter.calls.length, 0);
 });
 
+test("GET /status exposes the same current contract and historical evidence as the UI snapshot", async t => {
+  const f = await fixture(t);
+  const api = await apiOver(f, t);
+  const token = reader(f).token;
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.require("goals", task.goalId).status === "succeeded");
+  f.command("company.pause", { afterCurrent: true });
+  f.command("goal.edit", { id: task.goalId, patch: { acceptance: "Revised acceptance" } });
+  const response = await get(api, "/status?goalId=" + encodeURIComponent(task.goalId), token);
+  assert.equal(response.status, 200);
+  const { goal, tasks, verifications } = response.body.value;
+  const snapshot = f.company.snapshot().goals.find(row => row.id === task.goalId);
+  for (const field of ["status", "contractVersion", "completedContractVersion", "contractChange", "deliveryHash"]) {
+    assert.deepEqual(goal[field], snapshot[field]);
+  }
+  assert.equal(goal.status, "active");
+  assert.equal(goal.contractVersion, 2);
+  assert.equal(goal.completedContractVersion, 1);
+  assert.equal(tasks.find(row => row.id === task.id).goalContractVersion, 1);
+  assert.equal(verifications.find(row => row.taskId === task.id).goalContractVersion, 1);
+});
+
 test("GET /reviews returns real approve and changes-requested conclusions", async t => {
   let reviews = 0;
   const handler = async input => {

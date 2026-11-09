@@ -156,6 +156,8 @@ for (const outcome of ['success', 'failure']) test(`late integration ${outcome} 
 
 test('editing goal acceptance invalidates the integration checkpoint before coordination releases it', async t => {
   const f = await fixture(t, async input => {
+    if (input.task.origin?.kind === 'goal-contract') return { outcome: 'coordinated',
+      contractAssessment: { reason: 'The existing undelivered task covers the revised requirement', reuse: [], followUps: [] } };
     if (input.task.kind === 'coordination') return { outcome: 'coordinated', summary: 'Continue the existing task' };
     await writeFile(path.join(input.task.workspace.path, 'delivery.txt'), `Delivery for generation ${input.task.generation}`);
     return { outcome: 'completed', artifacts: [{ path: 'delivery.txt' }] };

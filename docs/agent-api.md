@@ -121,6 +121,8 @@
 
 `GET /status` 的 `modelPreferences` 读取与界面快照相同的 SQLite 实体（集合 `modelPreferences`，单例 id `model`），无记录时返回 `{id:"model",order:[],revision:0,updatedAt:null,updatedBy:null}`；保存或清除后 `order`、`revision` 与界面一致。该读取不启动模型，也不触发 model-check/model-details。
 
+目标的 `contractVersion` 是当前合同版本，`completedContractVersion` 是最近通过验收的版本。要求或验收变化后，`contractChange.status=pending` 表示等待负责人评估，`deliveryHash` 已指向新合同。任务与核验证据保留其 `goalContractVersion`，任务级审查通过 `reviewedContractVersion` 关联被审交付的版本。负责人确认后，`contractChange.decision` 记录沿用成果和后续工作；历史证据仍可查询。
+
 `GET /reviews` 返回 `reviews`（审查任务视图）与 `verifications`。每条 verification 保留源任务 `taskId`、审查任务 `reviewTaskId`、`kind`（`review` 或 `goal-review`）、`passed`、`summary`、`artifactHash` 与 `createdAt`；`reviewTaskId` 由审查 attempt 关联，批准与退回都会记录。审查是用户按需添加的独立子任务，未配置审查时 `reviews` 为空，表示“未审查”，不是失败。任务视图包含 `reviewScope`（`goal` 或 `task`）与 `passed`。`GET /tasks/{id}` 对审查任务同样返回其 verification（附 `reviewTaskId`），对源任务返回关联审查任务列表。读取仅查询 SQLite，不启动模型。
 
 ## 5. 幂等

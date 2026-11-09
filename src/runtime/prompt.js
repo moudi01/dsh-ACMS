@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
+import { contractVersion, deliveredWork, deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
 
 export function promptFor(company, task, attempt, options = {}) {
   const goal = company.store.require('goals', task.goalId); const agent = company.store.require('agents', attempt.agentId);
@@ -16,7 +17,8 @@ export function promptFor(company, task, attempt, options = {}) {
   });
   const managerExtras = agent.role === "manager" ? buildManagerExtras(company, goal, task) : {};
   const contract = {
-    attemptId: attempt.id, goal: { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, template: template ? { id: template.id, name: template.name, phases: template.phases } : null },
+    attemptId: attempt.id, goal: { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance,
+      contractVersion: contractVersion(goal), template: template ? { id: template.id, name: template.name, phases: template.phases } : null },
     task: { id: task.id, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind, reviewScope: task.reviewScope ?? null },
     role: { id: agent.id, name: agent.name, description: agent.description, grants: company.effectiveGrants({ id: agent.id, grants: attempt.grants }) }, workspace: task.workspace?.path,
     changeNotifications: (attempt.notificationIds ?? []).map(id => company.store.require('notifications', id)),
@@ -34,16 +36,24 @@ export function promptFor(company, task, attempt, options = {}) {
     } } : {}),
     ownerChecks: task.checksSnapshot ?? [],
     ...(agent.role === "manager" && options.modelContext ? { modelContext: options.modelContext } : {}),
-    ...(source ? { review: { scope: 'task', task: source.title, acceptance: source.acceptance, artifacts, sourceEvidence, allChangedFiles: source.changeSet, expectedHash: task.reviewArtifactHash, checks: company.store.list('verifications').filter(v => v.taskId === source.id).at(-1) } } : task.reviewScope === 'goal' ? { review: goalReviewEvidence(company, task, goal) } : {}),
+    ...(source ? { review: { scope: 'task', task: source.title, acceptance: task.acceptance, goalContractVersion: task.reviewedContractVersion ?? 1,
+      artifacts, sourceEvidence, allChangedFiles: source.changeSet, expectedHash: task.reviewArtifactHash, checks: deliveryChecks(company.store, source) } } : task.reviewScope === 'goal' ? { review: goalReviewEvidence(company, task, goal) } : {}),
   };
   const reworkContract = `For corrective work, report "rework":{"category":"product-defect|environment|contract-conflict|evidence","evidence":"observed facts","scope":"specific correction","affectedEntrypoints":["other affected paths to check"]}. Choose one category and list all entry points affected by the same issue. Use [] when the issue is isolated.`;
   const planContract = `Name the smallest usable deliverable in "minimumOutcome" and deferred work in "nonGoals". Use one task when a single task can meet the acceptance criteria, including a small document edit. Give a concrete "rationale" for any additional task or repeated review. Respect the goal's review policy and reuse valid checks and reviews.`;
   const coordinationMode = `Read CONTRACT.coordination, goalConstraints, goalTasks, plans and decisionLog. Decide the smallest recovery action allowed by the existing grants. Return {"outcome":"coordinated","summary":"decision and reason"} to release the existing checkpoint. After an integration failure this retries the same deliverable. Add "resume":"work" only when the author must change that deliverable, and explain why. Use {"outcome":"planned","minimumOutcome":"...","nonGoals":[],"rationale":"why extra work is needed","tasks":[...]} only when separate work is needed. Use managed actions to change dependencies or assignment, then report the decision. Honor owner stops and keep valid evidence. For a time-box warning, save the checkpoint and decide how to wrap up or narrow scope within budget. If progress requires new authority, owner-only material, a major scope change or more budget, return {"outcome":"blocked","kind":"human","reason":"...","question":"..."}. ${planContract} ${reworkContract}`;
-  const modes = task.kind === 'coordination' ? coordinationMode : task.kind === 'plan' ? `Return {"outcome":"planned","minimumOutcome":"...","nonGoals":[],"rationale":"...","summary":"...","tasks":[{"key":"one","title":"...","description":"...","acceptance":"...","dependencies":[],"longLived":false}]}. Dependencies reference keys in this plan. Create a small acyclic plan inside the authorized goal. Do not perform implementation during planning. Every task must have concrete deliverables and independent acceptance criteria. ${planContract}`
+  const assessmentMode = `Assess CONTRACT.goalContractChange against the current goal and task dependencies. Every prior deliverable must appear once in "contractAssessment":{"reason":"evidence and scope of reuse or follow-up","reuse":["prior-task-id"],"followUps":[{"taskId":"prior-task-id","followUp":"existing current-version work ID or new plan key"}]}. Include downstream prior deliverables that depend on replaced work in followUps. Use managed actions to update existing unfinished tasks that still depend on a replaced deliverable. Reuse applicable evidence and preserve the selected review policy. Use "coordinated" when existing tasks cover the scope, or "planned" when new work is needed. `;
+  const modes = task.kind === 'coordination' ? (task.origin?.kind === 'goal-contract' ? assessmentMode : '') + coordinationMode : task.kind === 'plan' ? `Return {"outcome":"planned","minimumOutcome":"...","nonGoals":[],"rationale":"...","summary":"...","tasks":[{"key":"one","title":"...","description":"...","acceptance":"...","dependencies":[],"longLived":false}]}. Dependencies reference keys in this plan. Create a small acyclic plan inside the authorized goal. Do not perform implementation during planning. Every task must have concrete deliverables and independent acceptance criteria. ${planContract}`
     : task.kind === 'review' ? `Independently inspect the delivered artifacts and automatic check evidence against the acceptance criteria. Judge the delivered outcome only: do not review the work process, the author's report or the conversation history. For a goal-level review, evaluate every listed target. Do not edit deliverables or implement fixes. Return {"outcome":"reviewed","decision":"approve" or "changes_requested","summary":"...","findings":["specific evidence"]}. Approve only when the delivered version meets the contract. If your execution tools or sandbox fail, return {"outcome":"blocked","kind":"technical","reason":"specific environment failure"} so ACMS retries the review. Use changes_requested only when evidence shows the delivery does not meet its acceptance contract. ${reworkContract}`
     : `Do the actual work inside the isolated workspace. Return {"outcome":"completed","summary":"...","artifacts":[{"path":"relative/path","title":"..."}]}. Deliver actual files, not only a final message. Do not change the source project outside this workspace. Do not write ACMS metadata, policy, credentials or database. Do not spawn background processes that outlive this run. If division of work is needed, return {"outcome":"decomposed","tasks":[{"key":"...","title":"...","description":"...","acceptance":"...","dependencies":[]}]} instead of spawning unmanaged agents. If truly blocked, return {"outcome":"blocked","kind":"technical" or "human","reason":"...","question":"...","reversibleDefault":"optional safe default already used"}. Solve reversible decisions autonomously. Missing permissions or unique required material require a human interaction, not invented answers.`;
   const management = agent.role === 'manager' ? `To manage and receive actual results, return {"outcome":"managed","actionBatchId":"stable-purpose-v1","summary":"...","actions":[{"command":"agent.save","args":{"name":"Worker","role":"worker","grants":[],"temporary":true}},{"command":"task.create","args":{"goalId":"${goal.id}","parentId":"${task.id}","agentId":"$actions[0].id","title":"Concrete work","description":"...","acceptance":"..."}}]}. Use only commands in role.grants. Each batch must contain 1–10 actions. In the summary give the concrete reason for each new task or repeated review and reuse existing tasks when they meet the need. Supply dependencies directly in task.create using earlier action IDs when possible, or split larger changes into bounded continuation batches. Batch actions run atomically in order; a whole string $actions[0].id references an EARLIER action's returned ID. Do not invent IDs. ACMS commits the batch, automatically wakes you again, and supplies actual results in CONTRACT.managementResults. On that next turn use those IDs to finish your work and deliver files, or submit a different necessary batch (maximum four continuation turns). Reuse the SAME actionBatchId and identical actions on retries: this returns the same IDs without duplicate roles/tasks. Never resubmit committed work with a new ID. A failed batch has no effects; correct the reported error. agent.save may grant only your current effective permissions and the new role's ceiling; workers must have grants: []. Owner policy and new business goals cannot be changed. Select the execution provider/model authorized in your task; do not access ACMS database or credentials. CONTRACT.modelContext lists authorized candidates, their declared capabilities and the owner model preference order. Explicit bindings win; preferences never widen authorization; unknown capabilities must not be treated as supported.` : '';
   return `ACMS_ATTEMPT_ID=${attempt.id}\nYou are working inside ACMS (Agent Company Management System). Follow the assigned scope and role. Do not create a new business goal or widen permissions. All scheduling and subagent creation is managed by ACMS. Output exactly one JSON object as your final answer, without a Markdown fence.\n${modes}\n${management}\nCONTRACT:\n${JSON.stringify(contract, null, 2)}`;
+}
+
+function deliveryChecks(store, task) {
+  return store.list('verifications').findLast(v => v.kind === 'checks' && v.taskId === task.id &&
+    v.artifactHash === task.artifactHash && (v.taskGeneration ?? 1) === deliveryGeneration(task) &&
+    (v.goalContractVersion ?? 1) === taskContractVersion(task)) ?? null;
 }
 
 function goalReviewEvidence(company, task, goal) {
@@ -51,8 +61,8 @@ function goalReviewEvidence(company, task, goal) {
   const targets = (task.reviewTargets ?? []).map(target => {
     const row = store.require('tasks', target.id);
     const artifacts = (row.artifactIds ?? []).map(id => store.require('artifacts', id));
-    const checks = store.list('verifications').filter(v => v.taskId === row.id && v.kind === 'checks').at(-1) ?? null;
-    return { taskId: row.id, title: row.title, acceptance: row.acceptance, summary: row.summary ?? '', artifacts: artifacts.map(a => ({ path: a.path, title: a.title, hash: a.hash })), checks };
+    return { taskId: row.id, title: row.title, acceptance: row.acceptance, goalContractVersion: taskContractVersion(row),
+      artifacts: artifacts.map(a => ({ path: a.path, title: a.title, hash: a.hash })), checks: deliveryChecks(store, row) };
   });
   return { scope: 'goal', goal: goal.title, acceptance: goal.acceptance, deliveryHash: task.deliveryHash, targets };
 }
@@ -74,6 +84,12 @@ function buildManagerExtras(company, goal, task) {
   const decisionLog = decisions.slice(-20).map(e => ({ seq: e.seq, at: e.at, type: e.type, actor: e.actor, decision: e.decision }));
   const source = task.coordinationOf ? store.get("tasks", task.coordinationOf) : null;
   return {
+    ...(task.origin?.kind === 'goal-contract' ? { goalContractChange: { ...goal.contractChange,
+      priorDeliverables: deliveredWork(store, goal).filter(t => taskContractVersion(t) !== contractVersion(goal)).map(t => ({
+        id: t.id, title: t.title, acceptance: t.acceptance, goalContractVersion: taskContractVersion(t), artifactHash: t.artifactHash,
+        dependencies: t.dependencies, checks: deliveryChecks(store, t),
+      })),
+    } } : {}),
     goalConstraints: goal.constraints ?? [],
     goalSource: goal.source ?? null,
     plans,

@@ -1,4 +1,5 @@
 import { assert, digest } from './util.js';
+import { matchesGoalContract } from './goal-contract.js';
 
 // References are data, never expressions: only an earlier action's returned ID.
 function resolve(value, results) {
@@ -26,6 +27,8 @@ export function runActionBatch(company, actor, { taskId, generation, batchId, ac
   // manual task.edit reassignment. A global manager (no goalId) stays eligible.
   assert(!manager.goalId || manager.goalId === task.goalId, 'SCOPE_DENIED', 'Manager may only act within its assigned goal');
   assert(task.agentId === actor.id && task.goalId === actor.goalId && task.generation === generation && task.status === 'running' && !task.stopRequested, 'STALE_RESULT', 'Management batch belongs to an obsolete assignment');
+  assert(!task.contractObsolete && matchesGoalContract(store.require('goals', task.goalId), task),
+    'STALE_RESULT', 'Management batch belongs to an obsolete goal contract');
   assert(typeof batchId === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(batchId), 'INVALID_BATCH_ID', 'actionBatchId must be a stable 1–80 character identifier');
   assert(Array.isArray(actions) && actions.length > 0 && actions.length <= 10, 'INVALID_ACTIONS', 'Management batches contain 1–10 actions');
   const id = `batch_${digest({ taskId, generation, batchId })}`;

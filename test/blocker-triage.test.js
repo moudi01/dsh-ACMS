@@ -7,7 +7,7 @@ import { selectRoute, selectionError } from "../src/core/model-selection.js";
 import { blockerCoordinationKey, blockerRoute } from "../src/core/blocker-policy.js";
 
 function claimCoordination(f, coordination, agentId = "manager") {
-  const attempt = { id: randomUUID(), taskId: coordination.id, goalId: coordination.goalId, agentId, role: "manager", kind: "coordination", taskGeneration: coordination.generation, blockerFeedbackHash: coordination.feedbackHash, grants: f.store.require("agents", agentId).grants, status: "running", startedAt: new Date().toISOString() };
+  const attempt = { id: randomUUID(), taskId: coordination.id, goalId: coordination.goalId, agentId, role: "manager", kind: "coordination", taskGeneration: coordination.generation, goalContractVersion: coordination.goalContractVersion, blockerFeedbackHash: coordination.feedbackHash, grants: f.store.require("agents", agentId).grants, status: "running", startedAt: new Date().toISOString() };
   f.store.transaction(() => { f.store.put("attempts", attempt); f.store.put("tasks", { ...f.store.require("tasks", coordination.id), status: "running", activeAttemptId: attempt.id }); });
   return attempt;
 }
