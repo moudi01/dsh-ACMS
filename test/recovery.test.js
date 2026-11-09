@@ -159,3 +159,44 @@ for (const outcome of ['success', 'failure']) test(`late integration ${outcome} 
   assert.equal(f.store.list('interactions').length, 0);
   assert.equal(f.store.list('tasks').filter(row => row.kind === 'coordination').length, 0);
 });
+
+
+test('editing goal acceptance invalidates the integration checkpoint before coordination releases it', async t => {
+  const f = await fixture(t, async input => {
+    if (input.task.kind === 'coordination') return { outcome: 'coordinated', summary: 'Continue the existing task' };
+    await writeFile(path.join(input.task.workspace.path, 'delivery.txt'), `Delivery for generation ${input.task.generation}`);
+    return { outcome: 'completed', artifacts: [{ path: 'delivery.txt' }] };
+  });
+  const integrationHashes = [];
+  f.workspaces.integrate = async task => {
+    integrationHashes.push(task.artifactHash);
+    if (integrationHashes.length === 1) {
+      f.command('company.pause', { afterCurrent: true });
+      throw new Error('Isolated integration failure');
+    }
+    return { status: 'available' };
+  };
+
+  const task = f.task();
+  await f.start();
+  const blocked = await until(() => {
+    const current = f.store.require('tasks', task.id);
+    return current.blocker?.kind === 'coordination' && current;
+  });
+  assert.equal(blocked.integrationPending, true);
+  const acceptance = 'Delivery must satisfy the revised goal contract';
+  f.command('goal.edit', { id: task.goalId, patch: { acceptance } });
+  const edited = f.store.require('tasks', task.id);
+  assert.equal(edited.generation, blocked.generation + 1);
+  assert.equal(edited.integrationPending, false);
+  f.command('company.resume');
+
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded');
+  const delivered = f.store.require('tasks', task.id);
+  const calls = f.adapter.calls.filter(call => call.task.id === task.id);
+  assert.deepEqual(calls.map(call => call.attempt.taskGeneration), [blocked.generation, edited.generation]);
+  assert.match(calls[1].prompt, /Delivery must satisfy the revised goal contract/);
+  assert.notEqual(delivered.artifactHash, blocked.artifactHash);
+  assert.deepEqual(integrationHashes, [blocked.artifactHash, delivered.artifactHash]);
+  assert.deepEqual(f.store.list('verifications').filter(record => record.taskId === task.id).map(record => record.artifactHash), integrationHashes);
+});

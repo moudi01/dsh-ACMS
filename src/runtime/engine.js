@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { assert, id, now, parseResult, digest, SYSTEM, OWNER } from '../core/util.js';
+import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
@@ -287,6 +287,11 @@ export class Engine {
           const resolution = (task.blocker?.resolutionTaskIds ?? []).map(id => this.store.get('tasks', id));
           const coordination = resolution.find(t => t?.kind === 'coordination');
           if (coordination && !failed.some(dep => dep.id === coordination.id) && coordination.origin?.blockerKind !== 'dependency') continue;
+          // A planned repair can leave the original dependency failed while it runs.
+          // Reassess that dependency once the repair finishes or cannot continue.
+          if (task.blocker?.kind === 'coordination' &&
+            resolution.every(t => t?.kind === 'work' && (t.status === 'succeeded' || !TERMINAL.has(t.status))) &&
+            resolution.some(t => !TERMINAL.has(t.status))) continue;
           // A failed coordination itself needs owner attention rather than another handoff.
           const reason = '依赖无法继续：' + failed.map(dep => dep.id + ' (' + dep.status + ')').join(', ');
           if (coordination && failed.some(dep => dep.id === coordination.id)) this.blockForOwner(task, 'dependency', reason, '请核对协调任务或调整依赖。');

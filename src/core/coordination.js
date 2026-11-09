@@ -112,8 +112,12 @@ export function releaseSource(store, coordination, options = {}) {
     return store.put("tasks", { ...source, status: paused ? "paused" : "blocked", blocker: { kind: "reworks", reason: "审查返工次数已达上限，等待用户决定是否追加额度或调整范围" } });
   }
   const reworkTasks = options.reworkTasks ?? [];
-  const integrationPending = !options.reviseDeliverable && (source.integrationPending ||
-    (coordination.origin?.blockerKind === "integration" && !!source.artifactHash));
+  // Older records lack the checkpoint flag. Only infer it from an integration
+  // handoff for this generation; a contract edit explicitly clears the flag.
+  const legacyIntegration = coordination.origin?.blockerKind === "integration" &&
+    !!coordination.coordinationKey?.startsWith(executorCoordinationKey(source.id, source.generation, "")) &&
+    !!source.artifactHash;
+  const integrationPending = !options.reviseDeliverable && (source.integrationPending ?? legacyIntegration);
   if (reworkTasks.length) {
     const dependencies = [...new Set([...(source.dependencies ?? []), ...reworkTasks])];
     return store.put("tasks", { ...source, status: paused ? "paused" : "blocked", integrationPending, dependencies, blocker: { kind: "coordination", reason: "负责人已拆分返工任务，等待其完成", resolutionTaskIds: reworkTasks } });

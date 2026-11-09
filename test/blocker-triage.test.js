@@ -245,3 +245,58 @@ test("manager retry cannot override an owner pause", async t => {
   assert.throws(() => f.command("task.retry", { id: task.id }, { kind: "agent", id: manager.id, goalId: task.goalId, grants: manager.grants }), { code: "OWNER_REQUIRED" });
   assert.equal(f.store.require("tasks", task.id).status, "paused");
 });
+
+for (const sameGeneration of [true, false]) test(`legacy integration checkpoint with ${sameGeneration ? "matching" : "stale"} generation`, async t => {
+  const f = await fixture(t);
+  f.engine.epoch = f.store.acquireLease(f.engine.owner);
+  const task = f.task();
+  const integrating = f.store.transaction(() => f.store.put("tasks", { ...task, status: "integrating", artifactHash: "legacy-delivery" }));
+  f.engine.block(integrating, "integration", "Integration failed", "Resolve");
+  if (!sameGeneration) f.command("goal.edit", { id: task.goalId, patch: { acceptance: "Revised acceptance" } });
+  f.store.transaction(() => f.store.put("tasks", { ...f.store.require("tasks", task.id), integrationPending: undefined }));
+  const coordination = f.store.list("tasks").find(row => row.coordinationOf === task.id);
+  const attempt = claimCoordination(f, coordination);
+  await f.engine.accept(attempt, { outcome: "coordinated", summary: "Resume the source task" }, { throwIfAborted() {} });
+  assert.equal(f.store.require("tasks", task.id).integrationPending, sameGeneration);
+});
+
+for (const restoresDependency of [true, false]) test(`planned repair is awaited before checking ${restoresDependency ? "a restored" : "an unresolved"} dependency`, async t => {
+  let upstream;
+  let finishRepair;
+  const f = await fixture(t, async input => {
+    if (input.task.kind === "coordination") return {
+      outcome: "planned", rationale: "Restore the upstream deliverable before continuing",
+      tasks: [{ key: "restore", title: "Restore the upstream deliverable", description: "Repair the fixture dependency", acceptance: "The upstream deliverable can be used" }],
+    };
+    if (input.task.title === "Restore the upstream deliverable") {
+      await new Promise(resolve => { finishRepair = resolve; });
+      if (restoresDependency) f.store.transaction(() => f.store.put("tasks", { ...upstream, status: "succeeded" }));
+    }
+    return defaultSimulation(input);
+  });
+  upstream = f.task();
+  const downstream = f.task({ dependencies: [upstream.id] });
+  f.store.transaction(() => f.store.put("tasks", { ...upstream, status: "failed" }));
+  await f.start();
+  await until(() => finishRepair);
+  try {
+    f.engine.refreshReadiness();
+    const waiting = f.store.require("tasks", downstream.id);
+    assert.equal(waiting.status, "blocked");
+    assert.equal(waiting.blocker?.kind, "coordination");
+    const [repairId] = waiting.blocker.resolutionTaskIds;
+    assert.equal(f.store.require("tasks", repairId).status, "running");
+    assert.equal(f.store.list("interactions").length, 0);
+  } finally {
+    finishRepair();
+  }
+
+  if (restoresDependency) {
+    await until(() => f.store.require("tasks", downstream.id).status === "succeeded");
+    assert.equal(f.store.list("interactions").length, 0);
+  } else {
+    await until(() => f.store.list("interactions").some(i => i.taskId === downstream.id && i.kind === "dependency" && i.status === "pending"));
+    assert.equal(f.store.require("tasks", downstream.id).status, "blocked");
+    assert.equal(f.adapter.calls.some(call => call.task.id === downstream.id), false);
+  }
+});
