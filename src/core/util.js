@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 export const now = () => new Date().toISOString();
 export const id = (prefix) => `${prefix}_${randomUUID()}`;
 export const clone = (value) => structuredClone(value);
+export const packageName = /^(?:@[a-z0-9][a-z0-9._-]{0,79}\/)?[a-z0-9][a-z0-9._-]{0,79}$/i;
 export const digest = (value) => createHash('sha256').update(typeof value === 'string' ? value : canonical(value)).digest('hex');
 export function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;

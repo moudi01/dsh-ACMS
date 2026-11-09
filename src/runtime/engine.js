@@ -11,6 +11,8 @@ import { executionOccupancy } from '../core/execution-capacity.js';
 import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute, ignoresBlocker } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
+import { classifyEnvironment, environmentFailure } from './preflight.js';
+import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './environment-gate.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 export class Engine {
@@ -21,6 +23,7 @@ export class Engine {
   }
   async start() {
     this.closing = false;
+    this.nextEnvironmentCheck = 0;
     this.epoch = this.store.acquireLease(this.owner);
     try {
       // Exclusive migration: the lease is held and the scheduler is not running
@@ -130,6 +133,10 @@ export class Engine {
         }
       });
       this.refreshReadiness();
+      if (this.store.list('tasks').some(task => task.environmentBlock)) {
+        await refreshEnvironmentGates(this);
+        if (this.company.policy().paused || this.closing) return;
+      }
       const p = this.company.policy();
       // Efficiency time box (issue #7): notify the manager once per box without
       // creating a budget interaction. Hard-cap handling stays below.
@@ -155,7 +162,7 @@ export class Engine {
       }
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
-      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
+      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.environmentBlock && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
         if (active.some(a => a.taskId === task.id)) continue;
@@ -305,7 +312,7 @@ export class Engine {
       const pending = new Set(this.store.list('interactions').filter(i => i.status === 'pending').map(i => i.taskId));
       for (const listed of this.store.list('tasks')) {
         const task = this.store.require('tasks', listed.id);
-        if (!['ready', 'blocked'].includes(task.status) || ignoresBlocker(task) || pending.has(task.id)) continue;
+        if (!['ready', 'blocked'].includes(task.status) || task.environmentBlock || ignoresBlocker(task) || pending.has(task.id)) continue;
         if (task.blocker && !task.blocker.resolutionTaskIds) continue;
         const dependencies = task.dependencies.map(id => ({ id, status: this.store.get('tasks', id)?.status ?? 'missing' }));
         const failed = dependencies.filter(dep => ['failed', 'missing'].includes(dep.status));
@@ -347,10 +354,21 @@ export class Engine {
     });
   }
   async execute(attempt, controller) {
-    let activation, cleanupFailure, recoveryFailure, deliveredResult = false; const timeout = setTimeout(() => controller.abort(new Error('Execution timeout')), this.company.policy().turnTimeoutMs);
+    let activation, cleanupFailure, recoveryFailure, preparingWorkspace = false, deliveredResult = false, preflight;
+    const timeout = setTimeout(() => controller.abort(new Error('Execution timeout')), this.company.policy().turnTimeoutMs);
     try {
       let task = this.currentAttemptTask(attempt);
+      const agent = this.store.require('agents', attempt.agentId);
+      preflight = await inspectEnvironment(this, task, agent);
+      controller.signal.throwIfAborted();
+      task = this.currentAttemptTask(attempt);
+      if (preflight.failures.length) {
+        this.acceptEnvironment(attempt, task, preflight, false);
+        return;
+      }
+      preparingWorkspace = true;
       const workspace = await this.workspaces.prepare(task, attempt);
+      preparingWorkspace = false;
       this.store.transaction(() => {
         this.fenced(); task = this.store.require('tasks', task.id);
         assert(task.activeAttemptId === attempt.id, 'STALE_RESULT', 'Workspace belongs to an obsolete attempt');
@@ -361,16 +379,22 @@ export class Engine {
       });
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
+      preflight = await inspectEnvironment(this, task, agent);
+      controller.signal.throwIfAborted();
+      task = this.currentAttemptTask(attempt);
+      if (preflight.failures.length) {
+        this.acceptEnvironment(attempt, task, preflight, false);
+        return;
+      }
       this.store.transaction(() => {
-        attempt = this.store.put('attempts', { ...attempt, status: 'running' });
+        attempt = this.store.put('attempts', { ...attempt, status: 'running', environment: preflight.report });
         this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
       });
-      const agent = this.store.require('agents', attempt.agentId);
       let modelContext;
       if (agent.role === 'manager') { try { modelContext = await this.adapter.modelContext?.(task.requirements); } catch (e) { this.lastError = '无法读取模型候选：' + e.message; } }
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
-      activation = await this.adapter.start({ task, attempt, agent, prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal, onAccepted: () => this.conversations?.accepted(attempt) });
+      activation = await this.adapter.start({ task, attempt, agent, routeSelection: preflight.selection, prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal, onAccepted: () => this.conversations?.accepted(attempt) });
       this.store.transaction(() => {
         this.fenced();
         for (const notificationId of attempt.notificationIds ?? []) {
@@ -397,7 +421,18 @@ export class Engine {
           recoveryFailure = Object.assign(new Error(`执行结果尚需核对：${error.message}; ${fact?.reason ?? '无法读取可靠结束回执'}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
         }
       }
-      if (this.store.ownsLease(this.owner, this.epoch)) this.fail(attempt, cleanupFailure ?? recoveryFailure ?? (controller.signal.aborted ? controller.signal.reason : error), controller.signal.aborted);
+      const failure = cleanupFailure ?? recoveryFailure ?? (controller.signal.aborted ? controller.signal.reason : error);
+      let observed = preflight;
+      const classified = !controller.signal.aborted && !cleanupFailure && !recoveryFailure && classifyEnvironment(failure, preparingWorkspace ? 'workspace' : null);
+      if (observed && (['package', 'esbuild'].includes(classified?.code) || preparingWorkspace)) {
+        try {
+          const current = this.currentAttemptTask(attempt);
+          observed = await inspectEnvironment(this, current, this.store.require('agents', attempt.agentId),
+            classified ? { failures: [classified] } : null, preflight.route);
+        } catch { /* Preserve the original error and the last observed facts. */ }
+      }
+      if (this.store.ownsLease(this.owner, this.epoch)) this.fail(attempt, controller.signal.aborted && !cleanupFailure && !recoveryFailure ? controller.signal.reason : failure,
+        controller.signal.aborted, observed, preparingWorkspace);
     } finally {
       clearTimeout(timeout);
       // The slot is not released until the provider confirms process cleanup.
@@ -445,6 +480,17 @@ export class Engine {
   async accept(attempt, output, signal) {
     let task = this.currentAttemptTask(attempt);
     if (this.refreshCoordinationAttempt(task, attempt)) return;
+    const technical = output.outcome === 'blocked' && ['technical', 'environment'].includes(output.kind);
+    const review = task.kind === 'review' && output.outcome === 'reviewed';
+    const reviewEnvironment = review && output.rework?.category === 'environment';
+    const diagnostic = technical ? output.reason : review && (!output.rework || reviewEnvironment) ?
+      [output.summary, ...(Array.isArray(output.findings) ? output.findings : []), output.rework?.evidence].join('\n') : null;
+    const failure = classifyEnvironment({ message: diagnostic }) ??
+      (reviewEnvironment || (technical && output.kind === 'environment') ? environmentFailure('review', review ? '独立审查' : '任务执行') : null);
+    if (failure) {
+      await this.acceptRuntimeEnvironment(attempt, task, [failure], signal);
+      return;
+    }
     if (task.kind === 'coordination' && output.outcome !== 'blocked') {
       const source = task.coordinationOf ? this.store.get('tasks', task.coordinationOf) : null;
       assert(!source || (!source.stopRequested && !['cancelled', 'deleted', 'archived', 'reconciling'].includes(source.status)),
@@ -507,6 +553,12 @@ export class Engine {
     assert(output.outcome === 'completed', 'INVALID_RESULT', 'Execution did not submit a completed result');
     const collected = await this.workspaces.collect(task, { ...attempt, signal }, output.artifacts ?? []);
     signal.throwIfAborted(); this.fenced();
+    const environmentFailures = collected.checks.filter(c => !c.passed && !c.timedOut)
+      .map(c => classifyEnvironment({ message: (c.stderr ?? '') + '\n' + (c.stdout ?? '') })).filter(Boolean);
+    if (environmentFailures.length) {
+      await this.acceptRuntimeEnvironment(attempt, task, environmentFailures, signal);
+      return;
+    }
     const checksPassed = collected.checks.every(c => c.passed);
     this.store.transaction(() => {
       task = this.currentAttemptTask(attempt);
@@ -521,6 +573,25 @@ export class Engine {
     });
   }
   acceptPlan(task, attempt, output) { return acceptPlanFlow(this, task, attempt, output); }
+  acceptEnvironment(attempt, task, { failures, report }, executed) {
+    this.store.transaction(() => {
+      task = this.currentAttemptTask(attempt);
+      if (task.status === 'reconciling') task = this.store.put('tasks', { ...task, status: 'running' });
+      if (!executed) task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
+      this.store.put('attempts', { ...this.store.require('attempts', attempt.id), environment: report, preflightOnly: !executed });
+      const finished = this.finishAttempt(attempt, executed ? 'completed' : 'failed', failures.map(f => f.reason).join('；'));
+      if (!executed) this.store.put('attempts', { ...finished, cleanupPending: false });
+      holdEnvironment(this, task, failures, report);
+    });
+  }
+  async acceptRuntimeEnvironment(attempt, task, failures, signal) {
+    const previous = this.store.get('attempts', attempt.id)?.environment;
+    const observed = await inspectEnvironment(this, task, this.store.require('agents', attempt.agentId), { failures },
+      previous ? { report: { ...previous.runtime } } : undefined);
+    signal.throwIfAborted();
+    this.acceptEnvironment(attempt, task, { report: observed.report,
+      failures: [...new Map([...failures, ...observed.failures].map(f => [f.fingerprint, f])).values()] }, true);
+  }
   scheduleRepair(task, reason, evidence) { return scheduleRepairFlow(this, task, reason, evidence); }
   async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
   queueIntegration(taskId) {
@@ -578,11 +649,12 @@ export class Engine {
     });
     return true;
   }
-  fail(attempt, error, aborted) {
+  fail(attempt, error, aborted, observed, preparingWorkspace = false) {
     this.store.transaction(() => {
       const task = this.store.require('tasks', attempt.taskId); const stopped = task.stopRequested;
       if (!ACTIVE.has(this.store.require('attempts', attempt.id).status)) return;
-      this.finishAttempt(attempt, aborted ? 'interrupted' : 'failed', error.message);
+      const failure = !aborted && !error.cleanupUncertain && !error.recoveryRequired && classifyEnvironment(error, preparingWorkspace ? 'workspace' : null);
+      this.finishAttempt(attempt, aborted ? 'interrupted' : 'failed', failure ? failure.reason : error.message);
       if (task.activeAttemptId !== attempt.id || (!stopped && (task.generation !== attempt.taskGeneration || ignoresBlocker(task)))) return;
       if (error.cleanupUncertain || error.recoveryRequired) {
         // A closed runner does not prove that its model/tool descendants stopped.
@@ -612,6 +684,16 @@ export class Engine {
         };
         this.block(task, 'model-selection', '没有可用执行候选：' + error.message,
           '请在模型偏好或执行人员绑定中调整候选后恢复任务。选择阻塞代码：' + evidence.code, evidence);
+        return;
+      }
+      if (failure && observed && !stopped && !this.closing) {
+        if (preparingWorkspace && observed.failures.length) {
+          this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true, cleanupPending: false, environment: observed.report });
+          const saved = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
+          holdEnvironment(this, saved, observed.failures, observed.report);
+        } else {
+          holdEnvironment(this, task, [failure, ...observed.failures.filter(f => f.fingerprint !== failure.fingerprint)], observed.report);
+        }
         return;
       }
       const retry = !stopped && !this.closing && task.attempts < this.company.policy().maxAttempts;

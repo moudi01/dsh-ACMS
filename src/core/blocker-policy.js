@@ -14,7 +14,7 @@ const OWNER_ONLY_KINDS = new Set(['human', 'budget', 'reworks', 'assignment', 'p
 export function blockerRoute(task, kind) {
   if (!task || task.kind === 'coordination') return 'owner';
   if (OWNER_ONLY_KINDS.has(kind)) return 'owner';
-  if (kind === 'model-selection' || kind === 'integration' || kind === 'dependency') return 'manager';
+  if (kind === 'model-selection' || kind === 'integration' || kind === 'dependency' || kind === 'environment') return 'manager';
   if ((kind === 'technical' || kind === 'execution') && ['plan', 'review', 'repair'].includes(task.kind)) return 'manager';
   return 'owner';
 }

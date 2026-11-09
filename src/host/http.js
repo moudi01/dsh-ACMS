@@ -31,6 +31,14 @@ export function createRoutes(runtime) {
     },
     '/api/acms/state': async () => json({ ...company.snapshot(), runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing, lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] }, dataDir: runtime.dataDir } }),
     '/api/acms/directories': async request => json(await browseDirectories(new URL(request.url).searchParams.get('path') ?? '', company.policy())),
+    '/api/acms/environment': async request => {
+      const task = company.store.require('tasks', new URL(request.url).searchParams.get('id'));
+      const block = task.environmentBlock;
+      const attempt = company.store.list('attempts').findLast(a => a.taskId === task.id);
+      return json({ taskStatus: task.status,
+        execution: attempt ? { status: attempt.status, preflightOnly: attempt.preflightOnly === true, cleanupPending: attempt.cleanupPending === true } : null,
+        environment: block?.report ?? attempt?.environment ?? null, failures: block?.failures ?? [] });
+    },
     '/api/acms/model-details': async request => { assert(adapter.modelDetails, 'DIAGNOSTICS_UNAVAILABLE', '此执行环境未提供模型信息接口'); return json(await adapter.modelDetails(await body(request), request.signal)); },
     '/api/acms/model-check': async request => { assert(adapter.probeModel, 'DIAGNOSTICS_UNAVAILABLE', '此执行环境未提供模型检测接口'); return json(await adapter.probeModel(await body(request), request.signal)); },
     '/api/acms/pairing': async request => {

@@ -220,6 +220,10 @@ export function coordinateBlocker(engine, task, { kind, reason, question = "", e
       return capacityBlock(engine, current, kind, reason, question, "自动阻塞接管无法创建负责人协调任务");
     }
     coordination = store.put("tasks", { ...coordination, blockerEvidence: fact });
+    // Preflight handoffs are visible to the manager immediately. Automatic
+    // dispatch would spend a model call while the known prerequisite is absent.
+    if (kind === "environment") coordination = store.put("tasks", { ...coordination, status: "blocked",
+      blocker: { kind: "environment-handoff", reason } });
     store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: coordination.id, reason, evidence }, SYSTEM, { goalId: current.goalId });
     return holdSourceForCoordination(store, current, coordination);
   });

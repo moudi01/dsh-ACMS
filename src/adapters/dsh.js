@@ -7,6 +7,9 @@ import { SELECTOR_VERSION, MAX_CANDIDATES, bindingFromAgent, buildCandidates, em
 import { inside } from '../runtime/workspaces.js';
 import { PairedRuntimes } from './paired.js';
 import { unknownExecution } from '../runtime/execution-receipt.js';
+import { environmentFailure } from '../runtime/preflight.js';
+
+const TASK_TOOLS = ['read', 'write', 'edit', 'bash', 'terminal_open'];
 
 export class DshAdapter {
   constructor(ctx, company, dataDir, options = {}) { this.ctx = ctx; this.company = company; this.dataDir = dataDir; this.parent = null; this.creatingParent = null; this.activations = new Map(); this.metadata = new Map(); this.diagnostics = new Map(); this.activeProbes = 0; this.paired = options.paired ?? new PairedRuntimes(company, dataDir, { spawn: spec => ctx.subprocess.spawn(spec) }); }
@@ -101,7 +104,50 @@ export class DshAdapter {
   }
   async modelDetails(input, signal) {
     const provider = await this.choose(input, { ignoreHealth: true });
-    return this.routeDetails({ provider: provider.name, llmProvider: provider.llmProvider ?? "", model: provider.model, reasoningEffort: input.reasoningEffort ?? null }, signal);
+    const route = { provider: provider.name, llmProvider: provider.llmProvider ?? "", model: provider.model, reasoningEffort: input.reasoningEffort ?? null };
+    return { ...await this.routeDetails(route, signal), environment: await this.inspectEntry(provider, route) };
+  }
+  async inspectEntry(provider, route, task) {
+    const health = this.healthFor(route);
+    const modelVerification = { status: health.status, checkedAt: health.checkedAt ?? null };
+    if (provider.origin === 'external') return {
+      mounted: 'unknown', authorization: 'unknown', modelVerification,
+      ...await this.paired.inspectEntry?.(provider.name),
+    };
+    const registry = this.ctx.get?.('tools') ?? this.ctx.tools;
+    // ACMS native children inherit the parent composition. Global absence
+    // alone is inconclusive when a DSH agent preset can provide scoped tools.
+    const presets = this.ctx.get?.('agentPresets');
+    const parent = task && presets && registry?.get ? await this.root() : this.parent;
+    const canInspect = typeof registry?.get === 'function' && (!presets || !!parent);
+    const names = canInspect ? TASK_TOOLS.filter(name => registry.get(name, parent?.agent)) : [];
+    const write = task?.requiresArtifacts === true;
+    const read = task?.kind === 'review';
+    const required = write || read || task?.requirements?.tools === 'required';
+    const command = names.includes('bash') || names.includes('terminal_open');
+    const mounted = canInspect ? (write ? names.includes('write') || names.includes('edit') || command :
+      read ? names.includes('read') || command : names.length > 0) ? 'available' : 'missing' : 'unknown';
+    const policy = parent?.agent?.ctx?.get?.('sandboxPolicy') ?? this.ctx.get?.('sandboxPolicy');
+    const session = parent?.agent?.session;
+    const sandboxMode = (session ? policy?.overrideOf?.(session) : null) ?? policy?.defaultMode;
+    const approval = parent?.agent?.ctx?.get?.('approval') ?? this.ctx.get?.('approval');
+    const authorization = write && sandboxMode === 'read-only' && !approval && !command && mounted === 'available' ? 'denied' : 'unknown';
+    const failures = [];
+    if (required && mounted === 'missing') failures.push(environmentFailure('tools', write ? '文件写入' : read ? '文件读取' : '文件或命令工具', true));
+    if (authorization === 'denied') failures.push(environmentFailure('authorization', '文件写入', true));
+    const companyMs = this.company.policy().turnTimeoutMs;
+    return { entry: 'available', mounted, tools: names, authorization, modelVerification,
+      sandboxMode: ['read-only', 'workspace-write', 'danger-full-access'].includes(sandboxMode) ? sandboxMode : null,
+      limits: { companyMs, runnerMs: null, idleMs: null, hostCleanupMs: null, runnerCleanupMs: null,
+        disposeMs: null, effectiveTotalMs: companyMs, effectiveLimitKnown: false, earliestKnownTimeoutMs: companyMs, runnerSource: 'unknown' }, failures };
+  }
+  async inspectTaskRoute(task, agent) {
+    const selection = await this.select(agent, { requirements: task.requirements });
+    if (selection.status !== 'selected') return { selection, report: { entry: 'unknown', mounted: 'unknown', authorization: 'unknown', failures: [] } };
+    const provider = this.providerFor(selection);
+    const report = await this.inspectEntry(provider, selection.chosen, task);
+    return { selection, report: { ...report, routeVersion: digest([selection.chosen.candidateId, selection.chosen.reasoningEffort,
+      report.entryVersion ?? null, report.sandboxMode ?? null]) } };
   }
   async probeModel(input, signal) {
     assert(!this.activeProbes, 'MODEL_CHECK_BUSY', '已有模型检测正在进行，请稍候');
@@ -201,8 +247,8 @@ export class DshAdapter {
       this.company.store.event("attempt.route.selected", attempt.id, { selection }, SYSTEM);
     });
   }
-  async start({ task, attempt, agent, prompt, signal, onAccepted }) {
-    const selection = await this.select(agent, { requirements: task.requirements });
+  async start({ task, attempt, agent, prompt, signal, onAccepted, routeSelection }) {
+    const selection = routeSelection ?? await this.select(agent, { requirements: task.requirements });
     if (selection.status !== "selected") throw this.selectionFailure(agent, selection, { explainDepth: false });
     const provider = this.providerFor(selection);
     if (provider.origin === "external") {
