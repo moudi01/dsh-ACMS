@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, readFile } from 'node:fs/promises';
+import { writeFile, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { defaultSimulation } from '../src/adapters/simulated.js';
 import { fixture, until } from './helpers.js';
 import { run } from '../src/runtime/workspaces.js';
 
@@ -104,4 +105,98 @@ test('template versions are pinned for new goals without rewriting existing ones
   assert.equal(f.store.require('goals', goal.id).templateId, f.template.id);
   const child = f.task();
   assert.equal(child.workflowSnapshot, undefined); assert.equal(child.stageIndex, undefined);
+});
+
+
+test('coordinated Git integration uses the existing worktree, artifacts and checks', async t => {
+  let checkpoint;
+  const f = await fixture(t, async input => {
+    if (input.task.kind === 'coordination') {
+      checkpoint = f.store.require('tasks', input.task.coordinationOf);
+      await unlink(path.join(f.source, 'temporary.txt'));
+      return { outcome: 'coordinated', summary: 'Target is clean, retry integration from the existing checkpoint' };
+    }
+    return defaultSimulation(input);
+  });
+  await gitProject(f);
+  await writeFile(path.join(f.source, 'temporary.txt'), 'Block integration until coordination');
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
+  const final = f.store.require('tasks', task.id);
+  assert.equal(final.integration.status, 'merged');
+  assert.equal(final.generation, checkpoint.generation);
+  assert.deepEqual(final.workspace, checkpoint.workspace);
+  assert.deepEqual(final.artifactIds, checkpoint.artifactIds);
+  assert.equal(final.artifactHash, checkpoint.artifactHash);
+  assert.equal(f.store.list('verifications').filter(record => record.taskId === task.id).length, 1);
+  assert.equal(f.adapter.calls.filter(call => call.task.id === task.id).length, 1);
+  const events = f.store.page(0, 1000).entries;
+  const seq = type => events.find(event => event.type === type && (event.sourceTaskId === task.id || event.entityId === task.id)).seq;
+  assert(seq('coordination.decided') < seq('coordination.applied'));
+  assert(seq('coordination.applied') < seq('task.integration.resumed'));
+  assert(seq('task.integration.resumed') < seq('task.succeeded'));
+});
+
+for (const outcome of ['success', 'failure']) test(`late integration ${outcome} leaves a cancelled task alone`, async t => {
+  const f = await fixture(t);
+  const task = f.task();
+  let finish;
+  let current;
+  f.workspaces.integrate = async (_task, isCurrent) => {
+    current = isCurrent;
+    await new Promise(resolve => { finish = resolve; });
+    if (outcome === 'failure') throw new Error('Late integration failure');
+    return { status: 'available' };
+  };
+  await f.start();
+  await until(() => finish);
+  f.command('task.cancel', { id: task.id });
+  assert.equal(current(), false);
+  finish();
+  await f.engine.integration;
+  assert.equal(f.store.require('tasks', task.id).status, 'cancelled');
+  assert.equal(f.store.list('interactions').length, 0);
+  assert.equal(f.store.list('tasks').filter(row => row.kind === 'coordination').length, 0);
+});
+
+
+test('editing goal acceptance invalidates the integration checkpoint before coordination releases it', async t => {
+  const f = await fixture(t, async input => {
+    if (input.task.kind === 'coordination') return { outcome: 'coordinated', summary: 'Continue the existing task' };
+    await writeFile(path.join(input.task.workspace.path, 'delivery.txt'), `Delivery for generation ${input.task.generation}`);
+    return { outcome: 'completed', artifacts: [{ path: 'delivery.txt' }] };
+  });
+  const integrationHashes = [];
+  f.workspaces.integrate = async task => {
+    integrationHashes.push(task.artifactHash);
+    if (integrationHashes.length === 1) {
+      f.command('company.pause', { afterCurrent: true });
+      throw new Error('Isolated integration failure');
+    }
+    return { status: 'available' };
+  };
+
+  const task = f.task();
+  await f.start();
+  const blocked = await until(() => {
+    const current = f.store.require('tasks', task.id);
+    return current.blocker?.kind === 'coordination' && current;
+  });
+  assert.equal(blocked.integrationPending, true);
+  const acceptance = 'Delivery must satisfy the revised goal contract';
+  f.command('goal.edit', { id: task.goalId, patch: { acceptance } });
+  const edited = f.store.require('tasks', task.id);
+  assert.equal(edited.generation, blocked.generation + 1);
+  assert.equal(edited.integrationPending, false);
+  f.command('company.resume');
+
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded');
+  const delivered = f.store.require('tasks', task.id);
+  const calls = f.adapter.calls.filter(call => call.task.id === task.id);
+  assert.deepEqual(calls.map(call => call.attempt.taskGeneration), [blocked.generation, edited.generation]);
+  assert.match(calls[1].prompt, /Delivery must satisfy the revised goal contract/);
+  assert.notEqual(delivered.artifactHash, blocked.artifactHash);
+  assert.deepEqual(integrationHashes, [blocked.artifactHash, delivered.artifactHash]);
+  assert.deepEqual(f.store.list('verifications').filter(record => record.taskId === task.id).map(record => record.artifactHash), integrationHashes);
 });

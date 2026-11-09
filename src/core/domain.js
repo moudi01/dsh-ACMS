@@ -164,7 +164,10 @@ export class Company {
     const kind = args.kind ?? 'work';
     // A review may still be requested after delivery; it is evidence, not a
     // reopened work item, so it does not resurrect a closed goal.
-    assert(!['succeeded', 'cancelled', 'archived', 'deleted'].includes(goal.status) || (actor.kind === 'system' && kind === 'review'), 'GOAL_CLOSED', 'Goal is closed');
+    const reviewRecovery = kind === 'coordination' && args.coordinationOf && this.store.get('tasks', args.coordinationOf);
+    const evidenceTask = kind === 'review' || (goal.status === 'succeeded' && reviewRecovery?.kind === 'review' && reviewRecovery.goalId === goal.id);
+    assert(!['succeeded', 'cancelled', 'archived', 'deleted'].includes(goal.status) ||
+      (actor.kind === 'system' && evidenceTask), 'GOAL_CLOSED', 'Goal is closed');
     assert(this.store.require('projects', goal.projectId).status !== 'deleted', 'ENTITY_DELETED', '请先恢复项目');
     const p = this.policy();
     assert(this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length < p.maxTasksPerGoal, 'TASK_LIMIT', 'Goal task limit reached');
@@ -386,10 +389,12 @@ export class Company {
   }
   resumeTask(args, actor, retry = false) {
     const task = this.store.require('tasks', args.id);
+    assert(actor.kind !== 'agent' || task.status !== 'paused', 'OWNER_REQUIRED', '仅用户可恢复主动暂停的任务');
     assert(['paused', 'blocked', ...(retry ? ['failed'] : [])].includes(task.status), 'INVALID_TRANSITION', 'Task cannot resume in its current state');
     assert(!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending'), 'WAITING_INPUT', 'Answer the pending interaction first');
-    for (const review of this.store.list('tasks')) if (review.reviewOf === task.id && !TERMINAL.has(review.status)) this.controlTask({ id: review.id }, 'cancelled', actor);
-    const saved = this.store.put('tasks', { ...task, status: 'ready', stopRequested: null, ...(retry ? { attempts: 0 } : {}) }, args.expectedRevision);
+    const integrationPending = task.integrationPending ?? (task.resumeStatus === 'integrating' || (task.blocker?.kind === 'integration' && !!task.artifactHash));
+    for (const review of this.store.list('tasks')) if (!integrationPending && review.reviewOf === task.id && !TERMINAL.has(review.status)) this.controlTask({ id: review.id }, 'cancelled', actor);
+    const saved = this.store.put('tasks', { ...task, status: 'ready', integrationPending, stopRequested: null, ...(retry ? { attempts: 0 } : {}) }, args.expectedRevision);
     this.store.event('task.resumed', task.id, {}, actor); return saved;
   }
   saveAgent(args, actor) {
@@ -454,7 +459,7 @@ export class Company {
       }
     }
     const saved = this.store.put('interactions', { ...interaction, status: 'answered', answer: text(args.answer, 'answer'), ...(additionalRuntimeMs ? { additionalRuntimeMs } : {}) }, args.expectedRevision);
-    this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : 'ready', lastAnswer: saved.answer, blocker: null, attempts: 0, retryAt: null });
+    this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : 'ready', lastAnswer: saved.answer, integrationPending: task.integrationPending ?? (interaction.kind === 'integration' && !!task.artifactHash), blocker: null, attempts: 0, retryAt: null });
     if (interaction.kind === 'budget') this.releaseBudgetWaits(task.goalId, saved.id, actor);
     this.store.event('interaction.answered', interaction.id, { taskId: task.id }, actor); return saved;
   }

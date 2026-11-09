@@ -1,4 +1,5 @@
-import { assert, digest, now, SYSTEM } from "./util.js";
+import { assert, digest, now, SYSTEM, text } from "./util.js";
+import { reworkDetails } from "./rework.js";
 import { coordinationAuthority, releaseCoordinatedSource, releaseTimeBox } from "./coordination.js";
 
 function orderNodes(nodes) {
@@ -56,7 +57,19 @@ export function acceptPlanFlow(engine, task, attempt, output) {
   const rationaleSource = typeof output.rationale === "string" && output.rationale.trim() ? "explicit" : (rationale ? "summary" : "none");
   const planId = task.id + ":g" + task.generation;
   const coordination = task.kind === "coordination";
-  const fingerprint = digest({ nodes: output.tasks, rationale, summary: output.summary ?? "", coordination });
+  const scope = output.minimumOutcome === undefined && output.nonGoals === undefined ? null : {
+    minimumOutcome: text(output.minimumOutcome, "minimumOutcome", 4000),
+    nonGoals: output.nonGoals,
+  };
+  if (scope) {
+    assert(Array.isArray(scope.nonGoals) && scope.nonGoals.length <= 30, "INVALID_PLAN", "nonGoals must list work excluded from this plan");
+    scope.nonGoals = scope.nonGoals.map(item => text(item, "nonGoals item", 500));
+    if (ordered.length > 1 || coordination) text(output.rationale, "reason for additional tasks", 4000);
+  }
+  assert(output.resume === undefined || (coordination && output.resume === "work"), "INVALID_PLAN", "Only coordination may request author revision");
+  const rework = coordination ? reworkDetails(output.rework) : null;
+  const fingerprint = digest({ nodes: output.tasks, rationale, summary: output.summary ?? "", coordination,
+    ...(scope ? { scope } : {}), ...(rework ? { rework } : {}), ...(output.resume ? { resume: output.resume } : {}) });
   return store.transaction(() => {
     // A plan is a manager decision: re-read the actor at acceptance time so a
     // retired, reassigned or out-of-goal manager cannot land work through a stale attempt.
@@ -74,6 +87,10 @@ export function acceptPlanFlow(engine, task, attempt, output) {
       return previous;
     }
     const actor = { kind: "agent", id: manager.id, goalId: task.goalId, grants: attempt.grants };
+    if (coordination) {
+      const goal = store.require("goals", task.goalId);
+      if (goal.status === "succeeded") store.put("goals", { ...goal, status: "active" });
+    }
     const mapped = new Map(); const records = [];
     for (const node of ordered) {
       const assignee = node.assignee ?? null;
@@ -88,18 +105,21 @@ export function acceptPlanFlow(engine, task, attempt, output) {
       records.push({ key: node.key, taskId: child.id, dependencies, assigneeAgentId: child.agentId ?? null, assignment: assignee === null ? "scheduler-default" : "manager" });
     }
     engine.finishAttempt(attempt, "completed", output.summary);
-    const plan = store.put("plans", { id: planId, goalId: task.goalId, taskId: task.id, generation: task.generation, attemptId: attempt.id, managerId: manager.id, coordinationOf: coordination ? task.coordinationOf : null, rationale, rationaleSource, fingerprint, nodes: records, acceptedAt: now() });
+    const plan = store.put("plans", { id: planId, goalId: task.goalId, taskId: task.id, generation: task.generation, attemptId: attempt.id, managerId: manager.id, coordinationOf: coordination ? task.coordinationOf : null, rationale, rationaleSource, scope, rework, fingerprint, nodes: records, acceptedAt: now() });
     if (coordination) {
       const reworkTasks = records.map(r => r.taskId);
-      const saved = store.put("tasks", { ...store.require("tasks", task.id), status: "succeeded", summary: output.summary ?? "", decision: { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "", sourceTaskId: task.coordinationOf } });
-      releaseCoordinatedSource(engine, saved, { reworkTasks });
+      const source = store.get("tasks", task.coordinationOf);
+      const decision = { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "",
+        sourceTaskId: task.coordinationOf, rework: rework ?? source?.reworkDetails ?? null, resume: output.resume ?? "checkpoint" };
+      const saved = store.put("tasks", { ...store.require("tasks", task.id), status: "succeeded", summary: output.summary ?? "", decision });
+      store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf, planId, tasks: reworkTasks, decision }, actor, { goalId: task.goalId });
+      releaseCoordinatedSource(engine, saved, { reworkTasks, reviseDeliverable: output.resume === "work" });
       if (task.origin?.kind === "timebox") { releaseTimeBox(store, saved, actor); company.refreshGoal(task.goalId); }
-      store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf, planId, tasks: reworkTasks, decision: { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "" } }, actor, { goalId: task.goalId });
     } else {
       if (task.kind === "plan") store.put("tasks", { ...store.require("tasks", task.id), status: "succeeded", summary: output.summary ?? "" });
       else store.put("tasks", { ...store.require("tasks", task.id), status: "blocked", dependencies: [...task.dependencies, ...mapped.values()], blocker: { kind: "children", resolutionTaskIds: [...mapped.values()] } });
       const goal = store.require("goals", task.goalId); store.put("goals", { ...goal, status: "active" });
-      store.event("plan.accepted", task.id, { planTaskId: task.id, managerAgentId: manager.id, rationale, rationaleSource, tasks: records.map(r => ({ key: r.key, taskId: r.taskId, assignment: r.assignment, assignedBy: r.assignment === "manager" ? manager.id : "scheduler" })), decision: { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "" } }, actor, { goalId: task.goalId });
+      store.event("plan.accepted", task.id, { planTaskId: task.id, managerAgentId: manager.id, rationale, rationaleSource, scope, tasks: records.map(r => ({ key: r.key, taskId: r.taskId, assignment: r.assignment, assignedBy: r.assignment === "manager" ? manager.id : "scheduler" })), decision: { kind: "manager-decision", by: manager.id, basis: rationale || output.summary || "" } }, actor, { goalId: task.goalId });
     }
     return plan;
   });
