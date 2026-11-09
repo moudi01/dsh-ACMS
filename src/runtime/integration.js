@@ -112,6 +112,11 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
   if (cleanup?.notStarted) {
     return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
   }
+  // A pending integration owns one slot. Verify the preceding command's
+  // cleanup before starting a read-only command in that slot.
+  if (record.commandId && !cleanup) {
+    return settle(engine, record, { reason: error?.message ?? '缺少集成命令的进程树清理回执', observed: record.observed });
+  }
   let observed;
   if (record.applyStartedAt) {
     try { observed = await inspect(engine, record); }
@@ -119,9 +124,6 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
       return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
         observed: record.observed, commandCleanupConfirmed: !!cleanup });
     }
-  }
-  if (record.commandId && !cleanup) {
-    return settle(engine, record, { reason: error?.message ?? '缺少集成命令的进程树清理回执', observed });
   }
   if (observed?.status === 'merged') return settle(engine, record, { result: observed });
   if (record.applyStartedAt && (observed?.status !== 'unchanged' || cleanup?.exitCode === 0)) {

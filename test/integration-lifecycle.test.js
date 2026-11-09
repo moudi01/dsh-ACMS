@@ -262,7 +262,8 @@ for (const missingCleanup of [false, true]) test(`restart after Git applied the 
   await f.start();
   if (missingCleanup) {
     assert.equal(current(f, task).status, 'reconciling');
-    assert.equal(current(f, task).integrationRecovery.observed.integratedCommit, after);
+    assert.equal(current(f, task).integrationRecovery.observed, null);
+    assert.equal(records(f)[0].inspectionCommandId, undefined);
     assert.equal(records(f)[0].phase, 'reconciling');
     assert.equal(canReconcileTask(current(f, task), []), true);
     f.command('policy.update', { patch: { maxConcurrent: 1, controlSlots: 0 } });
