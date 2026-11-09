@@ -193,3 +193,86 @@ test('resuming a goal leaves its unconfirmed stop held until a clean receipt arr
   await until(() => taskState(f, task).status === 'succeeded');
   assert.equal(f.adapter.calls.length, 2);
 });
+
+for (const hold of ['resumed', 'goal pause', 'task pause']) test(`a clean stopped receipt restores a deferred result with ${hold}`, async t => {
+  const release = Promise.withResolvers();
+  let started = false, proveCleanup = false;
+  const f = await fixture(t, async input => {
+    if (input.task.title === 'Deferred A') { started = true; await release.promise; }
+    return defaultSimulation(input);
+  });
+  const launch = f.adapter.start.bind(f.adapter);
+  f.adapter.start = async input => {
+    const activation = await launch(input);
+    if (input.task.title !== 'Deferred A') return activation;
+    return { ...activation, async dispose() {
+      await activation.dispose();
+      throw Object.assign(new Error('Fixture cleanup unconfirmed'), { cleanupUncertain: true });
+    } };
+  };
+  f.adapter.reconcile = async () => ({ status: 'stopped', cleanupConfirmed: proveCleanup, reason: proveCleanup ? 'Verified' : 'Missing proof' });
+  const a = f.task({ title: 'Deferred A', priority: 100 });
+  await f.start();
+  try {
+    await until(() => started);
+    control(f, 'pause', f.goal, { afterCurrent: true });
+  } finally { release.resolve(); }
+  await until(() => taskState(f, a).status === 'reconciling' && !f.engine.live.size);
+  const attemptId = taskState(f, a).activeAttemptId;
+  const attempt = () => f.store.require('attempts', attemptId);
+  assert.equal(attempt().resultDeferred, true);
+  f.command('task.reconcile', { id: a.id });
+  await until(() => attempt().recovery?.status === 'unknown');
+  assert.equal(attempt().resultAccepted, false);
+  assert.equal(attempt().cleanupPending, true);
+
+  f.command('company.pause', { afterCurrent: true });
+  const other = createGoal(f, 'Goal B');
+  const b = f.task({ goalId: other.id, title: 'Independent B' });
+  if (hold === 'resumed') control(f, 'resume');
+  if (hold === 'task pause') f.command('task.pause', { id: a.id });
+  proveCleanup = true;
+  f.command('task.reconcile', { id: a.id });
+  f.command('company.resume');
+  await until(() => taskState(f, b).status === 'succeeded');
+  if (hold !== 'resumed') {
+    assert.equal(taskState(f, a).status, 'paused');
+    assert.equal(attempt().status, 'completed');
+    assert.equal(attempt().cleanupPending, false);
+    assert.equal(attempt().resultDeferred, true);
+    assert.equal(attempt().resultAccepted, false);
+    control(f, 'resume');
+    if (hold === 'task pause') {
+      assert.equal(taskState(f, a).status, 'paused');
+      f.command('task.resume', { id: a.id });
+    }
+  }
+  await until(() => taskState(f, a).status === 'succeeded');
+  assert.equal(f.adapter.calls.filter(call => call.task.id === a.id).length, 1);
+  assert.equal(attempt().resultAccepted, true);
+  assert.equal(f.store.get('deferredResults', attemptId), null);
+});
+
+test('an inconsistent deferred attempt does not block another goal and a legacy clean receipt can replay', async t => {
+  const f = await fixture(t);
+  const a = f.task({ title: 'Legacy deferred result', priority: 100 });
+  const b = f.task({ goalId: createGoal(f, 'Independent goal').id });
+  const workspace = await f.workspaces.prepare(a, {});
+  const output = await defaultSimulation({ task: { ...a, workspace } });
+  const attempt = { id: 'attempt_legacy_deferred', taskId: a.id, goalId: a.goalId, agentId: a.agentId, kind: a.kind, role: 'worker',
+    taskGeneration: a.generation, goalContractVersion: a.goalContractVersion, status: 'interrupted', startedAt: new Date().toISOString(),
+    resultDeferred: true, resultAccepted: false, cleanupPending: false, recovery: { status: 'stopped', cleanupConfirmed: false } };
+  f.store.transaction(() => {
+    f.store.put('tasks', { ...a, workspace, activeAttemptId: attempt.id });
+    f.store.put('attempts', attempt);
+    f.store.put('deferredResults', { id: attempt.id, taskId: a.id, generation: a.generation, output });
+  });
+  await f.start();
+  await until(() => taskState(f, b).status === 'succeeded');
+  assert.equal(taskState(f, a).status, 'ready');
+  assert.equal(f.engine.lastError, null);
+  f.store.put('attempts', { ...attempt, recovery: { status: 'stopped', cleanupConfirmed: true } });
+  await until(() => taskState(f, a).status === 'succeeded');
+  assert.equal(f.adapter.calls.filter(call => call.task.id === a.id).length, 0);
+  assert.equal(f.store.get('deferredResults', attempt.id), null);
+});

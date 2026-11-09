@@ -51,31 +51,48 @@ export class Engine {
   kick() { if (this.closing || this.scheduled) return; this.scheduled = true; queueMicrotask(() => { this.scheduled = false; this.tick().catch(e => { this.lastError = String(e.message); }); }); }
   fenced() { assert(this.store.ownsLease(this.owner, this.epoch), 'LEASE_LOST', 'Scheduler no longer owns the company lease'); }
   async recover(taskId) {
-    for (const previous of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !a.legacyBatch && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
-      const legacyTask = this.store.get('tasks', previous.taskId);
+    for (const pending of this.store.list('attempts').filter(a => (!taskId || a.taskId === taskId) && !a.legacyBatch && !this.live.has(a.id) && (ACTIVE.has(a.status) || a.cleanupPending))) {
+      const legacyTask = this.store.get('tasks', pending.taskId);
       // Stage-model tasks are backed up and isolated; never reconcile, accept or
       // re-dispatch them under the atomic task model.
       if (legacyTask?.legacyBatch || legacyTask?.workflowSnapshot) continue;
       let fact;
       try {
-        fact = previous.deferredReplayAt ? { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' } :
-          await this.adapter.reconcile?.(previous) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
+        fact = pending.deferredReplayAt ? { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' } :
+          await this.adapter.reconcile?.(pending) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
       }
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
       this.fenced();
-      if (previous.provider?.startsWith('paired:') && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
-        fact = { status: 'unknown', reason: '配对回执未确认进程树清理', actions: ['refresh-receipt', 'inspect-execution'] };
+      // A stop or edit may have discarded the parked result during receipt I/O.
+      const previous = this.store.require('attempts', pending.id);
+      if ((previous.resultDeferred || previous.provider?.startsWith('paired:')) && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
+        fact = { status: 'unknown', reason: '执行回执未确认进程树清理', actions: ['refresh-receipt', 'inspect-execution'] };
       }
       if (previous.cleanupUncertain && fact.cleanupConfirmed !== true) {
         fact.status = 'unknown'; fact.reason = previous.cleanupError || 'Prior process tree cleanup is still unconfirmed'; delete fact.result;
       }
       const currentTask = this.store.require('tasks', previous.taskId);
+      const ownsTask = currentTask.activeAttemptId === previous.id && currentTask.generation === previous.taskGeneration;
+      const clean = ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed === true;
+      if (previous.resultDeferred && ownsTask && clean &&
+          (!currentTask.stopRequested || currentTask.stopRequested === 'paused')) {
+        this.store.transaction(() => {
+          this.store.put('attempts', { ...previous, status: 'completed', resultAccepted: false,
+            cleanupPending: false, cleanupUncertain: false, recovery: { status: 'cleanup-confirmed', reason: fact.reason } });
+          if (currentTask.status === 'reconciling' || currentTask.stopRequested === 'paused') {
+            // Retain the pause owner. Only releaseGoalPauses can lift a goal-owned hold.
+            this.store.put('tasks', { ...currentTask, status: 'paused', stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+          }
+          this.store.event('attempt.recovery', previous.id, { taskId: previous.taskId, fact }, SYSTEM);
+        });
+        continue;
+      }
+      const accepted = previous.resultAccepted ?? (previous.status === 'completed' && !previous.resultDeferred);
       if (currentTask.activeAttemptId === previous.id && currentTask.stopRequested
-        && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed === true) {
+        && clean) {
         // A stop intent survives host loss. A clean completed receipt also
         // proves termination, but must not apply a result the owner has stopped.
         this.store.transaction(() => {
-          const accepted = previous.resultAccepted || previous.status === 'completed';
           this.finishAttempt(previous, accepted ? 'completed' : 'interrupted', previous.summary);
           this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false, cleanupUncertain: false,
             recovery: { status: 'stopped', reason: `已确认进程树清理，状态已更新为 ${currentTask.stopRequested}。${fact.reason ?? ''}`, actions: [] } });
@@ -85,7 +102,7 @@ export class Engine {
         });
         continue;
       }
-      if ((previous.status === 'completed' || previous.resultAccepted) && ['completed', 'stopped'].includes(fact.status)) {
+      if (accepted && ['completed', 'stopped'].includes(fact.status)) {
         this.store.transaction(() => {
           this.store.put('attempts', { ...previous, status: 'completed', cleanupPending: false, cleanupUncertain: false, recovery: { status: 'cleanup-confirmed', reason: fact.reason } });
           const task = this.store.require('tasks', previous.taskId);
@@ -104,7 +121,6 @@ export class Engine {
       }
       this.store.transaction(() => {
         const task = this.store.require('tasks', previous.taskId);
-        const accepted = previous.resultAccepted || previous.status === 'completed';
         this.store.put('attempts', { ...previous, resultAccepted: accepted, acceptedTaskStatus: previous.acceptedTaskStatus ?? (accepted && task.status !== 'reconciling' ? task.status : null), status: fact.status === 'stopped' ? 'interrupted' : 'reconciling', cleanupPending: fact.status !== 'stopped', cleanupUncertain: fact.status === 'stopped' ? false : previous.cleanupUncertain, recovery: fact });
         if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration) this.store.put('tasks', { ...task, status: fact.status === 'stopped' ? (task.stopRequested ?? 'ready') : 'reconciling', stopRequested: fact.status === 'stopped' ? null : task.stopRequested });
         this.store.event('attempt.recovery', previous.id, { taskId: task.id, fact }, SYSTEM);
@@ -233,6 +249,7 @@ export class Engine {
         }
         if (agent.status !== 'available') { this.block(claimed, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。'); continue; }
         const attempt = this.claim(claimed, agent);
+        if (!attempt) continue;
         free--; busyAgents.add(agent.id); if (['work', 'repair'].includes(claimed.kind)) ordinary++;
         const controller = new AbortController(); const entry = { taskId: task.id, controller, promise: null };
         this.live.set(attempt.id, entry);
@@ -368,8 +385,12 @@ export class Engine {
       assert(matchesGoalContract(goal, current) && !current.contractObsolete, 'STALE_RESULT', 'Task belongs to an obsolete goal contract');
       const deferred = current.activeAttemptId && this.store.get('deferredResults', current.activeAttemptId);
       if (deferred && deferred.generation === current.generation) {
-        const previous = this.store.require('attempts', deferred.id);
-        assert(!previous.cleanupPending && previous.status === 'completed', 'CLEANUP_PENDING', '先核对原执行的清理回执');
+        const previous = this.store.get('attempts', deferred.id);
+        if (deferred.taskId !== current.id || !previous?.resultDeferred || previous.cleanupPending || previous.cleanupUncertain || previous.taskId !== current.id ||
+            previous.taskGeneration !== current.generation) return null;
+        // Older schedulers stored a verified stopped receipt as an interruption.
+        const recoveredStop = previous.status === 'interrupted' && previous.recovery?.status === 'stopped' && previous.recovery.cleanupConfirmed === true;
+        if (previous.status !== 'completed' && !recoveredStop) return null;
         this.store.put('tasks', { ...current, status: 'running' });
         return this.store.put('attempts', { ...previous, status: 'running', deferredReplayAt: now() });
       }
