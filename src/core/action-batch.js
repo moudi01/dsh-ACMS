@@ -1,5 +1,6 @@
 import { assert, digest } from './util.js';
 import { matchesGoalContract } from './goal-contract.js';
+import { assertGoalOpen } from './goal-control.js';
 
 // References are data, never expressions: only an earlier action's returned ID.
 function resolve(value, results) {
@@ -21,6 +22,7 @@ export function runActionBatch(company, actor, { taskId, generation, batchId, ac
   const manager = store.require('agents', actor.id);
   assert(manager.role === 'manager', 'FORBIDDEN', 'Only a manager can submit management actions');
   const task = store.require('tasks', taskId);
+  assertGoalOpen(store.require('goals', task.goalId));
   // The caller-supplied actor.goalId is derived from the task goal, so it cannot
   // prove that the manager belongs to that goal. Re-read the persisted manager and
   // reject a goal-scoped manager acting on another goal's task, for example after a

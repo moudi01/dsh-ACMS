@@ -14,6 +14,7 @@ export const SCHEMA_VERSION = "2";
 export const EFFECTIVE_ACTIVITY_EVENTS = [
   "project.saved", "goal.created", "goal.status.changed", "goal.succeeded", "goal.reopened", "goal.runtime.extended",
   "goal.contract.changed", "goal.contract.assessed",
+  "goal.paused", "goal.resumed", "goal.cancelled",
   "task.created", "task.changed", "task.dependencies", "task.blocked", "task.resumed", "task.retry.scheduled",
   "task.stop.completed", "task.succeeded", "task.restored", "task.deleted", "task.purged",
   "attempt.claimed", "attempt.starting", "attempt.finished", "attempt.failed", "attempt.recovery", "attempt.result.recovered",

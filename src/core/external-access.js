@@ -1,5 +1,5 @@
 import { assert, clone, id, now, text } from "./util.js";
-import { assertCredentialActive, credentialView, goalAllowed, newCredentialToken, normalizeExpiry, projectAllowed, sameIdentity, summarizeScope, validateScope } from "./agent-identity.js";
+import { assertCredentialActive, credentialView, goalAllowed, GOAL_CONTROL_COMMANDS, newCredentialToken, normalizeExpiry, projectAllowed, sameIdentity, summarizeScope, validateScope } from "./agent-identity.js";
 
 export function authorizeUserAgent(company, actor, command, args) {
   const credential = assertCredentialActive(company.store.get("agentCredentials", actor.id));
@@ -25,6 +25,10 @@ export function authorizeUserAgent(company, actor, command, args) {
 
 function resolveCommandGoal(company, command, args, credential) {
   const store = company.store;
+  if (GOAL_CONTROL_COMMANDS.includes(command)) {
+    assert(typeof args.id === 'string' && args.id, 'INVALID_REQUEST', 'A goal ID is required');
+    return args.id;
+  }
   if (command === "status.read" || command === "events.read") {
     if (args.goalId) return args.goalId;
     const scope = credential.scope ?? {};

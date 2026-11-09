@@ -20,6 +20,9 @@ const USAGE = [
   "  answer --interaction <id> --answer <s> [--expected-revision <n>]",
   "  pause --task <id> [--reason <s>]",
   "  resume --task <id> [--reason <s>]",
+  "  pause --goal <id> --expected-revision <n> [--after-current] [--reason <s>]",
+  "  resume --goal <id> --expected-revision <n>",
+  "  cancel --goal <id> --expected-revision <n> [--reason <s>]",
   "",
   "Options:",
   "  --url <baseUrl>        Direct base URL (overrides ACMS_AGENT_URL and the discovery file)",
@@ -126,6 +129,13 @@ async function main() {
     const body = { answer: options.answer };
     if (options["expected-revision"] !== undefined) body.expectedRevision = Number(options["expected-revision"]);
     return execute("POST", "/interactions/" + encodeURIComponent(String(options.interaction)) + "/answer", { key: requestKey(options), body });
+  }
+  if (["pause", "resume", "cancel"].includes(command) && options.goal) {
+    const expectedRevision = Number(options["expected-revision"]);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw new CliError("USAGE", "--expected-revision is required for goal control");
+    const body = { expectedRevision, ...(options.reason ? { reason: String(options.reason) } : {}) };
+    if (options["after-current"] === true) body.afterCurrent = true;
+    return execute("POST", "/goals/" + encodeURIComponent(String(options.goal)) + "/" + command, { key: requestKey(options), body });
   }
   if (command === "pause" || command === "resume") return execute("POST", "/tasks/" + encodeURIComponent(String(options.task)) + "/" + command, { key: requestKey(options), body: options.reason ? { reason: String(options.reason) } : {} });
   throw new CliError("USAGE", "Unknown command " + command);

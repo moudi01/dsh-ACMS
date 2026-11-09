@@ -4,8 +4,9 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { AcmsError, asBusyError, assert, now } from "../core/util.js";
-import { assertCredentialActive, findCredentialByToken, goalAllowed, projectAllowed, stableActor } from "../core/agent-identity.js";
+import { assertCredentialActive, findCredentialByToken, goalAllowed, GOAL_CONTROL_COMMANDS, projectAllowed, stableActor } from "../core/agent-identity.js";
 import { sanitizePreferences } from "../core/model-selection.js";
+import { goalControlView } from "../core/goal-control.js";
 
 export const API_VERSION = "1.0";
 export const CONTRACT_VERSION = 1;
@@ -53,8 +54,18 @@ const REQUEST_SCHEMAS = {
       requestId: EXTERNAL_KEY,
     },
   },
+  GoalControlRequest: {
+    type: "object",
+    required: ["expectedRevision"],
+    properties: {
+      expectedRevision: { type: "integer", minimum: 1 },
+      afterCurrent: { type: "boolean" },
+      reason: { type: "string", minLength: 1, maxLength: 2000 },
+      requestId: EXTERNAL_KEY,
+    },
+  },
 };
-const OPERATIONS = ["GET /discover", "GET /status", "GET /projects", "GET /projects/{id}", "GET /goals", "GET /goals/{id}", "GET /tasks", "GET /tasks/{id}", "GET /reviews", "GET /blockers", "GET /events", "POST /goals", "POST /projects", "POST /interactions/{id}/answer", "POST /tasks/{id}/pause", "POST /tasks/{id}/resume"];
+const OPERATIONS = ["GET /discover", "GET /status", "GET /projects", "GET /projects/{id}", "GET /goals", "GET /goals/{id}", "GET /tasks", "GET /tasks/{id}", "GET /reviews", "GET /blockers", "GET /events", "POST /goals", "POST /projects", "POST /interactions/{id}/answer", "POST /tasks/{id}/pause", "POST /tasks/{id}/resume", ...GOAL_CONTROL_COMMANDS.map(command => "POST /goals/{id}/" + command.slice(5))];
 
 function validateExternalKey(value, label = "Idempotency key") {
   assert(typeof value === "string", "INVALID_REQUEST", label + " must be a string");
@@ -64,6 +75,10 @@ function validateExternalKey(value, label = "Idempotency key") {
 }
 
 function validateSchema(schema, value, pointer) {
+  if (schema.type === "boolean") {
+    assert(typeof value === "boolean", "INVALID_REQUEST", pointer + " must be a boolean");
+    return value;
+  }
   if (schema.type === "external-key") return validateExternalKey(value, pointer);
   if (schema.enum) { assert(schema.enum.includes(value), "INVALID_REQUEST", pointer + " has an unsupported value"); return value; }
   if (schema.type === "object") {
@@ -172,7 +187,7 @@ export const ERROR_STATUS = {
   UNAUTHORIZED: 401,
   FORBIDDEN: 403, SCOPE_DENIED: 403, OWNER_REQUIRED: 403,
   NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405,
-  CONFLICT: 409, IDEMPOTENCY_CONFLICT: 409, REVISION_CONFLICT: 409, ACTIVE_LIMIT: 409, TASK_ACTIVE: 409, TASK_CLOSED: 409, WAITING_INPUT: 409, INVALID_TRANSITION: 409, INTERACTION_STALE: 409, GOAL_BUDGET_EXHAUSTED: 409, ALREADY_ANSWERED: 409, AGENT_RETIRED: 409, ENTITY_DELETED: 409, DELETE_BLOCKED: 409, PROJECT_IN_USE: 409,
+  CONFLICT: 409, IDEMPOTENCY_CONFLICT: 409, REVISION_CONFLICT: 409, ACTIVE_LIMIT: 409, TASK_ACTIVE: 409, TASK_CLOSED: 409, WAITING_INPUT: 409, INVALID_TRANSITION: 409, INTERACTION_STALE: 409, GOAL_BUDGET_EXHAUSTED: 409, GOAL_PAUSED: 409, GOAL_CLOSED: 409, ALREADY_ANSWERED: 409, AGENT_RETIRED: 409, ENTITY_DELETED: 409, DELETE_BLOCKED: 409, PROJECT_IN_USE: 409,
   ENGINE_BUSY: 503, SHUTTING_DOWN: 503, LEASE_LOST: 503,
 };
 
@@ -195,7 +210,7 @@ function resolveGoal(company, credential, goalIdParam, command) {
 
 function goalView(goal) {
   return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, contractVersion: contractVersion(goal),
-    completedContractVersion: goal.completedContractVersion ?? (goal.status === 'succeeded' ? contractVersion(goal) : null),
+    completedContractVersion: goal.completedContractVersion ?? (goal.status === 'succeeded' ? contractVersion(goal) : null), executionControl: goal.executionControl ?? null,
     contractChange: goal.contractChange ?? null, supersededTaskIds: goal.supersededTaskIds ?? [], templateId: goal.templateId ?? 'base', templateVersion: goal.templateSnapshot?.version ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
 }
 function projectView(project) {
@@ -225,11 +240,12 @@ function statusValue(company, goal) {
   const store = company.store;
   const tasks = store.list("tasks").filter(task => task.goalId === goal.id && task.status !== "deleted");
   const taskIds = new Set(tasks.map(task => task.id));
-  const attempts = store.list("attempts").filter(item => taskIds.has(item.taskId)).map(attemptView);
+  const attempts = store.list("attempts").filter(item => taskIds.has(item.taskId));
   const artifacts = store.list("artifacts").filter(item => taskIds.has(item.taskId)).map(artifactView);
   const verifications = store.list("verifications").filter(item => taskIds.has(item.taskId) || item.kind === 'goal-review' && item.taskId === goal.id).map(verificationView);
   const interactions = store.list("interactions").filter(item => taskIds.has(item.taskId) && item.status === "pending").map(interactionView);
-  return { goal: { ...goalView(goal), deliveryHash: company.deliveryHash(goal.id) }, tasks: tasks.map(taskView), attempts, artifacts, verifications, interactions, cursor: store.cursor(), modelPreferences: modelPreferencesView(store) };
+  return { goal: { ...goalView(goal), deliveryHash: company.deliveryHash(goal.id), controlSummary: goalControlView(goal, tasks, attempts) },
+    tasks: tasks.map(taskView), attempts: attempts.map(attemptView), artifacts, verifications, interactions, cursor: store.cursor(), modelPreferences: modelPreferencesView(store) };
 }
 
 function goalDetail(company, goal) {
@@ -340,16 +356,17 @@ async function answerRequest(runtime, credential, request, context, interactionI
   return { value: outcome.value, replayed: outcome.replayed, requestId: key };
 }
 
-async function controlRequest(runtime, credential, request, context, taskId, command) {
+async function controlRequest(runtime, credential, request, context, targetId, command) {
   const company = runtime.company;
   assertCredentialCommand(credential, command);
-  const body = await readWriteBody(request, "TaskControlRequest");
+  const goalControl = GOAL_CONTROL_COMMANDS.includes(command);
+  const body = await readWriteBody(request, goalControl ? "GoalControlRequest" : "TaskControlRequest");
   const key = resolveIdempotency(request, body);
   context.requestId = key;
-  const args = { ...body, id: taskId }; delete args.requestId;
+  const args = { ...body, id: targetId }; delete args.requestId;
   const outcome = company.command(stableActor(credential), internalRequestId(credential.id, key), command, args, { meta: true, externalKey: key, transport: "http-loopback" });
-  if (command === "task.resume" && !outcome.replayed) runtime.engine?.kick?.();
-  return { value: outcome.value, replayed: outcome.replayed, requestId: key };
+  if ((goalControl || command === "task.resume") && !outcome.replayed) runtime.engine?.kick?.();
+  return { value: goalControl ? goalView(outcome.value) : outcome.value, replayed: outcome.replayed, requestId: key };
 }
 
 function authenticate(company, request) {
@@ -396,6 +413,10 @@ async function dispatch(runtime, state, request, context) {
     return read(() => ({ goals: company.store.list("goals").filter(goal => goal.status !== "deleted" && goalAllowed(credential, goal, { write: false })).map(goalView) }));
   }
   if (parts.length === 2 && parts[0] === "goals") return read(() => goalDetail(company, resolveGoal(company, credential, parts[1], "status.read")));
+  if (parts.length === 3 && parts[0] === "goals" && GOAL_CONTROL_COMMANDS.includes("goal." + parts[2])) {
+    assert(method === "POST", "METHOD_NOT_ALLOWED", "POST required for this endpoint");
+    return controlRequest(runtime, credential, request, context, parts[1], "goal." + parts[2]);
+  }
   if (parts.length === 1 && parts[0] === "tasks") {
     return read(() => {
       const goal = resolveGoal(company, credential, goalParam(), "status.read");

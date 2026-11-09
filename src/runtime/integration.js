@@ -7,6 +7,7 @@ import { contractVersion, matchesGoalContract } from '../core/goal-contract.js';
 import { integrationPending } from '../core/task-actions.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
+import { goalStopped } from '../core/goal-control.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -78,6 +79,7 @@ function settle(engine, record, { result, error, reason, observed, commandCleanu
     }
     save(engine, record, { phase: 'failed', reason: error.message, observed: observed ?? null, finishedAt: now() }, 'integration.failed');
     const pending = engine.store.put('tasks', { ...task, ...fields, status: 'integrating', integrationPending: true });
+    if (goalStopped(engine.store.require('goals', task.goalId))) return;
     engine.block(pending, 'integration', error.message, '请解决目标工作区冲突或集成检查问题后恢复。', error.integrationEvidence);
   });
 }
@@ -169,7 +171,9 @@ export function interruptIntegration(engine) {
   if (!entry || entry.applying || entry.controller.signal.aborted) return;
   const task = engine.store.get('tasks', entry.taskId);
   const policy = engine.company.policy();
+  const goal = task && engine.store.get('goals', task.goalId);
   if (engine.closing || !owns(engine) || task?.stopRequested || task?.status !== 'integrating' ||
+    (goalStopped(goal) && goal.executionControl?.mode !== 'after-current') ||
     (policy.paused && policy.pauseMode !== 'after-current')) {
     entry.controller.abort(new AcmsError('INTEGRATION_STOPPED', '集成在最终合入前停止'));
   }
@@ -181,7 +185,7 @@ export async function executeIntegration(engine, taskId) {
   const task = engine.store.require('tasks', taskId);
   if (task.status !== 'integrating' || ignoresBlocker(task)) return;
   const goal = engine.store.require('goals', task.goalId);
-  if (!matchesGoalContract(goal, task) || goal.contractChange?.status === 'pending') return;
+  if (goalStopped(goal) || !matchesGoalContract(goal, task) || goal.contractChange?.status === 'pending') return;
   if (goalRuntimeSpent(goal, engine.store.list('attempts')) >= goalRuntimeLimit(goal, engine.company.policy())) {
     engine.block(task, 'budget', '目标累计执行时间额度已用完', '请追加目标执行时间额度后继续。');
     return;
@@ -190,7 +194,7 @@ export async function executeIntegration(engine, taskId) {
     engine.fenced();
     const current = engine.store.require('tasks', taskId);
     const policy = engine.company.policy();
-    if (current.revision !== task.revision || policy.paused ||
+    if (current.revision !== task.revision || policy.paused || goalStopped(engine.store.require('goals', task.goalId)) ||
       executionOccupancy(engine.store, engine.adapter, engine.live).used >= policy.maxConcurrent) return null;
     const saved = engine.store.put('integrations', {
       id: id('integration'), taskId, goalId: task.goalId, projectId: task.projectId, generation: task.generation,
@@ -208,10 +212,12 @@ export async function executeIntegration(engine, taskId) {
   const isCurrent = () => {
     const current = engine.store.require('tasks', taskId);
     const policy = engine.company.policy();
+    const currentGoal = engine.store.require('goals', task.goalId);
     return owns(engine) && !engine.closing && !signal.aborted && (!policy.paused || policy.pauseMode === 'after-current') &&
+      (!goalStopped(currentGoal) || currentGoal.executionControl?.mode === 'after-current') &&
       current.activeIntegrationId === record.id && current.status === 'integrating' && !ignoresBlocker(current) &&
       current.generation === record.generation && current.artifactHash === record.artifactHash &&
-      matchesGoalContract(engine.store.require('goals', task.goalId), current, record);
+      matchesGoalContract(currentGoal, current, record);
   };
   const guard = () => {
     assert(isCurrent(), 'STALE_INTEGRATION', 'Integration was stopped or replaced');

@@ -59,7 +59,7 @@
 }
 ```
 
-- `commands` 必须是以下集合的子集：`goal.submit`、`status.read`、`events.read`、`interaction.answer`、`task.pause`、`task.resume`、`project.create`；未提供时默认前四项。
+- `commands` 可包含 `goal.submit`、`status.read`、`events.read`、`interaction.answer`、`task.pause`、`task.resume`、`project.create`、`goal.pause`、`goal.resume`、`goal.cancel`。默认仍为前四项。
 - `allGoals=true` 只允许只读命令子集（`status.read`、`events.read`），用于项目内只读监控。
 - `projectCreate=true` 只允许 owner 签发，且 `commands` 必须包含 `project.create`；反向也必须同时成立。
 - `goalIds` 必须属于 `projectIds` 中的项目，且目标未删除。
@@ -100,6 +100,11 @@
 | POST | `/interactions/{id}/answer` | `interaction.answer` | 回答 pending interaction；`additionalRuntimeMs>0` 仅 owner |
 | POST | `/tasks/{id}/pause` | `task.pause` | 任务级暂停 |
 | POST | `/tasks/{id}/resume` | `task.resume` | 任务级恢复；blocked 需先回答交互 |
+| POST | `/goals/{id}/pause` | `goal.pause` | 暂停目标，默认立即停止。传入 `afterCurrent: true` 等待当前执行结束 |
+| POST | `/goals/{id}/resume` | `goal.resume` | 解除目标暂停，保留单任务暂停与其他阻塞 |
+| POST | `/goals/{id}/cancel` | `goal.cancel` | 取消目标，保留历史交付、审查和已合入记录 |
+
+目标控制请求需要 `expectedRevision` 和稳定幂等键，使用 `GET /goals/{id}` 返回的目标 `revision`。暂停和取消可填写 `reason`。授权范围仍限凭据明确指定或由该凭据提交的目标，且需逐项授予相应控制命令。目标详情的 `controlSummary.phase` 区分 `draining`、`stopping`、`reconciling`、`paused` 和 `cancelled`。取消后可创建新目标开展后续工作。
 
 不提供：外部创建任意任务、修改 agent/policy/template、公司级暂停/恢复、删除/purge、读取原始数据库或 token、跨目标查询。
 

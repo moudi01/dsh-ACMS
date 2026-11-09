@@ -14,7 +14,7 @@ function GoalReviewState({ goal, act, busy }) {
   const review = goal.reviewSummary;
   const pending = goal.contractChange?.status === 'pending';
   const active = review && ['ready', 'running', 'preparing', 'blocked', 'paused', 'integrating', 'reconciling', 'stopping'].includes(review.status);
-  const reason = busy ? '正在保存，请稍候' : pending ? '请先确认当前目标合同。' : active ? '已有进行中的最终审查，请等待结论。' : !(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '';
+  const reason = busy ? '正在保存，请稍候' : goal.status === 'cancelled' ? '目标已取消。' : goal.executionControl ? '请先恢复目标。' : pending ? '请先确认当前目标合同。' : active ? '已有进行中的最终审查，请等待结论。' : !(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '';
   return <section className="acms-review-state" aria-label="最终审查状态"><h3>最终审查</h3>
     <p>当前合同 v{goal.contractVersion ?? 1}{goal.completedContractVersion && <> · 最近完成 v{goal.completedContractVersion}</>}</p>
     {pending && <p className="acms-sectionnote">{goal.contractChange.coordinationTaskId ? '等待负责人确认新合同。' : '等待目标任务名额以安排合同确认。'}历史结论适用于当时的合同版本。</p>}
@@ -25,12 +25,33 @@ function GoalReviewState({ goal, act, busy }) {
     {goal.reviewHistory?.length > 0 && <details className="acms-review-history"><summary>历史审查（{goal.reviewHistory.length}）</summary>{goal.reviewHistory.map(item => <div className="acms-review-history-row" key={item.id}><span className="acms-tag">{reviewLabels[item.status] ?? item.status}</span>{item.status === 'succeeded' ? (item.passed ? ' 通过' : ' 未通过') : ''}{item.status === 'cancelled' ? ` 取消：${item.cancelReason || '未填写原因'}` : ''}<small>合同 v{item.goalContractVersion ?? 1} · {item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}</small></div>)}</details>}
   </section>;
 }
+function GoalControls({ goal, companyPaused, act, open, busy }) {
+  const control = goal.controlSummary ?? goal.executionControl;
+  const phase = control?.phase ?? control?.state ?? (goal.status === 'cancelled' ? 'cancelled' : 'open');
+  const labels = { open: '可调度', paused: '已暂停', draining: '等待当前执行结束', stopping: '正在停止', reconciling: '等待清理核对', cancelled: '已取消' };
+  const closed = goal.status === 'cancelled' || goal.status === 'archived' || goal.legacyBatch;
+  const args = { id: goal.id, expectedRevision: goal.revision };
+  const busyReason = busy ? '正在保存，请稍候' : '';
+  return <section className="acms-review-state" aria-label="目标执行控制">
+    <h3>目标执行控制</h3>
+    <p role="status"><span className="acms-tag">{labels[phase]}</span>{control?.active > 0 && <> · {control.active} 项执行尚未结束</>}</p>
+    <p className="acms-sectionnote">仅影响此目标的规划、执行、协调、审查与集成。{companyPaused && '公司当前暂停，恢复此目标后仍等待公司调度恢复。'}</p>
+    {control?.state === 'cancelled' && <p>历史交付和审查记录已保留。后续工作可创建新目标。</p>}
+    {control?.state === 'paused' && <p>{control.mode === 'after-current' ? '已获准的执行可以结束，模型结果会在恢复后入库。' : '已请求停止在途执行，等待进程清理后保留任务检查点。'}</p>}
+    {!closed && <div className="acms-actions wrap">
+      {(!control || control.mode === 'after-current') && <ActionButton reason={busyReason} onClick={() => act('goal.pause', args, '已请求立即暂停此目标')}>立即暂停目标</ActionButton>}
+      {!control && <ActionButton reason={busyReason} onClick={() => act('goal.pause', { ...args, afterCurrent: true }, '已暂停此目标的新增派发')}>当前执行结束后暂停</ActionButton>}
+      {control?.state === 'paused' && <ActionButton reason={busyReason} onClick={() => act('goal.resume', args, '已解除此目标的暂停')}>恢复目标</ActionButton>}
+      <ActionButton className="danger" reason={busyReason} onClick={() => open('goalCancel', goal)}>取消目标</ActionButton>
+    </div>}
+  </section>;
+}
 export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, act, busy }) {
   const tasks = entityTasks(kind, entity, data); const goals = data.goals.filter(g => kind === 'project' && g.projectId === entity.id);
   const project = kind === 'goal' ? data.projects.find(p => p.id === entity.projectId) : null;
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label={`${entityLabels[kind]}详情`}><header><span>{entityLabels[kind]}详情</span><button aria-label="关闭详情" onClick={close}>×</button></header><h2>{entity.title ?? entity.name}</h2>{project && <button className="text" onClick={() => navigate('project', project.id)}>所属项目：{project.name}</button>}<CollapsibleText text={entity.description} lines={3} label="说明" />{entity.repoRoot && <p><code>{entity.repoRoot}</code></p>}{entity.acceptance && <section><h3>验收标准</h3><CollapsibleText text={entity.acceptance} lines={3} label="验收标准" /></section>}<div className="acms-actions wrap"><button onClick={() => open(kind === 'goal' ? 'goalEdit' : kind, entity)}>编辑{entityLabels[kind]}</button><ActionButton className="danger" reason={entityDeletionReason(kind, entity, data)} onClick={() => open('deleteEntity', { ...entity, entityKind: kind })}>删除{entityLabels[kind]}</ActionButton></div>
     {kind === 'agent' && chat && <button className="primary" onClick={() => chat(entity.id)}>与智能体对话</button>}
-    {kind === 'goal' && act && <GoalReviewState goal={entity} act={act} busy={busy} />}
+    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalReviewState goal={entity} act={act} busy={busy} /></>}
     {goals.length > 0 && <section><h3>所属目标</h3>{goals.map(g => <button className="acms-entity-link" key={g.id} onClick={() => navigate('goal', g.id)}>{g.title} →</button>)}</section>}
     <section><h3>关联任务（{tasks.length}）</h3>{tasks.slice(0, 8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}{tasks.length > 8 && <details><summary>显示其余 {tasks.length - 8} 项</summary>{tasks.slice(8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}</details>}{!tasks.length && <p>暂无关联任务。</p>}</section><ChangeHistory kind={kind} id={entity.id} data={data} /></aside></div>;
 }

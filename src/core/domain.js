@@ -9,6 +9,7 @@ import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, crea
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from './runtime-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
+import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
@@ -43,6 +44,7 @@ export class Company {
     if (actor.kind === "user-agent") return authorizeUserAgent(this, actor, command, args);
     const agent = this.store.require('agents', actor.id);
     assert(agent.status === 'available' && this.effectiveGrants(actor).includes(command), 'FORBIDDEN', `Agent is not allowed to ${command}`);
+    if (actor.goalId) assertGoalOpen(this.store.get('goals', actor.goalId));
     // A caller-supplied goal must never hide the actual target task's scope.
     const goals = [args.goalId, args.id ? this.store.get('tasks', args.id)?.goalId : null].filter(Boolean);
     for (const goalId of goals) assert(goalId === actor.goalId, 'SCOPE_DENIED', 'Agent may only change its assigned goal');
@@ -61,6 +63,9 @@ export class Company {
         'project.delete': () => deleteEntity(this, 'project', args, actor),
         'project.restore': () => restoreEntity(this, 'project', args, actor),
         'goal.edit': () => this.editGoal(args, actor),
+        'goal.pause': () => controlGoal(this, args, actor, 'pause'),
+        'goal.resume': () => controlGoal(this, args, actor, 'resume'),
+        'goal.cancel': () => controlGoal(this, args, actor, 'cancel'),
         'goal.delete': () => deleteEntity(this, 'goal', args, actor),
         'goal.restore': () => restoreEntity(this, 'goal', args, actor),
         'agent.delete': () => deleteEntity(this, 'agent', args, actor),
@@ -152,6 +157,7 @@ export class Company {
       return previous;
     }
     const substantive = changed.some(key => key !== 'title');
+    if (substantive) assertGoalOpen(previous);
     const version = contractVersion(previous);
     if (substantive) assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
     let goal = this.store.put('goals', {
@@ -190,7 +196,7 @@ export class Company {
     return goal;
   }
   ensureGoalContractCoordination(goal) {
-    if (goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived', 'cancelled'].includes(goal.status)) return goal;
+    if (goalStopped(goal) || goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived'].includes(goal.status)) return goal;
     if (this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length >= this.policy().maxTasksPerGoal) return goal;
     const manager = findManager(this, goal.id);
     const task = this.createTask({
@@ -214,6 +220,7 @@ export class Company {
   }
   createTask(args, actor = SYSTEM, options = {}) {
     const goal = this.store.require('goals', args.goalId);
+    assertGoalOpen(goal);
     assert(!goal.legacyBatch, 'LEGACY_GOAL', '该目标已按旧阶段制数据归档，请恢复或新建目标后再派工');
     const kind = args.kind ?? 'work';
     // A review may still be requested after delivery; it is evidence, not a
@@ -268,7 +275,7 @@ export class Company {
   }
   refreshGoal(goalId, actor = SYSTEM) {
     const goal = this.store.require('goals', goalId);
-    if (['cancelled', 'archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
+    if (goalStopped(goal) || ['archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
     const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
     const complete = tasks.some(t => t.kind === 'work') && tasks.every(taskSettledForGoal);
     let status;
@@ -325,6 +332,7 @@ export class Company {
     if (args.scope === 'goal' || args.goalId) {
       const goalId = args.goalId ?? args.id;
       const goal = this.store.require('goals', goalId);
+      assertGoalOpen(goal);
       assert(!goal.legacyBatch, 'LEGACY_TASK', '旧目标已备份隔离，不能添加审查');
       assert(goal.status !== 'deleted', 'ENTITY_DELETED', '目标已删除');
       assert(goal.contractChange?.status !== 'pending', 'CONTRACT_PENDING', '请先确认当前目标合同');
@@ -341,6 +349,7 @@ export class Company {
       return review;
     }
     const source = this.store.require('tasks', args.id);
+    assertGoalOpen(this.store.require('goals', source.goalId));
     assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
     assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
     assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
@@ -361,6 +370,7 @@ export class Company {
   }
   editTask(args, actor) {
     const task = this.store.require('tasks', args.id); assert(task.kind !== 'review', 'SYSTEM_TASK', '审查任务使用执行任务的固定验收合同，请编辑对应执行任务');
+    assertGoalOpen(this.store.require('goals', task.goalId));
     if (TERMINAL.has(task.status)) this.owner(actor);
     const patch = args.patch ?? {}; const allowed = ['title', 'description', 'acceptance', 'priority', 'agentId', 'longLived', 'requirements'];
     assert(Object.keys(patch).every(k => allowed.includes(k)), 'INVALID_INPUT', 'Task state cannot be set directly');
@@ -391,17 +401,18 @@ export class Company {
     const saved = this.store.put('tasks', { ...task, dependencies: deps }, args.expectedRevision);
     this.store.event('task.dependencies', task.id, { dependencies: deps }, actor); return saved;
   }
-  controlTask(args, target, actor) {
+  controlTask(args, target, actor, { cascade = true, goalPauseId = null } = {}) {
     const task = this.store.require('tasks', args.id); assert(!TERMINAL.has(task.status), 'TASK_CLOSED', 'Task is already closed');
-    if (task.activeIntegrationId && task.stopRequested === 'cancelled' && target === 'paused') return task;
+    if (task.stopRequested === 'cancelled' && target === 'paused') return task;
     const pending = this.store.list('attempts').filter(a => a.taskId === task.id && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending));
     const active = pending.length > 0 || !!task.activeIntegrationId;
     const reconciling = task.status === 'reconciling' || pending.some(a => a.status === 'reconciling' || a.cleanupUncertain);
     const cancellation = target === 'cancelled' ? { cancelledAt: now(), cancelledBy: actor?.kind === 'owner' ? 'owner' : actor?.id ?? 'system', cancelReason: typeof args.reason === 'string' ? args.reason : null } : {};
     const saved = this.store.put('tasks', { ...task, status: active ? (reconciling ? 'reconciling' : 'stopping') : target, resumeStatus: task.status,
-      stopRequested: active ? target : null, recoveryRequested: active, ...cancellation }, args.expectedRevision);
+      stopRequested: active ? target : null, recoveryRequested: active, goalPauseId, ...cancellation }, args.expectedRevision);
+    if (target === 'cancelled') discardDeferredResult(this.store, task.activeAttemptId);
     if (target === 'cancelled') this.invalidateInteractions(task.id, '任务已取消');
-    for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
+    if (cascade) for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
     this.store.event(`task.${target}.requested`, task.id, args.reason ? { reason: args.reason } : {}, actor);
     if (target === 'cancelled') this.releaseTemporaryAgent(task.agentId, actor);
     return saved;
@@ -427,7 +438,7 @@ export class Company {
     const ids = new Set(tasks.filter(t => t.deletion?.batchId === task.id).map(t => t.id));
     this.store.remove('tasks', task.id, args.expectedRevision);
     for (const id of ids) if (id !== task.id) this.store.remove('tasks', id);
-    for (const collection of ['attempts', 'integrations', 'artifacts', 'verifications', 'interactions', 'actionBatches', 'plans']) for (const item of this.store.list(collection)) if (ids.has(item.taskId)) this.store.remove(collection, item.id);
+    for (const collection of ['attempts', 'integrations', 'artifacts', 'verifications', 'interactions', 'actionBatches', 'plans', 'deferredResults']) for (const item of this.store.list(collection)) if (ids.has(item.taskId)) this.store.remove(collection, item.id);
     // Audit IDs remain, but cached task bodies must not be returned after a purge.
     for (const row of this.store.db.prepare('SELECT id,result FROM commands').all()) {
       const value = JSON.parse(row.result);
@@ -446,12 +457,14 @@ export class Company {
     for (const item of group) for (const related of [...item.dependencies, ...(item.parentId ? [item.parentId] : [])]) assert(ids.has(related) || this.store.require('tasks', related).status !== 'deleted', 'RESTORE_BLOCKED', '请先恢复此任务的前置任务或父任务');
     for (const item of group) {
       const old = item.deletion.previousStatus;
-      this.store.put('tasks', { ...item, status: ['succeeded', 'cancelled', 'archived'].includes(old) ? old : 'paused', deletion: null, stopRequested: null, activeAttemptId: null }, item.id === task.id ? args.expectedRevision : undefined);
+      discardDeferredResult(this.store, item.activeAttemptId);
+      this.store.put('tasks', { ...item, status: ['succeeded', 'cancelled', 'archived'].includes(old) ? old : 'paused', deletion: null, stopRequested: null, activeAttemptId: null, goalPauseId: null }, item.id === task.id ? args.expectedRevision : undefined);
     }
     this.store.event('task.restored', task.id, { taskIds: group.map(t => t.id) }, actor); return this.store.require('tasks', task.id);
   }
   resumeTask(args, actor, retry = false) {
     const task = this.store.require('tasks', args.id);
+    assertGoalOpen(this.store.require('goals', task.goalId));
     assert(!task.contractObsolete && matchesGoalContract(this.store.require('goals', task.goalId), task),
       'STALE_RESULT', '任务属于旧目标合同，请在当前合同下安排后续工作');
     assert(actor.kind !== 'agent' || task.status !== 'paused', 'OWNER_REQUIRED', '仅用户可恢复主动暂停的任务');
@@ -613,6 +626,7 @@ export class Company {
       const reviews = reviewTasks.filter(review => review.reviewScope === 'goal' && review.goalId === g.id);
       const current = reviews.filter(review => review.deliveryHash === deliveryHashes.get(g.id));
       return { ...g, contractVersion: contractVersion(g), completedContractVersion: g.completedContractVersion ?? (g.status === 'succeeded' ? contractVersion(g) : null),
+        controlSummary: goalControlView(g, data.tasks, data.attempts),
         deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
     });
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));

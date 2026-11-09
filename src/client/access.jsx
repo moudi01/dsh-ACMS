@@ -8,6 +8,9 @@ const COMMANDS = [
   ["interaction.answer", "回复交互"],
   ["task.pause", "暂停任务"],
   ["task.resume", "恢复任务"],
+  ["goal.pause", "暂停目标"],
+  ["goal.resume", "恢复目标"],
+  ["goal.cancel", "取消目标"],
   ["project.create", "创建受限项目"]
 ];
 const READ_COMMANDS = ["status.read", "events.read"];
