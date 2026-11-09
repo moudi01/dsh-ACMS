@@ -71,6 +71,7 @@ node scripts/legacy-export.mjs --data-dir <dataDir> --apply    # 备份后归档
 <dataDir>/workspaces/          任务隔离工作副本
 <dataDir>/reviews/             独立审查验证副本
 <dataDir>/integration/         合并候选与失败诊断现场
+<dataDir>/integration-receipts/ 集成命令的进程树清理回执
 <dataDir>/paired-runs/         每次执行的完整身份回执与执行锁
 <dataDir>/pairing/             外部 agent 邀请回执与 runner
 <dataDir>/diagnostics/         显式模型检测的隔离目录
@@ -80,6 +81,16 @@ node scripts/legacy-export.mjs --data-dir <dataDir> --apply    # 备份后归档
 备份前暂停执行并关闭宿主，再备份完整数据目录和项目 Git 仓库。SQLite 正在运行时，不要只复制 company.db 而忽略 WAL。公司资料与模型输出可能包含项目私有内容，只在本地运行目录保存。
 
 ## 异常恢复
+
+### Git 集成
+
+自动合入使用 Windows Job Object。缺少已验证的进程容器时，自动合入在启动 Git 集成命令前停止。
+
+- 排队中的任务可直接暂停或取消。候选准备或检查已经开始时，立即暂停、取消和宿主关闭会请求停止自有进程树。清理确认后才释放占位。优雅暂停允许当前集成完成，并暂停接续调度。
+- 最终 fast-forward 启动前核对任务代次、停止意图、租约、项目授权、目标分支和 HEAD。命令启动后等候有界结果。Git 已合入时，任务记录实际提交与同期停止请求。
+- 重启时用持久集成记录、进程清理回执及 Git 分支历史核对实际结果。若证据不足，任务进入“核对中”，可用“重新读取回执”再次检查。确认已合入的提交直接补录，保留当前 Git 内容。
+
+### 模型执行
 
 `reconciling` 表示旧执行或副作用尚不能确认。任务详情“核对中断执行”里的操作是“重新读取回执”：它按该次执行的完整身份重读 `<dataDir>/paired-runs/` 下的逐次回执，不释放未知占用，也不派发新执行。身份由 provider、model、attemptId、contextKey、generation、kind、persistent 和 runtime 组成；回执为 `<runKey摘要>.json`，执行锁为同名 `.json.lock`。进程是否存活、根进程是否退出或宿主是否重启，都不能代替清理确认。
 

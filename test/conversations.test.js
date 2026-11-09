@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { fixture, until } from './helpers.js';
 import { Conversations } from '../src/runtime/conversations.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
+import { DshAdapter } from '../src/adapters/dsh.js';
 import { createRoutes } from '../src/host/http.js';
 
 function attach(f) {
@@ -103,4 +106,41 @@ test('conversation API supports history without embedding transcripts in global 
   const history = await route.fetch(new Request(`http://localhost/api/acms/conversation?id=${chat.id}`));
   assert.deepEqual((await history.json()).messages, []);
   assert.equal(f.company.snapshot().conversationMessages, undefined);
+});
+
+test('chat and model probes share the integration slot until cleanup is confirmed', async t => {
+  const f = await fixture(t);
+  const route = { provider: 'paired:fixture', model: 'fixture' };
+  let chatsStarted = 0, routesSelected = 0, probesStarted = 0;
+  const adapter = new DshAdapter({}, f.company, f.dataDir, {
+    paired: { run: async () => { probesStarted++; return {}; } },
+  });
+  adapter.choose = async () => { routesSelected++; return { name: route.provider, model: route.model, capabilities: {} }; };
+  adapter.chat = async () => { chatsStarted++; return 'fixture reply'; };
+  f.engine.adapter = f.adapter = adapter;
+  const chats = attach(f);
+  const chat = chats.open({ agentId: 'manager' });
+  f.command('policy.update', { patch: { maxConcurrent: 1, controlSlots: 0 } });
+  const task = f.task();
+  const integrationId = 'integration-held';
+  f.store.transaction(() => {
+    f.store.put('tasks', { ...task, status: 'reconciling', stopRequested: 'cancelled', activeIntegrationId: integrationId });
+    f.store.put('integrations', { id: integrationId, taskId: task.id, generation: task.generation, phase: 'reconciling', commandId: 'held-command' });
+  });
+  await f.start();
+  const held = send(chats, chat.id, 'Wait for the integration slot');
+  await until(() => !chats.jobs.size);
+  assert.equal(f.store.require('conversationMessages', held.id).status, 'failed');
+  await assert.rejects(adapter.probeModel(route), { code: 'ACTIVE_LIMIT' });
+  assert.deepEqual([chatsStarted, routesSelected, probesStarted], [0, 0, 0]);
+
+  const dir = path.join(f.dataDir, 'integration-receipts');
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'held-command.json'), JSON.stringify({ confirmed: true, exitCode: 1 }));
+  await until(() => f.store.require('tasks', task.id).status === 'cancelled');
+  assert.equal((await adapter.probeModel(route)).status, 'available');
+  const delivered = send(chats, chat.id, 'The slot is free');
+  await until(() => !chats.jobs.size);
+  assert.equal(f.store.require('conversationMessages', delivered.id).status, 'delivered');
+  assert.deepEqual([chatsStarted, routesSelected, probesStarted], [1, 1, 1]);
 });

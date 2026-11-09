@@ -18,6 +18,7 @@ export const EFFECTIVE_ACTIVITY_EVENTS = [
   "attempt.claimed", "attempt.starting", "attempt.finished", "attempt.failed", "attempt.recovery", "attempt.result.recovered",
   "review.queued", "review.requested", "review.decided", "review.rework.requested", "review.rework.limit", "review.rework.gate",
   "coordination.created", "coordination.decided", "coordination.applied", "blocker.coordinated", "task.integration.resumed",
+  "integration.started", "integration.checking", "integration.applying", "integration.completed", "integration.stopped", "integration.reconciling", "integration.failed",
   "interaction.answered",
 ];
 

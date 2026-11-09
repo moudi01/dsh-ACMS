@@ -21,10 +21,11 @@ public static class AcmsOwnedJob {
                 writer.AutoFlush = true;
                 string cwd = Encoding.UTF8.GetString(Convert.FromBase64String(reader.ReadLine()));
                 int runMs = Int32.Parse(reader.ReadLine()), cleanupMs = Int32.Parse(reader.ReadLine());
+                string receipt = Encoding.UTF8.GetString(Convert.FromBase64String(reader.ReadLine()));
                 int count = Int32.Parse(reader.ReadLine());
                 var argv = new string[count];
                 for (int i=0; i<count; i++) argv[i] = Encoding.UTF8.GetString(Convert.FromBase64String(reader.ReadLine()));
-                Run(argv[0], argv, cwd, runMs, cleanupMs, reader, writer);
+                Run(argv[0], argv, cwd, runMs, cleanupMs, receipt, reader, writer);
             }
         }
     }
@@ -87,7 +88,7 @@ public static class AcmsOwnedJob {
     }
     static void Send(StreamWriter writer, string message) { try { writer.WriteLine(message); } catch (IOException) {} }
 
-    public static void Run(string command, string[] argv, string cwd, int runMs, int cleanupMs, StreamReader reader, StreamWriter writer) {
+    public static void Run(string command, string[] argv, string cwd, int runMs, int cleanupMs, string receipt, StreamReader reader, StreamWriter writer) {
         IntPtr job = IntPtr.Zero, attributes = IntPtr.Zero, handles = IntPtr.Zero;
         var inherited = new IntPtr[3]; var pi = new PROCESS_INFORMATION();
         bool assigned = false, confirmed = false; uint exitCode = 1; string error = "";
@@ -140,7 +141,22 @@ public static class AcmsOwnedJob {
                 } else confirmed = true; // CreateProcess never succeeded
             } catch (Exception e) { error += "; " + e.Message; }
             // Report evidence before closing the non-inheritable job handle.
-            Send(writer, "{\"type\":\"cleanup\",\"confirmed\":" + (confirmed ? "true" : "false") + ",\"exitCode\":" + exitCode + ",\"reason\":" + Json(error) + "}");
+            string proof = "{\"type\":\"cleanup\",\"confirmed\":" + (confirmed ? "true" : "false") + ",\"exitCode\":" + exitCode + ",\"reason\":" + Json(error) + "}";
+            if (receipt.Length != 0) {
+                try {
+                    string pending = receipt + ".tmp";
+                    using (var stream = new FileStream(pending, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+                        byte[] bytes = Encoding.UTF8.GetBytes(proof);
+                        stream.Write(bytes, 0, bytes.Length);
+                        stream.Flush(true);
+                    }
+                    File.Move(pending, receipt);
+                } catch (Exception) {
+                    // The live control pipe can still deliver proof. Recovery
+                    // without that pipe must wait for a durable receipt.
+                }
+            }
+            Send(writer, proof);
             if (job != IntPtr.Zero) CloseHandle(job);
             if (pi.thread != IntPtr.Zero) CloseHandle(pi.thread);
             if (pi.process != IntPtr.Zero) CloseHandle(pi.process);

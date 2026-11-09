@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { assert, id, now, OWNER, SYSTEM, digest } from '../core/util.js';
+import { executionOccupancy } from '../core/execution-capacity.js';
 
 const LIVE = ['preparing', 'running', 'cancelling', 'reconciling'];
 const PENDING = ['queued', 'sending', 'restarting', 'streaming'];
@@ -140,8 +141,8 @@ export class Conversations {
   async answer(chat, message, controller) {
     let reply, jobCounted = false, cleanupPending = false; const timer = setTimeout(() => controller.abort(new Error('独立对话等待超时，请稍后重试')), 180000);
     try {
-      const active = this.store.list('attempts').filter(a => LIVE.includes(a.status) || a.cleanupPending).length;
-      assert(active + (this.adapter.activeChats ?? 0) + (this.adapter.activeProbes ?? 0) < this.company.policy().maxConcurrent, 'CHAT_CAPACITY', '执行资源已满，消息未发送；请稍后重试');
+      assert(executionOccupancy(this.store, this.adapter).used < this.company.policy().maxConcurrent,
+        'CHAT_CAPACITY', '执行资源已满，消息未发送；请稍后重试');
       this.adapter.activeChats = (this.adapter.activeChats ?? 0) + 1;
       jobCounted = true;
       this.update(message.id, { status: 'sending' });

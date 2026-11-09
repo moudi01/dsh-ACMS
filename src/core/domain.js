@@ -1,5 +1,6 @@
 import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest } from './util.js';
 import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { executionOccupancy } from './execution-capacity.js';
 import { goalSummary } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
@@ -111,14 +112,13 @@ export class Company {
     for (const k of ['turnTimeoutMs', 'maxGoalRuntimeMs', 'maxArtifactBytes']) integer(next[k], k, 1000, 2147483647);
     for (const k of ['goalTimeBoxMs', 'timeBoxReserveMs']) integer(next[k] ?? 0, k, 0, 2147483647);
     for (const k of ['allowedProviders', 'allowedModels', 'allowedProjectRoots']) assert(Array.isArray(next[k]) && next[k].every(x => typeof x === 'string' && x.length > 0), 'INVALID_INPUT', `${k} must be strings`);
-    const active = this.store.list('attempts').filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending);
-    assert(next.maxConcurrent >= active.length, 'ACTIVE_LIMIT', 'Pause active work before reducing the limit below current usage');
+    assert(next.maxConcurrent >= executionOccupancy(this.store).used, 'ACTIVE_LIMIT', 'Pause active work before reducing the limit below current usage');
     const result = this.store.put('policy', next, args.expectedRevision);
     this.store.event('policy.changed', p.id, { before: p, after: result }, actor); return result;
   }
   setPaused(paused, actor, afterCurrent = false) {
     this.owner(actor); const p = this.store.put('policy', { ...this.policy(), paused, pauseMode: paused ? afterCurrent ? 'after-current' : 'immediate' : null });
-    if (paused && !afterCurrent) for (const task of this.store.list('tasks')) if (['running', 'reviewing'].includes(task.status)) this.controlTask({ id: task.id }, 'paused', actor);
+    if (paused && !afterCurrent) for (const task of this.store.list('tasks')) if (['running', 'reviewing', 'integrating'].includes(task.status)) this.controlTask({ id: task.id }, 'paused', actor);
     this.store.event(paused ? 'company.paused' : 'company.resumed', p.id, {}, actor); return p;
   }
   saveProject(args, actor) { this.owner(actor); return this.saveProjectRecord(args, actor); }
@@ -331,8 +331,9 @@ export class Company {
   }
   controlTask(args, target, actor) {
     const task = this.store.require('tasks', args.id); assert(!TERMINAL.has(task.status), 'TASK_CLOSED', 'Task is already closed');
+    if (task.activeIntegrationId && task.stopRequested === 'cancelled' && target === 'paused') return task;
     const pending = this.store.list('attempts').filter(a => a.taskId === task.id && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending));
-    const active = pending.length > 0;
+    const active = pending.length > 0 || !!task.activeIntegrationId;
     const reconciling = task.status === 'reconciling' || pending.some(a => a.status === 'reconciling' || a.cleanupUncertain);
     const cancellation = target === 'cancelled' ? { cancelledAt: now(), cancelledBy: actor?.kind === 'owner' ? 'owner' : actor?.id ?? 'system', cancelReason: typeof args.reason === 'string' ? args.reason : null } : {};
     const saved = this.store.put('tasks', { ...task, status: active ? (reconciling ? 'reconciling' : 'stopping') : target, resumeStatus: task.status,
@@ -364,7 +365,7 @@ export class Company {
     const ids = new Set(tasks.filter(t => t.deletion?.batchId === task.id).map(t => t.id));
     this.store.remove('tasks', task.id, args.expectedRevision);
     for (const id of ids) if (id !== task.id) this.store.remove('tasks', id);
-    for (const collection of ['attempts', 'artifacts', 'verifications', 'interactions', 'actionBatches', 'plans']) for (const item of this.store.list(collection)) if (ids.has(item.taskId)) this.store.remove(collection, item.id);
+    for (const collection of ['attempts', 'integrations', 'artifacts', 'verifications', 'interactions', 'actionBatches', 'plans']) for (const item of this.store.list(collection)) if (ids.has(item.taskId)) this.store.remove(collection, item.id);
     // Audit IDs remain, but cached task bodies must not be returned after a purge.
     for (const row of this.store.db.prepare('SELECT id,result FROM commands').all()) {
       const value = JSON.parse(row.result);
