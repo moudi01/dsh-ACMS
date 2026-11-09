@@ -1,3 +1,4 @@
+import { contractVersion, deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
 import http from "node:http";
 import path from "node:path";
 import { promises as fs } from "node:fs";
@@ -193,22 +194,27 @@ function resolveGoal(company, credential, goalIdParam, command) {
 }
 
 function goalView(goal) {
-  return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, templateId: goal.templateId ?? 'base', templateVersion: goal.templateSnapshot?.version ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
+  return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, contractVersion: contractVersion(goal),
+    completedContractVersion: goal.completedContractVersion ?? (goal.status === 'succeeded' ? contractVersion(goal) : null),
+    contractChange: goal.contractChange ?? null, supersededTaskIds: goal.supersededTaskIds ?? [], templateId: goal.templateId ?? 'base', templateVersion: goal.templateSnapshot?.version ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
 }
 function projectView(project) {
   return { id: project.id, name: project.name, repoRoot: project.repoRoot, mode: project.mode, checks: project.checks ?? [], autoMerge: project.autoMerge === true, status: project.status, source: project.source ?? null, createdAt: project.createdAt, updatedAt: project.updatedAt };
 }
 function taskView(task) {
-  return { id: task.id, goalId: task.goalId, projectId: task.projectId, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind, status: task.status, agentId: task.agentId, parentId: task.parentId ?? null, dependencies: [...(task.dependencies ?? [])], reviewScope: task.reviewScope ?? null, passed: task.passed ?? null, attemptCount: task.attempts ?? 0, blocker: task.blocker ?? null, lastAnswer: task.lastAnswer ?? null, artifactHash: task.artifactHash ?? null, reviewOf: task.reviewOf ?? null, feedback: task.feedback ?? null, requiresArtifacts: task.requiresArtifacts !== false, createdAt: task.createdAt, updatedAt: task.updatedAt };
+  return { id: task.id, goalId: task.goalId, projectId: task.projectId, title: task.title, description: task.description, acceptance: task.acceptance, kind: task.kind, status: task.status, goalContractVersion: taskContractVersion(task),
+    deliveryGeneration: deliveryGeneration(task), reviewedContractVersion: task.kind === 'review' ? task.reviewedContractVersion ?? 1 : null,
+    reviewedTaskGeneration: task.reviewedTaskGeneration ?? null, deliveryHash: task.deliveryHash ?? null,
+    agentId: task.agentId, parentId: task.parentId ?? null, dependencies: [...(task.dependencies ?? [])], reviewScope: task.reviewScope ?? null, passed: task.passed ?? null, attemptCount: task.attempts ?? 0, blocker: task.blocker ?? null, lastAnswer: task.lastAnswer ?? null, artifactHash: task.artifactHash ?? null, reviewOf: task.reviewOf ?? null, feedback: task.feedback ?? null, requiresArtifacts: task.requiresArtifacts !== false, createdAt: task.createdAt, updatedAt: task.updatedAt };
 }
 function attemptView(attempt) {
-  return { id: attempt.id, taskId: attempt.taskId, agentId: attempt.agentId, status: attempt.status, model: attempt.model ?? null, provider: attempt.provider ?? null, llmProvider: attempt.llmProvider ?? null, selection: attempt.selection ?? null, startedAt: attempt.startedAt ?? null, finishedAt: attempt.finishedAt ?? null, summary: attempt.summary ?? null };
+  return { id: attempt.id, taskId: attempt.taskId, agentId: attempt.agentId, status: attempt.status, goalContractVersion: taskContractVersion(attempt), model: attempt.model ?? null, provider: attempt.provider ?? null, llmProvider: attempt.llmProvider ?? null, selection: attempt.selection ?? null, startedAt: attempt.startedAt ?? null, finishedAt: attempt.finishedAt ?? null, summary: attempt.summary ?? null };
 }
 function artifactView(artifact) {
   return { id: artifact.id, taskId: artifact.taskId, path: artifact.path, title: artifact.title, hash: artifact.hash, bytes: artifact.bytes ?? null, createdAt: artifact.createdAt };
 }
 function verificationView(item) {
-  return { id: item.id, taskId: item.taskId, kind: item.kind, passed: item.passed === true, summary: item.summary ?? null, artifactHash: item.artifactHash ?? null, createdAt: item.createdAt };
+  return { id: item.id, taskId: item.taskId, kind: item.kind, goalContractVersion: taskContractVersion(item), taskGeneration: item.taskGeneration ?? null, passed: item.passed === true, summary: item.summary ?? null, artifactHash: item.artifactHash ?? null, createdAt: item.createdAt };
 }
 function interactionView(item) {
   return { id: item.id, taskId: item.taskId, kind: item.kind, question: item.question, status: item.status, generation: item.taskGeneration ?? null, expectedRevision: item.revision, createdAt: item.createdAt };
@@ -221,9 +227,9 @@ function statusValue(company, goal) {
   const taskIds = new Set(tasks.map(task => task.id));
   const attempts = store.list("attempts").filter(item => taskIds.has(item.taskId)).map(attemptView);
   const artifacts = store.list("artifacts").filter(item => taskIds.has(item.taskId)).map(artifactView);
-  const verifications = store.list("verifications").filter(item => taskIds.has(item.taskId)).map(verificationView);
+  const verifications = store.list("verifications").filter(item => taskIds.has(item.taskId) || item.kind === 'goal-review' && item.taskId === goal.id).map(verificationView);
   const interactions = store.list("interactions").filter(item => taskIds.has(item.taskId) && item.status === "pending").map(interactionView);
-  return { goal: goalView(goal), tasks: tasks.map(taskView), attempts, artifacts, verifications, interactions, cursor: store.cursor(), modelPreferences: modelPreferencesView(store) };
+  return { goal: { ...goalView(goal), deliveryHash: company.deliveryHash(goal.id) }, tasks: tasks.map(taskView), attempts, artifacts, verifications, interactions, cursor: store.cursor(), modelPreferences: modelPreferencesView(store) };
 }
 
 function goalDetail(company, goal) {

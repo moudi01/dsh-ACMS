@@ -12,14 +12,17 @@ export function ChangeHistory({ kind, id, data }) {
 const reviewLabels = { ready: '待执行', running: '进行中', preparing: '准备中', blocked: '已阻塞', paused: '已暂停', succeeded: '已结束', failed: '失败', cancelled: '已取消', integrating: '集成中', reconciling: '待核对', stopping: '停止中' };
 function GoalReviewState({ goal, act, busy }) {
   const review = goal.reviewSummary;
+  const pending = goal.contractChange?.status === 'pending';
   const active = review && ['ready', 'running', 'preparing', 'blocked', 'paused', 'integrating', 'reconciling', 'stopping'].includes(review.status);
-  const reason = busy ? '正在保存，请稍候' : active ? '已有进行中的最终审查，请等待结论。' : !(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '';
+  const reason = busy ? '正在保存，请稍候' : pending ? '请先确认当前目标合同。' : active ? '已有进行中的最终审查，请等待结论。' : !(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '';
   return <section className="acms-review-state" aria-label="最终审查状态"><h3>最终审查</h3>
-    {!review ? <p className="acms-sectionnote">当前交付还没有最终审查任务{goal.reviewHistory?.length ? '（历史审查见下方）' : ''}。可以基于当前交付发起一次，或保持未审查交付。</p> : <><p><span className="acms-tag">{reviewLabels[review.status] ?? review.status}</span>{review.status === 'succeeded' ? (review.passed ? ' 已通过' : ' 未通过（失败证据已保留）') : ''}</p>
+    <p>当前合同 v{goal.contractVersion ?? 1}{goal.completedContractVersion && <> · 最近完成 v{goal.completedContractVersion}</>}</p>
+    {pending && <p className="acms-sectionnote">{goal.contractChange.coordinationTaskId ? '等待负责人确认新合同。' : '等待目标任务名额以安排合同确认。'}历史结论适用于当时的合同版本。</p>}
+    {!review ? <p className="acms-sectionnote">当前交付还没有最终审查任务{goal.reviewHistory?.length ? '（历史审查见下方）' : ''}。{!pending && (goal.status === 'succeeded' && goal.templateSnapshot?.finalReview === false ? '按模板配置未审查。' : '可以基于当前交付发起一次。')}</p> : <><p><span className="acms-tag">{reviewLabels[review.status] ?? review.status}</span>{review.status === 'succeeded' ? (review.passed ? ' 已通过' : ' 未通过（失败证据已保留）') : ''}</p>
       {review.status === 'cancelled' && <><p className="acms-sectionnote">审查已取消：{review.cancelReason || '未填写原因'}（{review.cancelledBy === 'owner' ? '所有者' : review.cancelledBy ?? '未知'}，{review.cancelledAt ? new Date(review.cancelledAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}）。取消不会重开已交付任务，也不会自动重建审查。</p><p className="acms-sectionnote">可以基于当前交付重新发起一次最终审查；交付物变化时会重新核对，不会复用旧结论。</p></>}
       {review.status === 'failed' && <p className="acms-sectionnote">审查执行失败，失败证据已保留；可重新发起。</p>}</>}
     <ActionButton reason={reason} onClick={() => act('review.request', { goalId: goal.id }, '已发起目标最终审查')}>{review?.status === 'cancelled' || review?.status === 'failed' ? '重新发起最终审查' : '发起最终审查'}</ActionButton>
-    {goal.reviewHistory?.length > 0 && <details className="acms-review-history"><summary>历史审查（{goal.reviewHistory.length}）</summary>{goal.reviewHistory.map(item => <div className="acms-review-history-row" key={item.id}><span className="acms-tag">{reviewLabels[item.status] ?? item.status}</span>{item.status === 'succeeded' ? (item.passed ? ' 通过' : ' 未通过') : ''}{item.status === 'cancelled' ? ` 取消：${item.cancelReason || '未填写原因'}` : ''}<small>{item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}</small></div>)}</details>}
+    {goal.reviewHistory?.length > 0 && <details className="acms-review-history"><summary>历史审查（{goal.reviewHistory.length}）</summary>{goal.reviewHistory.map(item => <div className="acms-review-history-row" key={item.id}><span className="acms-tag">{reviewLabels[item.status] ?? item.status}</span>{item.status === 'succeeded' ? (item.passed ? ' 通过' : ' 未通过') : ''}{item.status === 'cancelled' ? ` 取消：${item.cancelReason || '未填写原因'}` : ''}<small>合同 v{item.goalContractVersion ?? 1} · {item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}</small></div>)}</details>}
   </section>;
 }
 export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, act, busy }) {

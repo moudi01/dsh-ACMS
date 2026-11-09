@@ -1,5 +1,7 @@
 import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest } from './util.js';
 import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
+import { canCoordinate, findManager } from './coordination.js';
 import { executionOccupancy } from './execution-capacity.js';
 import { goalSummary } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
@@ -140,21 +142,71 @@ export class Company {
   editGoal(args, actor) {
     this.owner(actor); const previous = this.store.require('goals', args.id);
     assert(previous.status !== 'deleted', 'ENTITY_DELETED', '请先恢复目标');
-    const patch = args.patch ?? {}; assert(Object.keys(patch).every(k => ['title', 'description', 'acceptance'].includes(k)), 'INVALID_INPUT', '只能编辑目标标题、说明和验收标准');
-    for (const [k, v] of Object.entries(patch)) text(v, k, k === 'title' ? 300 : 20000);
-    const goal = this.store.put('goals', { ...previous, ...patch }, args.expectedRevision);
-    if (Object.keys(patch).some(k => patch[k] !== previous[k])) {
-      for (const task of this.store.list('tasks').filter(t => t.goalId === goal.id && t.kind !== 'review' && !TERMINAL.has(t.status))) restartForChange(this, task);
-      recordChange(this, 'goal', previous, goal, Object.keys(patch), actor);
+    const patch = { ...args.patch }; assert(Object.keys(patch).every(k => ['title', 'description', 'acceptance'].includes(k)), 'INVALID_INPUT', '只能编辑目标标题、说明和验收标准');
+    for (const [k, v] of Object.entries(patch)) patch[k] = text(v, k, k === 'title' ? 300 : 20000);
+    const changed = Object.keys(patch).filter(key => patch[key] !== previous[key]);
+    if (!changed.length) {
+      assert(args.expectedRevision === undefined || args.expectedRevision === previous.revision, 'CONFLICT', '记录已变化，请刷新后重试');
+      return previous;
     }
+    const substantive = changed.some(key => key !== 'title');
+    const version = contractVersion(previous);
+    if (substantive) assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
+    let goal = this.store.put('goals', {
+      ...previous, ...patch,
+      ...(substantive ? {
+        status: 'active', contractVersion: version + 1,
+        completedContractVersion: previous.completedContractVersion ?? (previous.status === 'succeeded' ? version : null),
+        completedDeliveryHash: previous.completedDeliveryHash ?? (previous.status === 'succeeded' ? goalDeliveryHash(previous, deliveredWork(this.store, previous)) : null),
+        contractChange: { fromVersion: version, status: 'pending', coordinationTaskId: null,
+          previous: { description: previous.description, acceptance: previous.acceptance } },
+      } : {}),
+    }, args.expectedRevision);
+    if (substantive) {
+      const tasks = this.store.list('tasks').filter(task => task.goalId === goal.id && !task.legacyBatch && !task.workflowSnapshot &&
+        (!TERMINAL.has(task.status) || (task.status === 'failed' && task.kind !== 'review')));
+      for (const task of tasks) {
+        const obsolete = task.kind === 'review' || task.origin?.kind === 'goal-contract' || task.reviewTaskId;
+        if (obsolete) {
+          const current = this.store.require('tasks', task.id);
+          if (!TERMINAL.has(current.status)) this.controlTask({ id: current.id, reason: '目标合同已更新' }, 'cancelled', SYSTEM);
+          this.store.put('tasks', { ...this.store.require('tasks', task.id), contractObsolete: true });
+          continue;
+        }
+        const current = this.store.require('tasks', task.id);
+        const restarted = restartForChange(this, current);
+        this.store.put('tasks', { ...restarted, goalContractVersion: version + 1,
+          ...(current.kind === 'plan' ? { description: goal.description, acceptance: goal.acceptance } :
+            (current.usesGoalAcceptance ?? current.acceptance === previous.acceptance) ? { acceptance: goal.acceptance } : {}),
+        });
+      }
+      goal = this.ensureGoalContractCoordination(goal);
+      this.store.event('goal.contract.changed', goal.id, { fromVersion: version, contractVersion: version + 1,
+        coordinationTaskId: goal.contractChange.coordinationTaskId, fields: changed }, actor);
+    }
+    recordChange(this, 'goal', previous, goal, substantive ? [...changed, 'contractVersion'] : changed, actor);
     return goal;
+  }
+  ensureGoalContractCoordination(goal) {
+    if (goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived', 'cancelled'].includes(goal.status)) return goal;
+    if (this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length >= this.policy().maxTasksPerGoal) return goal;
+    const manager = findManager(this, goal.id);
+    const task = this.createTask({
+      goalId: goal.id, kind: 'coordination', title: `确认目标合同 v${contractVersion(goal)}`,
+      description: '核对旧交付和依赖是否适用于新的目标要求。沿用有依据的成果，为受影响的范围安排必要后续工作。',
+      acceptance: '逐项记录旧交付可沿用或需补做的依据，保留历史证据与用户审查配置。',
+      agentId: canCoordinate(this, manager) ? manager.id : null, priority: 100,
+      origin: { kind: 'goal-contract', createdBy: 'scheduler', basis: '目标要求或验收发生变化' },
+      coordinationKey: `goal-contract:${goal.id}:${contractVersion(goal)}`,
+    }, SYSTEM);
+    return this.store.put('goals', { ...goal, contractChange: { ...goal.contractChange, coordinationTaskId: task.id } });
   }
   createGoal(args, actor) { this.owner(actor); return this.createGoalRecord(args, actor); }
   createGoalRecord(args, actor, options = {}) {
     assert(this.store.require("projects", args.projectId).status !== "deleted", "ENTITY_DELETED", "请先恢复项目");
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const constraints = options.constraints ?? [];
-    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
+    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
     if (args.plan !== false) { const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId); assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色'); this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description, kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM); }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }
@@ -173,7 +225,7 @@ export class Company {
     assert(this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length < p.maxTasksPerGoal, 'TASK_LIMIT', 'Goal task limit reached');
     assert(['work', 'plan', 'repair', 'review', 'coordination'].includes(kind), 'INVALID_INPUT', 'Invalid task kind');
     assert(actor.kind === 'system' || kind === 'work', 'SYSTEM_TASK', 'Internal task kinds are created by the engine');
-    if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'reviewScope', 'reviewTargets', 'deliveryHash', 'requestedBy', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);
+    if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'reviewedTaskGeneration', 'reviewedContractVersion', 'reviewScope', 'reviewTargets', 'deliveryHash', 'requestedBy', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);
     integer(args.priority ?? 50, 'priority', 0, 100);
     const deps = [...new Set(args.dependencies ?? [])];
     for (const dep of deps) assert(this.store.require('tasks', dep).goalId === goal.id && this.store.require('tasks', dep).status !== 'deleted', 'SCOPE_DENIED', 'Dependencies must belong to the same goal and not be deleted');
@@ -186,6 +238,9 @@ export class Company {
       acceptance: text(args.acceptance ?? goal.acceptance, 'acceptance'), kind, agentId, dependencies: deps, parentId: args.parentId ?? null,
       reviewOf: args.reviewOf ?? null, reviewArtifactHash: args.reviewArtifactHash ?? null, status: deps.length ? 'blocked' : 'ready',
       reviewScope: args.reviewScope ?? null, reviewTargets: args.reviewTargets ?? null, deliveryHash: args.deliveryHash ?? null, requestedBy: args.requestedBy ?? null,
+      goalContractVersion: contractVersion(goal), usesGoalAcceptance: args.acceptance === undefined,
+      ...(kind === 'review' ? { reviewedTaskGeneration: args.reviewedTaskGeneration ?? null,
+        reviewedContractVersion: args.reviewedContractVersion ?? contractVersion(goal) } : {}),
       generation: 1, attempts: 0, reworks: 0, priority: args.priority ?? 50,
       longLived: args.longLived ?? false, requiresArtifacts: ['work', 'repair'].includes(kind),
       requirements: kind === 'review' ? { ...normalizeRequirements(args.requirements), isolation: 'independent-review' } : normalizeRequirements(args.requirements),
@@ -212,10 +267,11 @@ export class Company {
   refreshGoal(goalId, actor = SYSTEM) {
     const goal = this.store.require('goals', goalId);
     if (['cancelled', 'archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
-    const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot);
+    const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
     const complete = tasks.some(t => t.kind === 'work') && tasks.every(t => ['succeeded', 'archived'].includes(t.status));
     let status;
-    if (!tasks.length) status = 'empty';
+    if (goal.contractChange?.status === 'pending') status = 'active';
+    else if (!tasks.length) status = 'empty';
     else if (!complete) status = tasks.some(t => t.kind === 'plan' && !TERMINAL.has(t.status)) ? 'planning' : 'active';
     else {
       const template = goal.templateSnapshot ?? this.store.get('templates', goal.templateId ?? 'base');
@@ -230,25 +286,25 @@ export class Company {
       }
     }
     if (status === goal.status) return goal;
-    const saved = this.store.put('goals', { ...goal, status });
+    const saved = this.store.put('goals', { ...goal, status, ...(status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {}) });
     this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, { from: goal.status, status }, actor);
     return saved;
   }
   deliveryHash(goalId) {
-    const rows = this.store.list('tasks')
-      .filter(t => t.goalId === goalId && t.kind === 'work' && t.status === 'succeeded' && !t.legacyBatch && !t.workflowSnapshot)
-      .map(t => `${t.id}:${t.artifactHash ?? ''}`).sort();
-    return digest(rows.join('|'));
+    const goal = this.store.require('goals', goalId);
+    return goalDeliveryHash(goal, deliveredWork(this.store, goal));
   }
   latestGoalReview(goalId) {
-    return this.store.list('tasks').filter(t => t.goalId === goalId && t.kind === 'review' && t.reviewScope === 'goal' && t.status !== 'deleted').at(-1) ?? null;
+    const goal = this.store.require('goals', goalId);
+    return this.store.list('tasks').filter(t => t.goalId === goalId && t.kind === 'review' && t.reviewScope === 'goal' &&
+      t.status !== 'deleted' && taskContractVersion(t) === contractVersion(goal)).at(-1) ?? null;
   }
   reviewerFor(goalId, excluded = []) {
     const skip = new Set((Array.isArray(excluded) ? excluded : [excluded]).filter(Boolean));
     return this.store.list('agents').find(a => a.role === 'reviewer' && a.status === 'available' && !skip.has(a.id)) ?? this.temporaryAgent(goalId, 'reviewer');
   }
   createGoalReview(goal, deliveryHash) {
-    const targets = this.store.list('tasks').filter(t => t.goalId === goal.id && t.kind === 'work' && t.status === 'succeeded' && !t.legacyBatch && !t.workflowSnapshot);
+    const targets = deliveredWork(this.store, goal);
     // A reviewer must not have authored any reviewed deliverable.
     const reviewer = this.reviewerFor(goal.id, targets.map(t => t.lastAuthorId));
     const review = this.createTask({
@@ -256,7 +312,7 @@ export class Company {
       description: '按目标模板对目标整体交付成果做一次最终审查。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
       acceptance: goal.acceptance, agentId: reviewer.id, requiresArtifacts: false,
       reviewScope: 'goal', deliveryHash,
-      reviewTargets: targets.map(t => ({ id: t.id, title: t.title, artifactHash: t.artifactHash, artifactIds: t.artifactIds ?? [] })),
+      reviewTargets: targets.map(t => ({ id: t.id, title: t.title, artifactHash: t.artifactHash, artifactIds: t.artifactIds ?? [], deliveryGeneration: deliveryGeneration(t), goalContractVersion: taskContractVersion(t) })),
       origin: { kind: 'template', decidedBy: null, createdBy: 'scheduler', basis: '目标模板最终审查' },
     }, SYSTEM);
     this.store.event('review.queued', review.id, { goalId: goal.id, scope: 'goal', reviewerId: reviewer.id, deliveryHash, targets: targets.map(t => t.id) }, SYSTEM);
@@ -269,13 +325,14 @@ export class Company {
       const goal = this.store.require('goals', goalId);
       assert(!goal.legacyBatch, 'LEGACY_TASK', '旧目标已备份隔离，不能添加审查');
       assert(goal.status !== 'deleted', 'ENTITY_DELETED', '目标已删除');
+      assert(goal.contractChange?.status !== 'pending', 'CONTRACT_PENDING', '请先确认当前目标合同');
       const deliveryHash = this.deliveryHash(goal.id);
       const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewScope === 'goal' && task.goalId === goal.id && task.deliveryHash === deliveryHash && task.status !== 'deleted' && !TERMINAL.has(task.status));
       if (active) {
         this.store.event('review.request.reused', active.id, { goalId: goal.id, deliveryHash, requestedBy: actor.id ?? actor.kind }, actor, { goalId: goal.id });
         return active;
       }
-      const targets = this.store.list('tasks').filter(task => task.goalId === goal.id && task.kind === 'work' && task.status === 'succeeded' && !task.legacyBatch && !task.workflowSnapshot);
+      const targets = deliveredWork(this.store, goal);
       assert(targets.length > 0, 'NO_DELIVERABLE', '目标还没有已交付成果，不能发起最终审查');
       const review = this.createGoalReview(goal, deliveryHash);
       this.store.event('review.requested', review.id, { goalId: goal.id, scope: 'goal', deliveryHash, reviewerId: review.agentId }, actor, { goalId: goal.id });
@@ -285,7 +342,7 @@ export class Company {
     assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
     assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
     assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
-    const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewOf === source.id && task.reviewArtifactHash === source.artifactHash && task.status !== 'deleted' && !TERMINAL.has(task.status));
+    const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewOf === source.id && matchesTaskReview(task, source) && task.status !== 'deleted' && !TERMINAL.has(task.status));
     if (active) {
       this.store.event('review.request.reused', active.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, requestedBy: actor.id ?? actor.kind }, actor, { goalId: source.goalId });
       return active;
@@ -294,7 +351,7 @@ export class Company {
       goalId: source.goalId, kind: 'review', title: `审查：${source.title}`,
       description: '审查已交付成果。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
       acceptance: source.acceptance, parentId: source.id, reviewOf: source.id,
-      reviewArtifactHash: source.artifactHash, agentId: reviewer.id, requiresArtifacts: false,
+      reviewArtifactHash: source.artifactHash, reviewedTaskGeneration: deliveryGeneration(source), reviewedContractVersion: taskContractVersion(source), agentId: reviewer.id, requiresArtifacts: false,
       reviewScope: 'task', origin: { kind: 'owner-review-request', decidedBy: null, createdBy: actor.kind, basis: '用户添加审查' },
     }, SYSTEM, { trustedOrigin: true });
     this.store.event('review.requested', review.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, reviewerId: reviewer.id }, actor, { goalId: source.goalId });
@@ -311,8 +368,11 @@ export class Company {
     for (const k of ['title', 'description', 'acceptance']) if (patch[k] !== undefined) text(patch[k], k);
     assert(args.expectedRevision === undefined || args.expectedRevision === task.revision, 'CONFLICT', '记录已变化，请刷新后重试');
     if (!Object.keys(patch).some(k => patch[k] !== task[k])) return task;
+    assert(actor.kind !== 'agent' || !this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending'),
+      'WAITING_INPUT', '请先处理待回复的问题');
     let saved = restartForChange(this, task, { direct: true });
-    saved = this.store.put('tasks', { ...saved, ...patch, ...(task.status === 'blocked' ? { status: 'ready', blocker: null } : {}) });
+    saved = this.store.put('tasks', { ...saved, ...patch, goalContractVersion: contractVersion(this.store.require('goals', task.goalId)),
+      ...(patch.acceptance !== undefined ? { usesGoalAcceptance: false } : {}), ...(task.status === 'blocked' ? { status: 'ready', blocker: null } : {}) });
     this.invalidateInteractions(task.id, '任务约定已更新，旧问题失效');
     recordChange(this, 'task', task, saved, Object.keys(patch), actor);
     if (patch.agentId && patch.agentId !== task.agentId) this.releaseTemporaryAgent(task.agentId, actor);
@@ -390,6 +450,8 @@ export class Company {
   }
   resumeTask(args, actor, retry = false) {
     const task = this.store.require('tasks', args.id);
+    assert(!task.contractObsolete && matchesGoalContract(this.store.require('goals', task.goalId), task),
+      'STALE_RESULT', '任务属于旧目标合同，请在当前合同下安排后续工作');
     assert(actor.kind !== 'agent' || task.status !== 'paused', 'OWNER_REQUIRED', '仅用户可恢复主动暂停的任务');
     assert(['paused', 'blocked', ...(retry ? ['failed'] : [])].includes(task.status), 'INVALID_TRANSITION', 'Task cannot resume in its current state');
     assert(!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending'), 'WAITING_INPUT', 'Answer the pending interaction first');
@@ -534,16 +596,17 @@ export class Company {
     const byCreationDesc = (a, b) => (Date.parse(b.createdAt ?? '') || 0) - (Date.parse(a.createdAt ?? '') || 0) || (b.revision ?? 0) - (a.revision ?? 0) || String(b.id).localeCompare(String(a.id));
     const representative = reviews => reviews.slice().sort(byCreationDesc)[0] ?? null;
     const deliveryHashes = new Map(data.goals.map(goal => [goal.id, this.deliveryHash(goal.id)]));
-    const reviewSummary = review => review ? ({ id: review.id, status: review.status, passed: review.passed ?? null, reviewScope: review.reviewScope ?? null, createdAt: review.createdAt, updatedAt: review.updatedAt, cancelledAt: review.cancelledAt ?? null, cancelledBy: review.cancelledBy ?? null, cancelReason: review.cancelReason ?? null, deliveryHash: review.deliveryHash ?? null, artifactHash: review.reviewArtifactHash ?? null }) : null;
+    const reviewSummary = review => review ? ({ id: review.id, status: review.status, passed: review.passed ?? null, reviewScope: review.reviewScope ?? null, createdAt: review.createdAt, updatedAt: review.updatedAt, cancelledAt: review.cancelledAt ?? null, cancelledBy: review.cancelledBy ?? null, cancelReason: review.cancelReason ?? null, deliveryHash: review.deliveryHash ?? null, artifactHash: review.reviewArtifactHash ?? null, goalContractVersion: taskContractVersion(review), reviewedContractVersion: review.reviewedContractVersion ?? 1 }) : null;
     data.tasks = data.tasks.map(task => {
-      const current = reviewTasks.filter(review => review.reviewOf === task.id && review.reviewArtifactHash === task.artifactHash);
+      const current = reviewTasks.filter(review => review.reviewOf === task.id && matchesTaskReview(review, task));
       return { ...task, reviewSummary: reviewSummary(representative(current)) };
     });
     const goalActivity = new Map(data.goals.map(goal => [goal.id, data.tasks.filter(task => task.goalId === goal.id).reduce((max, task) => latest(max, task.activityAt), ownActivity(goal))]));
     data.goals = data.goals.map(g => {
       const reviews = reviewTasks.filter(review => review.reviewScope === 'goal' && review.goalId === g.id);
       const current = reviews.filter(review => review.deliveryHash === deliveryHashes.get(g.id));
-      return { ...g, taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
+      return { ...g, contractVersion: contractVersion(g), completedContractVersion: g.completedContractVersion ?? (g.status === 'succeeded' ? contractVersion(g) : null),
+        deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
     });
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));
     data.modelPreferences = sanitizePreferences(this.store.get("modelPreferences", "model"));
