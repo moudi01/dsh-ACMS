@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { assert, parseResult, digest, OWNER, SYSTEM } from '../core/util.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
-import { SELECTOR_VERSION, MAX_CANDIDATES, bindingFromAgent, buildCandidates, emptyRequirements, selectRoute, selectionError } from '../core/model-selection.js';
+import { SELECTOR_VERSION, MAX_CANDIDATES, bindingFromAgent, buildCandidates, emptyRequirements, modelPolicyFingerprint, selectRoute, selectionError } from '../core/model-selection.js';
 import { inside } from '../runtime/workspaces.js';
 import { PairedRuntimes } from './paired.js';
 import { unknownExecution } from '../runtime/execution-receipt.js';
@@ -247,14 +247,28 @@ export class DshAdapter {
       this.company.store.event("attempt.route.selected", attempt.id, { selection }, SYSTEM);
     });
   }
-  async start({ task, attempt, agent, prompt, signal, onAccepted, routeSelection }) {
+  assertTaskRouteCurrent(agent, selection) {
+    if (!selection) return;
+    const current = agent.id && agent.revision != null ? this.company.store?.get('agents', agent.id) : agent;
+    assert(current && current.revision === agent.revision && (current.status == null || current.status === 'available') &&
+      selection.policyFingerprint === modelPolicyFingerprint(this.company.policy()) &&
+      selection.preferencesRevision === this.preferences().revision,
+    'ROUTE_PREFLIGHT_STALE', '执行角色、模型策略或偏好已更新，需要重新选路并预检');
+  }
+  async start({ task, attempt, agent, prompt, signal, onAccepted, routeSelection, assertCurrent }) {
     const selection = routeSelection ?? await this.select(agent, { requirements: task.requirements });
+    const beforeDispatch = () => {
+      signal.throwIfAborted();
+      assertCurrent?.();
+      this.assertTaskRouteCurrent(agent, selection);
+    };
+    beforeDispatch();
     if (selection.status !== "selected") throw this.selectionFailure(agent, selection, { explainDepth: false });
     const provider = this.providerFor(selection);
     if (provider.origin === "external") {
       const reasoningEffort = selection.chosen.reasoningEffort ?? provider.reasoningEffort ?? null;
       this.recordRoute(attempt, selection, provider, null, reasoningEffort);
-      const input = { mode: "task", attemptId: attempt.id, generation: attempt.taskGeneration, kind: task.kind, cwd: task.workspace.path, contextKey: attempt.contextKey, prompt, onAccepted };
+      const input = { mode: "task", attemptId: attempt.id, generation: attempt.taskGeneration, kind: task.kind, cwd: task.workspace.path, contextKey: attempt.contextKey, prompt, onAccepted, beforeDispatch };
       input.execution = this.paired.execution(provider.name, input);
       // Commit the selected route and exact run/session keys before any launch.
       this.company.store.transaction(() => {
@@ -270,13 +284,14 @@ export class DshAdapter {
     let routed = selection; let details = null;
     if (provider.capabilities.agentOptions) {
       try { details = await this.routeDetails({ provider: provider.name, llmProvider: provider.llmProvider ?? "", model: provider.model, reasoningEffort: selection.chosen.reasoningEffort ?? null }, signal); }
-      catch (error) { if (error.code !== "REASONING_UNSUPPORTED") throw error; throw selectionError(this.depthSelectionFailure(selection, provider, error.reason)); }
+      catch (error) { beforeDispatch(); if (error.code !== "REASONING_UNSUPPORTED") throw error; throw selectionError(this.depthSelectionFailure(selection, provider, error.reason)); }
       const effective = details.reasoning.effective ?? null;
       if (routed.chosen && routed.chosen.reasoningEffort !== effective) routed = { ...routed, chosen: { ...routed.chosen, reasoningEffort: effective } };
     }
     const reasoningEffort = details?.reasoning.effective ?? routed.chosen.reasoningEffort ?? provider.reasoningEffort ?? null;
+    const parentHandle = await this.root();
     this.recordRoute(attempt, routed, provider, provider.capabilities?.agentOptions ? provider.llmProvider : null, reasoningEffort);
-    const parentHandle = await this.root(); signal.throwIfAborted();
+    beforeDispatch();
     const activation = await this.ctx.subagents.startActivation({ provider: provider.name, label: attempt.contextKey,
       request: { parent: parentHandle.agent, cwd: task.workspace.path, prompt: [{ type: "text", text: prompt }],
         ...(provider.capabilities.agentOptions ? { agentOptions: { provider: provider.llmProvider, model: provider.model, ...(reasoningEffort ? { reasoningEffort } : {}) } } : {}),

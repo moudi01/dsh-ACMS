@@ -259,6 +259,7 @@ var CodexAppServerWire = class {
 		this.turnCompleted = completion;
 		const threadId = this.threadId;
 		try {
+			this.options.beforeTurn?.();
 			const turn = object(object(await this.guarded(this.transport.request("turn/start", {
 				threadId,
 				...(this.options.reasoningEffort ? { effort: this.options.reasoningEffort } : {}),

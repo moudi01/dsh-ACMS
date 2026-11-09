@@ -1,6 +1,7 @@
 import { digest, now, SYSTEM } from '../core/util.js';
 import { ignoresBlocker } from '../core/blocker-policy.js';
 import { matchesGoalContract } from '../core/goal-contract.js';
+import { ENVIRONMENT_RECOVERED_REASON } from '../core/hierarchy.js';
 import { inspectHost } from './preflight.js';
 
 export async function inspectEnvironment(engine, task, agent, previous, route) {
@@ -82,7 +83,12 @@ function clearEnvironment(engine, task, report) {
   const waiting = handoff?.status === 'blocked' && handoff.blocker?.kind === 'environment-handoff';
   const detachable = waiting || handoff?.status === 'cancelled' || handoff?.status === 'deleted';
   const dependencies = detachable ? task.dependencies.filter(id => id !== handoffId) : task.dependencies;
-  if (waiting) company.controlTask({ id: handoffId, reason: '环境重新预检通过' }, 'cancelled', SYSTEM);
+  if (waiting) {
+    const closed = company.controlTask({ id: handoffId, reason: ENVIRONMENT_RECOVERED_REASON }, 'cancelled', SYSTEM);
+    store.put('tasks', { ...closed, environmentResolution: {
+      sourceTaskId: task.id, environmentVersion: report.version, resolvedAt: now(),
+    } });
+  }
   const interaction = interactionId && store.get('interactions', interactionId);
   if (interaction?.status === 'pending') store.put('interactions', { ...interaction, status: 'cancelled', reason: '环境重新预检通过' });
   const relatedBlocker = task.blocker?.kind === 'environment' || (interaction && task.blocker?.kind === interaction.kind) ||
@@ -108,7 +114,10 @@ export async function refreshEnvironmentGates(engine) {
     const agent = store.get('agents', task.agentId);
     if (!agent || agent.status !== 'available') continue;
     let observed;
-    try { observed = await inspectEnvironment(engine, task, agent, task.environmentBlock); }
+    try {
+      observed = await inspectEnvironment(engine, task, agent, task.environmentBlock);
+      engine.adapter.assertTaskRouteCurrent?.(agent, observed.selection);
+    }
     catch { continue; } // Unavailable observations cannot clear a durable gate.
     engine.fenced();
     store.transaction(() => {

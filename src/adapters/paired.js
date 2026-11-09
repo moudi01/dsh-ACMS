@@ -140,7 +140,8 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
     if (held) throw cleanupError(held.cleanupError || '此执行器仍有未确认清理的执行，需先核对进程容器');
     assert(input.mode !== 'probe' || model.probeSupported !== false, 'PAIRED_PROBE_UNSUPPORTED', `此运行环境暂不支持无工具检测：${model.probeReason}`);
     if (model.runtime === 'codex-app-server') return this.runCodex(model, input, signal);
-    const request = { ...input, protocol: PROTOCOL, requestId, model: model.model, reasoningEffort: model.reasoningEffort, approvalPolicy: 'never', sandbox: input.mode === 'probe' ? 'read-only' : 'workspace-write', retainContext: input.mode === 'task' && model.persistent && !input.freshContext };
+    const { beforeDispatch, ...requestInput } = input;
+    const request = { ...requestInput, protocol: PROTOCOL, requestId, model: model.model, reasoningEffort: model.reasoningEffort, approvalPolicy: 'never', sandbox: input.mode === 'probe' ? 'read-only' : 'workspace-write', retainContext: input.mode === 'task' && model.persistent && !input.freshContext };
     await fs.mkdir(input.cwd, { recursive: true }); signal?.throwIfAborted();
     const run = { modelId, attemptId: input.attemptId }; this.running.set(requestId, run);
     let timer, child, failure, stdout = '', bytes = 0;
@@ -149,7 +150,7 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
     const abort = () => stop(signal?.reason instanceof Error ? signal.reason : new Error('执行已取消'));
     try {
       child = run.child = await this.ownedProcess({ argv: [model.command, ...model.args], cwd: input.cwd,
-        env: { ELECTRON_RUN_AS_NODE: '1' }, runMs: input.mode === 'probe' ? 40000 : this.company.policy().turnTimeoutMs }, { cleanupMs: this.cleanupMs, signal });
+        env: { ELECTRON_RUN_AS_NODE: '1' }, runMs: input.mode === 'probe' ? 40000 : this.company.policy().turnTimeoutMs }, { cleanupMs: this.cleanupMs, signal, beforeStart: beforeDispatch });
       timer = setTimeout(() => stop(new Error('执行器超时')), input.mode === 'probe' ? 40000 : this.company.policy().turnTimeoutMs);
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', b => { bytes += Buffer.byteLength(b); if (bytes > 2097152) stop(new Error('执行器响应超过 2 MiB')); else stdout += b; });
@@ -157,7 +158,10 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
       child.stdin.on('error', stop);
       signal?.addEventListener('abort', abort, { once: true });
       if (signal?.aborted) abort();
-      else child.stdin.end(JSON.stringify(request), () => { if (!failure && !signal?.aborted) input.onAccepted?.(); });
+      else {
+        beforeDispatch?.();
+        child.stdin.end(JSON.stringify(request), () => { if (!failure && !signal?.aborted) input.onAccepted?.(); });
+      }
       const outcome = await Promise.race([child.done, aborted.promise]);
       if (failure) throw failure;
       if (outcome.cleanup?.reason) throw new Error(outcome.cleanup.reason);
@@ -192,13 +196,19 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
       if (store.summary.status && store.summary.status !== 'idle') throw new Error('Previous Codex session is not reliably settled');
     } catch (error) { store?.quarantine(error.message); throw cleanupError(error.message, error); }
     const run = { modelId: model.id, attemptId: input.attemptId, messages: new Map() }; this.running.set(runId, run);
+    let dispatchError;
+    const beforeDispatch = () => {
+      try { input.beforeDispatch?.(); }
+      catch (error) { dispatchError = error; throw error; }
+    };
     try {
       store.update({ attemptId: input.attemptId, executionIdentity: input.execution, status: 'starting', terminalResult: null, lastSnippet: '', toolCalls: 0, turnTokenUsage: null });
       run.handle = await startCodexRun({ prompt: [{ type: 'text', text: input.prompt }], signal }, {
         argv: [model.command, ...model.args], cwd: input.cwd, model: model.model, reasoningEffort: model.reasoningEffort,
-        permissionMode: 'acms-workspace', store, spawn: spec => this.ownedProcess({ ...spec, runMs: this.company.policy().turnTimeoutMs }, { spawn: this.spawn, cleanupMs: this.cleanupMs, signal }), env: { ELECTRON_RUN_AS_NODE: '1' },
+        permissionMode: 'acms-workspace', store, spawn: spec => this.ownedProcess({ ...spec, runMs: this.company.policy().turnTimeoutMs }, { spawn: this.spawn, cleanupMs: this.cleanupMs, signal, beforeStart: beforeDispatch }), env: { ELECTRON_RUN_AS_NODE: '1' },
         disposeGraceMs: 5000, startupTimeoutMs: 60000, turnTimeoutMs: this.company.policy().turnTimeoutMs,
         onAccepted: input.onAccepted,
+        beforeTurn: beforeDispatch,
         onNotification: (method, p) => {
           if (method === 'item/agentMessage/delta') { const item = run.messages.get(p.itemId) ?? { id: p.itemId, text: '' }; item.text = (item.text + p.delta).slice(-65536); run.messages.set(item.id, item); }
           if (method === 'item/completed' && p.item?.type === 'agentMessage') run.messages.set(p.item.id, { id: p.item.id, text: (p.item.text ?? '').slice(0,65536) });
@@ -207,9 +217,14 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
         onError: () => {},
       });
       const result = await run.handle.result;
+      if (dispatchError) throw dispatchError;
       assert(result.stopReason === 'completed', 'PAIRED_RUN_FAILED', result.diagnostic || 'Codex 执行未完成');
       return { executed: true, reasoningEffort: model.reasoningEffort, output: parseResult(result.structured ?? result.output?.filter(b => b.type === 'text').map(b => b.text).join('\n')) };
-    } catch (error) { if (error.cleanupUncertain) { run.cleanupUncertain = true; run.cleanupError = error.message; store.quarantine(error.message); } throw error; }
+    } catch (error) {
+      if (!error.cleanupUncertain) throw dispatchError ?? error;
+      run.cleanupUncertain = true; run.cleanupError = error.message; store.quarantine(error.message);
+      throw error;
+    }
     finally {
       try {
         if (run.handle) await bounded(run.handle.dispose(), this.cleanupMs + 1000, 'Codex cleanup deadline exceeded');

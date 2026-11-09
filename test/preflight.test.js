@@ -6,7 +6,7 @@ import path from 'node:path';
 import { DshAdapter } from '../src/adapters/dsh.js';
 import { PairedRuntimes } from '../src/adapters/paired.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
-import { classifyEnvironment } from '../src/runtime/preflight.js';
+import { classifyEnvironment, environmentFailure } from '../src/runtime/preflight.js';
 import { createRoutes } from '../src/host/http.js';
 import { fixture, until } from './helpers.js';
 
@@ -14,12 +14,14 @@ const readTask = (f, task) => f.store.require('tasks', task.id);
 const handoffs = f => f.store.list('tasks').filter(t => t.origin?.blockerKind === 'environment');
 const blocked = (f, task) => until(() => !f.engine.live.size && readTask(f, task).status === 'blocked' && readTask(f, task).environmentBlock);
 
-test('a declared missing package blocks with zero calls and resumes the same workspace after installation', async t => {
+for (const finalReview of [false, true]) test(`dependency recovery completes the goal with finalReview=${finalReview}`, async t => {
   const f = await fixture(t);
   f.command('project.save', { id: f.project.id, checks: [
     { id: 'package-check', command: 'node', args: ['-e', "require('fixture-package')"], requiredPackages: ['fixture-package'] },
   ] });
-  const task = f.task();
+  const goal = finalReview ? f.command('goal.create', { projectId: f.project.id, title: 'Review after recovery',
+    description: 'Verify recovery under the standard template', acceptance: 'Deliver and review the artifact', templateId: 'base', plan: false }) : f.goal;
+  const task = f.task({ goalId: goal.id });
   await f.start();
   const before = await blocked(f, task);
   assert.equal(before.failures[0].subject, 'fixture-package');
@@ -33,11 +35,81 @@ test('a declared missing package blocks with zero calls and resumes the same wor
   await writeFile(path.join(installed, 'package.json'), '{"main":"index.js"}');
   await writeFile(path.join(installed, 'index.js'), 'module.exports = {};');
   f.command('task.resume', { id: task.id });
-  await until(() => readTask(f, task).status === 'succeeded');
-  assert.equal(f.adapter.calls.length, 1);
+  await until(() => f.store.require('goals', goal.id).status === 'succeeded');
+  assert.equal(readTask(f, task).status, 'succeeded');
+  assert.equal(f.adapter.calls.length, finalReview ? 2 : 1);
   assert.equal(f.adapter.calls[0].task.workspace.path, workspace);
   assert.equal(readTask(f, task).generation, task.generation);
   assert.equal(handoffs(f)[0].status, 'cancelled');
+  assert.equal(handoffs(f)[0].environmentResolution.sourceTaskId, task.id);
+  assert.equal(f.store.list('verifications').filter(v => v.kind === 'goal-review' && v.passed).length, finalReview ? 1 : 0);
+});
+
+function routingFixture(f) {
+  const launched = [];
+  const llm = {
+    listProviders: () => [{ id: 'fixture' }],
+    listModels: async () => ['old-model', 'new-model'].map(id => ({ id, provider: 'fixture' })),
+    resolveModelInfo: async () => ({}),
+  };
+  const providers = new Map(['spawn', 'fork'].map(name => [name, { name, capabilities: { agentOptions: true }, prepareContinuable() {} }]));
+  const services = { llm, tools: { get: name => name === 'write' ? {} : undefined } };
+  const ctx = { get: key => services[key], agents: { create: async () => ({ agent: { id: 'parent' }, dispose: async () => {} }) },
+    subagents: { providers, startActivation: async request => { launched.push(request); throw new Error('Unexpected fixture launch'); } } };
+  const adapter = new DshAdapter(ctx, f.company, f.dataDir);
+  f.engine.adapter = adapter;
+  f.command('agent.save', { id: 'manager', status: 'retired' });
+  return { adapter, llm, launched };
+}
+
+for (const field of ['allowedModels', 'allowedProviders']) test(`revoking ${field} during final preflight prevents dispatch`, async t => {
+  const f = await fixture(t);
+  const { adapter, launched } = routingFixture(f);
+  const agent = f.command('agent.save', { name: 'Bound worker', provider: 'spawn', model: 'old-model' });
+  const task = f.task({ agentId: agent.id });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const inspect = adapter.inspectEntry.bind(adapter);
+  let inspections = 0;
+  adapter.inspectEntry = async (...args) => {
+    if (++inspections === 2) { entered.resolve(); await release.promise; }
+    return inspect(...args);
+  };
+  await f.start();
+  try {
+    await Promise.race([entered.promise, until(() => inspections === 2)]);
+    f.command('policy.update', { patch: { [field]: [field === 'allowedModels' ? 'new-model' : 'fork'] } });
+  } finally { release.resolve(); }
+  await until(() => readTask(f, task).status === 'blocked' &&
+    f.store.list('attempts').some(a => a.taskId === task.id && a.selection?.status === 'blocked'));
+  assert.equal(launched.length, 0);
+  const attempts = f.store.list('attempts').filter(a => a.taskId === task.id);
+  assert.equal(attempts[0].preflightOnly, true);
+  assert.equal(attempts.at(-1).selection.status, 'blocked');
+});
+
+test('a binding change during model metadata lookup preflights the new provider before launch', async t => {
+  const f = await fixture(t);
+  const { adapter, llm, launched } = routingFixture(f);
+  const agent = f.command('agent.save', { name: 'Bound worker', provider: 'spawn', model: 'old-model' });
+  const task = f.task({ agentId: agent.id });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let waiting = false;
+  llm.resolveModelInfo = async () => { waiting = true; entered.resolve(); await release.promise; return {}; };
+  const inspect = adapter.inspectEntry.bind(adapter);
+  adapter.inspectEntry = async (provider, ...args) => {
+    const report = await inspect(provider, ...args);
+    if (provider.name === 'fork') return { ...report, mounted: 'missing', failures: [environmentFailure('tools', '文件写入', true)] };
+    return report;
+  };
+  await f.start();
+  try {
+    await Promise.race([entered.promise, until(() => waiting)]);
+    f.command('agent.save', { id: agent.id, provider: 'fork', model: 'new-model' });
+  } finally { release.resolve(); }
+  const evidence = await blocked(f, task);
+  assert.equal(evidence.report.runtime.mounted, 'missing');
+  assert.equal(launched.length, 0);
+  assert.equal(readTask(f, task).attempts, 0);
 });
 
 test('program and missing directory checks run before a model or workspace setup', async t => {

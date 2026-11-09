@@ -3,7 +3,7 @@ import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-ac
 import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
 import { canCoordinate, findManager } from './coordination.js';
 import { executionOccupancy } from './execution-capacity.js';
-import { goalSummary } from './hierarchy.js';
+import { goalSummary, taskSettledForGoal } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
@@ -270,7 +270,7 @@ export class Company {
     const goal = this.store.require('goals', goalId);
     if (['cancelled', 'archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
     const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
-    const complete = tasks.some(t => t.kind === 'work') && tasks.every(t => ['succeeded', 'archived'].includes(t.status));
+    const complete = tasks.some(t => t.kind === 'work') && tasks.every(taskSettledForGoal);
     let status;
     if (goal.contractChange?.status === 'pending') status = 'active';
     else if (!tasks.length) status = 'empty';

@@ -362,6 +362,7 @@ export class Engine {
       preflight = await inspectEnvironment(this, task, agent);
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
+      this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       if (preflight.failures.length) {
         this.acceptEnvironment(attempt, task, preflight, false);
         return;
@@ -386,6 +387,7 @@ export class Engine {
       preflight = await inspectEnvironment(this, task, agent);
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
+      this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       if (preflight.failures.length) {
         this.acceptEnvironment(attempt, task, preflight, false);
         return;
@@ -396,7 +398,9 @@ export class Engine {
       });
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
-      activation = await this.adapter.start({ task, attempt, agent, routeSelection: preflight.selection, prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal, onAccepted: () => this.conversations?.accepted(attempt) });
+      activation = await this.adapter.start({ task, attempt, agent, routeSelection: preflight.selection,
+        prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal,
+        assertCurrent: () => this.currentAttemptTask(attempt), onAccepted: () => this.conversations?.accepted(attempt) });
       this.store.transaction(() => {
         this.fenced();
         for (const notificationId of attempt.notificationIds ?? []) {
@@ -656,7 +660,8 @@ export class Engine {
       const task = this.store.require('tasks', attempt.taskId); const stopped = task.stopRequested;
       if (!ACTIVE.has(this.store.require('attempts', attempt.id).status)) return;
       const failure = !aborted && !error.cleanupUncertain && !error.recoveryRequired && classifyEnvironment(error, preparingWorkspace ? 'workspace' : null);
-      this.finishAttempt(attempt, aborted ? 'interrupted' : 'failed', failure ? failure.reason : error.message);
+      const staleRoute = error.code === 'ROUTE_PREFLIGHT_STALE';
+      this.finishAttempt(attempt, aborted || staleRoute ? 'interrupted' : 'failed', failure ? failure.reason : error.message);
       if (task.activeAttemptId !== attempt.id || (!stopped && (task.generation !== attempt.taskGeneration || ignoresBlocker(task)))) return;
       if (error.cleanupUncertain || error.recoveryRequired) {
         // A closed runner does not prove that its model/tool descendants stopped.
@@ -673,6 +678,18 @@ export class Engine {
       if (error.code === 'OWNER_STEER' && !stopped && !this.closing) {
         this.store.put('tasks', { ...task, status: 'ready', resumeOnStart: false, stopRequested: null, retryAt: null, attempts: Math.max(0, task.attempts - 1) });
         this.store.event('attempt.owner.steered', attempt.id, { taskId: task.id }, OWNER);
+        return;
+      }
+      if (staleRoute && !stopped && !this.closing) {
+        this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true, cleanupPending: false });
+        for (const notificationId of attempt.notificationIds ?? []) {
+          const notification = this.store.get('notifications', notificationId);
+          if (notification?.attemptId === attempt.id && notification.status === 'delivered') {
+            this.store.put('notifications', { ...notification, status: 'pending', attemptId: null, deliveredAt: null });
+          }
+        }
+        this.store.put('tasks', { ...task, status: 'ready', retryAt: null, attempts: Math.max(0, task.attempts - 1) });
+        this.store.event('attempt.route.recheck', attempt.id, { taskId: task.id }, SYSTEM);
         return;
       }
       if (selectionBlocked(error) && !stopped && !this.closing) {
