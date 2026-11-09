@@ -211,9 +211,11 @@ export class WorkspaceManager {
         checks: error.details?.checks?.filter(c => !c.passed).map(c => ({ id: c.id, code: c.code })) ?? [] });
     }
   }
-  async inspectIntegration(record) {
+  runIntegrationCommand(command, args, cwd, options) {
+    return runContained(command, args, cwd, options);
+  }
+  async inspectIntegration(record, invoke) {
     const { targetRoot, targetHead, targetRef, integratedCommit, commit, checks, candidate } = record;
-    const invoke = (command, args, cwd) => runContained(command, args, cwd, { timeout: 5000 });
     const observed = await invoke('git', ['rev-parse', '--verify', targetRef], targetRoot);
     assert(observed.code === 0 && !observed.timedOut, 'GIT_ERROR', observed.stderr || 'Unable to verify the integration target');
     const actualHead = observed.stdout.trim();

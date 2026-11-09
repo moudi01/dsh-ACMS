@@ -6,7 +6,7 @@ import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
 import { completeCoordination, coordinationAuthority, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow, timeBoxCoordinationKey, CAPACITY_LIMIT_CODES } from '../core/coordination.js';
 import { executeIntegration, interruptIntegration, recoverIntegrations, refreshIntegrationReceipts } from './integration.js';
-import { integrationPending } from '../core/task-actions.js';
+import { executionOccupancy } from '../core/execution-capacity.js';
 import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute, ignoresBlocker } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
@@ -136,9 +136,8 @@ export class Engine {
         if (!boxLimit || used < boxLimit) continue;
         this.ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, p);
       }
-      const active = this.store.list('attempts').filter(a => !a.legacyBatch && (ACTIVE.has(a.status) || a.cleanupPending || this.live.has(a.id)));
-      const occupiedIntegrations = this.store.list('integrations').filter(integrationPending).length;
-      let free = p.maxConcurrent - active.length - occupiedIntegrations - (this.adapter.activeProbes ?? 0) - (this.adapter.activeChats ?? 0); if (free <= 0) return;
+      const { attempts: active, integrations: occupiedIntegrations, used } = executionOccupancy(this.store, this.adapter, this.live);
+      let free = p.maxConcurrent - used; if (free <= 0) return;
       let integrationQueued = occupiedIntegrations > 0 || this.queuedIntegrations.size > 0;
       if (!integrationQueued) {
         const waiting = this.store.list('tasks').find(t => t.status === 'integrating' && !ignoresBlocker(t) && !active.some(a => a.taskId === t.id));

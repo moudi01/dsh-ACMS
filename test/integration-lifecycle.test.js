@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixture, gitProject, until } from './helpers.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { canReconcileTask } from '../src/core/task-actions.js';
 import { run } from '../src/runtime/workspaces.js';
+import { cleanupError } from '../src/runtime/owned-process.js';
 
 const windows = { skip: process.platform !== 'win32' };
 const crashHost = fileURLToPath(new URL('./fixtures/integration-crash-host.mjs', import.meta.url));
@@ -63,6 +64,58 @@ test('queued integration can be paused and cancelled before any command starts',
   assert.equal(current(f, task).status, 'cancelled');
   assert.equal(records(f).length, 0);
   assert.equal(await head(f), before);
+  assert.equal(f.adapter.calls.length, 0);
+});
+
+test('Git inspection retains its own cleanup hold across refresh and restart', async t => {
+  const f = await fixture(t);
+  const task = f.task();
+  const record = {
+    id: 'integration-fixture', taskId: task.id, generation: task.generation,
+    artifactHash: 'delivery', phase: 'applying', applyStartedAt: new Date().toISOString(),
+    commandId: 'apply-command', targetRoot: f.source, targetRef: 'refs/heads/main', integratedCommit: 'candidate',
+  };
+  const dir = path.join(f.dataDir, 'integration-receipts');
+  await mkdir(dir, { recursive: true });
+  const proof = JSON.stringify({ confirmed: true, exitCode: 0 });
+  await writeFile(path.join(dir, record.commandId + '.json'), proof);
+  f.store.transaction(() => {
+    f.store.put('tasks', { ...task, status: 'integrating', activeIntegrationId: record.id, artifactHash: record.artifactHash });
+    f.store.put('integrations', record);
+  });
+  let calls = 0, receipt;
+  f.workspaces.runIntegrationCommand = async (_command, args, _cwd, options) => {
+    options.beforeStart();
+    assert.equal(path.dirname(options.cleanupReceipt), dir);
+    if (++calls === 1) {
+      receipt = options.cleanupReceipt;
+      assert.equal(records(f)[0].inspectionCommandId + '.json', path.basename(receipt));
+      throw cleanupError('injected Git inspection cleanup failure');
+    }
+    await writeFile(options.cleanupReceipt, proof);
+    return { code: 0, stdout: args[0] === 'rev-parse' ? 'candidate\n' : '' };
+  };
+
+  await f.start();
+  const held = records(f)[0];
+  assert.equal(held.phase, 'reconciling');
+  assert.equal(held.commandId, record.commandId);
+  assert.notEqual(held.inspectionCommandId, held.commandId);
+  f.command('task.reconcile', { id: task.id });
+  await until(() => !current(f, task).recoveryRequested && !f.engine.ticking);
+  assert.equal(records(f)[0].inspectionCommandId, held.inspectionCommandId);
+  await f.engine.stop();
+  await f.engine.start();
+  assert.equal(current(f, task).status, 'reconciling');
+  assert.equal(records(f)[0].inspectionCommandId, held.inspectionCommandId);
+  assert.equal(calls, 1);
+
+  await writeFile(receipt, proof, { flag: 'wx' });
+  await until(() => current(f, task).status === 'succeeded');
+  assert.equal(current(f, task).integration.integratedCommit, 'candidate');
+  assert.equal(records(f)[0].inspectionCommandId, null);
+  assert.equal(records(f)[0].phase, 'completed');
+  assert.equal(calls, 3);
   assert.equal(f.adapter.calls.length, 0);
 });
 

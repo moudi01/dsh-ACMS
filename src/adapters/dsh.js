@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { assert, parseResult, digest, OWNER, SYSTEM } from '../core/util.js';
+import { executionOccupancy } from '../core/execution-capacity.js';
 import { SELECTOR_VERSION, MAX_CANDIDATES, bindingFromAgent, buildCandidates, emptyRequirements, selectRoute, selectionError } from '../core/model-selection.js';
 import { inside } from '../runtime/workspaces.js';
 import { PairedRuntimes } from './paired.js';
@@ -104,8 +105,8 @@ export class DshAdapter {
   }
   async probeModel(input, signal) {
     assert(!this.activeProbes, 'MODEL_CHECK_BUSY', '已有模型检测正在进行，请稍候');
-    const active = this.company.store?.list('attempts').filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending).length ?? 0;
-    assert(active + (this.activeChats ?? 0) < this.company.policy().maxConcurrent, 'ACTIVE_LIMIT', '执行资源已满，请等待任务结束后再检测');
+    assert(executionOccupancy(this.company.store, this).used < this.company.policy().maxConcurrent,
+      'ACTIVE_LIMIT', '执行资源已满，请等待任务结束后再检测');
     this.activeProbes++;
     let result, cleanupPending = false; const started = Date.now();
     try {

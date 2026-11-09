@@ -4,7 +4,8 @@ import { AcmsError, assert, digest, id, now, SYSTEM } from '../core/util.js';
 import { ignoresBlocker } from '../core/blocker-policy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 import { integrationPending } from '../core/task-actions.js';
-import { readCommandCleanup, runContained } from './host-command.js';
+import { executionOccupancy } from '../core/execution-capacity.js';
+import { readCommandCleanup } from './host-command.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -32,7 +33,7 @@ function save(engine, record, patch, event) {
   });
 }
 
-function settle(engine, record, { result, error, reason, observed, cleanupConfirmed = false, retryCheckpoint = false }) {
+function settle(engine, record, { result, error, reason, observed, commandCleanupConfirmed = false, retryCheckpoint = false }) {
   return engine.store.transaction(() => {
     engine.fenced();
     const task = engine.store.require('tasks', record.taskId);
@@ -40,7 +41,7 @@ function settle(engine, record, { result, error, reason, observed, cleanupConfir
     const stopRequested = task.stopRequested ?? null;
     const fields = { activeIntegrationId: null, stopRequested: null, recoveryRequested: false, integrationRecovery: null };
     if (reason) {
-      save(engine, record, { phase: 'reconciling', reason, stopRequested, cleanupConfirmed, observed: observed ?? null }, 'integration.reconciling');
+      save(engine, record, { phase: 'reconciling', reason, stopRequested, commandCleanupConfirmed, observed: observed ?? null }, 'integration.reconciling');
       engine.store.put('tasks', { ...task, status: 'reconciling', recoveryRequested: false, integrationRecovery: { reason, observed: observed ?? null } });
       return;
     }
@@ -73,16 +74,50 @@ function settle(engine, record, { result, error, reason, observed, cleanupConfir
   });
 }
 
+async function clearCommand(engine, record, field, file) {
+  save(engine, record, { [field]: null });
+  await unlink(file).catch(() => {});
+}
+
+async function inspect(engine, record) {
+  return engine.workspaces.inspectIntegration(record, async (command, args, cwd) => {
+    const inspectionCommandId = id('command');
+    const cleanupReceipt = receipt(engine, inspectionCommandId);
+    await mkdir(path.dirname(cleanupReceipt), { recursive: true });
+    save(engine, record, { inspectionCommandId });
+    let cleanupUnknown = false;
+    try {
+      return await engine.workspaces.runIntegrationCommand(command, args, cwd, {
+        timeout: 5000, cleanupReceipt, beforeStart: () => engine.fenced(),
+      });
+    } catch (error) {
+      cleanupUnknown = !!error.cleanupUncertain;
+      throw error;
+    } finally {
+      if (!cleanupUnknown && owns(engine)) await clearCommand(engine, record, 'inspectionCommandId', cleanupReceipt);
+    }
+  });
+}
+
 async function reconcile(engine, record, { error, recovering = false, cleanup } = {}) {
   cleanup ??= record.commandId ? await readCommandCleanup(receipt(engine, record.commandId)) : null;
+  if (record.inspectionCommandId) {
+    const file = receipt(engine, record.inspectionCommandId);
+    if (!await readCommandCleanup(file)) {
+      return settle(engine, record, { reason: record.reason ?? '缺少 Git 核对命令的进程树清理回执',
+        observed: record.observed, commandCleanupConfirmed: !!cleanup });
+    }
+    await clearCommand(engine, record, 'inspectionCommandId', file);
+  }
   if (cleanup?.notStarted) {
     return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
   }
   let observed;
   if (record.applyStartedAt) {
-    try { observed = await engine.workspaces.inspectIntegration(record); }
+    try { observed = await inspect(engine, record); }
     catch (failure) {
-      return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message, cleanupConfirmed: !!cleanup });
+      return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
+        observed: record.observed, commandCleanupConfirmed: !!cleanup });
     }
   }
   if (record.commandId && !cleanup) {
@@ -90,7 +125,7 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
   }
   if (observed?.status === 'merged') return settle(engine, record, { result: observed });
   if (record.applyStartedAt && (observed?.status !== 'unchanged' || cleanup?.exitCode === 0)) {
-    return settle(engine, record, { reason: '无法确认最终 Git 命令是否合入候选提交', observed, cleanupConfirmed: !!cleanup });
+    return settle(engine, record, { reason: '无法确认最终 Git 命令是否合入候选提交', observed, commandCleanupConfirmed: !!cleanup });
   }
   settle(engine, record, { error: error ?? new Error('最终 Git 命令未合入候选提交'), observed, retryCheckpoint: recovering && !record.applyStartedAt });
 }
@@ -109,7 +144,11 @@ export async function refreshIntegrationReceipts(engine) {
       await reconcile(engine, record, { recovering: true });
       continue;
     }
-    if (record.cleanupConfirmed || !record.commandId) continue;
+    if (record.inspectionCommandId) {
+      if (await readCommandCleanup(receipt(engine, record.inspectionCommandId))) await reconcile(engine, record, { recovering: true });
+      continue;
+    }
+    if (record.commandCleanupConfirmed || !record.commandId) continue;
     const cleanup = await readCommandCleanup(receipt(engine, record.commandId));
     if (cleanup) await reconcile(engine, record, { recovering: true, cleanup });
   }
@@ -139,7 +178,9 @@ export async function executeIntegration(engine, taskId) {
   const record = engine.store.transaction(() => {
     engine.fenced();
     const current = engine.store.require('tasks', taskId);
-    if (current.revision !== task.revision || engine.company.policy().paused) return null;
+    const policy = engine.company.policy();
+    if (current.revision !== task.revision || policy.paused ||
+      executionOccupancy(engine.store, engine.adapter, engine.live).used >= policy.maxConcurrent) return null;
     const saved = engine.store.put('integrations', {
       id: id('integration'), taskId, goalId: task.goalId, projectId: task.projectId, generation: task.generation,
       artifactHash: task.artifactHash, artifactIds: task.artifactIds, contract: contract(engine, task.projectId), phase: 'preparing',
@@ -177,7 +218,7 @@ export async function executeIntegration(engine, taskId) {
     if (apply) entry.applying = true;
     let cleanupUnknown = false;
     try {
-      return await runContained(executable, args, cwd, {
+      return await engine.workspaces.runIntegrationCommand(executable, args, cwd, {
         ...options, cleanupReceipt, signal: apply ? undefined : signal,
         beforeStart: binary => {
           guard();
@@ -192,8 +233,7 @@ export async function executeIntegration(engine, taskId) {
       throw error;
     } finally {
       if (!apply && !cleanupUnknown && owns(engine)) {
-        save(engine, record, { commandId: null });
-        await unlink(cleanupReceipt).catch(() => {});
+        await clearCommand(engine, record, 'commandId', cleanupReceipt);
       }
     }
   };
