@@ -51,26 +51,38 @@ export function completeGoalContract(company, task, output, actor, planTasks = n
     const followUp = store.get('tasks', planTasks.get(entry.followUp) ?? entry.followUp);
     assert(followUp?.goalId === goal.id && followUp.kind === 'work' && !['cancelled', 'deleted', 'archived', 'failed'].includes(followUp.status) &&
       matchesGoalContract(goal, followUp), 'INVALID_CONTRACT_ASSESSMENT', 'Replacement work must exist under the current goal contract');
-    return { taskId: entry.taskId, followUpTaskId: followUp.id };
+    const prior = store.require('tasks', entry.taskId);
+    return { taskId: prior.id, followUpTaskId: followUp.id, replacedDelivery: {
+      goalContractVersion: taskContractVersion(prior), generation: deliveryGeneration(prior), artifactHash: prior.artifactHash ?? null,
+    } };
   });
   assert(remaining.size === 0, 'INVALID_CONTRACT_ASSESSMENT', 'Assess every prior deliverable before releasing the new contract');
-  const replaced = new Set(followUps.map(item => item.taskId));
-  const dependsOnReplaced = (taskId, seen) => {
-    if (replaced.has(taskId)) return true;
-    if (seen.has(taskId)) return false;
-    seen.add(taskId);
-    return (store.get('tasks', taskId)?.dependencies ?? []).some(id => dependsOnReplaced(id, seen));
+  const replacements = new Map(followUps.map(item => [item.taskId, item.followUpTaskId]));
+  const ancestors = (taskId, seen = new Set()) => {
+    for (const dependency of store.get('tasks', taskId)?.dependencies ?? []) {
+      if (seen.has(dependency)) continue;
+      seen.add(dependency);
+      ancestors(dependency, seen);
+    }
+    return seen;
   };
-  assert(!reuse.some(id => dependsOnReplaced(id, new Set())), 'INVALID_CONTRACT_ASSESSMENT',
+  assert(!reuse.some(id => [...ancestors(id)].some(dependency => replacements.has(dependency))), 'INVALID_CONTRACT_ASSESSMENT',
     'Assign follow-up work to prior deliverables that depended on a replaced deliverable');
-  const replacements = new Set(followUps.map(item => item.followUpTaskId));
   const unfinished = store.list('tasks').filter(row => row.goalId === goal.id && row.kind === 'work' &&
-    !row.legacyBatch && !row.workflowSnapshot && !TERMINAL.has(row.status) && !replacements.has(row.id));
-  assert(!unfinished.some(row => row.dependencies.some(id => replaced.has(id))), 'INVALID_CONTRACT_ASSESSMENT',
-    'Update dependencies of unfinished work that still uses replaced deliverables');
+    !row.legacyBatch && !row.workflowSnapshot && !TERMINAL.has(row.status));
+  assert(!unfinished.some(row => row.dependencies.some(id => replacements.has(id) && replacements.get(id) !== row.id)),
+    'INVALID_CONTRACT_ASSESSMENT', 'Use replacement dependencies; historical input is allowed only for the task replacing it');
+  for (const { taskId, followUpTaskId } of followUps) {
+    const currentDependencies = ancestors(followUpTaskId);
+    for (const dependency of ancestors(taskId)) {
+      const replacement = replacements.get(dependency);
+      assert(!replacement || replacement === followUpTaskId || currentDependencies.has(replacement),
+        'INVALID_CONTRACT_ASSESSMENT', 'A downstream replacement must wait for the current upstream replacement');
+    }
+  }
   const decision = { reason: assessment.reason.trim(), reuse, followUps, decidedBy: actor.id, decidedAt: now() };
   store.put('goals', { ...goal, contractChange: { ...change, status: 'assessed', decision },
-    supersededTaskIds: [...new Set([...(goal.supersededTaskIds ?? []), ...replaced])] });
+    supersededTaskIds: [...new Set([...(goal.supersededTaskIds ?? []), ...replacements.keys()])] });
   store.event('goal.contract.assessed', goal.id, { contractVersion: contractVersion(goal), coordinationTaskId: task.id, decision }, actor);
   return decision;
 }

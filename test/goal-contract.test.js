@@ -95,6 +95,66 @@ test('replacement plan covers affected dependencies and a new final review uses 
   assert.deepEqual(f.store.require('tasks', independent.id), oldIndependent);
   assert.equal(f.adapter.calls.filter(call => call.task.kind === 'work').length, 4);
   assert.equal(f.adapter.calls.filter(call => call.task.kind === 'review').length, 2);
+
+  const currentApproval = f.store.list('verifications').find(row => row.kind === 'goal-review' && row.artifactHash === nextReview.deliveryHash);
+  const author = f.command('agent.save', { name: 'Author for the renewed delivery', role: 'worker' });
+  f.command('task.edit', { id: upstream.id, patch: { agentId: author.id, acceptance: 'Deliver the newly requested upstream output' } });
+  await completed(f, goal.id);
+  const renewedReview = f.company.latestGoalReview(goal.id);
+  const renewed = f.store.require('tasks', upstream.id);
+  assert.equal(renewed.deliveryGeneration, 2);
+  assert.equal(renewed.goalContractVersion, 2);
+  assert.equal(renewed.artifactHash, firstReview.reviewTargets.find(row => row.id === upstream.id).artifactHash);
+  assert.notEqual(renewedReview.id, nextReview.id);
+  assert.notEqual(renewedReview.deliveryHash, nextReview.deliveryHash);
+  assert.deepEqual(renewedReview.reviewTargets.map(row => row.id).sort(), [upstream.id, independent.id, replacementId].sort());
+  assert.deepEqual(f.store.require('verifications', currentApproval.id), currentApproval);
+  assert.deepEqual(f.store.require('goals', goal.id).supersededTaskIds, [downstream.id]);
+  assert.equal(f.adapter.calls.filter(call => call.task.id === upstream.id).length, 2);
+});
+
+test('separate replacements keep their own historical inputs and wait for current upstream work', async t => {
+  const f = await fixture(t);
+  const upstream = f.task({ title: 'Original upstream' });
+  const downstream = f.task({ title: 'Original downstream', dependencies: [upstream.id] });
+  await f.start();
+  await completed(f, f.goal.id);
+  f.command('company.pause', { afterCurrent: true });
+  const goal = f.command('goal.edit', { id: f.goal.id, patch: { acceptance: 'Revised dependency output' } });
+  const upstreamReplacement = f.task({ title: 'Replace upstream', dependencies: [upstream.id] });
+  const downstreamReplacement = f.task({ title: 'Replace downstream', dependencies: [downstream.id, upstream.id] });
+  f.command('task.pause', { id: upstreamReplacement.id });
+  f.engine.refreshReadiness();
+  const coordinator = f.store.require('tasks', goal.contractChange.coordinationTaskId);
+  const attempt = f.engine.claim(coordinator, f.store.require('agents', coordinator.agentId));
+  const output = { outcome: 'coordinated', contractAssessment: assessment('Update both dependency outputs separately', [], [
+    { taskId: upstream.id, followUp: upstreamReplacement.id },
+    { taskId: downstream.id, followUp: downstreamReplacement.id },
+  ]) };
+  const signal = new AbortController().signal;
+  await assert.rejects(f.engine.accept(attempt, output, signal), { code: 'INVALID_CONTRACT_ASSESSMENT' });
+  assert.equal(f.store.require('goals', goal.id).contractChange.status, 'pending');
+  f.command('task.dependencies', { id: downstreamReplacement.id, dependencies: [downstream.id] });
+  await assert.rejects(f.engine.accept(attempt, output, signal), { code: 'INVALID_CONTRACT_ASSESSMENT' });
+  f.command('task.dependencies', { id: downstreamReplacement.id, dependencies: [downstream.id, upstreamReplacement.id] });
+  await f.engine.accept(attempt, output, signal);
+  // This direct result fixture has no adapter activation to dispose.
+  f.store.transaction(() => f.store.put('attempts', { ...f.store.require('attempts', attempt.id), cleanupPending: false }));
+  f.command('company.resume');
+  await f.engine.tick();
+  assert.equal(f.store.require('tasks', downstreamReplacement.id).status, 'blocked');
+  assert.equal(f.store.require('tasks', upstreamReplacement.id).status, 'paused');
+  assert(!f.adapter.calls.some(call => call.task.id === downstreamReplacement.id || call.task.id === upstreamReplacement.id));
+
+  f.command('task.resume', { id: upstreamReplacement.id });
+  await completed(f, goal.id);
+  const input = f.adapter.calls.find(call => call.task.id === downstreamReplacement.id);
+  const contract = JSON.parse(input.prompt.split('CONTRACT:\n')[1]);
+  const paths = contract.inputArtifacts.map(item => item.path);
+  const blob = taskId => f.store.list('artifacts').find(item => item.taskId === taskId).blob;
+  assert(paths.includes(blob(upstreamReplacement.id)));
+  assert(paths.includes(blob(downstream.id)));
+  assert(!paths.includes(blob(upstream.id)));
 });
 
 test('queued and running goal reviews cannot approve a later contract', async t => {

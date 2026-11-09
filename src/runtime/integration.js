@@ -57,6 +57,13 @@ function settle(engine, record, { result, error, reason, observed, commandCleanu
       const integration = { ...result, integrationId: record.id, ...(stopRequested ? { stopRequested } : {}) };
       save(engine, record, { phase: 'completed', result: integration, reason: null, observed: null, stopRequested, finishedAt: now() }, 'integration.completed');
       engine.store.put('tasks', { ...task, ...fields, status: 'succeeded', integrationPending: false, integration });
+      const goal = engine.store.require('goals', task.goalId);
+      // A replacement excluded the previous delivery. Successful integration
+      // of this task under the current contract puts the new delivery back in
+      // the goal hash before the scheduler decides which review applies.
+      if (task.kind === 'work' && matchesGoalContract(goal, task, record) && goal.supersededTaskIds?.includes(task.id)) {
+        engine.store.put('goals', { ...goal, supersededTaskIds: goal.supersededTaskIds.filter(id => id !== task.id) });
+      }
       engine.company.releaseTemporaryAgent(task.agentId);
       engine.store.event('task.succeeded', task.id, { integration, artifactHash: record.artifactHash }, SYSTEM);
       engine.updateGoal(task.goalId);
