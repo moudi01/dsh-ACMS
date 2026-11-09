@@ -1,5 +1,6 @@
+import { reworkDetails } from "./rework.js";
 import { assert, digest, now, SYSTEM } from "./util.js";
-import { blockerCoordinationKey } from "./blocker-policy.js";
+import { blockerCoordinationKey, ignoresBlocker } from "./blocker-policy.js";
 
 export const CAPACITY_LIMIT_CODES = new Set(["TASK_LIMIT", "AGENT_LIMIT"]);
 
@@ -28,7 +29,7 @@ export function releaseTimeBox(store, coordination, actor = SYSTEM) {
   return saved;
 }
 export function executorCoordinationKey(taskId, generation, reasonCode) { return "executor:" + taskId + ":g" + generation + ":" + reasonCode; }
-export function feedbackHashOf(output) { return digest({ summary: output?.summary ?? "", findings: Array.isArray(output?.findings) ? output.findings : [] }); }
+export function feedbackHashOf(output) { return digest({ summary: output?.summary ?? "", findings: Array.isArray(output?.findings) ? output.findings : [], ...(output?.rework ? { rework: output.rework } : {}) }); }
 
 function managerInScope(manager, goalId) {
   return !!manager && manager.role === "manager" && manager.status === "available" && (!manager.goalId || manager.goalId === goalId);
@@ -59,7 +60,7 @@ export function coordinationAuthority(company, attempt, task) {
   const store = company.store;
   const agent = store.require("agents", attempt.agentId);
   assert(attempt.role === "manager" && agent.role === "manager", "FORBIDDEN", "Only a current manager can submit a coordination decision");
-  assert(agent.status === "available", "FORBIDDEN", "Coordinator is no longer available");
+  assert(task.agentId === agent.id && agent.status === "available", "FORBIDDEN", "Coordinator is no longer available");
   assert(!agent.goalId || agent.goalId === task.goalId, "SCOPE_DENIED", "Coordinator does not belong to the task goal");
   const grants = company.effectiveGrants({ id: agent.id, grants: attempt.grants });
   assert(grants.includes("task.retry"), "FORBIDDEN", "Coordinator no longer has the task.retry grant required to release the source task");
@@ -92,15 +93,15 @@ export function createCoordination(company, source, options = {}) {
 
 export function holdSourceForCoordination(store, source, coordination) {
   const current = store.require("tasks", source.id);
-  if (["succeeded", "cancelled", "archived", "deleted"].includes(current.status)) return current;
+  if (ignoresBlocker(current) || current.status === "paused") return current;
   const dependencies = [...new Set([...(current.dependencies ?? []), coordination.id])];
   const blocker = { kind: "coordination", reason: "等待负责人协调：" + (coordination.title ?? coordination.id), resolutionTaskIds: [coordination.id] };
-  return store.put("tasks", { ...current, status: "blocked", dependencies, blocker });
+  return store.put("tasks", { ...current, status: "blocked", integrationPending: current.integrationPending || current.status === "integrating", dependencies, blocker });
 }
 
 export function releaseSource(store, coordination, options = {}) {
   const source = store.get("tasks", coordination.coordinationOf);
-  if (!source || ["succeeded", "cancelled", "archived", "deleted"].includes(source.status)) return source;
+  if (!source || ignoresBlocker(source)) return source;
   if (source.blocker?.kind !== "coordination") return source;
   const ids = source.blocker.resolutionTaskIds ?? [];
   if (!ids.includes(coordination.id)) return source;
@@ -111,15 +112,25 @@ export function releaseSource(store, coordination, options = {}) {
     return store.put("tasks", { ...source, status: paused ? "paused" : "blocked", blocker: { kind: "reworks", reason: "审查返工次数已达上限，等待用户决定是否追加额度或调整范围" } });
   }
   const reworkTasks = options.reworkTasks ?? [];
+  const integrationPending = !options.reviseDeliverable && (source.integrationPending ||
+    (coordination.origin?.blockerKind === "integration" && !!source.artifactHash));
   if (reworkTasks.length) {
     const dependencies = [...new Set([...(source.dependencies ?? []), ...reworkTasks])];
-    return store.put("tasks", { ...source, status: paused ? "paused" : "blocked", dependencies, blocker: { kind: "coordination", reason: "负责人已拆分返工任务，等待其完成", resolutionTaskIds: reworkTasks } });
+    return store.put("tasks", { ...source, status: paused ? "paused" : "blocked", integrationPending, dependencies, blocker: { kind: "coordination", reason: "负责人已拆分返工任务，等待其完成", resolutionTaskIds: reworkTasks } });
   }
-  return store.put("tasks", { ...source, status: paused ? "paused" : "ready", blocker: null });
+  const ready = source.dependencies.every(id => store.get("tasks", id)?.status === "succeeded");
+  return store.put("tasks", { ...source, status: paused ? "paused" : ready ? "ready" : "blocked", integrationPending, blocker: null, attempts: 0, retryAt: null });
 }
 
 export function releaseCoordinatedSource(engine, coordination, options = {}) {
+  const before = engine.store.get("tasks", coordination.coordinationOf);
   const released = releaseSource(engine.store, coordination, options);
+  if (released && released.revision !== before?.revision) {
+    engine.store.event("coordination.applied", coordination.id, {
+      sourceTaskId: released.id, status: released.status, dependencies: released.dependencies,
+      next: released.integrationPending ? "integration" : "execution", blocker: released.blocker,
+    }, SYSTEM, { goalId: released.goalId });
+  }
   if (released && released.status === "blocked" && released.blocker?.kind === "reworks" && !engine.store.list("interactions").some(i => i.taskId === released.id && i.status === "pending")) {
     engine.block(released, "reworks", released.blocker.reason, "审查返工次数已达上限。请回复追加的返工额度或调整范围后恢复任务。");
     return engine.store.require("tasks", released.id);
@@ -127,28 +138,18 @@ export function releaseCoordinatedSource(engine, coordination, options = {}) {
   return released;
 }
 
-export function scheduleRepairFlow(engine, task, reason) {
+export function scheduleRepairFlow(engine, task, reason, evidence) {
   const { company, store } = engine;
   return store.transaction(() => {
+    const current = store.require("tasks", task.id);
+    if (task.generation !== current.generation || ignoresBlocker(current) || current.status === "paused") return current;
+    task = current;
     // A coordination task is the bounded management entry point. If it cannot
     // complete, stop automation instead of repairing or coordinating it again.
     if (task.kind === "coordination") return engine.block(task, "technical", reason, "协调任务自身无法完成；已停止自动修复与协调递归，请负责人或 owner 直接处理该分支后恢复。");
     if ((task.repairs ?? 0) >= company.policy().maxReworks) {
-      const key = executorCoordinationKey(task.id, task.generation, "repair-limit");
-      const previous = store.list("tasks").find(t => t.kind === "coordination" && t.coordinationKey === key && t.status !== "deleted");
-      if (previous?.status === "succeeded") return engine.block(task, "repair_limit", reason, "自动修复与协调均已结束，请确认追加额度、调整范围或分派后再恢复此分支。");
-      const manager = findManager(company, task.goalId);
-      if (!canCoordinate(company, manager)) return engine.block(task, "assignment", "没有具备协调授权的负责人来处理修复上限", "请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。");
-      const coordination = (() => {
-        try { return createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调解阻：" + task.title, description: "自动修复达到上限，需要负责人决定返工范围、分派或依赖。\n问题：" + reason + "\n原任务：" + task.description }); }
-        catch (error) {
-          if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
-          return null;
-        }
-      })();
-      if (!coordination) return capacityBlock(engine, task, "repair_limit", reason, "", "自动修复达到上限，但无法创建负责人协调任务");
-      store.event("repair.limit", task.id, { reason, coordinationTaskId: coordination.id }, SYSTEM, { goalId: task.goalId });
-      return holdSourceForCoordination(store, task, coordination);
+      return coordinateBlocker(engine, task, { kind: "repair_limit", reason, evidence,
+        key: executorCoordinationKey(task.id, task.generation, "repair-limit") });
     }
     const repair = company.createTask({ goalId: task.goalId, kind: "repair", title: "解阻：" + task.title, description: "诊断并解决以下技术阻塞。输出可应用的修复文件或修复说明，原任务会自动读取交付物后继续。\n问题：" + reason + "\n原任务：" + task.description, acceptance: "给出可验证的故障原因和具体修复交付物；交付成果可由用户按需添加审查。", parentId: task.id, checkIds: [], origin: { kind: "scheduler", decidedBy: null, createdBy: "scheduler", basis: "自动解阻" } }, SYSTEM);
     store.put("tasks", { ...repair, repairOf: task.id });
@@ -158,69 +159,63 @@ export function scheduleRepairFlow(engine, task, reason) {
   });
 }
 
-export function coordinateExecutionLimit(engine, task, reason) {
-  const { company, store } = engine;
-  return store.transaction(() => {
-    const key = executorCoordinationKey(task.id, task.generation, "execution-limit");
-    const previous = store.list("tasks").find(t => t.kind === "coordination" && t.coordinationKey === key && t.status !== "deleted");
-    if (previous?.status === "succeeded") return engine.block(task, "execution_limit", reason, "自动重试与协调均已结束，请确认调整范围或分派后再恢复此分支。");
-    const manager = findManager(company, task.goalId);
-    if (!canCoordinate(company, manager)) return engine.block(task, "assignment", "没有具备协调授权的负责人来处理执行上限", "请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。");
-    const coordination = (() => {
-      try { return createCoordination(company, task, { manager, key, feedbackHash: digest({ reason }), reason, title: "协调失败处理：" + task.title, description: "任务自动重试已用完，需要负责人决定返工范围、分派或依赖。\n原因：" + reason + "\n原任务：" + task.description }); }
-      catch (error) {
-        if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
-        return null;
-      }
-    })();
-    if (!coordination) return capacityBlock(engine, task, "execution_limit", reason, "", "自动重试已用完，但无法创建负责人协调任务");
-    store.event("execution.limit", task.id, { reason, coordinationTaskId: coordination.id }, SYSTEM, { goalId: task.goalId });
-    return holdSourceForCoordination(store, task, coordination);
-  });
+export function coordinateExecutionLimit(engine, task, reason, evidence) {
+  return coordinateBlocker(engine, task, { kind: "execution_limit", reason, evidence,
+    key: executorCoordinationKey(task.id, task.generation, "execution-limit") });
 }
 
-/**
- * Route a recoverable blocker to the goal manager instead of asking the owner.
- * One coordination entry per (task generation, blocker kind); a repeated blocker
- * reuses the open entry, and a recurrence after the manager already decided is
- * handed back to the owner rather than looping automation.
- */
-export function coordinateBlocker(engine, task, { kind, reason, question = '' }) {
+// Keep one live handoff per source generation. At most two handoffs may be
+// dispatched for that generation, and each completed fact is handled once.
+export function coordinateBlocker(engine, task, { kind, reason, question = "", evidence = null, key }) {
   const { company, store } = engine;
   return store.transaction(() => {
-    const current = store.require('tasks', task.id);
-    // Pause, stop, terminal state and coordination tasks keep the previous owner path.
-    if (current.kind === 'coordination' || current.stopRequested || ['paused', 'cancelled', 'archived', 'succeeded', 'deleted'].includes(current.status)) {
-      return engine.blockForOwner(current, kind, reason, question);
-    }
-    const key = blockerCoordinationKey(current, kind);
-    const coordinations = store.list('tasks').filter(t => t.kind === 'coordination' && t.coordinationOf === current.id && t.status !== 'deleted');
-    const open = coordinations.find(t => !['succeeded', 'cancelled'].includes(t.status));
+    const current = store.require("tasks", task.id);
+    if (task.generation !== current.generation || ignoresBlocker(current)) return current;
+    if (current.kind === "coordination" || current.status === "paused") return engine.blockForOwner(current, kind, reason, question);
+    if (store.list("interactions").some(i => i.taskId === current.id && i.status === "pending")) return current;
+    const prefix = executorCoordinationKey(current.id, current.generation, "");
+    const baseKey = key ?? blockerCoordinationKey(current, kind);
+    const fact = { kind, reason, evidence };
+    const hash = digest(fact);
+    const prior = store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === current.id &&
+      t.coordinationKey?.startsWith(prefix));
+    const open = prior.find(t => ["ready", "running", "blocked", "paused"].includes(t.status));
+    const description = [
+      "自动阻塞接管。请在现有授权内确定最小恢复动作；保留原任务和有效证据。",
+      "阻塞：" + kind + "，" + reason,
+      "事实：" + JSON.stringify(evidence),
+      "原任务：" + current.description,
+    ].join("\n").slice(0, 15000);
     if (open) {
-      store.event('blocker.coordinated', current.id, { blockerKind: kind, route: 'manager', coordinationTaskId: open.id, reason, reused: true }, SYSTEM, { goalId: current.goalId });
+      if (open.feedbackHash !== hash) {
+        store.put("tasks", { ...open, description, feedbackHash: hash, blockerEvidence: fact,
+          origin: { ...open.origin, blockerKind: kind, basis: reason } });
+        store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: open.id, reason, evidence, reused: true, updated: true }, SYSTEM, { goalId: current.goalId });
+      }
+      if (current.blocker?.resolutionTaskIds?.includes(open.id) && current.status === "blocked") return current;
       return holdSourceForCoordination(store, current, open);
     }
-    if (coordinations.some(t => t.coordinationKey === key && t.status === 'succeeded')) {
-      return engine.blockForOwner(current, kind, reason, '本代任务的同类阻塞已由负责人处理过，自动接管已停止；请确认范围、分派或权限后恢复此分支。' + (question ? ' 原问题：' + question : ''));
+    const legacyHash = key ? digest({ reason }) : digest({ kind, reason });
+    if (prior.length >= 2 || prior.some(t => t.feedbackHash === hash ||
+        (t.coordinationKey === baseKey && t.feedbackHash === legacyHash) || t.status !== "succeeded")) {
+      return engine.blockForOwner(current, kind, reason, "此异常已由负责人处理过，或自动协调额度已用完；请核对条件后再恢复。" + (question ? " 原问题：" + question : ""));
     }
     const manager = findManager(company, current.goalId);
     if (!canCoordinate(company, manager)) {
-      return engine.blockForOwner(current, 'assignment', '没有具备协调授权的负责人来处理该阻塞：' + reason, '请创建或恢复当前目标（或全局）负责人，并确认其拥有 task.create 与 task.retry 授权后恢复此任务。' + (question ? ' 原问题：' + question : ''));
+      return engine.blockForOwner(current, "assignment", "没有具备协调授权的负责人来处理该阻塞：" + reason, "请确认当前目标负责人拥有 task.create 与 task.retry 授权后恢复任务。");
     }
-    const coordination = (() => {
-      try {
-        return createCoordination(company, current, {
-          manager, key, feedbackHash: digest({ kind, reason }), reason, blockerKind: kind,
-          title: '协调解阻：' + current.title,
-          description: '自动阻塞接管（' + kind + '）：负责人需在现有授权内决定重试、换分派、缩小范围或调整依赖；只有新增权限、必须由用户提供的材料、重大范围变化或真实总预算不足才升级给用户。\n阻塞原因：' + reason + '\n原任务：' + current.description
-        });
-      } catch (error) {
-        if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
-        return null;
-      }
-    })();
-    if (!coordination) return capacityBlock(engine, current, kind, reason, question, '自动阻塞接管无法创建负责人协调任务');
-    store.event('blocker.coordinated', current.id, { blockerKind: kind, route: 'manager', coordinationTaskId: coordination.id, reason }, SYSTEM, { goalId: current.goalId });
+    let coordination;
+    try {
+      coordination = createCoordination(company, current, {
+        manager, key: prior.some(t => t.coordinationKey === baseKey) ? baseKey + ":2" : baseKey,
+        feedbackHash: hash, reason, blockerKind: kind, title: "协调解阻：" + current.title, description,
+      });
+    } catch (error) {
+      if (!CAPACITY_LIMIT_CODES.has(error.code)) throw error;
+      return capacityBlock(engine, current, kind, reason, question, "自动阻塞接管无法创建负责人协调任务");
+    }
+    coordination = store.put("tasks", { ...coordination, blockerEvidence: fact });
+    store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: coordination.id, reason, evidence }, SYSTEM, { goalId: current.goalId });
     return holdSourceForCoordination(store, current, coordination);
   });
 }
@@ -231,17 +226,21 @@ export function completeCoordination(engine, task, attempt, output) {
     const current = store.require("tasks", task.id);
     coordinationAuthority(company, attempt, current);
     const source = current.coordinationOf ? store.get("tasks", current.coordinationOf) : null;
+    assert(output.resume === undefined || output.resume === "work", "INVALID_RESULT", "Omit resume to keep the current checkpoint, or use work to revise the deliverable");
+    const rework = reworkDetails(output.rework) ?? source?.reworkDetails ?? null;
+    const decision = { kind: "manager-decision", by: attempt.agentId, basis: output.summary ?? "",
+      sourceTaskId: current.coordinationOf ?? null, rework, resume: output.resume ?? "checkpoint" };
     engine.finishAttempt(attempt, "completed", output.summary);
-    const saved = store.put("tasks", { ...current, status: "succeeded", summary: output.summary ?? "", decision: { kind: "manager-decision", by: attempt.agentId, basis: output.summary ?? "", sourceTaskId: current.coordinationOf ?? null } });
+    const saved = store.put("tasks", { ...current, status: "succeeded", summary: output.summary ?? "", decision });
     const actor = { kind: "agent", id: attempt.agentId, goalId: task.goalId, grants: attempt.grants };
-    if (source) releaseCoordinatedSource(engine, saved);
+    store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf ?? null, decision }, actor, { goalId: task.goalId });
+    if (source) releaseCoordinatedSource(engine, saved, { reviseDeliverable: output.resume === "work" });
     if (current.origin?.kind === "timebox") {
       releaseTimeBox(store, saved, actor);
       // The last ordinary task may have finished while this coordination was
       // still open; release is the only remaining event, so recompute delivery.
       company.refreshGoal(task.goalId);
     }
-    store.event("coordination.decided", task.id, { sourceTaskId: task.coordinationOf ?? null, decision: { kind: "manager-decision", by: attempt.agentId, basis: output.summary ?? "" } }, actor, { goalId: task.goalId });
     return saved;
   });
 }

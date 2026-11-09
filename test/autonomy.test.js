@@ -504,3 +504,75 @@ test("a failed coordination blocks without repair or nested coordination", async
   assert.equal(f.store.list("interactions").filter(i => i.taskId === coordination.id && i.status === "pending").length, 1);
   assert.throws(() => f.store.transaction(() => createCoordination(f.company, saved, { key: "nested-coordination-key", feedbackHash: "e".repeat(64), reason: "nested" })), { code: "COORDINATION_RECURSION" });
 });
+
+
+test("small document edit has one deliverable and records excluded work", async t => {
+  const scope = { minimumOutcome: "Correct one sentence", nonGoals: ["Restructure the guide", "Create a review task"] };
+  const f = await fixture(t, async input => {
+    if (input.task.kind === "plan") {
+      assert.match(input.prompt, /Use one task when a single task can meet the acceptance criteria/);
+      return { outcome: "planned", ...scope, rationale: "The sentence can be fixed and checked in one task", tasks: [
+        { key: "edit", title: "Correct the sentence", description: "Fix one sentence in the guide", acceptance: "Corrected sentence is present" },
+      ] };
+    }
+    return defaultSimulation(input);
+  });
+  const template = f.command("workflow.publish", { name: "Plan and deliver", phases: [{ id: "plan", name: "Plan" }, { id: "execute", name: "Deliver" }] });
+  const goal = f.command("goal.create", { title: "Small document edit", description: "Correct the misleading sentence in the guide", acceptance: "The sentence matches the current behavior", projectId: f.project.id, templateId: template.id });
+  await f.start();
+  await until(() => f.store.require("goals", goal.id).status === "succeeded");
+  assert.deepEqual(f.store.list("tasks").filter(task => task.goalId === goal.id).map(task => task.kind), ["plan", "work"]);
+  assert.deepEqual(f.store.list("plans").find(plan => plan.goalId === goal.id).scope, scope);
+  assert.equal(f.adapter.calls.filter(call => call.task.goalId === goal.id).length, 2);
+});
+
+test("review findings preserve classification and fix scope in the manager contract and decision", async t => {
+  const finding = { category: "contract-conflict", evidence: "The guide and CLI report different limits", scope: "Align both documented limits with the acceptance contract", affectedEntrypoints: ["README", "CLI help"] };
+  const f = await fixture(t, async input => {
+    if (input.task.kind === "review") return { outcome: "reviewed", decision: "changes_requested", summary: "Two inconsistent limits", rework: finding };
+    if (input.task.kind === "coordination") {
+      assert.deepEqual(contractOf(input).coordination.reworkDetails, { ...finding, source: "explicit" });
+      return { outcome: "coordinated", summary: "Record affected paths", rework: finding };
+    }
+    return defaultSimulation(input);
+  });
+  const work = f.task();
+  await f.start();
+  await until(() => f.store.require("tasks", work.id).status === "succeeded");
+  f.command("review.request", { id: work.id });
+  const coordination = await until(() => f.store.list("tasks").find(task => task.coordinationOf === work.id && task.status === "succeeded"));
+  const details = { ...finding, source: "explicit" };
+  assert.deepEqual(coordination.decision.rework, details);
+  assert.deepEqual(f.store.list("verifications").find(record => record.kind === "review").rework, details);
+  assert.deepEqual(f.store.require("tasks", work.id).reworkDetails, details);
+});
+
+test("an optional review environment failure retains the delivered artifact and valid prior review", async t => {
+  let failingReviewId;
+  let failedOnce = false;
+  const f = await fixture(t, async input => {
+    if (input.task.id === failingReviewId && !failedOnce) {
+      failedOnce = true;
+      return { outcome: "blocked", kind: "technical", reason: "Review sandbox unavailable" };
+    }
+    return defaultSimulation(input);
+  });
+  f.command("policy.update", { patch: { maxAttempts: 1 } });
+  const work = f.task();
+  await f.start();
+  const delivered = await until(() => {
+    const task = f.store.require("tasks", work.id);
+    return task.status === "succeeded" && task;
+  });
+  const prior = f.command("review.request", { id: work.id });
+  await until(() => f.store.require("tasks", prior.id).status === "succeeded");
+  const evidence = f.store.list("verifications").find(record => record.kind === "review" && record.taskId === work.id);
+  const next = f.command("review.request", { id: work.id });
+  failingReviewId = next.id;
+  await until(() => f.store.require("tasks", next.id).status === "succeeded");
+  assert.equal(f.store.list("tasks").filter(task => task.coordinationOf === next.id).length, 1);
+  assert.deepEqual(f.store.require("verifications", evidence.id), evidence);
+  assert.equal(f.store.require("tasks", work.id).artifactHash, delivered.artifactHash);
+  assert.equal(f.store.require("goals", f.goal.id).status, "succeeded");
+  assert.equal(f.adapter.calls.filter(call => call.task.id === work.id).length, 1);
+});

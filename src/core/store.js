@@ -17,7 +17,7 @@ export const EFFECTIVE_ACTIVITY_EVENTS = [
   "task.stop.completed", "task.succeeded", "task.restored", "task.deleted", "task.purged",
   "attempt.claimed", "attempt.starting", "attempt.finished", "attempt.failed", "attempt.recovery", "attempt.result.recovered",
   "review.queued", "review.requested", "review.decided", "review.rework.requested", "review.rework.limit", "review.rework.gate",
-  "coordination.created", "coordination.decided", "blocker.coordinated",
+  "coordination.created", "coordination.decided", "coordination.applied", "blocker.coordinated", "task.integration.resumed",
   "interaction.answered",
 ];
 

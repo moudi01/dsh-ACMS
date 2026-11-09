@@ -14,7 +14,7 @@ function resolve(value, results) {
   return value;
 }
 
-export function runActionBatch(company, actor, { taskId, generation, batchId, actions }) {
+export function runActionBatch(company, actor, { taskId, generation, batchId, actions, rationale }) {
   const { store } = company;
   assert(actor?.kind === 'agent', 'FORBIDDEN', 'Management batches require an assigned agent');
   const manager = store.require('agents', actor.id);
@@ -42,7 +42,7 @@ export function runActionBatch(company, actor, { taskId, generation, batchId, ac
       results.push(previous ? previous.results[index] : company.command(actor, `${id}:${index}`, action.command, args));
     }
     if (previous) return previous;
-    const saved = store.put('actionBatches', { id, taskId, generation, batchId, actorId: actor.id, fingerprint, results });
+    const saved = store.put('actionBatches', { id, taskId, generation, batchId, actorId: actor.id, fingerprint, results, rationale: typeof rationale === "string" ? rationale.slice(0, 4000) : null });
     store.event('management.batch.committed', taskId, { batchId, actionCount: actions.length, resultIds: results.map(r => r.id) }, actor);
     return saved;
   });

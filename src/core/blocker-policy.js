@@ -14,11 +14,18 @@ const OWNER_ONLY_KINDS = new Set(['human', 'budget', 'reworks', 'assignment', 'p
 export function blockerRoute(task, kind) {
   if (!task || task.kind === 'coordination') return 'owner';
   if (OWNER_ONLY_KINDS.has(kind)) return 'owner';
-  if (kind === 'model-selection' || kind === 'integration') return 'manager';
-  if ((kind === 'technical' || kind === 'execution') && ['review', 'repair'].includes(task.kind)) return 'manager';
+  if (kind === 'model-selection' || kind === 'integration' || kind === 'dependency') return 'manager';
+  if ((kind === 'technical' || kind === 'execution') && ['plan', 'review', 'repair'].includes(task.kind)) return 'manager';
   return 'owner';
 }
 
 export function blockerCoordinationKey(task, kind) {
   return `executor:${task.id}:g${task.generation}:blocker:${kind}`;
+}
+
+// A failed execution can be handed off. An explicit stop or an uncertain
+// execution must settle before any blocker may change the task state.
+export function ignoresBlocker(task) {
+  return task.stopRequested || task.legacyBatch || task.workflowSnapshot ||
+    ['succeeded', 'cancelled', 'archived', 'deleted', 'stopping', 'reconciling'].includes(task.status);
 }

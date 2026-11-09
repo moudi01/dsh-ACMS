@@ -1,3 +1,4 @@
+import { reworkDetails } from "../core/rework.js";
 import { assert, id, SYSTEM } from "../core/util.js";
 import { canCoordinate, createCoordination, feedbackHashOf, findManager, reviewCoordinationKey } from "../core/coordination.js";
 
@@ -8,6 +9,14 @@ import { canCoordinate, createCoordination, feedbackHashOf, findManager, reviewC
 export async function acceptReviewFlow(engine, review, attempt, output) {
   const { store } = engine;
   assert(output.outcome === "reviewed" && ["approve", "changes_requested"].includes(output.decision), "INVALID_REVIEW", "Reviewer must return a decision");
+  if (output.decision === "changes_requested") {
+    // A recovered legacy receipt may contain only the summary and findings.
+    const rework = reworkDetails(output.rework) ?? {
+      category: "product-defect", evidence: [output.summary, ...(output.findings ?? [])].filter(Boolean).join("\n"),
+      scope: "核对审查发现并由负责人确认修复范围", affectedEntrypoints: [], source: "legacy-review",
+    };
+    output = { ...output, rework };
+  }
   if (review.reviewScope === "goal") return acceptGoalReview(engine, review, attempt, output);
   return acceptTaskReview(engine, review, attempt, output, store);
 }
@@ -22,11 +31,16 @@ async function acceptTaskReview(engine, review, attempt, output, store) {
   assert(unchanged, "ARTIFACT_CHANGED", "Reviewed files changed after delivery");
 
   store.transaction(() => {
+    engine.fenced();
+    const currentReview = store.require("tasks", review.id);
+    assert(currentReview.generation === attempt.taskGeneration && currentReview.activeAttemptId === attempt.id &&
+      !currentReview.stopRequested && ["running", "reconciling"].includes(currentReview.status),
+      "STALE_REVIEW", "Review was stopped or replaced while checking the deliverable");
     source = store.require("tasks", source.id);
     assert(source.status === "succeeded" && source.artifactHash === review.reviewArtifactHash, "STALE_REVIEW", "Deliverable changed during review");
     engine.finishAttempt(attempt, "completed", output.summary);
-    store.put("tasks", { ...review, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
-    store.put("verifications", { id: id("verification"), taskId: source.id, goalId: source.goalId, attemptId: attempt.id, artifactHash: source.artifactHash, kind: "review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [] });
+    store.put("tasks", { ...currentReview, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
+    store.put("verifications", { id: id("verification"), taskId: source.id, goalId: source.goalId, attemptId: attempt.id, artifactHash: source.artifactHash, kind: "review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [], ...(output.rework ? { rework: output.rework } : {}) });
     const actor = { kind: "agent", id: attempt.agentId, goalId: source.goalId };
     store.event("review.decided", review.id, { taskId: source.id, scope: "task", decision: output.decision, artifactHash: source.artifactHash }, actor, { goalId: source.goalId });
     if (output.decision === "approve") return;
@@ -47,7 +61,7 @@ function acceptGoalReview(engine, review, attempt, output) {
   store.transaction(() => {
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...review, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
-    store.put("verifications", { id: id("verification"), taskId: goal.id, goalId: goal.id, attemptId: attempt.id, artifactHash: review.deliveryHash, kind: "goal-review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [] });
+    store.put("verifications", { id: id("verification"), taskId: goal.id, goalId: goal.id, attemptId: attempt.id, artifactHash: review.deliveryHash, kind: "goal-review", reviewerId: attempt.agentId, passed: output.decision === "approve", summary: output.summary, findings: output.findings ?? [], ...(output.rework ? { rework: output.rework } : {}) });
     const actor = { kind: "agent", id: attempt.agentId, goalId: goal.id };
     store.event("review.decided", review.id, { goalId: goal.id, scope: "goal", decision: output.decision, deliveryHash: review.deliveryHash }, actor, { goalId: goal.id });
     if (output.decision !== "approve") {
@@ -71,7 +85,7 @@ function requestRework(engine, source, review, attempt, output, options = {}) {
   const maxReworks = company.policy().maxReworks;
   const exceeded = reworks > maxReworks;
   const feedback = [output.summary, ...(output.findings ?? [])].filter(Boolean).join("\n");
-  store.put("tasks", { ...current, reworks, feedback, reviewLimitExceeded: exceeded });
+  store.put("tasks", { ...current, reworks, feedback, reworkDetails: output.rework, reviewLimitExceeded: exceeded });
   // Rework is new work: a delivered goal returns to active before any
   // coordination/gate task is created under it.
   const goal = store.require("goals", source.goalId);
@@ -111,11 +125,12 @@ function requestRework(engine, source, review, attempt, output, options = {}) {
       "被审成果：" + source.id + (source.title ? "（" + source.title + "）" : ""),
       "审查摘要：" + (output.summary ?? ""),
       "审查发现：" + ((output.findings ?? []).join("；") || "无"),
+      "返工分类与范围：" + JSON.stringify(output.rework),
       "返工次数：" + reworks + "（上限 " + maxReworks + "）",
       "要求：在现有授权内决定返工范围；不需要返工时说明依据。审查不重开被审任务。",
     ].join("\n").slice(0, 15000),
   });
-  store.event("review.rework.requested", source.id, { reviewTaskId: review.id, reworks, maxReworks, coordinationTaskId: coordination.id }, actor, { goalId: source.goalId });
+  store.event("review.rework.requested", source.id, { reviewTaskId: review.id, reworks, maxReworks, coordinationTaskId: coordination.id, rework: output.rework }, actor, { goalId: source.goalId });
 }
 
 // When no manager can decide (or the rework ceiling is hit), create a real
