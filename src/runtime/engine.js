@@ -379,6 +379,10 @@ export class Engine {
       });
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
+      let modelContext;
+      if (agent.role === 'manager') { try { modelContext = await this.adapter.modelContext?.(task.requirements); } catch (e) { this.lastError = '无法读取模型候选：' + e.message; } }
+      controller.signal.throwIfAborted();
+      task = this.currentAttemptTask(attempt);
       preflight = await inspectEnvironment(this, task, agent);
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
@@ -390,8 +394,6 @@ export class Engine {
         attempt = this.store.put('attempts', { ...attempt, status: 'running', environment: preflight.report });
         this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
       });
-      let modelContext;
-      if (agent.role === 'manager') { try { modelContext = await this.adapter.modelContext?.(task.requirements); } catch (e) { this.lastError = '无法读取模型候选：' + e.message; } }
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
       activation = await this.adapter.start({ task, attempt, agent, routeSelection: preflight.selection, prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal, onAccepted: () => this.conversations?.accepted(attempt) });
