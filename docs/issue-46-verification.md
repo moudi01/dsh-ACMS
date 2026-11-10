@@ -3,6 +3,7 @@
 - Issue：[P2][调度] 让目标优先级影响跨目标派发并在界面显示（https://github.com/moudi01/dsh-ACMS/issues/46）
 - 仓库基线：`origin/main` `57bed91d5a53a36c5ef4e878253d9e85714a4909`（Merge pull request #59）
 - 实现提交：`1831b18`（分支 `codex/issue-46-goal-priority`）；本记录提交只补记该 SHA
+- 复核修订提交：`32a1f66`（补后续派发回归、空输入回落与文档修正；本记录提交只补记该 SHA）
 - 验证日期：2026-11-10（Asia/Shanghai）
 - 验证环境：Windows；Node.js `v24.22.0`；npm `11.19.1`；本机 Chrome（UI 检查）。未安装或升级运行中的 DSH，未调用真实模型。
 
