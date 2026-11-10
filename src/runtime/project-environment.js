@@ -203,14 +203,7 @@ function redactLog(value) {
     .replace(/(:\/\/)[^/\s]+@/g, '$1[redacted]@');
 }
 
-async function checkInputs(check, cwd, signal) {
-  // Absolute argv paths are inputs even when the owner omits them from the
-  // declaration. The declaration covers inputs hidden from argv, e.g. imports.
-  const paths = new Set(check.inputs ?? []);
-  for (const arg of check.args) {
-    const value = arg.startsWith('-') ? arg.match(/^--?[^=]+=(.*)$/s)?.[1] : arg;
-    if (value && (path.isAbsolute(value) || /^file:\/\//i.test(value) || /^\.\.[/\\]/.test(value))) paths.add(value);
-  }
+async function fingerprintCheckFiles(paths, cwd, signal) {
   const files = [];
   for (const file of paths) {
     signal?.throwIfAborted();
@@ -229,6 +222,18 @@ async function checkInputs(check, cwd, signal) {
     }
     files.push([file, entry]);
   }
+  return files;
+}
+
+async function checkInputs(check, cwd, signal) {
+  // Absolute argv paths are inputs even when the owner omits them from the
+  // declaration. The declaration covers inputs hidden from argv, e.g. imports.
+  const paths = new Set(check.inputs ?? []);
+  for (const arg of check.args) {
+    const value = arg.startsWith('-') ? arg.match(/^--?[^=]+=(.*)$/s)?.[1] : arg;
+    if (value && (path.isAbsolute(value) || /^file:\/\//i.test(value) || /^\.\.[/\\]/.test(value))) paths.add(value);
+  }
+  const files = await fingerprintCheckFiles(paths, cwd, signal);
   return { files, reusable: Array.isArray(check.inputs) && files.every(([, entry]) => entry !== null) };
 }
 
@@ -259,8 +264,11 @@ export async function verifyInCopy({ dataDir, source, inputHash, check, preparat
     assert(!identity || actual.version === identity.version, 'CHECK_INPUT_CHANGED', 'Verification command or environment changed');
     const env = await privateEnvironment(directory);
     const result = await invoke(actual.executable, check.args, cwd, { timeout: check.timeoutMs ?? 120000, signal, env, checkId: check.id });
-    const after = await checkInputs(check, cwd, signal);
-    const inputsStable = digest(after.files) === digest(actual.inputs);
+    // Unresolved paths already prevent reuse. They may be output or signal
+    // paths, so their creation does not invalidate the live command result.
+    const bound = actual.inputs.filter(([, entry]) => entry !== null);
+    const afterFiles = new Map(await fingerprintCheckFiles(bound.map(([file]) => file), cwd, signal));
+    const inputsStable = bound.every(([file, entry]) => digest(afterFiles.get(file) ?? null) === digest(entry));
     const outputs = await inputFiles(cwd, signal);
     const outputMap = new Map(outputs);
     const inputUnchanged = inputs.every(([file, hash]) => outputMap.get(file) === hash);

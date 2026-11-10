@@ -291,6 +291,13 @@ test('external script and declared file changes invalidate both cached and revie
   assert.deepEqual(await reviewChecks(), {});
   assert.equal((await collect()).checks[0].code, 2);
 
+  await writeFile(script, `require('node:fs').writeFileSync(${JSON.stringify(config)}, '{"exit":3}');`);
+  const mutatedDuringCheck = (await collect()).checks[0];
+  assert.equal(mutatedDuringCheck.code, 0);
+  assert.equal(mutatedDuringCheck.passed, false);
+  assert.match(mutatedDuringCheck.reason, /changed during execution/);
+
+  await writeFile(script, program);
   await writeJson(config, { exit: 0 });
   const unbound = { ...check };
   delete unbound.inputs;
@@ -304,5 +311,5 @@ test('external script and declared file changes invalidate both cached and revie
     assert.deepEqual(await reviewChecks(), {});
     assert.equal((await collect(spec)).checks[0].reused, undefined);
   }
-  assert.equal(invocations, 7);
+  assert.equal(invocations, 8);
 });
