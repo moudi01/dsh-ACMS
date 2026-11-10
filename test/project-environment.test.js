@@ -135,7 +135,7 @@ test('workspace-local preparation caches are isolated and invalidate on lock or 
   const f = await fixture(t);
   await writeFile(path.join(f.source, 'lock.json'), 'one');
   await writeFile(path.join(f.source, 'runtime.json'), 'v1');
-  const spec = { command: process.execPath, network: 'allow', inputs: ['lock.json', 'runtime.json'], timeoutMs: 3000,
+  const spec = { command: process.execPath, network: 'allow', inputs: ['lock.json', 'runtime.json'], externalInputs: [], timeoutMs: 3000,
     args: ['-e', "require('node:fs').mkdirSync('node_modules'); if (process.env.ACMS_FIXTURE_SECRET) process.exit(7)"] };
   const previousSecret = process.env.ACMS_FIXTURE_SECRET;
   process.env.ACMS_FIXTURE_SECRET = 'fixture-only';
@@ -159,6 +159,51 @@ test('workspace-local preparation caches are isolated and invalidate on lock or 
   assert.equal((await run(b.path)).reused, true);
   await writeFile(path.join(a.path, 'runtime.json'), 'v2');
   assert.notEqual((await run(a.path)).key, lockChange.key);
+});
+
+test('custom preparation tracks external script and config contents in the same workspace', windows, async t => {
+  const f = await fixture(t);
+  const script = path.join(f.root, 'prepare.cjs');
+  const config = path.join(f.root, 'prepare-settings.json');
+  const program = version => `
+    const fs = require('node:fs');
+    fs.mkdirSync('node_modules');
+    fs.writeFileSync('node_modules/fixture.txt', ${JSON.stringify(version)} + require(${JSON.stringify(config)}).suffix);
+  `;
+  await writeFile(path.join(f.source, 'lock.json'), 'pinned');
+  await writeFile(script, program('v1'));
+  await writeJson(config, { suffix: 'a' });
+  const { preparation } = f.command('project.save', { id: f.project.id, preparation: {
+    command: process.execPath, args: [script], inputs: ['lock.json'], externalInputs: [config], network: 'allow',
+  } });
+  const workspace = await f.workspaces.prepare(f.task(), {});
+  let invocations = 0;
+  const run = (spec = preparation) => prepareDependencies(f.dataDir, workspace.path, spec, (...args) => {
+    invocations++;
+    return runContained(...args);
+  });
+  const installed = () => readFile(path.join(workspace.path, 'node_modules', 'fixture.txt'), 'utf8');
+  const first = await run();
+  assert.equal(await installed(), 'v1a');
+  assert.equal((await run()).reused, true);
+
+  await writeFile(script, program('v2'));
+  const updatedScript = await run();
+  assert.notEqual(updatedScript.key, first.key);
+  assert.equal(await installed(), 'v2a');
+
+  await writeJson(config, { suffix: 'b' });
+  assert.notEqual((await run()).key, updatedScript.key);
+  assert.equal(await installed(), 'v2b');
+  assert.equal(invocations, 3);
+
+  const { externalInputs, ...undeclared } = preparation;
+  const missing = { ...preparation, externalInputs: [...(externalInputs ?? []), path.join(f.root, 'unavailable.json')] };
+  for (const spec of [undeclared, missing]) {
+    await run(spec);
+    assert.equal((await run(spec)).reused, undefined);
+  }
+  assert.equal(invocations, 7);
 });
 
 for (const unknown of [false, true]) test(`preparation failure reports ${unknown ? 'unknown cleanup' : 'access denied'} without launching the model`, async t => {

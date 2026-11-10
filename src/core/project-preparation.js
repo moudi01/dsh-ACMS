@@ -24,9 +24,14 @@ export function normalizePreparation(value) {
     'INVALID_INPUT', 'Preparation inputs must be relative lock or configuration files');
   if (network === 'offline-npm') assert(inputs.includes('package-lock.json') && inputs.includes('package.json'),
     'INVALID_INPUT', 'Offline npm preparation must track package-lock.json and package.json');
+  const externalInputs = value.externalInputs;
+  assert(externalInputs === undefined || (network === 'allow' && Array.isArray(externalInputs) && externalInputs.length <= 40 &&
+    externalInputs.every(file => typeof file === 'string' && path.isAbsolute(file) && file.length <= 4096 && !file.includes('\0'))),
+    'INVALID_INPUT', 'Custom preparation externalInputs must be an array of absolute file paths');
   const cacheSeed = value.cacheSeed ?? null;
   assert(cacheSeed === null || (network === 'offline-npm' && typeof cacheSeed === 'string' && path.isAbsolute(cacheSeed) && !cacheSeed.includes('\0')),
     'INVALID_INPUT', 'An offline npm cache seed must be an absolute directory');
   return { command, args, network, inputs: [...new Set(inputs)].sort(), cacheSeed,
+    ...(externalInputs === undefined ? {} : { externalInputs: [...new Set(externalInputs)].sort() }),
     timeoutMs: integer(value.timeoutMs ?? 120000, 'preparation.timeoutMs', 1, 1200000) };
 }

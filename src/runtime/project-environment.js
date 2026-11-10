@@ -82,7 +82,7 @@ export function logSummary(result) {
       classifyEnvironment({ message: combined })?.code ?? null };
 }
 
-async function lockInputs(cwd, spec) {
+async function lockInputs(cwd, spec, signal) {
   const root = await realpath(cwd);
   return Promise.all(spec.inputs.map(async file => {
     const target = path.join(root, file);
@@ -90,7 +90,7 @@ async function lockInputs(cwd, spec) {
     const relative = path.relative(root, actual);
     assert(relative === path.normalize(file) && (await lstat(target)).isFile(),
       'PREPARATION_INPUT', 'Preparation input must be a regular file inside the workspace');
-    return [file, await fileHash(target)];
+    return [file, await fileHash(target, signal)];
   }));
 }
 
@@ -158,32 +158,40 @@ export async function prepareDependencies(dataDir, cwd, spec, invoke, signal) {
     const relative = path.relative(await realpath(dataDir), root);
     assert(relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative),
       'PREPARATION_INPUT', 'Preparation requires an isolated workspace under the host data directory');
-    const inputs = await lockInputs(cwd, spec);
+    const inputs = await lockInputs(cwd, spec, signal);
     const runtime = await toolHash(spec.command);
-    const cli = spec.network === 'offline-npm' ? await toolHash(spec.args[0]) : null;
+    const commandInputs = await preparationCommandInputs(spec, cwd, signal);
     const environment = hostEnvironmentIdentity();
-    const key = digest([spec, inputs, runtime, cli, environment]);
+    const key = digest([spec, inputs, runtime, commandInputs.files, environment]);
+    const assertInputsStable = async () => {
+      assert(digest(await lockInputs(cwd, spec, signal)) === digest(inputs), 'PREPARATION_INPUT', 'Preparation inputs changed');
+      const stable = spec.network === 'offline-npm'
+        ? await toolHash(spec.args[0]) === commandInputs.files : await boundFilesStable(commandInputs.files, cwd, signal);
+      assert(stable, 'PREPARATION_INPUT', 'Preparation command inputs changed');
+    };
     const directory = path.join(dataDir, 'env', digest(cwd).slice(0, 24));
     const receipt = path.join(directory, 'prepared.json');
     const previous = await readFile(receipt, 'utf8').then(JSON.parse).catch(() => null);
     const installed = await lstat(path.join(cwd, 'node_modules')).then(stat => stat.isDirectory(), () => false);
-    if (previous?.key === key && installed && previous.dependenciesHash === digest(await inputFiles(cwd, signal, true))) {
+    if (commandInputs.reusable && previous?.key === key && installed &&
+        previous.dependenciesHash === digest(await inputFiles(cwd, signal, true))) {
+      await assertInputsStable();
       return { ...previous, reused: true };
     }
     signal?.throwIfAborted();
     const execution = path.join(directory, key.slice(0, 24));
     const env = await privateEnvironment(execution);
     const args = spec.network === 'offline-npm' ? await offlineNpm(cwd, spec, env, execution) : spec.args;
-    evidence = { ...evidence, args: redactArguments(args), key, inputs, environment };
+    evidence = { ...evidence, args: redactArguments(args), key, inputs, environment, reusable: commandInputs.reusable };
     // Do not let a partially prepared tree reuse an earlier success receipt.
     await rm(receipt, { force: true });
     await rm(path.join(root, 'node_modules'), { recursive: true, force: true, maxRetries: 4, retryDelay: 100 });
     const result = await invoke(spec.command, args, cwd, { timeout: spec.timeoutMs, signal, env, checkId: 'dependency-preparation' });
     evidence = { ...evidence, code: result.code, timedOut: result.timedOut, cleanupConfirmed: result.cleanupConfirmed, log: logSummary(result) };
     assert(result.code === 0 && !result.timedOut && result.cleanupConfirmed === true, 'PREPARATION_FAILED', 'Dependency preparation failed');
-    assert(digest(await lockInputs(cwd, spec)) === digest(inputs), 'PREPARATION_INPUT', 'Preparation changed a pinned input');
+    await assertInputsStable();
     evidence.dependenciesHash = digest(await inputFiles(cwd, signal, true));
-    await writeFile(receipt, JSON.stringify(evidence), { flush: true });
+    if (commandInputs.reusable) await writeFile(receipt, JSON.stringify(evidence), { flush: true });
     return evidence;
   } catch (error) {
     if (error.cleanupUncertain || signal?.aborted || ['STALE_RESULT', 'LEASE_LOST', 'GOAL_PAUSED', 'GOAL_CLOSED', 'PREPARATION_CHANGED'].includes(error.code)) throw error;
@@ -203,7 +211,7 @@ function redactLog(value) {
     .replace(/(:\/\/)[^/\s]+@/g, '$1[redacted]@');
 }
 
-async function fingerprintCheckFiles(paths, cwd, signal) {
+async function fingerprintFiles(paths, cwd, signal) {
   const files = [];
   for (const file of paths) {
     signal?.throwIfAborted();
@@ -225,15 +233,33 @@ async function fingerprintCheckFiles(paths, cwd, signal) {
   return files;
 }
 
+async function boundFilesStable(files, cwd, signal) {
+  const bound = files.filter(([, entry]) => entry !== null);
+  const after = await fingerprintFiles(bound.map(([file]) => file), cwd, signal);
+  return digest(after) === digest(bound);
+}
+
+function fileArguments(args, includeRelativeScripts = false) {
+  const values = args.map(arg => arg.startsWith('-') ? arg.match(/^--?[^=]+=(.*)$/s)?.[1] : arg);
+  return values.filter(value => {
+    if (!value) return false;
+    if (path.isAbsolute(value) || /^file:\/\//i.test(value) || /^\.\.[/\\]/.test(value)) return true;
+    return includeRelativeScripts && (/^\.[/\\]/.test(value) || /^[^<>:"|?*\r\n]+\.(?:[cm]?js|tsx?|py|ps1|cmd|bat|sh)$/i.test(value));
+  });
+}
+
+async function preparationCommandInputs(spec, cwd, signal) {
+  if (spec.network === 'offline-npm') return { files: await toolHash(spec.args[0]), reusable: true };
+  const paths = new Set([...(spec.externalInputs ?? []), ...fileArguments(spec.args, true)]);
+  const files = await fingerprintFiles(paths, cwd, signal);
+  return { files, reusable: Array.isArray(spec.externalInputs) && files.every(([, entry]) => entry !== null) };
+}
+
 async function checkInputs(check, cwd, signal) {
   // Absolute argv paths are inputs even when the owner omits them from the
   // declaration. The declaration covers inputs hidden from argv, e.g. imports.
-  const paths = new Set(check.inputs ?? []);
-  for (const arg of check.args) {
-    const value = arg.startsWith('-') ? arg.match(/^--?[^=]+=(.*)$/s)?.[1] : arg;
-    if (value && (path.isAbsolute(value) || /^file:\/\//i.test(value) || /^\.\.[/\\]/.test(value))) paths.add(value);
-  }
-  const files = await fingerprintCheckFiles(paths, cwd, signal);
+  const paths = new Set([...(check.inputs ?? []), ...fileArguments(check.args)]);
+  const files = await fingerprintFiles(paths, cwd, signal);
   return { files, reusable: Array.isArray(check.inputs) && files.every(([, entry]) => entry !== null) };
 }
 
@@ -241,8 +267,8 @@ export async function checkIdentity(check, cwd, preparation, signal) {
   const executable = await resolveHostExecutable(check.command, cwd);
   const binary = await toolHash(executable);
   const environment = hostEnvironmentIdentity();
-  const preparationIdentity = preparation ? digest([preparation, await lockInputs(cwd, preparation),
-    await toolHash(preparation.command), preparation.network === 'offline-npm' ? await toolHash(preparation.args[0]) : null])
+  const preparationIdentity = preparation ? digest([preparation, await lockInputs(cwd, preparation, signal),
+    await toolHash(preparation.command), (await preparationCommandInputs(preparation, cwd, signal)).files])
     : digest(await inputFiles(cwd, signal, true));
   const { files, reusable } = await checkInputs(check, cwd, signal);
   return { environment, version: digest([check, binary, preparationIdentity, environment, files]), executable, inputs: files,
@@ -266,9 +292,7 @@ export async function verifyInCopy({ dataDir, source, inputHash, check, preparat
     const result = await invoke(actual.executable, check.args, cwd, { timeout: check.timeoutMs ?? 120000, signal, env, checkId: check.id });
     // Unresolved paths already prevent reuse. They may be output or signal
     // paths, so their creation does not invalidate the live command result.
-    const bound = actual.inputs.filter(([, entry]) => entry !== null);
-    const afterFiles = new Map(await fingerprintCheckFiles(bound.map(([file]) => file), cwd, signal));
-    const inputsStable = bound.every(([file, entry]) => digest(afterFiles.get(file) ?? null) === digest(entry));
+    const inputsStable = await boundFilesStable(actual.inputs, cwd, signal);
     const outputs = await inputFiles(cwd, signal);
     const outputMap = new Map(outputs);
     const inputUnchanged = inputs.every(([file, hash]) => outputMap.get(file) === hash);
