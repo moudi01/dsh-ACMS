@@ -8,7 +8,7 @@ import { defaultProjectId, graphSections, graphLayout, hiddenDependencies } from
 import { activeViewTasks, compareActivity, completedTasks, isCompleted, orderByActivity, verificationsForTask, visibleCounts } from './display.js';
 import { goalSummary } from '../core/hierarchy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
-import { canReconcileTask, taskDeletionReason } from '../core/task-actions.js';
+import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason } from '../core/task-actions.js';
 import { entityDeletionReason } from '../core/entity-actions.js';
 import { EntityDrawer, EntityTrash, ChangeHistory, entityLabels } from './entities.jsx';
 import { ConversationWindow } from './conversation.jsx';
@@ -250,6 +250,11 @@ function Editor({ modal, data, close, act, busy, error }) {
   const [localError, setLocalError] = useState(''); const [artifact, setArtifact] = useState(null);
   useEffect(() => { if (type === 'artifact') api.artifact(value.id).then(setArtifact).catch(e => setLocalError(e.message)); }, []);
   const change = (key, value) => setForm(f => ({ ...f, [key]: value }));
+  const changesContract = type === 'goalEdit' && ['description', 'acceptance'].some(key => form[key]?.trim() !== value[key]);
+  const goalTasksUsed = changesContract ? goalTaskCount(data.tasks, value.id) : 0;
+  const goalTasksLimit = data.policy.maxTasksPerGoal;
+  const contractCapacityReason = changesContract && goalTasksUsed >= goalTasksLimit
+    ? `合同变更尚未保存。${goalContractCapacityMessage(goalTasksUsed, goalTasksLimit)}` : '';
   const answerPaused = type === 'answer' && data.tasks.find(t => t.id === value.taskId)?.status === 'paused';
   const budgetGoal = type === 'answer' && value.kind === 'budget' ? data.goals.find(g => g.id === value.goalId) : null;
   const budgetUsed = budgetGoal ? goalRuntimeSpent(budgetGoal, data.attempts) : 0;
@@ -260,6 +265,7 @@ function Editor({ modal, data, close, act, busy, error }) {
   const titles = { project: value.id ? '编辑项目' : '添加项目', goal: '新建目标', goalEdit: '编辑目标', goalCancel: '取消目标', deleteEntity: `删除${entityLabels[value.entityKind] ?? ''}`, task: '新建任务', taskEdit: '编辑任务', deleteTask: '删除任务', purgeTask: '彻底删除任务', agent: value.id ? '编辑角色' : '创建角色', workflow: value.id ? '发布目标模板新版本' : '创建目标模板', answer: '回复阻塞问题', dependencies: '调整任务依赖', policy: '公司级硬边界', artifact: '交付物预览', reconcile: '核对中断执行' };
   const submit = async e => {
     e.preventDefault(); setLocalError('');
+    if (contractCapacityReason) return;
     if (type === 'task' && !form.goalId) { setLocalError('请选择授权目标，任务必须归属于目标。'); return; }
     try {
       let command, args;
@@ -303,6 +309,6 @@ function Editor({ modal, data, close, act, busy, error }) {
     {type === 'reconcile' && <p>重新读取执行回执。身份、锁或清理状态不确定时继续保留占位；不会凭人工勾选重新派发。</p>}
     {type === 'purgeTask' && <><p>将永久清除「{value.title}」及关联审查、执行、验收和产物索引，无法恢复。项目源文件和本机工作副本不会被删除。</p><Field label="输入任务标题确认">{input('confirmTitle', value.title)}</Field></>}
     {type === 'deleteTask' && <><p>将“{value.title}”及关联审查移入回收站，停止在任务看板中显示。</p><p className="acms-sectionnote">执行记录与交付物保留，可从任务工作台的回收站恢复。</p></>}{type === 'artifact' && (artifact ? <><p>{artifact.title} · {artifact.path}</p><code className="acms-hash">SHA 标识：{artifact.hash}</code><pre className="acms-artifact-preview">{artifact.content}</pre>{artifact.truncated && <p>预览已截断；原文件完整保留。</p>}</> : <p>正在读取交付物…</p>)}
-    </div><footer><button type="button" onClick={close}>{type === 'artifact' ? '关闭' : '取消'}</button>{type !== 'artifact' && <ActionButton className={type === 'goalCancel' ? 'danger' : 'primary'} reason={busy ? '正在保存，请稍候' : type === 'agent' ? form.modelBlockReason || '' : type === 'deleteEntity' ? entityDeletionReason(value.entityKind, value, data) : budgetReason || assignmentReason || taskGoalReason} type="submit">{busy ? '正在保存…' : type === 'goal' ? '创建目标并启动' : type === 'goalCancel' ? '确认取消目标' : type === 'answer' ? answerLabel : type === 'purgeTask' ? '确认彻底删除' : ['deleteTask', 'deleteEntity'].includes(type) ? '移入回收站' : '保存'}</ActionButton>}</footer></form></Modal>;
+    </div><footer><button type="button" onClick={close}>{type === 'artifact' ? '关闭' : '取消'}</button>{type !== 'artifact' && <ActionButton className={type === 'goalCancel' ? 'danger' : 'primary'} reason={busy ? '正在保存，请稍候' : type === 'agent' ? form.modelBlockReason || '' : type === 'deleteEntity' ? entityDeletionReason(value.entityKind, value, data) : contractCapacityReason || budgetReason || assignmentReason || taskGoalReason} type="submit">{busy ? '正在保存…' : type === 'goal' ? '创建目标并启动' : type === 'goalCancel' ? '确认取消目标' : type === 'answer' ? answerLabel : type === 'purgeTask' ? '确认彻底删除' : ['deleteTask', 'deleteEntity'].includes(type) ? '移入回收站' : '保存'}</ActionButton>}</footer></form></Modal>;
 }
 export function Logo() { return <svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="9" fill="currentColor" /><path d="M8 23 16 8l8 15M12 17h8" stroke="var(--acms-bg,#fff)" strokeWidth="2.3" strokeLinejoin="round" /></svg>; }
