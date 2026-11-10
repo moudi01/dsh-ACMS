@@ -127,6 +127,7 @@ export class Engine {
       if (accepted && ['completed', 'stopped'].includes(fact.status)) {
         this.store.transaction(() => {
           this.store.put('attempts', { ...previous, status: 'completed', cleanupPending: false, cleanupUncertain: false, recovery: { status: 'cleanup-confirmed', reason: fact.reason } });
+          this.store.event('attempt.cleanup.confirmed', previous.id, { taskId: previous.taskId }, SYSTEM);
           const task = this.store.require('tasks', previous.taskId);
           if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration && task.status === 'reconciling' && previous.acceptedTaskStatus) this.store.put('tasks', { ...task, status: previous.acceptedTaskStatus });
           this.company.releaseTemporaryAgent(previous.agentId);
@@ -584,6 +585,7 @@ export class Engine {
             return;
           }
           this.store.put('attempts', { ...saved, cleanupPending: false });
+          this.store.event('attempt.cleanup.confirmed', saved.id, { taskId: saved.taskId }, SYSTEM);
           const task = this.store.require('tasks', saved.taskId);
           // Stop may arrive after acceptance while dispose is still pending.
           // Once cleanup succeeds there is no active attempt left for recover().
@@ -815,7 +817,7 @@ export class Engine {
       if (!executed && !attempt.preparingHost) task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
       this.store.put('attempts', { ...this.store.require('attempts', attempt.id), environment: report, preflightOnly: !executed });
       const finished = this.finishAttempt(attempt, executed ? 'completed' : 'failed', failures.map(f => f.reason).join('；'));
-      if (!executed) this.store.put('attempts', { ...finished, cleanupPending: false });
+      if (!executed) { this.store.put('attempts', { ...finished, cleanupPending: false }); this.store.event('attempt.cleanup.confirmed', finished.id, { taskId: task.id }, SYSTEM); }
       holdEnvironment(this, task, failures, report);
     });
   }
@@ -930,6 +932,7 @@ export class Engine {
       }
       if (staleRoute && !stopped && !this.closing) {
         this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true, cleanupPending: false });
+        this.store.event('attempt.cleanup.confirmed', attempt.id, { taskId: task.id }, SYSTEM);
         for (const notificationId of attempt.notificationIds ?? []) {
           const notification = this.store.get('notifications', notificationId);
           if (notification?.attemptId === attempt.id && notification.status === 'delivered') {
@@ -956,6 +959,7 @@ export class Engine {
       if (failure && observed && !stopped && !this.closing) {
         if (preparingWorkspace && observed.failures.length) {
           this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true, cleanupPending: false, environment: observed.report });
+          this.store.event('attempt.cleanup.confirmed', attempt.id, { taskId: task.id }, SYSTEM);
           const saved = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
           holdEnvironment(this, saved, observed.failures, observed.report);
         } else {

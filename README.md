@@ -102,6 +102,7 @@ npm run test:usability # 首次目标创建、目录浏览和剪贴板粘贴
 npm run test:structure # 层级导航、彻底删除、外部配对与手动检测
 npm run test:graph-ui # 依赖图项目/目标隔离
 npm run test:display   # 折叠默认值、已完成列表与活动排序
+npm run test:capacity  # 执行容量口径、分类占用与总览入口
 npm run build     # 生成 lib/client.js
 ```
 

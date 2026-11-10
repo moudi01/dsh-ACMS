@@ -13,11 +13,13 @@ export class Conversations {
   constructor(company, engine, adapter, dataDir) {
     this.company = company; this.store = company.store; this.engine = engine; this.adapter = adapter; this.dataDir = dataDir;
     this.jobs = new Map(); this.deliveries = new Map(); this.quarantined = new Set(); this.closing = false;
+    adapter.activeChatDetails = adapter.activeChatDetails ?? new Map();
     engine.conversations = this;
   }
   recover() {
     for (const m of this.store.list('conversationMessages').filter(m => m.role === 'user' && m.cleanupPending)) {
-      if (!this.quarantined.has(m.id)) { this.quarantined.add(m.id); this.adapter.activeChats = (this.adapter.activeChats ?? 0) + 1; }
+      if (!this.quarantined.has(m.id)) { this.quarantined.add(m.id); this.adapter.activeChats = (this.adapter.activeChats ?? 0) + 1;
+        this.adapter.activeChatDetails.set(m.id, { conversationId: m.conversationId, agentId: m.agentId, taskId: m.taskId ?? null, messageId: m.id, phase: 'cleanupPending' }); }
     }
     this.store.transaction(() => {
       for (const m of this.store.list('conversationMessages').filter(m => PENDING.includes(m.status) && !(m.taskId && m.status === 'queued'))) {
@@ -148,6 +150,7 @@ export class Conversations {
         'CHAT_CAPACITY', '执行资源已满，消息未发送；请稍后重试');
       this.adapter.activeChats = (this.adapter.activeChats ?? 0) + 1;
       jobCounted = true;
+      this.adapter.activeChatDetails.set(message.id, { conversationId: chat.id, agentId: chat.agentId, taskId: null, messageId: message.id, phase: 'chat' });
       this.update(message.id, { status: 'sending' });
       reply = this.store.transaction(() => this.save({ id: id('message'), conversationId: chat.id, agentId: chat.agentId, taskId: null,
         role: 'assistant', text: '', status: 'streaming', replyTo: message.id }));
@@ -167,10 +170,11 @@ export class Conversations {
       this.update(reply.id, { status:'completed', text:limitText(text) });
     } catch(error) {
       cleanupPending = error.cleanupUncertain === true;
-      if (cleanupPending) this.quarantined.add(message.id);
+      if (cleanupPending) { this.quarantined.add(message.id);
+        this.adapter.activeChatDetails.set(message.id, { conversationId: chat.id, agentId: chat.agentId, taskId: null, messageId: message.id, phase: 'cleanupPending' }); }
       const patch = { status:controller.signal.aborted ? 'interrupted' : 'failed', cleanupPending, error:limitText(error.message) };
       this.update(message.id, patch); if(reply) this.update(reply.id,patch);
-    } finally { clearTimeout(timer); if(jobCounted && !cleanupPending) this.adapter.activeChats--; }
+    } finally { clearTimeout(timer); if(jobCounted && !cleanupPending) { this.adapter.activeChats--; this.adapter.activeChatDetails.delete(message.id); } }
   }
   stop(conversationId) {
     this.store.require('conversations', conversationId); this.jobs.get(conversationId)?.controller.abort(new Error('所有者停止了本次回复'));

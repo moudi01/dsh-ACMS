@@ -99,3 +99,23 @@
 .acms-review-history summary{cursor:pointer;color:var(--acms-muted);font-size:12px}
 .acms-review-history-row{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:4px 0;font-size:12px}
 .acms-review-history-row small{color:var(--acms-muted)}
+
+/* Issue #47: one execution capacity source shared by overview and scheduler. */
+.acms-capacity-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:12px 0}
+.acms-capacity-summary>div{border:1px solid var(--acms-line);border-radius:8px;padding:10px 12px;display:grid;gap:2px;background:var(--acms-panel)}
+.acms-capacity-summary span{font-size:12px;color:var(--acms-fg)}
+.acms-capacity-summary strong{font-size:20px;line-height:1.2}
+.acms-capacity-summary small{font-size:11px;color:var(--acms-muted)}
+.acms-capacity-phases{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin:12px 0}
+.acms-capacity-phases>div{border:1px solid var(--acms-line);border-radius:8px;padding:8px 10px;display:grid;gap:2px;text-align:center}
+.acms-capacity-phases>div[data-empty="true"]{opacity:1;border-style:dashed}
+.acms-capacity-phases span{font-size:12px;color:var(--acms-fg)}
+.acms-capacity-phases strong{font-size:18px}
+.acms-capacity-entries{display:grid;gap:8px}
+.acms-capacity-entry{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:10px;align-items:center;text-align:left;padding:10px 12px;border:1px solid var(--acms-line);border-radius:8px;background:var(--acms-panel);width:100%}
+.acms-capacity-entry>span{font-size:11px;color:var(--acms-muted);border:1px solid var(--acms-line);border-radius:999px;padding:1px 8px}
+.acms-capacity-entry>b{overflow-wrap:anywhere;min-width:0}
+.acms-capacity-entry>em{font-style:normal;font-size:12px;color:var(--acms-accent)}
+.acms-capacity-entry>small{color:var(--acms-muted);font-size:11px;white-space:nowrap}
+.acms-capacity-entry[data-static="true"]{opacity:.8}
+@media(max-width:720px){.acms-capacity-summary{grid-template-columns:1fr 1fr}.acms-capacity-phases{grid-template-columns:repeat(3,minmax(0,1fr))}.acms-capacity-entry{grid-template-columns:minmax(0,1fr) auto}.acms-capacity-entry>span{display:none}}

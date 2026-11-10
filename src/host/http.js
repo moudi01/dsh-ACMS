@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import { assert, OWNER } from '../core/util.js';
+import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
 
 export function json(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } }); }
@@ -29,7 +30,7 @@ export function createRoutes(runtime) {
       if (input.action === 'stop') return json(runtime.conversations.stop(input.conversationId));
       assert(false, 'CHAT_ACTION', '未知会话操作');
     },
-    '/api/acms/state': async () => json({ ...company.snapshot(), runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing, lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] }, dataDir: runtime.dataDir } }),
+    '/api/acms/state': async () => json({ ...company.snapshot(), runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing, lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, capacity: executionCapacity(company.store, adapter, engine.live, company.policy()), providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] }, dataDir: runtime.dataDir } }),
     '/api/acms/directories': async request => json(await browseDirectories(new URL(request.url).searchParams.get('path') ?? '', company.policy())),
     '/api/acms/environment': async request => {
       const task = company.store.require('tasks', new URL(request.url).searchParams.get('id'));
