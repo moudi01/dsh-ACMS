@@ -4,6 +4,8 @@ import { matchesGoalContract } from '../core/goal-contract.js';
 import { ENVIRONMENT_RECOVERED_REASON } from '../core/hierarchy.js';
 import { goalStopped } from '../core/goal-control.js';
 import { inspectHost } from './preflight.js';
+import { preparationForTask } from '../core/project-preparation.js';
+import { isLiveAttempt } from '../core/entity-actions.js';
 
 export async function inspectEnvironment(engine, task, agent, previous, route) {
   const [host, runtime] = await Promise.all([
@@ -16,7 +18,7 @@ export async function inspectEnvironment(engine, task, agent, previous, route) {
     report: { host: hostReport, runtime: { ...routeReport, modelVerification }, version: digest([hostReport, routeReport]) } };
 }
 
-export function holdEnvironment(engine, task, failures, report) {
+export function holdEnvironment(engine, task, failures, report, preparationRetryVersion = null) {
   const { store } = engine;
   const previous = task.environmentBlock;
   const reason = failures.map(f => f.reason).join('；');
@@ -24,7 +26,7 @@ export function holdEnvironment(engine, task, failures, report) {
   const evidence = { failures, report, observedAt: previous?.observedAt ?? now() };
   let saved = store.put('tasks', { ...task, status: 'blocked', retryAt: null,
     blocker: task.blocker?.resolutionTaskIds?.length ? task.blocker : { kind: 'environment', reason },
-    environmentBlock: { ...evidence, handoffId: previous?.handoffId ?? null, interactionId: previous?.interactionId ?? null } });
+    environmentBlock: { ...evidence, preparationRetryVersion, handoffId: previous?.handoffId ?? null, interactionId: previous?.interactionId ?? null } });
   if (!previous) {
     saved = engine.block(saved, 'environment', reason, question, evidence);
     const handoffId = saved.blocker?.resolutionTaskIds?.[0];
@@ -124,18 +126,26 @@ export async function refreshEnvironmentGates(engine) {
     store.transaction(() => {
       const current = store.require('tasks', task.id);
       if (current.revision !== task.revision || engine.company.policy().paused || engine.closing || goalStopped(store.get('goals', task.goalId))) return;
+      if (store.list('attempts').some(attempt => attempt.taskId === task.id && isLiveAttempt(attempt))) return;
       const previous = task.environmentBlock;
-      const retryPreparation = previous.failures.some(f => f.code === 'preparation') &&
-        (current.status === 'ready' || previous.report.host.preparationVersion !== observed.report.host.preparationVersion);
-      const hasPreparation = !!store.get('projects', current.projectId)?.preparation && current.reviewScope !== 'goal';
+      const project = store.get('projects', current.projectId);
+      const version = observed.report.host.preparationVersion;
+      if (version !== digest(project?.preparation ?? null)) return;
+      const hasPreparation = !!preparationForTask(project, current);
+      const pendingPreparation = hasPreparation && previous.preparationRetryVersion === version;
+      const retryRequested = current.status === 'ready' || previous.report.host.preparationVersion !== version;
+      const retryPreparation = pendingPreparation || (retryRequested &&
+        previous.failures.some(f => f.code === 'preparation' || (hasPreparation && f.code === 'package')));
+      const retryVersion = retryPreparation && hasPreparation ? version : null;
       const unresolved = previous.failures.filter(failure => failure.code === 'preparation' ? !retryPreparation :
-        !(retryPreparation && hasPreparation && failure.code === 'package') && !verifiedAfter(failure, previous, observed.report));
-      const observedFailures = retryPreparation && hasPreparation ? observed.failures.filter(f => f.code !== 'package') : observed.failures;
+        !(retryVersion && failure.code === 'package') && !verifiedAfter(failure, previous, observed.report));
+      const observedFailures = retryVersion ? observed.failures.filter(f => f.code !== 'package') : observed.failures;
       if (!retryPreparation && previous.report.host.preparationFailure) observed.report.host.preparationFailure = previous.report.host.preparationFailure;
       const failures = [...new Map([...unresolved, ...observedFailures].map(f => [f.fingerprint, f])).values()];
       if (!failures.length) clearEnvironment(engine, task, observed.report);
-      else if (observed.report.version !== previous.report.version || digest(failures) !== digest(previous.failures)) {
-        holdEnvironment(engine, task, failures, observed.report);
+      else if (observed.report.version !== previous.report.version || digest(failures) !== digest(previous.failures) ||
+          retryVersion !== (previous.preparationRetryVersion ?? null)) {
+        holdEnvironment(engine, task, failures, observed.report, retryVersion);
       } else if (task.status === 'ready') store.put('tasks', { ...task, status: 'blocked' });
     });
   }

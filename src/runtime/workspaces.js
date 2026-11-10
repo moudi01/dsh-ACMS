@@ -118,12 +118,12 @@ export class WorkspaceManager {
     const evidence = task.checkIds.length ? this.company.store.list('verifications').filter(v => v.kind === 'checks' && v.taskId === task.id).flatMap(v => v.checks) : [];
     for (const checkId of task.checkIds) {
       const check = (task.checksSnapshot ?? project.checks).find(c => c.id === checkId); assert(check, 'UNKNOWN_CHECK', `Configured check ${checkId} is missing from the task contract`);
-      const identity = await checkIdentity(check, source, project.preparation).catch(error => {
+      const identity = await checkIdentity(check, source, project.preparation, attempt.signal).catch(error => {
         if (!project.preparation || error.code !== 'ENOENT') throw error;
         return null;
       });
-      const cached = project.preparation?.network !== 'allow' && evidence.findLast(item => item.id === check.id && item.passed && item.cleanupConfirmed === true &&
-        item.inputHash === inputHash && item.inputUnchanged === true && item.checkVersion === identity?.version);
+      const cached = identity?.reusable && evidence.findLast(item => item.id === check.id && item.reusable === true && item.passed &&
+        item.cleanupConfirmed === true && item.inputHash === inputHash && item.inputUnchanged === true && item.checkVersion === identity.version);
       checkResults.push(cached ? { ...cached, reused: true } : await verifyInCopy({ dataDir: this.dataDir, source,
         inputHash, check, preparation: project.preparation, identity, signal: attempt.signal,
         invoke: (command, args, cwd, options) => invoke(command, args, cwd, { ...options, guard }) }));
@@ -153,9 +153,13 @@ export class WorkspaceManager {
       const checks = [];
       for (const item of row.checks) {
         const check = project.checks.find(check => check.id === item.id);
-        if (!check || !item.passed || item.cleanupConfirmed !== true || item.inputHash !== inputHash || item.inputUnchanged !== true) continue;
-        const identity = await checkIdentity(check, cwd, project.preparation).catch(() => null);
-        if (identity?.version !== item.checkVersion) continue;
+        if (!check || item.reusable !== true || !item.passed || item.cleanupConfirmed !== true ||
+            item.inputHash !== inputHash || item.inputUnchanged !== true) continue;
+        const identity = await checkIdentity(check, cwd, project.preparation, signal).catch(error => {
+          signal?.throwIfAborted();
+          return null;
+        });
+        if (!identity?.reusable || identity.version !== item.checkVersion) continue;
         const { stdout, stderr, preparation, ...summary } = item;
         checks.push(summary);
       }

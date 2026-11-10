@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname, release, userInfo } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { assert, digest } from '../core/util.js';
 import { resolveHostExecutable } from './host-command.js';
@@ -202,14 +203,45 @@ function redactLog(value) {
     .replace(/(:\/\/)[^/\s]+@/g, '$1[redacted]@');
 }
 
-export async function checkIdentity(check, cwd, preparation) {
+async function checkInputs(check, cwd, signal) {
+  // Absolute argv paths are inputs even when the owner omits them from the
+  // declaration. The declaration covers inputs hidden from argv, e.g. imports.
+  const paths = new Set(check.inputs ?? []);
+  for (const arg of check.args) {
+    const value = arg.startsWith('-') ? arg.match(/^--?[^=]+=(.*)$/s)?.[1] : arg;
+    if (value && (path.isAbsolute(value) || /^file:\/\//i.test(value) || /^\.\.[/\\]/.test(value))) paths.add(value);
+  }
+  const files = [];
+  for (const file of paths) {
+    signal?.throwIfAborted();
+    let entry = null;
+    try {
+      const filename = /^file:\/\//i.test(file) ? fileURLToPath(file) : path.resolve(cwd, file);
+      const actual = await realpath(filename);
+      if ((await stat(actual)).isFile()) {
+        const relative = path.relative(cwd, actual);
+        const external = path.isAbsolute(file) || /^file:\/\//i.test(file) ||
+          relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
+        entry = [external ? actual : relative, await fileHash(actual, signal)];
+      }
+    } catch {
+      signal?.throwIfAborted();
+    }
+    files.push([file, entry]);
+  }
+  return { files, reusable: Array.isArray(check.inputs) && files.every(([, entry]) => entry !== null) };
+}
+
+export async function checkIdentity(check, cwd, preparation, signal) {
   const executable = await resolveHostExecutable(check.command, cwd);
   const binary = await toolHash(executable);
   const environment = hostEnvironmentIdentity();
   const preparationIdentity = preparation ? digest([preparation, await lockInputs(cwd, preparation),
     await toolHash(preparation.command), preparation.network === 'offline-npm' ? await toolHash(preparation.args[0]) : null])
-    : digest(await inputFiles(cwd, undefined, true));
-  return { environment, version: digest([check, binary, preparationIdentity, environment]), executable };
+    : digest(await inputFiles(cwd, signal, true));
+  const { files, reusable } = await checkInputs(check, cwd, signal);
+  return { environment, version: digest([check, binary, preparationIdentity, environment, files]), executable, inputs: files,
+    reusable: reusable && preparation?.network !== 'allow' };
 }
 
 export async function verifyInCopy({ dataDir, source, inputHash, check, preparation, identity, signal, invoke }) {
@@ -223,17 +255,21 @@ export async function verifyInCopy({ dataDir, source, inputHash, check, preparat
     assert(digest(inputs) === inputHash, 'CHECK_INPUT_CHANGED', 'Verification copy does not match its input');
     const prepared = await prepareDependencies(directory, cwd, preparation, invoke, signal);
     assert(await inputFingerprint(cwd, signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Dependency preparation changed verification input');
-    const actual = await checkIdentity(check, cwd, preparation);
+    const actual = await checkIdentity(check, cwd, preparation, signal);
     assert(!identity || actual.version === identity.version, 'CHECK_INPUT_CHANGED', 'Verification command or environment changed');
     const env = await privateEnvironment(directory);
     const result = await invoke(actual.executable, check.args, cwd, { timeout: check.timeoutMs ?? 120000, signal, env, checkId: check.id });
+    const after = await checkInputs(check, cwd, signal);
+    const inputsStable = digest(after.files) === digest(actual.inputs);
     const outputs = await inputFiles(cwd, signal);
     const outputMap = new Map(outputs);
     const inputUnchanged = inputs.every(([file, hash]) => outputMap.get(file) === hash);
     return { ...result, stdout: redactLog(result.stdout), stderr: redactLog(result.stderr), id: check.id, command: check.command, args: redactArguments(check.args), cwd,
       inputHash, outputHash: digest(outputs), inputUnchanged, environment: actual.environment, checkVersion: actual.version, preparation: prepared,
-      log: logSummary(result), passed: result.cleanupConfirmed === true && result.code === 0 && !result.timedOut && inputUnchanged,
-      ...(inputUnchanged ? {} : { reason: 'Check changed input files in the isolated copy' }) };
+      reusable: actual.reusable && inputsStable,
+      log: logSummary(result), passed: result.cleanupConfirmed === true && result.code === 0 && !result.timedOut && inputUnchanged && inputsStable,
+      ...(!inputsStable ? { reason: 'Declared or external check inputs changed during execution' }
+        : !inputUnchanged ? { reason: 'Check changed input files in the isolated copy' } : {}) };
   } catch (error) {
     retain = error.cleanupUncertain === true;
     throw error;

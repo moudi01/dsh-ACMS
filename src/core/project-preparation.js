@@ -1,6 +1,10 @@
 import path from 'node:path';
 import { assert, integer, text } from './util.js';
 
+export function preparationForTask(project, task) {
+  return ['work', 'repair', 'review'].includes(task.kind) && task.reviewScope !== 'goal' ? project?.preparation : null;
+}
+
 export function normalizePreparation(value) {
   if (value == null) return null;
   assert(typeof value === 'object' && !Array.isArray(value), 'INVALID_INPUT', 'Preparation must be an object or null');

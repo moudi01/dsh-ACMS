@@ -17,6 +17,7 @@ import { classifyEnvironment, environmentFailure } from './preflight.js';
 import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './environment-gate.js';
 import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-control.js';
 import { readCommandCleanup } from './host-command.js';
+import { preparationForTask } from '../core/project-preparation.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 const checkReceipt = (engine, commandId) => path.join(engine.workspaces.dataDir, 'check-receipts', commandId + '.json');
@@ -445,8 +446,7 @@ export class Engine {
         return;
       }
       const agent = this.store.require('agents', attempt.agentId);
-      const preparationFor = () => ['work', 'repair', 'review'].includes(task.kind) && task.reviewScope !== 'goal'
-        ? this.store.require('projects', task.projectId).preparation : null;
+      const preparationFor = () => preparationForTask(this.store.require('projects', task.projectId), task);
       const preparation = preparationFor();
       const guardPreparation = () => assert(digest(preparationFor() ?? null) === digest(preparation ?? null),
         'PREPARATION_CHANGED', 'Owner preparation configuration changed');
