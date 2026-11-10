@@ -1,5 +1,5 @@
 import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest, packageName } from './util.js';
-import { canReconcileTask, taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason, taskPurgeReason } from './task-actions.js';
 import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
 import { canCoordinate, findManager } from './coordination.js';
 import { executionOccupancy } from './execution-capacity.js';
@@ -157,14 +157,17 @@ export class Company {
     const patch = { ...args.patch }; assert(Object.keys(patch).every(k => ['title', 'description', 'acceptance'].includes(k)), 'INVALID_INPUT', '只能编辑目标标题、说明和验收标准');
     for (const [k, v] of Object.entries(patch)) patch[k] = text(v, k, k === 'title' ? 300 : 20000);
     const changed = Object.keys(patch).filter(key => patch[key] !== previous[key]);
-    if (!changed.length) {
-      assert(args.expectedRevision === undefined || args.expectedRevision === previous.revision, 'CONFLICT', '记录已变化，请刷新后重试');
-      return previous;
-    }
+    assert(args.expectedRevision === undefined || args.expectedRevision === previous.revision, 'CONFLICT', '记录已变化，请刷新后重试', { collection: 'goals', id: previous.id });
+    if (!changed.length) return previous;
     const substantive = changed.some(key => key !== 'title');
-    if (substantive) assertGoalOpen(previous);
+    if (substantive) {
+      assertGoalOpen(previous);
+      assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
+      const used = goalTaskCount(this.store.list('tasks'), previous.id);
+      const limit = this.policy().maxTasksPerGoal;
+      assert(used < limit, 'TASK_LIMIT', `合同变更未保存。${goalContractCapacityMessage(used, limit)}`, { used, limit });
+    }
     const version = contractVersion(previous);
-    if (substantive) assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
     let goal = this.store.put('goals', {
       ...previous, ...patch,
       ...(substantive ? {
@@ -202,7 +205,7 @@ export class Company {
   }
   ensureGoalContractCoordination(goal) {
     if (goalStopped(goal) || goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived'].includes(goal.status)) return goal;
-    if (this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length >= this.policy().maxTasksPerGoal) return goal;
+    if (goalTaskCount(this.store.list('tasks'), goal.id) >= this.policy().maxTasksPerGoal) return goal;
     const manager = findManager(this, goal.id);
     const task = this.createTask({
       goalId: goal.id, kind: 'coordination', title: `确认目标合同 v${contractVersion(goal)}`,
@@ -236,7 +239,7 @@ export class Company {
       (actor.kind === 'system' && evidenceTask), 'GOAL_CLOSED', 'Goal is closed');
     assert(this.store.require('projects', goal.projectId).status !== 'deleted', 'ENTITY_DELETED', '请先恢复项目');
     const p = this.policy();
-    assert(this.store.list('tasks').filter(t => t.goalId === goal.id && t.status !== 'deleted').length < p.maxTasksPerGoal, 'TASK_LIMIT', 'Goal task limit reached');
+    assert(goalTaskCount(this.store.list('tasks'), goal.id) < p.maxTasksPerGoal, 'TASK_LIMIT', 'Goal task limit reached');
     assert(['work', 'plan', 'repair', 'review', 'coordination'].includes(kind), 'INVALID_INPUT', 'Invalid task kind');
     assert(actor.kind === 'system' || kind === 'work', 'SYSTEM_TASK', 'Internal task kinds are created by the engine');
     if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'reviewedTaskGeneration', 'reviewedContractVersion', 'reviewScope', 'reviewTargets', 'deliveryHash', 'requestedBy', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);

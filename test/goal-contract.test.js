@@ -12,6 +12,84 @@ const assessment = (reason, reuse = [], followUps = []) => ({ reason, reuse, fol
 const completed = (f, goalId) => until(() => f.store.require('goals', goalId).status === 'succeeded');
 const contractTasks = (f, goalId) => f.store.list('tasks').filter(task => task.goalId === goalId && task.origin?.kind === 'goal-contract');
 
+test('a full goal keeps its approved contract until a slot opens for one confirmation', async t => {
+  const f = await fixture(t, input => input.task.origin?.kind === 'goal-contract'
+    ? { outcome: 'blocked', kind: 'human', reason: 'Fixture holds contract confirmation open', question: 'Confirm the revised requirements?' }
+    : defaultSimulation(input));
+  f.command('policy.update', { patch: { maxTasksPerGoal: 2 } });
+  const goal = f.command('goal.create', { title: 'Reviewed goal', description: 'Deliver one file', acceptance: 'Original acceptance', projectId: f.project.id, plan: false });
+  f.task({ goalId: goal.id });
+  await f.start();
+  await completed(f, goal.id);
+  await f.engine.stop();
+
+  const reviewedTasks = f.store.list('tasks').filter(task => task.goalId === goal.id);
+  assert.deepEqual(reviewedTasks.map(task => [task.kind, task.status]), [['work', 'succeeded'], ['review', 'succeeded']]);
+  const approval = f.store.list('verifications').find(row => row.kind === 'goal-review' && row.taskId === goal.id);
+  assert.ok(approval);
+  const renamed = f.command('goal.edit', { id: goal.id, patch: { title: 'Renamed goal', acceptance: goal.acceptance } });
+  assert.equal(renamed.contractVersion, 1);
+  assert.equal(renamed.status, 'succeeded');
+  assert.deepEqual(f.command('goal.edit', { id: goal.id, patch: { acceptance: goal.acceptance } }), renamed);
+
+  const edit = { id: goal.id, patch: { title: 'Revised goal', acceptance: 'Revised acceptance' }, expectedRevision: renamed.revision };
+  const save = () => f.command('goal.edit', edit, OWNER, 'retry-contract-edit');
+  const capacityError = { code: 'TASK_LIMIT', message: /未保存.*每个目标任务上限/, details: { used: 2, limit: 2 } };
+  assert.throws(save, capacityError);
+  assert.throws(save, capacityError);
+  assert.deepEqual(f.store.require('goals', goal.id), renamed);
+  assert.deepEqual(f.store.list('tasks').filter(task => task.goalId === goal.id), reviewedTasks);
+  assert.deepEqual(f.store.require('verifications', approval.id), approval);
+  assert.equal(f.company.deliveryHash(goal.id), renamed.completedDeliveryHash);
+
+  f.command('policy.update', { patch: { maxTasksPerGoal: 3 } });
+  const updated = save();
+  assert.equal(updated.contractVersion, 2);
+  assert.equal(updated.contractChange.status, 'pending');
+  assert.equal(updated.completedDeliveryHash, renamed.completedDeliveryHash);
+  assert.deepEqual(save(), updated);
+  assert.equal(f.command('goal.edit', { id: goal.id, patch: edit.patch }).contractChange.coordinationTaskId, updated.contractChange.coordinationTaskId);
+  assert.deepEqual(contractTasks(f, goal.id).map(task => task.id), [updated.contractChange.coordinationTaskId]);
+
+  f.command('policy.update', { patch: { maxTasksPerGoal: 4 } });
+  const ordinary = f.task({ goalId: goal.id, title: 'Ordinary work under the revised contract' });
+  await f.start();
+  await until(() => f.store.list('interactions').some(row => row.taskId === updated.contractChange.coordinationTaskId && row.status === 'pending'));
+  await f.engine.tick();
+  assert.deepEqual(contractTasks(f, goal.id).map(task => task.id), [updated.contractChange.coordinationTaskId]);
+  assert.equal(f.store.require('goals', goal.id).contractChange.status, 'pending');
+  assert.equal(f.store.require('tasks', ordinary.id).status, 'ready');
+  assert.ok(!f.store.list('attempts').some(attempt => attempt.taskId === ordinary.id));
+  assert.deepEqual(f.store.require('verifications', approval.id), approval);
+});
+
+test('a previously saved contract waiting for a task slot resumes once after capacity increases', async t => {
+  const f = await fixture(t, () => ({ outcome: 'blocked', kind: 'human', reason: 'Fixture holds contract confirmation open', question: 'Confirm the revised requirements?' }));
+  f.command('policy.update', { patch: { maxTasksPerGoal: 1 } });
+  const task = f.task();
+  const goal = f.store.require('goals', f.goal.id);
+  f.store.transaction(() => {
+    f.store.put('goals', { ...goal, acceptance: 'Previously saved revised acceptance', contractVersion: 2,
+      contractChange: { fromVersion: 1, status: 'pending', coordinationTaskId: null,
+        previous: { description: goal.description, acceptance: goal.acceptance } } });
+    f.store.put('tasks', { ...task, goalContractVersion: 2 });
+  });
+  await f.start();
+  await f.engine.tick();
+  assert.deepEqual(contractTasks(f, goal.id), []);
+  assert.equal(f.store.require('tasks', task.id).status, 'ready');
+
+  f.command('policy.update', { patch: { maxTasksPerGoal: 2 } });
+  const confirmation = await until(() => f.store.require('goals', goal.id).contractChange.coordinationTaskId);
+  await until(() => f.store.list('interactions').some(row => row.taskId === confirmation && row.status === 'pending'));
+  await f.engine.stop();
+  await f.start();
+  await f.engine.tick();
+  assert.deepEqual(contractTasks(f, goal.id).map(task => task.id), [confirmation]);
+  assert.equal(f.store.require('goals', goal.id).contractVersion, 2);
+  assert.deepEqual(f.store.list('attempts').map(attempt => attempt.taskId), [confirmation]);
+});
+
 test('in-memory legacy delivery keeps its title-only approval and requires one assessment after an acceptance edit', async t => {
   const store = new Store(':memory:');
   t.after(() => store.close());

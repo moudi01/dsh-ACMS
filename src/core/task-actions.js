@@ -2,6 +2,14 @@
 // receipt refresh available for persisted stop intents without a live host.
 export const integrationPending = record => ['preparing', 'checking', 'applying', 'reconciling'].includes(record.phase);
 
+export function goalTaskCount(tasks, goalId) {
+  return tasks.filter(task => task.goalId === goalId && task.status !== 'deleted').length;
+}
+
+export function goalContractCapacityMessage(used, limit) {
+  return `目标任务名额已满（已用 ${used} 项，上限 ${limit} 项）。请在「公司设置 → 编辑边界」调高「每个目标任务上限」，为合同确认留出一个名额。`;
+}
+
 export function canReconcileTask(task, attempts) {
   return task.status === 'reconciling' || (task.status === 'stopping' && (!!task.activeIntegrationId || attempts.some(a => a.taskId === task.id
     && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending))));
