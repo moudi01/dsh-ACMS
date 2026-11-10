@@ -65,7 +65,7 @@ const REQUEST_SCHEMAS = {
     },
   },
 };
-const OPERATIONS = ["GET /discover", "GET /status", "GET /projects", "GET /projects/{id}", "GET /goals", "GET /goals/{id}", "GET /tasks", "GET /tasks/{id}", "GET /reviews", "GET /blockers", "GET /events", "POST /goals", "POST /projects", "POST /interactions/{id}/answer", "POST /tasks/{id}/pause", "POST /tasks/{id}/resume", ...GOAL_CONTROL_COMMANDS.map(command => "POST /goals/{id}/" + command.slice(5))];
+const OPERATIONS = ["GET /discover", "GET /status", "GET /projects", "GET /projects/{id}", "GET /goals", "GET /goals/{id}", "GET /tasks", "GET /tasks/{id}", "GET /artifacts/{id}", "GET /reviews", "GET /blockers", "GET /events", "POST /goals", "POST /projects", "POST /interactions/{id}/answer", "POST /tasks/{id}/pause", "POST /tasks/{id}/resume", ...GOAL_CONTROL_COMMANDS.map(command => "POST /goals/{id}/" + command.slice(5))];
 
 function validateExternalKey(value, label = "Idempotency key") {
   assert(typeof value === "string", "INVALID_REQUEST", label + " must be a string");
@@ -189,6 +189,7 @@ export const ERROR_STATUS = {
   NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405,
   CONFLICT: 409, IDEMPOTENCY_CONFLICT: 409, REVISION_CONFLICT: 409, ACTIVE_LIMIT: 409, TASK_ACTIVE: 409, TASK_CLOSED: 409, WAITING_INPUT: 409, INVALID_TRANSITION: 409, INTERACTION_STALE: 409, GOAL_BUDGET_EXHAUSTED: 409, GOAL_PAUSED: 409, GOAL_CLOSED: 409, ALREADY_ANSWERED: 409, AGENT_RETIRED: 409, ENTITY_DELETED: 409, DELETE_BLOCKED: 409, PROJECT_IN_USE: 409,
   ENGINE_BUSY: 503, SHUTTING_DOWN: 503, LEASE_LOST: 503,
+  ARTIFACT_MISSING: 410, ARTIFACT_CORRUPT: 409, ARTIFACT_TOO_LARGE: 413,
 };
 
 function assertCredentialCommand(credential, command) {
@@ -443,6 +444,23 @@ async function dispatch(runtime, state, request, context) {
   if (parts.length === 3 && parts[0] === "interactions" && parts[2] === "answer") {
     assert(method === "POST", "METHOD_NOT_ALLOWED", "POST required for this endpoint");
     return answerRequest(runtime, credential, request, context, parts[1]);
+  }
+  if (parts.length === 2 && parts[0] === "artifacts") {
+    assert(method === "GET", "METHOD_NOT_ALLOWED", "GET required for this endpoint");
+    assertCredentialCommand(credential, "status.read");
+    const artifact = company.store.get("artifacts", parts[1]);
+    assert(artifact, "NOT_FOUND", "Artifact not found");
+    const task = company.store.get("tasks", artifact.taskId);
+    assert(task && task.status !== "deleted", "NOT_FOUND", "Artifact task not found");
+    const goal = company.store.get("goals", task.goalId);
+    assert(goal && goalAllowed(credential, goal, { write: false }), "SCOPE_DENIED", "Requested artifact is outside this credential scope");
+    const limit = company.policy().maxArtifactBytes;
+    assert(Number.isFinite(artifact.bytes) && artifact.bytes <= limit, "ARTIFACT_TOO_LARGE", "Artifact exceeds the company size limit");
+    let bytes;
+    try { bytes = await fs.readFile(artifact.blob); } catch { throw new AcmsError("ARTIFACT_MISSING", "Artifact blob is missing"); }
+    assert(bytes.length === artifact.bytes, "ARTIFACT_CORRUPT", "Artifact byte count does not match its record");
+    return { value: { artifact: artifactView(artifact), goalId: goal.id, taskId: task.id, size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"), encoding: "base64", content: bytes.toString("base64") } };
   }
   if (parts.length === 1 && parts[0] === "reviews") return read(() => reviewsValue(company, resolveGoal(company, credential, goalParam(), "status.read")));
   if (parts.length === 1 && parts[0] === "blockers") return read(() => blockersValue(company, resolveGoal(company, credential, goalParam(), "status.read")));

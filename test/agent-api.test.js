@@ -7,7 +7,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Store } from "../src/core/store.js";
 import { Company } from "../src/core/domain.js";
@@ -765,4 +765,41 @@ test("goal scope is the union of configured goals and goals the credential submi
   const denied = await f.call("/status?goalId=" + f.otherGoal.id, { token: c.token });
   assert.equal(denied.status, 403);
   assert.equal(denied.body.error.code, "SCOPE_DENIED");
+});
+
+async function putAgentArtifact(f, goal, id, bytes) {
+  const task = f.owner("task.create", { goalId: goal.id, title: "Artifact " + id, description: "x", acceptance: "x" });
+  const blob = path.join(f.dataDir, "artifacts", id);
+  await mkdir(path.dirname(blob), { recursive: true });
+  await writeFile(blob, bytes);
+  return f.store.put("artifacts", { id, taskId: task.id, attemptId: "attempt_" + id, path: "交付/中文 文件.txt", title: "交付", hash: "acms-base64-digest", bytes: bytes.length, blob });
+}
+
+test("artifact read returns authorized raw bytes with digests and rejects other scopes or revoked credentials", async t => {
+  const f = await apiFixture(t);
+  const bytes = Buffer.from([0, 255, 1, 2, 65, 0]);
+  const artifact = await putAgentArtifact(f, f.goal, "artifact_agent_read", bytes);
+  const c = f.credential({ goalIds: [f.goal.id] });
+  const read = await f.call("/artifacts/" + artifact.id, { token: c.token });
+  assert.equal(read.status, 200);
+  assert.equal(read.body.value.taskId, artifact.taskId);
+  assert.equal(read.body.value.goalId, f.goal.id);
+  assert.equal(read.body.value.size, bytes.length);
+  assert.equal(read.body.value.encoding, "base64");
+  assert.equal(read.body.value.sha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.deepEqual(Buffer.from(read.body.value.content, "base64"), bytes);
+
+  const sibling = f.owner("goal.create", { title: "Sibling goal", description: "x", acceptance: "x", projectId: f.project.id, plan: false });
+  const siblingArtifact = await putAgentArtifact(f, sibling, "artifact_sibling_goal", Buffer.from([9]));
+  const crossGoal = await f.call("/artifacts/" + siblingArtifact.id, { token: c.token });
+  assert.equal(crossGoal.status, 403);
+  assert.equal(crossGoal.body.error.code, "SCOPE_DENIED");
+
+  const revoked = f.credential({ goalIds: [f.goal.id] });
+  f.owner("agentCredential.revoke", { credentialId: revoked.credential.id, expectedRevision: revoked.credential.revision });
+  const unauthorized = await f.call("/artifacts/" + artifact.id, { token: revoked.token });
+  assert.equal(unauthorized.status, 401);
+
+  const missing = await f.call("/artifacts/artifact_absent", { token: c.token });
+  assert.equal(missing.status, 404);
 });

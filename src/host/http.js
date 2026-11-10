@@ -1,7 +1,26 @@
 import { promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { assert, OWNER } from '../core/util.js';
 import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
+
+const DOWNLOAD_MIME = {
+  '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.pdf': 'application/pdf', '.zip': 'application/zip',
+};
+function downloadName(value) {
+  const base = String(value ?? '').split(/[\\/]/).pop() || 'artifact';
+  return base.replace(/[\u0000-\u001f\u007f"]/g, '_');
+}
+function contentDisposition(name) {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'artifact';
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+function downloadMime(value) {
+  const extension = String(value ?? '').toLowerCase().match(/\.[a-z0-9]+$/)?.[0];
+  return DOWNLOAD_MIME[extension] ?? 'application/octet-stream';
+}
 
 export function json(value, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } }); }
 async function body(request) {
@@ -77,10 +96,30 @@ export function createRoutes(runtime) {
       const bytes = await fs.readFile(artifact.blob);
       return json({ ...artifact, content: bytes.subarray(0, 262144).toString('utf8'), truncated: bytes.length > 262144 });
     },
+    '/api/acms/artifact/download': async request => {
+      const artifactId = new URL(request.url).searchParams.get('id');
+      assert(artifactId, 'INVALID_INPUT', 'Artifact id is required');
+      const artifact = company.store.get('artifacts', artifactId);
+      assert(artifact, 'NOT_FOUND', 'Artifact not found');
+      const limit = company.policy().maxArtifactBytes;
+      assert(Number.isFinite(artifact.bytes) && artifact.bytes <= limit, 'ARTIFACT_TOO_LARGE', 'Artifact exceeds the company size limit');
+      let bytes;
+      try { bytes = await fs.readFile(artifact.blob); }
+      catch { assert(false, 'ARTIFACT_MISSING', 'Artifact blob is missing'); }
+      assert(bytes.length === artifact.bytes, 'ARTIFACT_CORRUPT', `Artifact byte count mismatch: expected ${artifact.bytes}, found ${bytes.length}`);
+      assert(bytes.length <= limit, 'ARTIFACT_TOO_LARGE', 'Artifact exceeds the company size limit');
+      const filename = downloadName(artifact.path);
+      return new Response(bytes, { status: 200, headers: {
+        'content-type': downloadMime(artifact.path), 'content-length': String(bytes.length),
+        'content-disposition': contentDisposition(filename), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+        'x-acms-artifact-id': artifact.id, 'x-acms-artifact-hash': String(artifact.hash ?? ''),
+        'x-acms-artifact-sha256': createHash('sha256').update(bytes).digest('hex'), 'x-acms-artifact-bytes': String(bytes.length),
+      } });
+    },
   };
   return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
     try { return await handler(request); } catch (e) {
-      const status = ['NOT_FOUND'].includes(e.code) ? 404 : ['CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT'].includes(e.code) ? 409 : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED'].includes(e.code) ? 403 : 400;
+      const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : e.code === 'ARTIFACT_CORRUPT' ? 409 : ['NOT_FOUND'].includes(e.code) ? 404 : ['CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT'].includes(e.code) ? 409 : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);
     }
   } }));

@@ -59,6 +59,7 @@
     "test:display": "node scripts/display-defaults-ui-test.mjs",
     "test:capacity": "node scripts/capacity-ui-test.mjs",
     "test:goal-priority": "node scripts/goal-priority-ui-test.mjs",
+    "test:artifact-download": "node scripts/artifact-download-ui-test.mjs",
     "test:review-recovery": "node scripts/review-recovery-ui-test.mjs",
     "test:empty-models": "node scripts/empty-models-test.mjs",
     "test:pairing-ui": "node scripts/pairing-ui-test.mjs",
