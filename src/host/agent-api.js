@@ -211,7 +211,7 @@ function resolveGoal(company, credential, goalIdParam, command) {
 function goalView(goal) {
   return { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance, projectId: goal.projectId, status: goal.status, contractVersion: contractVersion(goal),
     completedContractVersion: goal.completedContractVersion ?? (goal.status === 'succeeded' ? contractVersion(goal) : null), executionControl: goal.executionControl ?? null,
-    contractChange: goal.contractChange ?? null, supersededTaskIds: goal.supersededTaskIds ?? [], templateId: goal.templateId ?? 'base', templateVersion: goal.templateSnapshot?.version ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: goal.priority ?? null, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
+    contractChange: goal.contractChange ?? null, supersededTaskIds: goal.supersededTaskIds ?? [], templateId: goal.templateId ?? 'base', templateVersion: goal.templateSnapshot?.version ?? null, constraints: goal.constraints ?? [], source: goal.source ?? null, priority: Number.isInteger(goal.priority) ? goal.priority : 50, createdAt: goal.createdAt, updatedAt: goal.updatedAt, revision: goal.revision };
 }
 function projectView(project) {
   return { id: project.id, name: project.name, repoRoot: project.repoRoot, mode: project.mode, checks: project.checks ?? [], autoMerge: project.autoMerge === true, status: project.status, source: project.source ?? null, createdAt: project.createdAt, updatedAt: project.updatedAt };

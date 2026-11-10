@@ -60,7 +60,7 @@ function normalizeConstraints(value) {
 
 export function submitGoal(company, args, actor, context = {}) {
   const constraints = normalizeConstraints(args.constraints);
-  const priority = args.priority === undefined ? 0 : args.priority;
+  const priority = args.priority === undefined ? 50 : args.priority;
   assert(Number.isSafeInteger(priority) && priority >= 0 && priority <= 100, "INVALID_INPUT", "priority must be an integer between 0 and 100");
   const source = { kind: "user-agent", principalId: actor.id, onBehalfOf: clone(actor.onBehalfOf), requestId: context.externalKey ?? context.internalRequestId ?? "internal", submittedAt: now(), transport: context.transport ?? "http-loopback" };
   const goal = company.createGoalRecord({ ...args, priority }, actor, { source, constraints });

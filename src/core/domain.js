@@ -154,12 +154,12 @@ export class Company {
   editGoal(args, actor) {
     this.owner(actor); const previous = this.store.require('goals', args.id);
     assert(previous.status !== 'deleted', 'ENTITY_DELETED', '请先恢复目标');
-    const patch = { ...args.patch }; assert(Object.keys(patch).every(k => ['title', 'description', 'acceptance'].includes(k)), 'INVALID_INPUT', '只能编辑目标标题、说明和验收标准');
-    for (const [k, v] of Object.entries(patch)) patch[k] = text(v, k, k === 'title' ? 300 : 20000);
+    const patch = { ...args.patch }; assert(Object.keys(patch).every(k => ['title', 'description', 'acceptance', 'priority'].includes(k)), 'INVALID_INPUT', '只能编辑目标标题、说明、验收标准和优先级');
+    for (const [k, v] of Object.entries(patch)) patch[k] = k === 'priority' ? integer(v, 'priority', 0, 100) : text(v, k, k === 'title' ? 300 : 20000);
     const changed = Object.keys(patch).filter(key => patch[key] !== previous[key]);
     assert(args.expectedRevision === undefined || args.expectedRevision === previous.revision, 'CONFLICT', '记录已变化，请刷新后重试', { collection: 'goals', id: previous.id });
     if (!changed.length) return previous;
-    const substantive = changed.some(key => key !== 'title');
+    const substantive = changed.some(key => !['title', 'priority'].includes(key));
     if (substantive) {
       assertGoalOpen(previous);
       assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
@@ -222,7 +222,7 @@ export class Company {
     assert(this.store.require("projects", args.projectId).status !== "deleted", "ENTITY_DELETED", "请先恢复项目");
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const constraints = options.constraints ?? [];
-    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}), ...(args.priority !== undefined ? { priority: integer(args.priority, "priority", 0, 100) } : {}) });
+    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
     if (args.plan !== false) { const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId); assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色'); this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description, kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM); }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }

@@ -232,7 +232,11 @@ export class Engine {
       }
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
-      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.environmentBlock && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => (['plan', 'review', 'coordination'].includes(b.kind) - ['plan', 'review', 'coordination'].includes(a.kind)) || b.priority - a.priority || a.createdAt.localeCompare(b.createdAt));
+      const goalPriority = new Map(this.store.list('goals').map(goal => [goal.id, Number.isInteger(goal.priority) ? goal.priority : 50]));
+      const taskPriority = task => Number.isInteger(task.priority) ? task.priority : 50;
+      const controlRank = task => ['plan', 'review', 'coordination'].includes(task.kind) ? 1 : 0;
+      const ready = this.store.list('tasks').filter(t => t.status === 'ready' && !t.environmentBlock && !t.stopRequested && !t.legacyBatch && !t.workflowSnapshot && (!t.retryAt || t.retryAt <= Date.now())).sort((a, b) => controlRank(b) - controlRank(a) || taskPriority(b) - taskPriority(a) ||
+        (goalPriority.get(b.goalId) ?? 50) - (goalPriority.get(a.goalId) ?? 50) || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
         if (active.some(a => a.taskId === task.id)) continue;

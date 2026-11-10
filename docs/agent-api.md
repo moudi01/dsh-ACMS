@@ -110,7 +110,7 @@
 
 ### 4.1 目标提交
 
-`POST /goals` 的请求体为 `GoalSubmitRequest`：`title`、`description`、`acceptance`、`projectId` 必填；`constraints`（最多 20 项，`{key,text}`）与 `priority`（0–100）可选；`requestId` 为传输幂等字段。创建的目标写入 `source={kind:"user-agent", principalId, onBehalfOf, requestId, submittedAt, transport}`，并写一条 `goal.submitted` 审计事件（`decision.kind=user-constraint`）。返回 `{goalId, planTaskId, cursor}`。
+`POST /goals` 的请求体为 `GoalSubmitRequest`：`title`、`description`、`acceptance`、`projectId` 必填；`constraints`（最多 20 项，`{key,text}`）与 `priority`（0–100，默认 50）可选；`requestId` 为传输幂等字段。创建的目标写入 `source={kind:"user-agent", principalId, onBehalfOf, requestId, submittedAt, transport}`，并写一条 `goal.submitted` 审计事件（`decision.kind=user-constraint`）。返回 `{goalId, planTaskId, cursor}`。目标响应中的 `priority` 对缺少该字段的旧目标按 50 返回。
 
 ### 4.2 响应 envelope
 
