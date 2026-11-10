@@ -64,11 +64,17 @@ export class Engine {
       try {
         const check = pending.hostCheck;
         const cleanup = check ? await readCommandCleanup(checkReceipt(this, check.id)) : null;
-        if (check && cleanup) await this.clearHostCheck(pending.id, check.id);
-        fact = check && !cleanup
-          ? { status: 'unknown', reason: `宿主检查 ${check.checkId} 的进程树清理尚未确认`, actions: ['refresh-receipt', 'inspect-execution'] }
-          : pending.deferredReplayAt ? { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' } :
-          await this.adapter.reconcile?.(pending) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
+        if (check && cleanup) await this.clearHostCheck(pending.id, check.id, cleanup);
+        const saved = this.store.require('attempts', pending.id);
+        if (saved.hostCheck) {
+          fact = { status: 'unknown', reason: `宿主检查 ${saved.hostCheck.checkId} 的进程树清理尚未确认`, actions: ['refresh-receipt', 'inspect-execution'] };
+        } else if (saved.deferredReplayAt) {
+          fact = saved.hostCheckCleanup?.replayAt === saved.deferredReplayAt
+            ? { status: 'stopped', cleanupConfirmed: true, reason: `已核实回放期间宿主检查 ${saved.hostCheckCleanup.checkId} 的清理回执` }
+            : { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' };
+        } else {
+          fact = await this.adapter.reconcile?.(saved) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
+        }
       }
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
       this.fenced();
@@ -87,10 +93,14 @@ export class Engine {
           (!currentTask.stopRequested || currentTask.stopRequested === 'paused')) {
         this.store.transaction(() => {
           this.store.put('attempts', { ...previous, status: 'completed', resultAccepted: false,
-            cleanupPending: false, cleanupUncertain: false, recovery: { status: 'cleanup-confirmed', reason: fact.reason } });
+            deferredReplayAt: null, cleanupPending: false, cleanupUncertain: false,
+            recovery: { status: 'cleanup-confirmed', reason: fact.reason } });
           if (currentTask.status === 'reconciling' || currentTask.stopRequested === 'paused') {
-            // Retain the pause owner. Only releaseGoalPauses can lift a goal-owned hold.
-            this.store.put('tasks', { ...currentTask, status: 'paused', stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+            const replayReady = previous.deferredReplayAt && !currentTask.stopRequested && !currentTask.goalPauseId;
+            this.store.put('tasks', { ...currentTask, status: replayReady ? 'ready' : 'paused',
+              stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+          } else if (previous.deferredReplayAt && currentTask.status === 'running') {
+            this.store.put('tasks', { ...currentTask, status: 'ready' });
           }
           this.store.event('attempt.recovery', previous.id, { taskId: previous.taskId, fact }, SYSTEM);
         });
@@ -413,7 +423,7 @@ export class Engine {
         const recoveredStop = previous.status === 'interrupted' && previous.recovery?.status === 'stopped' && previous.recovery.cleanupConfirmed === true;
         if (previous.status !== 'completed' && !recoveredStop) return null;
         this.store.put('tasks', { ...current, status: 'running' });
-        return this.store.put('attempts', { ...previous, status: 'running', deferredReplayAt: now() });
+        return this.store.put('attempts', { ...previous, status: 'running', deferredReplayAt: now(), hostCheckCleanup: null });
       }
       const attemptId = id('attempt'); const contextKey = `acms:${task.goalId}:${task.id}:role-${agent.role}:${agent.id}:g${task.generation}`;
       const notificationIds = this.store.list('notifications').filter(n => n.agentId === agent.id && n.status === 'pending').slice(0, 100).map(n => n.id);
@@ -585,11 +595,15 @@ export class Engine {
       if (!parked) return this.accept(attempt, output, signal);
     }
   }
-  async clearHostCheck(attemptId, commandId) {
+  async clearHostCheck(attemptId, commandId, proof) {
     this.store.transaction(() => {
       this.fenced();
       const current = this.store.require('attempts', attemptId);
-      if (current.hostCheck?.id === commandId) this.store.put('attempts', { ...current, hostCheck: null });
+      if (current.hostCheck?.id !== commandId) return;
+      const hostCheckCleanup = proof && current.deferredReplayAt
+        ? { id: commandId, checkId: current.hostCheck.checkId, replayAt: current.deferredReplayAt, exitCode: proof.exitCode }
+        : null;
+      this.store.put('attempts', { ...current, hostCheck: null, hostCheckCleanup });
     });
     await unlink(checkReceipt(this, commandId)).catch(() => {});
   }
@@ -603,14 +617,28 @@ export class Engine {
     };
     const beforeStart = () => {
       signal.throwIfAborted();
-      this.currentAttemptTask(attempt, true);
+      return this.currentAttemptTask(attempt, true);
     };
-    this.store.transaction(() => {
-      beforeStart();
+    const admitted = this.store.transaction(() => {
+      const task = beforeStart();
+      const policy = this.company.policy();
+      if (policy.paused && policy.pauseMode !== 'after-current') {
+        this.company.controlTask({ id: task.id }, 'paused', SYSTEM, { cascade: false });
+        return false;
+      }
       const saved = this.store.require('attempts', attempt.id);
       assert(!saved.hostCheck, 'CLEANUP_PENDING', 'Previous host check cleanup must be confirmed');
-      this.store.put('attempts', { ...saved, hostCheck: { id: commandId, checkId, startedAt: now() } });
+      // A recovered result is active work again once a command is admitted.
+      // Scope-level pause still leaves inactive reconciliation holds untouched.
+      if (task.status === 'reconciling') this.store.put('tasks', { ...task, status: 'running' });
+      this.store.put('attempts', { ...saved, hostCheck: { id: commandId, checkId, startedAt: now() }, hostCheckCleanup: null });
+      return true;
     });
+    if (!admitted) {
+      const reason = new Error('paused');
+      this.live.get(attempt.id)?.controller.abort(reason);
+      throw reason;
+    }
     this.store.events.on('event', stop);
     let cleanupUnknown = false;
     try {
@@ -621,7 +649,10 @@ export class Engine {
       throw error;
     } finally {
       this.store.events.off('event', stop);
-      if (!cleanupUnknown && this.store.ownsLease(this.owner, this.epoch)) await this.clearHostCheck(attempt.id, commandId);
+      if (!cleanupUnknown && this.store.ownsLease(this.owner, this.epoch)) {
+        const proof = attempt.deferredReplayAt ? await readCommandCleanup(cleanupReceipt) : null;
+        if (this.store.ownsLease(this.owner, this.epoch)) await this.clearHostCheck(attempt.id, commandId, proof);
+      }
     }
   }
   async acceptOutput(attempt, output, signal) {
@@ -807,7 +838,11 @@ export class Engine {
       const failure = !aborted && !error.cleanupUncertain && !error.recoveryRequired && classifyEnvironment(error, preparingWorkspace ? 'workspace' : null);
       const staleRoute = error.code === 'ROUTE_PREFLIGHT_STALE';
       const keepDeferred = !!attempt.deferredReplayAt && (stopped === 'paused' || this.closing);
-      this.finishAttempt(attempt, keepDeferred ? 'completed' : aborted || staleRoute ? 'interrupted' : 'failed', failure ? failure.reason : error.message, keepDeferred);
+      // Replay owns no new model process. Keep its payload and command identity
+      // until the host check can be reconciled with its own receipt.
+      if (!(attempt.deferredReplayAt && error.cleanupUncertain)) {
+        this.finishAttempt(attempt, keepDeferred ? 'completed' : aborted || staleRoute ? 'interrupted' : 'failed', failure ? failure.reason : error.message, keepDeferred);
+      }
       if (task.activeAttemptId !== attempt.id || (!stopped && (task.generation !== attempt.taskGeneration || ignoresBlocker(task)))) return;
       if (error.cleanupUncertain || error.recoveryRequired) {
         // A closed runner does not prove that its model/tool descendants stopped.
