@@ -125,8 +125,14 @@ export async function refreshEnvironmentGates(engine) {
       const current = store.require('tasks', task.id);
       if (current.revision !== task.revision || engine.company.policy().paused || engine.closing || goalStopped(store.get('goals', task.goalId))) return;
       const previous = task.environmentBlock;
-      const unresolved = previous.failures.filter(failure => !verifiedAfter(failure, previous, observed.report));
-      const failures = [...new Map([...unresolved, ...observed.failures].map(f => [f.fingerprint, f])).values()];
+      const retryPreparation = previous.failures.some(f => f.code === 'preparation') &&
+        (current.status === 'ready' || previous.report.host.preparationVersion !== observed.report.host.preparationVersion);
+      const hasPreparation = !!store.get('projects', current.projectId)?.preparation && current.reviewScope !== 'goal';
+      const unresolved = previous.failures.filter(failure => failure.code === 'preparation' ? !retryPreparation :
+        !(retryPreparation && hasPreparation && failure.code === 'package') && !verifiedAfter(failure, previous, observed.report));
+      const observedFailures = retryPreparation && hasPreparation ? observed.failures.filter(f => f.code !== 'package') : observed.failures;
+      if (!retryPreparation && previous.report.host.preparationFailure) observed.report.host.preparationFailure = previous.report.host.preparationFailure;
+      const failures = [...new Map([...unresolved, ...observedFailures].map(f => [f.fingerprint, f])).values()];
       if (!failures.length) clearEnvironment(engine, task, observed.report);
       else if (observed.report.version !== previous.report.version || digest(failures) !== digest(previous.failures)) {
         holdEnvironment(engine, task, failures, observed.report);

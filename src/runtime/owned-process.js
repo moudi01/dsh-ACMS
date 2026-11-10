@@ -22,7 +22,7 @@ export async function bounded(promise, ms, reason) {
 // Same small process-service interface as the host, also usable by Node tests.
 export function spawnNode(spec) {
   const child = nodeSpawn(spec.argv[0], spec.argv.slice(1), {
-    cwd: spec.cwd, env: { ...process.env, ...spec.env }, shell: false, windowsHide: true, stdio: 'pipe',
+    cwd: spec.cwd, env: spec.replaceEnv ? spec.env : { ...process.env, ...spec.env }, shell: false, windowsHide: true, stdio: 'pipe',
   });
   const done = new Promise((resolve, reject) => {
     child.once('error', error => { if (!child.pid) error.noProcessStarted = true; reject(error); });
