@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Field, ActionButton } from './components.jsx';
 import { api } from './api.js';
+import { capacityBlockReason } from '../core/execution-capacity.js';
 const healthLabel = s => ({ available: '检测通过', unavailable: '检测失败' }[s] ?? '未检测');
 export function ModelPicker({ form, setForm, data, onCheck }) {
   const catalog = data.runtime.modelCatalog ?? { models: [] }; const [defaults] = useState(catalog.defaultSelection);
@@ -29,7 +30,8 @@ export function ModelPicker({ form, setForm, data, onCheck }) {
   };
   const rows = catalog.models.flatMap(m => m.routes.filter((r, i, all) => r.origin === 'external' || all.findIndex(x => x.origin === 'internal' && x.llmProvider === r.llmProvider) === i).map(r => ({ id: m.id, route: r })));
   const active = data.attempts.filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending).length;
-  const noCheck = checking ? '正在检测，最长等待 45 秒' : !selected ? '请先选择模型' : selected.probeSupported === false ? `此运行环境暂不支持无工具检测：${selected.probeReason}` : data.runtime.activeProbes ? '已有模型检测正在进行' : active >= data.policy.maxConcurrent ? '执行资源已满，请等待任务结束' : '';
+  const capacity = data.runtime.capacity; const used = capacity?.used ?? active; const limit = capacity?.limit ?? data.policy.maxConcurrent;
+  const noCheck = checking ? '正在检测，最长等待 45 秒' : !selected ? '请先选择模型' : selected.probeSupported === false ? `此运行环境暂不支持无工具检测：${selected.probeReason}` : data.runtime.activeProbes ? '已有模型检测正在进行' : capacityBlockReason(capacity) || (used >= limit ? `执行资源已满（${used}/${limit}）` : '');
   const sibling = inherits => routes.find(r => r.origin === 'internal' && r.llmProvider === selected?.llmProvider && r.inheritsParentContext === inherits);
   return <section className="acms-model-picker" aria-label="模型配置"><div className="acms-model-list" role="radiogroup" aria-label="模型列表">{rows.map(({ id, route }) => {
     const chosen = model === id && selected && (route.origin === 'external' ? route.provider === selected.provider : route.llmProvider === selected.llmProvider && selected.origin === 'internal');

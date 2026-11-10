@@ -18,6 +18,7 @@ const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', 
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
 const tabs = [['overview', '公司总览', '◈'], ['projects', '项目与目标', '▱'], ['tasks', '任务工作台', '▤'], ['agents', '组织管理', '♧'], ['models', '模型列表', '◇'], ['workflows', '目标模板', '⇢'], ['artifacts', '产物与验收', '▧'], ['access', '外部接入', '⇄'], ['settings', '公司设置', '⚙']];
 const terminal = ['succeeded', 'cancelled', 'archived'];
+const CAPACITY_LABELS = { running: '运行中', stopping: '正在停止', cleanupPending: '待清理核对', integrating: 'Git 集成', chat: '独立对话', probe: '模型检测' };
 const openGoal = goal => !['succeeded', 'cancelled', 'archived'].includes(goal.status);
 function date(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'; }
 function Badge({ status }) { return <span className="acms-badge" data-status={status}><i />{LABEL[status] ?? status}</span>; }
@@ -87,7 +88,7 @@ export function App() {
           {!data.runtime.providers.length && <div className="acms-alert">尚未检测到执行器。请在 DSH 安装或启用子智能体 provider；你仍可配置项目、组织与流程。</div>}
           <div className="acms-metrics">{[
             ['进行中的目标', data.goals.filter(g => goalSummary(g, data.tasks).total > 0 && ['active', 'planning'].includes(g.status)).length, 'AUTHORIZED GOALS', () => { setScope({ activeGoals: true }); setTab('projects'); }],
-            ['执行资源', `${active.length} / ${data.policy.maxConcurrent}`, 'ACTIVE RUNS', () => setTab('runs')],
+            ['执行资源', `${data.runtime.capacity?.used ?? active.length} / ${data.runtime.capacity?.limit ?? data.policy.maxConcurrent}`, 'ACTIVE RUNS', () => setTab('runs')],
             ['审查进行中', data.tasks.filter(t => t.kind === 'review' && !terminal.includes(t.status)).length, 'REVIEW QUEUE', () => { setScope({}); setTab('tasks'); }],
             ['需要你处理', pending.length, 'YOUR INBOX', () => setTab('inbox')],
           ].map(([label, value, hint, go]) => <button key={label} className="acms-metric-link" onClick={go} aria-label={`查看${label}`}><span>{label}</span><strong>{value}</strong><small>{hint} ↗</small></button>)}</div>
@@ -99,7 +100,7 @@ export function App() {
           <section className="acms-panel"><div className="acms-sectionhead"><h2>最近的执行</h2><span className="acms-muted">执行结束后会自动进入检查与交付</span></div><RunTable attempts={data.attempts.slice(-8).reverse()} data={data} select={selectTask} navigate={navigate} /></section>
         </>}
         {tab === 'projects' && <ProjectsPage data={data} navigate={navigate} select={selectTask} open={open} scope={scope} act={safeAct} busy={busy} onGoal={(projectId, goalId, options = {}) => { setScope({ projectId, goalId, ...(options.completed ? { completed: true } : {}) }); setTab('tasks'); }} />}
-        {tab === 'runs' && <><PageHead title="当前执行" description="点击任务查看执行详情。" /><RunTable attempts={active} data={data} select={selectTask} navigate={navigate} /></>}
+        {tab === 'runs' && <><PageHead title="当前执行" description="占用口径与调度器一致：任务执行、Git 集成、独立对话和模型检测各占一个名额。" /><CapacityPanel capacity={data.runtime.capacity} data={data} select={selectTask} chat={chat} openModels={() => setTab('models')} /><section className="acms-panel"><div className="acms-sectionhead"><h2>任务执行明细</h2><span className="acms-muted">点击任务查看执行详情</span></div><RunTable attempts={active} data={data} select={selectTask} navigate={navigate} /></section></>}
         {tab === 'inbox' && <><PageHead title="待处理事项" description="只处理需要你提供材料或作出决定的分支。" />{!pending.length && <Empty title="暂无待处理事项" />}{pending.map(i => <section className="acms-panel" key={i.id}><button className="text" onClick={() => selectTask(i.taskId)}>{data.tasks.find(t => t.id === i.taskId)?.title}</button><p>{i.question}</p><button onClick={() => open('answer', i)}>查看并回复</button></section>)}</>}
         {tab === 'tasks' && <Tasks navigate={navigate} data={data} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={() => setScope({})} />}
         {tab === 'models' && <ModelsPage data={data} refresh={refresh} />}
@@ -118,6 +119,29 @@ export function App() {
 }
 function PageHead({ eyebrow, title, description, action }) { return <div className="acms-pagehead"><div><div className="acms-eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>; }
 function RunTable({ attempts, data, select, navigate }) { return !attempts.length ? <p className="acms-sectionnote">还没有执行记录。创建目标后，规划、执行和审查会自动衔接。</p> : <div className="acms-table-scroll"><table><thead><tr><th>任务</th><th>智能体</th><th>状态</th><th>开始时间</th><th>耗时</th></tr></thead><tbody>{attempts.map(a => <tr key={a.id}><td><button className="text" onClick={() => select(a.taskId)}>{data.tasks.find(t => t.id === a.taskId)?.title}</button></td><td>{navigate ? <button className="text" onClick={() => navigate('agent', a.agentId)}>{data.agents.find(g => g.id === a.agentId)?.name ?? '已删除角色'}</button> : data.agents.find(g => g.id === a.agentId)?.name ?? '已删除角色'}</td><td><Badge status={a.status} /></td><td>{date(a.startedAt)}</td><td>{a.elapsedMs ? `${(a.elapsedMs / 1000).toFixed(1)} 秒` : '—'}</td></tr>)}</tbody></table></div>; }
+function CapacityPanel({ capacity, data, select, chat, openModels }) {
+  if (!capacity) return <section className="acms-panel"><div className="acms-sectionhead"><h2>执行容量</h2></div><p className="acms-sectionnote">当前宿主未提供执行容量数据。请刷新页面；若仍为空，说明宿主插件版本过旧，需先完成升级。</p></section>;
+  const entries = capacity.entries ?? [];
+  const tasks = entries.filter(entry => entry.kind === 'attempt' || entry.kind === 'integration');
+  const chats = entries.filter(entry => entry.kind === 'chat');
+  const probeCount = capacity.counts?.probe ?? 0;
+  const limit = capacity.limit ?? data.policy.maxConcurrent;
+  return <section className="acms-panel acms-capacity" aria-label="执行容量">
+    <div className="acms-sectionhead"><h2>执行容量</h2><span className="acms-muted">与调度器共用同一占用口径</span></div>
+    <div className="acms-capacity-summary">
+      <div><span>总占用</span><strong>{capacity.used} / {limit}</strong></div>
+      <div><span>空闲名额</span><strong>{capacity.free ?? '—'}</strong></div>
+      <div><span>协调预留</span><strong>{capacity.reserve ?? data.policy.controlSlots}</strong><small>普通任务上限 {capacity.ordinaryLimit ?? Math.max(1, limit - data.policy.controlSlots)}</small></div>
+    </div>
+    <div className="acms-capacity-phases">{Object.entries(CAPACITY_LABELS).map(([key, label]) => <div key={key} data-empty={!(capacity.phases?.[key] > 0)}><span>{label}</span><strong>{capacity.phases?.[key] ?? 0}</strong></div>)}</div>
+    <div className="acms-capacity-entries">
+      {!entries.length && <p className="acms-sectionnote">当前没有执行占用。</p>}
+      {tasks.map(entry => <button key={`${entry.kind}:${entry.id}`} className="acms-capacity-entry" onClick={() => select(entry.taskId)}><span>{entry.kind === 'integration' ? '集成' : '任务'}</span><b>{data.tasks.find(task => task.id === entry.taskId)?.title ?? entry.taskId}</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>查看任务 ↗</small></button>)}
+      {chats.map((entry, index) => entry.agentId ? <button key={`chat:${entry.conversationId ?? index}`} className="acms-capacity-entry" onClick={() => chat(entry.agentId)}><span>对话</span><b>{data.agents.find(agent => agent.id === entry.agentId)?.name ?? entry.agentId}</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>打开对话 ↗</small></button> : <div key={`chat:${index}`} className="acms-capacity-entry" data-static="true"><span>对话</span><b>独立对话</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>暂无关联入口</small></div>)}
+      {Array.from({ length: probeCount }, (_, index) => <button key={`probe:${index}`} className="acms-capacity-entry" onClick={openModels}><span>检测</span><b>模型连通性检测</b><em>模型检测</em><small>打开模型列表 ↗</small></button>)}
+    </div>
+  </section>;
+}
 function Tasks({ data, select, create, createGoal, act, busy, open, scope, navigate, clearScope }) {
   const autoProject = defaultProjectId(data.projects, data.tasks);
   const [mode, setMode] = useState('tree'); const [project, setProject] = useState(() => scope.status ? '' : scope.projectId ?? autoProject); const [goal, setGoal] = useState(scope.goalId ?? '');
