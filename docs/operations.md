@@ -90,7 +90,25 @@ node scripts/legacy-export.mjs --data-dir <dataDir> --apply    # 备份后归档
 <dataDir>/install-backups/     安装配置备份
 ```
 
-备份前暂停执行并关闭宿主，再备份完整数据目录和项目 Git 仓库。SQLite 正在运行时，不要只复制 company.db 而忽略 WAL。公司资料与模型输出可能包含项目私有内容，只在本地运行目录保存。
+备份前暂停执行（最好关闭宿主）再复制数据目录和项目 Git 仓库。SQLite 正在运行时，不要只复制 company.db 而忽略 WAL；受控入口见下一节。公司资料与模型输出可能包含项目私有内容，只在本地运行目录保存。
+
+## 备份、恢复与保留
+
+本机受控入口（源项目 Git 仓库仍单独处理）：
+
+```powershell
+node scripts/backup.mjs --data-dir <dataDir>                 # 只输出计划，不写文件
+node scripts/backup.mjs --data-dir <dataDir> --out <backupDir> --apply
+node scripts/backup.mjs --verify <backupDir>
+node scripts/restore-backup.mjs --backup <backupDir> --target <emptyDir>
+node scripts/prune-data.mjs --data-dir <dataDir> --days 30   # 保留 dry-run，不删除
+```
+
+- 数据库使用 SQLite `VACUUM INTO` 生成一致性快照（覆盖 WAL），并做 `integrity_check`；其余文件按原始字节 SHA-256 写入 `backup-manifest.json`，`--verify` 会检查大小、摘要、数据库完整性和多余文件。raw-byte SHA-256 与 ACMS 的 `artifact.hash`（Base64 文本摘要）不能互换。
+- 默认排除可重建目录 `node_modules`、`.git`、`.cache`、`diagnostics` 与 `company.db-wal/shm`；排除项在清单和恢复生成的 `REBUILD.md` 中带重建方法。`pairing/` 含外部配对 runner 信息，默认不进入备份，需在新环境重新配对（`--include-pairing` 需所有者自行评估敏感性）。`conversations/` 与 `artifacts/` 可能包含私有内容，计划阶段会明确告警。
+- 恢复目标必须是空目录；脚本先校验清单再复制，拒绝覆盖已有数据。恢复后的在途执行进入 `reconciling`，只能“重新读取回执”，不要重跑、删除锁或改数据库；配对与依赖按 `REBUILD.md` 重建。
+- `prune-data.mjs` 只做 dry-run：列出超过保留期限的 `workspaces/`、`reviews/`、`integration/`、`diagnostics/` 副本及空间；仍被未完成任务、运行中执行或待清理占位引用的目录会标记保护，不会出现在可清理列表。实际删除仍由所有者按现有授权流程执行。
+- 首版仅支持当前本机数据目录，不包含云备份、跨设备同步、源项目仓库、认证文件或外部模型配对令牌。
 
 ## 异常恢复
 
