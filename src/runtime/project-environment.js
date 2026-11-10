@@ -11,9 +11,9 @@ const excluded = new Set(['.git', '.acms', '.codex', '.aws', '.ssh', '.npmrc', '
 const included = (name, dependencies = false) => (dependencies && name.toLowerCase() === 'node_modules') ||
   (!excluded.has(name.toLowerCase()) && !name.toLowerCase().startsWith('.env'));
 
-async function fileHash(file) {
+async function fileHash(file, signal) {
   const hash = createHash('sha256');
-  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  for await (const chunk of createReadStream(file, { signal })) hash.update(chunk);
   return hash.digest('hex');
 }
 
@@ -31,7 +31,7 @@ async function inputFiles(root, signal, dependencies = false) {
       if (!included(entry.name, dependencies)) continue;
       const name = path.posix.join(relative, entry.name);
       if (entry.isDirectory()) await walk(name, inDependencies || entry.name.toLowerCase() === 'node_modules');
-      else if (entry.isFile() && (!dependencies || inDependencies)) files.push([name, await fileHash(path.join(root, name))]);
+      else if (entry.isFile() && (!dependencies || inDependencies)) files.push([name, await fileHash(path.join(root, name), signal)]);
       else if (entry.isSymbolicLink() && !dependencies) throw Object.assign(new Error('Verification input contains a symbolic link'), { code: 'CHECK_INPUT_LINK' });
     }
   }
@@ -166,7 +166,9 @@ export async function prepareDependencies(dataDir, cwd, spec, invoke, signal) {
     const receipt = path.join(directory, 'prepared.json');
     const previous = await readFile(receipt, 'utf8').then(JSON.parse).catch(() => null);
     const installed = await lstat(path.join(cwd, 'node_modules')).then(stat => stat.isDirectory(), () => false);
-    if (previous?.key === key && installed) return { ...previous, reused: true };
+    if (previous?.key === key && installed && previous.dependenciesHash === digest(await inputFiles(cwd, signal, true))) {
+      return { ...previous, reused: true };
+    }
     signal?.throwIfAborted();
     const execution = path.join(directory, key.slice(0, 24));
     const env = await privateEnvironment(execution);
@@ -179,6 +181,7 @@ export async function prepareDependencies(dataDir, cwd, spec, invoke, signal) {
     evidence = { ...evidence, code: result.code, timedOut: result.timedOut, cleanupConfirmed: result.cleanupConfirmed, log: logSummary(result) };
     assert(result.code === 0 && !result.timedOut && result.cleanupConfirmed === true, 'PREPARATION_FAILED', 'Dependency preparation failed');
     assert(digest(await lockInputs(cwd, spec)) === digest(inputs), 'PREPARATION_INPUT', 'Preparation changed a pinned input');
+    evidence.dependenciesHash = digest(await inputFiles(cwd, signal, true));
     await writeFile(receipt, JSON.stringify(evidence), { flush: true });
     return evidence;
   } catch (error) {

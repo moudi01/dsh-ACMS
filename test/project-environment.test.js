@@ -114,6 +114,10 @@ test('workspace-local preparation caches are isolated and invalidate on lock or 
   assert.equal(first.key, second.key);
   assert.notEqual(first.cwd, second.cwd);
   assert.equal((await run(a.path)).reused, true);
+  const unexpected = path.join(a.path, 'node_modules', 'unexpected.js');
+  await writeFile(unexpected, 'unexpected dependency content');
+  assert.equal((await run(a.path)).reused, undefined);
+  await assert.rejects(stat(unexpected), { code: 'ENOENT' });
   await writeFile(path.join(a.path, 'lock.json'), 'two');
   const lockChange = await run(a.path);
   assert.notEqual(lockChange.key, first.key);
