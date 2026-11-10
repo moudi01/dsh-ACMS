@@ -214,7 +214,8 @@ export class Company {
       agentId: canCoordinate(this, manager) ? manager.id : null, priority: 100,
       origin: { kind: 'goal-contract', createdBy: 'scheduler', basis: '目标要求或验收发生变化' },
       coordinationKey: `goal-contract:${goal.id}:${contractVersion(goal)}`,
-    }, SYSTEM);    return this.store.put('goals', { ...goal, contractChange: { ...goal.contractChange, coordinationTaskId: task.id } });
+    }, SYSTEM);
+    return this.store.put('goals', { ...goal, contractChange: { ...goal.contractChange, coordinationTaskId: task.id } });
   }
   createGoal(args, actor) { this.owner(actor); return this.createGoalRecord(args, actor); }
   createGoalRecord(args, actor, options = {}) {

@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { startPreview } from './preview-server.mjs';
 
 // Issue #46 acceptance: the owner can set, view and change goal priority in the
-// panel, and the stored value matches the external submission semantics.
+// panel. External submission defaults are covered by test/goal-priority.test.js.
 const server = await startPreview({ seed: true, startEngine: false });
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1100 }, colorScheme: 'light' });
@@ -39,6 +39,14 @@ try {
   await expect(drawer).toContainText('优先级：10');
   const edited = server.company.snapshot().goals.find(goal => goal.id === created.id);
   if (edited?.priority !== 10) throw new Error(`edited priority is ${edited?.priority}, expected 10`);
+
+  // Clearing the field falls back to the documented default instead of 0.
+  await drawer.getByRole('button', { name: '编辑目标' }).click();
+  await page.getByLabel('优先级（0–100）').fill('');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await expect(drawer).toContainText('优先级：50');
+  const fallback = server.company.snapshot().goals.find(goal => goal.id === created.id);
+  if (fallback?.priority !== 50) throw new Error(`cleared priority is ${fallback?.priority}, expected 50`);
 
   await page.screenshot({ path: 'test-results/ui/goal-priority.png', fullPage: true });
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);

@@ -85,6 +85,39 @@ test('任务优先级高于目标优先级，目标优先级只在同类任务�
   await until(() => f.store.get('tasks', fast.id)?.status === 'succeeded' && f.store.get('tasks', slow.id)?.status === 'succeeded');
 });
 
+test('调整目标优先级影响后续派发，且在途任务与合同保持不变', async t => {
+  const sim = blockingSimulation();
+  const f = await fixture(t, sim.handler);
+  f.command('policy.update', { patch: { maxConcurrent: 1, controlSlots: 0 } });
+  const firstGoal = goal(f, '先高后低目标', 100);
+  const secondGoal = goal(f, '先低后高目标', 0);
+  const firstTask = task(f, firstGoal, '目标 A 任务一');
+  const laterTask = task(f, firstGoal, '目标 A 任务二');
+  const secondTask = task(f, secondGoal, '目标 B 任务一');
+  await f.start();
+  await until(() => sim.calls.length === 1);
+  assert.equal(sim.calls[0].goalId, firstGoal.id);
+  const running = f.store.list('attempts').find(attempt => attempt.taskId === firstTask.id && attempt.status === 'running');
+  assert.ok(running, 'the first task is in flight and blocked by the fixture');
+
+  const firstRecord = f.store.require('goals', firstGoal.id);
+  const secondRecord = f.store.require('goals', secondGoal.id);
+  f.command('goal.edit', { id: firstGoal.id, expectedRevision: firstRecord.revision, patch: { priority: 0 } });
+  f.command('goal.edit', { id: secondGoal.id, expectedRevision: secondRecord.revision, patch: { priority: 100 } });
+
+  const still = f.store.require('attempts', running.id);
+  assert.equal(still.status, 'running');
+  assert.equal(still.taskGeneration, running.taskGeneration);
+  assert.equal(f.store.require('tasks', firstTask.id).status, 'running');
+  assert.equal(f.store.require('goals', firstGoal.id).contractVersion, firstRecord.contractVersion);
+  assert.equal(f.store.require('goals', firstGoal.id).contractChange ?? null, null);
+
+  sim.release();
+  await until(() => sim.calls.length >= 2);
+  assert.equal(sim.calls[1].goalId, secondGoal.id);
+  await until(() => [firstTask, laterTask, secondTask].every(record => f.store.get('tasks', record.id)?.status === 'succeeded'));
+});
+
 test('所有者可以修改目标优先级，且优先级变化不触发合同变更', async t => {
   const f = await fixture(t);
   const record = goal(f, '可编辑优先级目标', 50);
