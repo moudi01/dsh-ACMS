@@ -14,6 +14,11 @@ const PAUSE_HEADING_RE = /^##\s+.*暂停.*停止/;
 const PAUSE_TERMS = ['暂停公司', '恢复调度', '单任务暂停', '停止在途执行', '清理', 'reconciling'];
 
 const toPosix = value => value.split(path.sep).join('/');
+const isFence = line => /^\s*```/.test(line);
+// A PowerShell continuation uses a backtick preceded by whitespace. Requiring
+// that separator avoids mistaking an inline-code line that ends with a
+// closing backtick for a continuation.
+const isContinuation = line => !isFence(line) && /[ \t]`\s*$/.test(line);
 
 async function exists(target) {
   try {
@@ -64,15 +69,13 @@ function logicalLines(text) {
   const merged = [];
   for (let index = 0; index < raw.length; index += 1) {
     let current = raw[index];
-    let consumed = index;
-    // A fence delimiter also ends with backticks; never treat it as a line
-    // continuation, otherwise it would swallow the next physical line.
-    while (!/^\s*```/.test(current) && /`\s*$/.test(current) && consumed + 1 < raw.length) {
-      current = current.replace(/`\s*$/, ' ') + raw[consumed + 1];
-      consumed += 1;
+    // Never merge a fence delimiter, and never consume the line that starts a
+    // fence, so the fence state stays aligned with the physical document.
+    while (isContinuation(current) && index + 1 < raw.length && !isFence(raw[index + 1])) {
+      current = current.replace(/[ \t]`\s*$/, ' ') + raw[index + 1];
+      index += 1;
     }
     merged.push({ line: index + 1, text: current });
-    index = consumed;
   }
   return merged;
 }

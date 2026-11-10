@@ -113,6 +113,56 @@ test('反引号续行的多行命令参数仍被校验', () => {
   assert.deepEqual(commands[0].params, ['TargetProfile', 'BogusParam']);
 });
 
+test('行内代码以反引号结尾时不吞掉紧随的 fence', () => {
+  const text = [
+    '先运行 `npm run check`',
+    '```text-evidence',
+    'pwsh -File .\\scripts\\install.ps1 -Bogus',
+    '```',
+    '',
+    '```powershell',
+    'pwsh -File .\\scripts\\install.ps1 -TargetProfile desktop',
+    '```',
+  ].join('\n');
+  const commands = extractPowerShellCommands(text);
+  assert.equal(commands.length, 1);
+  assert.deepEqual(commands[0].params, ['TargetProfile']);
+});
+
+test('证据块内续行以反引号结尾时不吞掉关闭 fence', () => {
+  const text = [
+    '```text-evidence',
+    'pwsh -File .\\scripts\\install.ps1 -TargetProfile desktop `',
+    '```',
+    '',
+    '```powershell',
+    'pwsh -File .\\scripts\\install.ps1 -BogusParam',
+    '```',
+  ].join('\n');
+  const commands = extractPowerShellCommands(text);
+  assert.equal(commands.length, 1);
+  assert.deepEqual(commands[0].params, ['BogusParam']);
+});
+
+test('普通 text 代码块不再豁免命令校验', async () => {
+  const root = await fixture({
+    'docs/operations.md': [
+      OPERATIONS,
+      '```text',
+      'pwsh -File .\\scripts\\install.ps1 -BogusParam',
+      '```',
+      '',
+    ].join('\n'),
+  });
+  try {
+    const errors = await checkCommandParams(root);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /-BogusParam/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('脚本名大写时仍按 Windows 大小写不敏感校验参数', async () => {
   const root = await fixture({
     'docs/operations.md': `${OPERATIONS}\n\`\`\`powershell\npwsh -File .\\scripts\\Install.ps1 -BogusParam\n\`\`\`\n`,
