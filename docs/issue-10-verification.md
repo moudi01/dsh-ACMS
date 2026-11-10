@@ -3,7 +3,7 @@
 - Issue：[P2][文档] 修正卸载命令与暂停、上下文行为说明，并建立一致性检查（https://github.com/moudi01/dsh-ACMS/issues/10）
 - 仓库基线：`origin/main` `17c31b530aa1986ce1c114c950118422ff7e46a8`（Merge pull request #57）
 - 改动提交：`bbecc92`（分支 `codex/issue-10-docs-consistency`），包含初版全部代码、测试与文档改动
-- 复核修订提交：`1d0b03b`、`b1ac6ed`、`7b350f5`（修复独立审查三轮发现的问题，详见第 6 节）
+- 复核修订提交：`1d0b03b`、`b1ac6ed`、`7b350f5`、`13c909a`（修复独立审查多轮发现的问题并校正记录归属，详见第 6 节）
 - 本记录提交：仅新增本文件和 `docs/validation.md` 的检查指引，不改变被测代码
 - 验证日期：2026-11-10（Asia/Shanghai）
 - 验证环境：Windows；Node.js `v24.22.0`；npm `11.19.1`。未安装或升级运行中的 DSH，未调用真实模型，未执行会修改 DSH profile 的安装/卸载脚本。
