@@ -15,10 +15,6 @@ const PAUSE_TERMS = ['暂停公司', '恢复调度', '单任务暂停', '停止�
 
 const toPosix = value => value.split(path.sep).join('/');
 const isFence = line => /^\s*```/.test(line);
-const fenceInfo = line => {
-  const match = /^\s*```\s*([A-Za-z0-9_-]*)\s*$/.exec(line);
-  return match ? match[1].toLowerCase() : '';
-};
 // Backtick continuations are unambiguous inside a fenced code block. In prose,
 // require whitespace before the backtick so an inline-code line ending with a
 // closing backtick is not merged into the next paragraph.
