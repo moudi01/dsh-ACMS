@@ -103,6 +103,7 @@ npm run test:structure # 层级导航、彻底删除、外部配对与手动检�
 npm run test:graph-ui # 依赖图项目/目标隔离
 npm run test:display   # 折叠默认值、已完成列表与活动排序
 npm run test:capacity  # 执行容量口径、分类占用与总览入口
+npm run test:goal-priority # 目标优先级的界面设置、查看与修改
 npm run build     # 生成 lib/client.js
 ```
 
