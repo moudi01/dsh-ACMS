@@ -188,6 +188,7 @@ export async function verifyBackup(backupDir) {
   const errors = [];
   const pathError = (relative, database = false) => {
     if (typeof relative !== 'string' || !relative) return 'path is missing';
+    if (relative.includes('\\')) return 'must use forward slashes';
     if (path.isAbsolute(relative) || /^[A-Za-z]:/.test(relative) || relative.startsWith('\\\\')) return 'must be relative';
     if (relative.split('/').some(segment => segment === '' || segment === '..')) return 'must not contain empty or parent segments';
     if (!isInside(root, path.resolve(root, ...relative.split('/')))) return 'escapes backup root';

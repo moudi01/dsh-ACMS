@@ -141,6 +141,7 @@ test('恢复到空目录可复现数据并把旧 dataDir 引用改写为新目�
     assert.match(rebuild, /pairing/);
     assert.match(rebuild, /rewritten/);
     assert.match(rebuild, /reconciling/);
+    assert.equal(await readFile(path.join(target, 'workspaces/task_gitfile/.git'), 'utf8'), 'gitdir: D:/source/.git/worktrees/task_gitfile');
     assert.ok(!(await exists(path.join(target, 'pairing'))));
     assert.equal(run('backup.mjs', ['--verify', target, '--json']).status, 0);
 
@@ -155,12 +156,21 @@ test('crafted manifest 的数据库路径不能穿越备份目录', async t => {
   try {
     const backup = path.join(f.root, 'backup');
     assert.equal(run('backup.mjs', ['--data-dir', f.dataDir, '--out', backup, '--apply', '--json']).status, 0);
-    const manifest = JSON.parse(await readFile(path.join(backup, 'backup-manifest.json'), 'utf8'));
+    const manifestPath = path.join(backup, 'backup-manifest.json');
+    const original = await readFile(manifestPath, 'utf8');
+    const manifest = JSON.parse(original);
+    manifest.database.file = 'sub\\company.db';
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+    const backslash = run('backup.mjs', ['--verify', backup, '--json']);
+    assert.equal(backslash.status, 1);
+    assert.ok(JSON.parse(backslash.stdout).errors.some(error => error.includes('forward slashes')));
+
+    const restoredManifest = JSON.parse(original);
     const escapePath = path.join(f.root, 'escape.db');
     await writeFile(escapePath, await readFile(path.join(backup, 'company.db')));
     const before = await readFile(escapePath);
-    manifest.database.file = '../escape.db';
-    await writeFile(path.join(backup, 'backup-manifest.json'), JSON.stringify(manifest, null, 2));
+    restoredManifest.database.file = '../escape.db';
+    await writeFile(manifestPath, JSON.stringify(restoredManifest, null, 2));
     const verified = run('backup.mjs', ['--verify', backup, '--json']);
     assert.equal(verified.status, 1);
     assert.ok(JSON.parse(verified.stdout).errors.some(error => error.includes('database.file')));
@@ -185,6 +195,8 @@ test('保留 dry-run 列出过期副本并保护活跃任务与在途集成', as
     for (const relative of ['workspaces/task_active', 'workspaces/task_legacy_noid', 'workspaces/task_done', 'workspaces/task_integrating', 'reviews/review_1', 'integration/integration_pending', 'integration/integration_done', 'diagnostics/probe']) {
       await ageTree(path.join(f.dataDir, relative), old);
     }
+    // Rebuildable dependency files must not extend retention by themselves.
+    await utimes(path.join(f.dataDir, 'workspaces/task_done/node_modules/pkg/index.js'), new Date(), new Date());
     const result = run('prune-data.mjs', ['--data-dir', f.dataDir, '--days', '1', '--json']);
     assert.equal(result.status, 0, result.stderr);
     const plan = JSON.parse(result.stdout);

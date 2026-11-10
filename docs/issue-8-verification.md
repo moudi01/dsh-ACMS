@@ -33,7 +33,7 @@
 - `scripts/backup.mjs`：
   - `--data-dir <dir>` 默认只输出计划（文件数、字节、排除项、空间需求、敏感告警），`--apply` 才写备份。
   - 数据库用 SQLite `VACUUM INTO` 生成一致性快照（覆盖 WAL），写入后 `PRAGMA integrity_check`；文件按原始字节 SHA-256 生成 `backup-manifest.json`。计划空间需求包含数据库快照估算（主库 + WAL），并按目标卷可用空间判断。
-  - 默认排除 `node_modules`、`.git`（目录或 worktree 的 `.git` 文件）、`.cache`、`diagnostics`、顶层 `company.db`/`-wal`/`-shm`（快照替代）与 `pairing/`（敏感，需 `--include-pairing` 显式加入）；历史备份/交付物中嵌套的 `company.db` 会正常备份。符号链接不跟随并记录原因。`conversations/`、`artifacts/` 私有内容在计划中告警。
+  - 默认排除 `node_modules`、`.git` 目录、`.cache`、`diagnostics`、顶层 `company.db`/`-wal`/`-shm`（快照替代）与 `pairing/`（敏感，需 `--include-pairing` 显式加入）；worktree 的 `.git` 指针文件保留，以便恢复后的 git 工作副本继续使用；历史备份/交付物中嵌套的 `company.db` 会正常备份。符号链接不跟随并记录原因。`conversations/`、`artifacts/` 私有内容在计划中告警。
   - `--verify <backup>` 做全量独立遍历：数据库完整性、每项大小/摘要、缺失、多余文件与符号链接；失败返回非零。
 - `scripts/restore-backup.mjs`：先校验清单，再只能恢复到空目录；复制后把数据库实体中指向旧数据目录的绝对路径（任务工作副本、artifact blob 等）改写为新目录并更新恢复清单，生成 `REBUILD.md` 记录排除材料、路径改写、在途执行 `reconciling` 和源项目仓库边界；已存在的恢复目标拒绝覆盖。
 - `scripts/prune-data.mjs`：保留策略 dry-run，按目录树最新修改时间列出过期的 `workspaces/`、`reviews/`、`integration/`、`diagnostics/` 及字节数；仍被未完成任务、运行中执行、待清理占位或在途集成 ID 引用的目录标记保护，不进入可清理列表；不自动删除。
@@ -65,7 +65,7 @@
 - 仅支持当前本机数据目录；不包含云备份、跨设备同步、源项目 Git 仓库、认证文件或外部模型配对令牌。
 - 数据库快照是一致的，但文件复制不是对运行中宿主的整体锁；推荐先暂停执行（最好关闭宿主），计划与文档均如此提示。若宿主持续写入工作副本，备份文件可能与数据库某一时点不完全对应。
 - 排除 `pairing/` 后，恢复环境需要重新配对外部模型；`--include-pairing` 会把本机 runner 信息写入备份，需所有者自行评估敏感性。
-- `prune-data.mjs` 只做 dry-run；实际删除不在本脚本中执行。保留期限只覆盖工作副本/审查/集成/诊断目录，按目录树内最新修改时间判断（跳过 `node_modules`/`.git`）；不覆盖 `artifacts/`（内容寻址，可能仍被任务引用）与 `company.db`。只读打开 WAL 数据库后，SQLite 可能在数据目录留下空的 `-wal/-shm` 辅助文件，不修改业务数据。
+- `prune-data.mjs` 只做 dry-run；实际删除不在本脚本中执行。保留期限只覆盖工作副本/审查/集成/诊断目录，按目录树内最新修改时间判断（跳过 `node_modules`/`.git`）；不覆盖 `artifacts/`（内容寻址，可能仍被任务引用）与 `company.db`。只读打开 WAL 数据库后，SQLite 可能在数据目录留下 `-shm/-wal` 辅助文件（例如 32 KiB 的 `-shm` 与 0 B 的 `-wal`），不修改业务数据。
 - 恢复会改写数据库实体中的旧数据目录绝对路径；仅改写绝对路径，cwd 位于旧目录时相对字段保持不变；历史事件/命令文本中的旧路径作为审计记录保留，不改写。恢复后外部配对需按 `REBUILD.md` 重建（除非显式包含 pairing）。git worktree 的 `.git` 指针文件会保留，恢复后的工作副本仍可作为 git 仓库继续执行。
 - 备份为整文件读入内存（单个文件大小未额外限制，超大文件会占用等量内存），不保留原始 mtime/文件模式；恢复后的文件按私有内容权限写入。备份与恢复目标都用 realpath 校验，拒绝目标越界（含 junction）。
 - 未修改 ACMS 运行时状态机、界面或调度；工具不触发模型，也不写业务数据库。
