@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { verifyBackup, sha256 } from './backup.mjs';
+import { verifyBackup, sha256, realTarget, isInside } from './backup.mjs';
 
 function parseArgs(argv) {
   const args = { backup: null, target: null, json: false };
@@ -19,11 +19,12 @@ function parseArgs(argv) {
   if (!args.backup || !args.target) throw new Error('Both --backup and --target are required');
   return args;
 }
-const inside = (root, target) => { const relative = path.relative(path.resolve(root), path.resolve(target)); return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative)); };
+// The target may not contain the backup directory, checked with real paths.
+
 
 export async function restoreBackup({ backup, target }) {
   const source = path.resolve(backup); const destination = path.resolve(target);
-  if (inside(source, destination)) throw new Error('Restore target must be outside the backup directory');
+  if (isInside(await realTarget(source), await realTarget(destination))) throw new Error('Restore target must be outside the backup directory');
   const verification = await verifyBackup(source);
   if (!verification.ok) throw new Error(`Backup verification failed: ${verification.errors.join('; ')}`);
   let targetEntries = [];
@@ -34,11 +35,18 @@ export async function restoreBackup({ backup, target }) {
   const manifest = verification.manifest;
   const rewritten = rewritePaths(path.join(destination, manifest.database.file), manifest.source, destination);
   const databaseBytes = await fs.readFile(path.join(destination, manifest.database.file));
+  const check = new DatabaseSync(path.join(destination, manifest.database.file));
+  try {
+    const row = check.prepare('PRAGMA integrity_check').get();
+    if (row?.integrity_check !== 'ok') throw new Error(`Restored database integrity check failed: ${row?.integrity_check}`);
+  } finally { check.close(); }
   manifest.database = { ...manifest.database, bytes: databaseBytes.length, sha256: sha256(databaseBytes) };
   manifest.restoredFrom = manifest.source;
   manifest.restoredAt = new Date().toISOString();
   manifest.restoredTo = destination;
   manifest.rewrittenPaths = rewritten;
+  const fileBytes = manifest.files.reduce((sum, file) => sum + file.bytes, 0);
+  manifest.totals = { ...manifest.totals, files: manifest.files.length, bytes: fileBytes, databaseBytes: databaseBytes.length, requiredBytes: fileBytes + databaseBytes.length };
   await fs.writeFile(path.join(destination, 'backup-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
   const lines = [
     '# ACMS restore notes', '',
@@ -64,6 +72,10 @@ function rewritePaths(databasePath, oldRoot, newRoot) {
   let rewritten = 0;
   const resolve = value => {
     if (typeof value !== 'string' || !value) return value;
+    // Only absolute paths can point into the old data directory. Relative
+    // fields such as branch names, commits or artifact paths must stay intact
+    // even when the restore process happens to run from the old directory.
+    if (!path.isAbsolute(value)) return value;
     const relative = path.relative(path.resolve(oldRoot), path.resolve(value));
     if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) return value;
     rewritten += 1;

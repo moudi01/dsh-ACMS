@@ -36,7 +36,12 @@ async function newestMtime(target) {
   const stat = await fs.lstat(target);
   if (!stat.isDirectory()) return stat.mtimeMs;
   let newest = stat.mtimeMs;
-  for (const entry of await fs.readdir(target, { withFileTypes: true })) newest = Math.max(newest, await newestMtime(path.join(target, entry.name)));
+  for (const entry of await fs.readdir(target, { withFileTypes: true })) {
+    // Rebuildable dependency and Git metadata do not extend retention by
+    // themselves; their copy time should not keep a whole workspace alive.
+    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+    newest = Math.max(newest, await newestMtime(path.join(target, entry.name)));
+  }
   return newest;
 }
 
@@ -49,13 +54,14 @@ export async function prunePlan({ dataDir, days = 30 }) {
     const rows = database.prepare("SELECT collection, id, body FROM entities WHERE collection IN ('tasks','attempts','integrations')").all();
     for (const row of rows) {
       const body = JSON.parse(row.body);
-      if (row.collection === 'tasks' && !TERMINAL.has(body.status)) protectedIds.set(body.id, `未完成任务（${body.status}）`);
+      const id = body.id ?? row.id;
+      if (row.collection === 'tasks' && !TERMINAL.has(body.status)) protectedIds.set(id, `未完成任务（${body.status}）`);
       if (row.collection === 'attempts' && (LIVE_ATTEMPT.has(body.status) || body.cleanupPending === true)) {
-        protectedIds.set(body.id, `运行中/待清理执行（${body.status}）`);
+        protectedIds.set(id, `运行中/待清理执行（${body.status}）`);
         if (body.taskId) protectedIds.set(body.taskId, `运行中/待清理执行（${body.status}）`);
       }
       if (row.collection === 'integrations' && PENDING_INTEGRATION.has(body.phase)) {
-        protectedIds.set(body.id, `在途集成（${body.phase}）`);
+        protectedIds.set(id, `在途集成（${body.phase}）`);
         if (body.taskId) protectedIds.set(body.taskId, `在途集成（${body.phase}）`);
       }
     }

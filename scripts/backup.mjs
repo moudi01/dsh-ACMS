@@ -70,9 +70,6 @@ async function walk(root) {
         await visit(absolute); continue;
       }
       if (entry.isFile()) {
-        if (relative === '.git' || relative.endsWith('/.git')) {
-          excluded.push({ path: relative, bytes: (await fs.lstat(absolute)).size, reason: 'worktree 的 .git 文件记录源项目绝对路径', rebuild: '由源项目当前提交重新创建隔离工作副本' }); continue;
-        }
         if (['company.db', 'company.db-wal', 'company.db-shm'].includes(relative)) {
           excluded.push({ path: relative, bytes: (await fs.lstat(absolute)).size,
             reason: relative === 'company.db' ? '数据库由一致性快照替代' : 'WAL/SHM 由一致性数据库快照覆盖',
@@ -189,6 +186,21 @@ export async function verifyBackup(backupDir) {
   catch (error) { throw new Error(`Cannot read backup manifest: ${error.message}`); }
   if (manifest.format !== FORMAT) throw new Error(`Unsupported backup format: ${manifest.format}`);
   const errors = [];
+  const pathError = (relative, database = false) => {
+    if (typeof relative !== 'string' || !relative) return 'path is missing';
+    if (path.isAbsolute(relative) || /^[A-Za-z]:/.test(relative) || relative.startsWith('\\\\')) return 'must be relative';
+    if (relative.split('/').some(segment => segment === '' || segment === '..')) return 'must not contain empty or parent segments';
+    if (!isInside(root, path.resolve(root, ...relative.split('/')))) return 'escapes backup root';
+    if (database && relative.includes('/')) return 'database file must be a plain basename';
+    return null;
+  };
+  const databaseError = pathError(manifest.database?.file, true);
+  if (databaseError) errors.push(`database.file: ${databaseError}`);
+  for (const file of manifest.files ?? []) {
+    const problem = pathError(file.path);
+    if (problem) errors.push(`${file.path ?? '<missing>'}: ${problem}`);
+  }
+  if (errors.length) return { ok: false, errors };
   const check = async (relative, expected) => {
     const absolute = path.join(root, ...relative.split('/'));
     let stat;
@@ -240,9 +252,14 @@ function print(value, asJson) {
   }
   console.log(`ACMS backup ${value.mode} ${value.target ?? ''}`);
   console.log(`- files: ${value.totals.files}, bytes: ${value.totals.bytes}, excluded bytes: ${value.totals.excludedBytes}`);
+  if (value.totals.requiredBytes !== undefined) console.log(`- required bytes: ${value.totals.requiredBytes}`);
   for (const item of value.excluded) console.log(`- excluded ${item.path}: ${item.reason}`);
   for (const warning of value.warnings) console.log(`! ${warning}`);
-  if (value.database) console.log(`- company.db ${value.database.bytes} bytes sha256=${value.database.sha256}`);
+  if (value.database) {
+    if (value.database.sha256) console.log(`- company.db ${value.database.bytes} bytes sha256=${value.database.sha256}`);
+    else console.log(`- company.db estimated ${value.database.estimatedBytes} bytes (source ${value.database.sourceBytes}, wal ${value.database.walBytes})`);
+  }
+  if (value.space) console.log(`- space: required ${value.space.requiredBytes}, free ${value.space.freeBytes}, sufficient ${value.space.sufficient}`);
   if (value.mode === 'plan') console.log('Plan only. Re-run with --apply to write the backup.');
 }
 
@@ -271,4 +288,4 @@ if (isMain) {
   }
 }
 
-export { sha256, isInside, walk };
+export { sha256, isInside, walk, realTarget };
