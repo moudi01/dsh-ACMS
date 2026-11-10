@@ -3,7 +3,7 @@
 - Issue：[P2][体验] 总览与调度器使用同一执行资源占用口径（https://github.com/moudi01/dsh-ACMS/issues/47）
 - 仓库基线：`origin/main` `2fc7a678b3e90598e80fcbd5f5128653dcc50c18`（Merge pull request #58）
 - 实现提交：`d8dc16a`（分支 `codex/issue-47-capacity`）；本记录提交只补记该 SHA
-- 复核修订提交：本 PR 中 `d8dc16a` 之后的修复提交（修复对话入口、清理确认刷新、检测事件、明细键与对比度，详见第 6 节；本记录在复核提交后补记 SHA）
+- 复核修订提交：`8cd15f4`（修复对话入口、清理确认刷新、检测事件、明细键与对比度，详见第 6 节）；本记录提交只补记该 SHA
 - 验证日期：2026-11-10（Asia/Shanghai）
 - 验证环境：Windows；Node.js `v24.22.0`；npm `11.19.1`；本机 Chrome（UI 检查）。未安装或升级运行中的 DSH，未调用真实模型。
 
