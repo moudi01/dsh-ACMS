@@ -9,6 +9,7 @@ const LINK_RE = /!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/g;
 const PS_REF_RE = /scripts[\\/]([A-Za-z0-9_.-]+\.ps1)\b/g;
 const PATH_REF_RE = /scripts[\\/]([A-Za-z0-9_.-]+\.(?:ps1|mjs|cjs|js))\b/g;
 const ARG_SEPARATOR_RE = /[;；|&]/;
+const EVIDENCE_FENCE = 'text-evidence';
 const PAUSE_HEADING_RE = /^##\s+.*暂停.*停止/;
 const PAUSE_TERMS = ['暂停公司', '恢复调度', '单任务暂停', '停止在途执行', '清理', 'reconciling'];
 
@@ -55,30 +56,51 @@ export function parsePowerShellParams(text) {
   return [...block.matchAll(/\[[^\]\n]*\]\s*\$([A-Za-z_][A-Za-z0-9_]*)/g)].map(match => match[1]);
 }
 
+// Merge PowerShell backtick continuations so a parameter on the next physical
+// line is still associated with the command. Reported line numbers point at the
+// first physical line of the command.
+function logicalLines(text) {
+  const raw = text.split(/\r?\n/);
+  const merged = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    let current = raw[index];
+    let consumed = index;
+    // A fence delimiter also ends with backticks; never treat it as a line
+    // continuation, otherwise it would swallow the next physical line.
+    while (!/^\s*```/.test(current) && /`\s*$/.test(current) && consumed + 1 < raw.length) {
+      current = current.replace(/`\s*$/, ' ') + raw[consumed + 1];
+      consumed += 1;
+    }
+    merged.push({ line: index + 1, text: current });
+    index = consumed;
+  }
+  return merged;
+}
+
 // Returns every documented invocation of a scripts/*.ps1 file and the
-// `-Switch` tokens that follow it on the same command line. Fenced `text`
-// blocks are documentation excerpts rather than runnable commands, so their
-// contents are not parsed as invocations.
+// `-Switch` tokens that follow it on the same command line. Fenced excerpts
+// marked `text-evidence` are quoted evidence, not runnable instructions, so
+// their contents are not parsed as invocations.
 export function extractPowerShellCommands(text) {
   const commands = [];
   let fence = null;
-  text.split(/\r?\n/).forEach((line, index) => {
-    const fenceMatch = /^\s*```\s*([A-Za-z0-9_-]*)\s*$/.exec(line);
+  for (const { line, text: current } of logicalLines(text)) {
+    const fenceMatch = /^\s*```\s*([A-Za-z0-9_-]*)\s*$/.exec(current);
     if (fenceMatch) {
       fence = fence === null ? fenceMatch[1].toLowerCase() : null;
-      return;
+      continue;
     }
-    if (fence === 'text') return;
+    if (fence === EVIDENCE_FENCE) continue;
     const reference = new RegExp(PS_REF_RE.source, 'g');
     let match;
-    while ((match = reference.exec(line))) {
-      let tail = line.slice(match.index + match[0].length);
+    while ((match = reference.exec(current))) {
+      let tail = current.slice(match.index + match[0].length);
       const cut = tail.search(ARG_SEPARATOR_RE);
       if (cut >= 0) tail = tail.slice(0, cut);
       const params = [...tail.matchAll(/(?:^|\s)-([A-Za-z][A-Za-z0-9_]*)\b/g)].map(item => item[1]);
-      commands.push({ line: index + 1, script: match[1], params });
+      commands.push({ line, script: match[1], params });
     }
-  });
+  }
   return commands;
 }
 
@@ -99,7 +121,9 @@ export async function checkCommandParams(root) {
     const relative = toPosix(path.relative(root, file));
     const text = await readFile(file, 'utf8');
     for (const command of extractPowerShellCommands(text)) {
-      const params = declared.get(command.script);
+      // Windows paths are case-insensitive, so resolve script names the same way.
+      const params = declared.get(command.script)
+        ?? [...declared.entries()].find(([name]) => name.toLowerCase() === command.script.toLowerCase())?.[1];
       if (!params) continue; // Missing script files are reported by checkReferencedScripts.
       for (const param of command.params) {
         if (!params.includes(param)) {

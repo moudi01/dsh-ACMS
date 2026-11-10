@@ -86,9 +86,9 @@ test('命令参数提取在命令分隔符处停止', () => {
   assert.deepEqual(commands[1].params, ['TargetProfile']);
 });
 
-test('text 代码块是说明摘录，不作为可执行命令校验', () => {
+test('text-evidence 摘录不当作可执行命令校验', () => {
   const text = [
-    '```text',
+    '```text-evidence',
     'pwsh -File .\\scripts\\install.ps1 -Bogus',
     '```',
     '',
@@ -99,6 +99,31 @@ test('text 代码块是说明摘录，不作为可执行命令校验', () => {
   const commands = extractPowerShellCommands(text);
   assert.equal(commands.length, 1);
   assert.deepEqual(commands[0].params, ['TargetProfile']);
+});
+
+test('反引号续行的多行命令参数仍被校验', () => {
+  const text = [
+    '```powershell',
+    'pwsh -File .\\scripts\\install.ps1 -TargetProfile desktop `',
+    '  -BogusParam',
+    '```',
+  ].join('\n');
+  const commands = extractPowerShellCommands(text);
+  assert.equal(commands.length, 1);
+  assert.deepEqual(commands[0].params, ['TargetProfile', 'BogusParam']);
+});
+
+test('脚本名大写时仍按 Windows 大小写不敏感校验参数', async () => {
+  const root = await fixture({
+    'docs/operations.md': `${OPERATIONS}\n\`\`\`powershell\npwsh -File .\\scripts\\Install.ps1 -BogusParam\n\`\`\`\n`,
+  });
+  try {
+    const errors = await checkCommandParams(root);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /-BogusParam/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('仓库自身通过全部文档一致性检查', async () => {
