@@ -7,13 +7,13 @@ import { readFileSync, existsSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Store } from "../src/core/store.js";
 import { Company } from "../src/core/domain.js";
 import { createAgentApi } from "../src/host/agent-api.js";
 import { createRoutes } from "../src/host/http.js";
-import { OWNER } from "../src/core/util.js";
+import { OWNER, digest } from "../src/core/util.js";
 
 async function apiFixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "acms-agent-api-"));
@@ -593,6 +593,7 @@ test("writes an atomic discovery document without secrets and removes it on clos
 test("enforces status.read and events.read on every scoped read endpoint", async t => {
   const f = await apiFixture(t);
   const task = f.owner("task.create", { goalId: f.goal.id, title: "Readable", description: "x", acceptance: "x" });
+  const artifact = await putAgentArtifact(f, f.goal, "artifact_read_command", Buffer.from([1, 2, 3]));
   const submitOnly = f.credential({ goalIds: [f.goal.id], commands: ["goal.submit"] });
   const reads = [
     "/status?goalId=" + f.goal.id,
@@ -602,6 +603,7 @@ test("enforces status.read and events.read on every scoped read endpoint", async
     "/goals/" + f.goal.id,
     "/tasks?goalId=" + f.goal.id,
     "/tasks/" + task.id,
+    "/artifacts/" + artifact.id,
     "/reviews?goalId=" + f.goal.id,
     "/blockers?goalId=" + f.goal.id,
     "/events?goalId=" + f.goal.id,
@@ -765,4 +767,43 @@ test("goal scope is the union of configured goals and goals the credential submi
   const denied = await f.call("/status?goalId=" + f.otherGoal.id, { token: c.token });
   assert.equal(denied.status, 403);
   assert.equal(denied.body.error.code, "SCOPE_DENIED");
+});
+
+async function putAgentArtifact(f, goal, id, bytes) {
+  const task = f.owner("task.create", { goalId: goal.id, title: "Artifact " + id, description: "x", acceptance: "x" });
+  const blob = path.join(f.dataDir, "artifacts", id);
+  await mkdir(path.dirname(blob), { recursive: true });
+  await writeFile(blob, bytes);
+  return f.store.put("artifacts", { id, taskId: task.id, attemptId: "attempt_" + id, path: "交付/中文 文件.txt", title: "交付", hash: digest(bytes.toString("base64")), bytes: bytes.length, blob });
+}
+
+test("artifact read returns authorized raw bytes with digests and rejects other scopes or revoked credentials", async t => {
+  const f = await apiFixture(t);
+  const bytes = Buffer.from([0, 255, 1, 2, 65, 0]);
+  const artifact = await putAgentArtifact(f, f.goal, "artifact_agent_read", bytes);
+  const c = f.credential({ goalIds: [f.goal.id] });
+  const read = await f.call("/artifacts/" + artifact.id, { token: c.token });
+  assert.equal(read.status, 200);
+  assert.equal(read.body.value.taskId, artifact.taskId);
+  assert.equal(read.body.value.goalId, f.goal.id);
+  assert.equal(read.body.value.size, bytes.length);
+  assert.equal(read.body.value.encoding, "base64");
+  assert.equal(read.body.value.sha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.equal(read.body.value.artifact.hash, digest(bytes.toString("base64")));
+  assert.notEqual(read.body.value.artifact.hash, read.body.value.sha256);
+  assert.deepEqual(Buffer.from(read.body.value.content, "base64"), bytes);
+
+  const sibling = f.owner("goal.create", { title: "Sibling goal", description: "x", acceptance: "x", projectId: f.project.id, plan: false });
+  const siblingArtifact = await putAgentArtifact(f, sibling, "artifact_sibling_goal", Buffer.from([9]));
+  const crossGoal = await f.call("/artifacts/" + siblingArtifact.id, { token: c.token });
+  assert.equal(crossGoal.status, 403);
+  assert.equal(crossGoal.body.error.code, "SCOPE_DENIED");
+
+  const revoked = f.credential({ goalIds: [f.goal.id] });
+  f.owner("agentCredential.revoke", { credentialId: revoked.credential.id, expectedRevision: revoked.credential.revision });
+  const unauthorized = await f.call("/artifacts/" + artifact.id, { token: revoked.token });
+  assert.equal(unauthorized.status, 401);
+
+  const missing = await f.call("/artifacts/artifact_absent", { token: c.token });
+  assert.equal(missing.status, 404);
 });

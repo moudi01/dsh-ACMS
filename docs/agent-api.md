@@ -76,7 +76,7 @@
 - 目标级范围：`goalIds` 明确列出、或目标由该凭据提交（`goal.source.principalId`）、或只读且 `allGoals=true` 时目标项目在 `projectIds` 内。写操作不接受 `allGoals` 放行。
 - 项目级范围：`projectIds` 明确列出，或项目由该凭据创建。
 - 越权返回 403 `SCOPE_DENIED`；命令不在白名单返回 403 `FORBIDDEN`；owner-only 操作返回 403 `OWNER_REQUIRED`。错误消息不包含 token、数据库路径或堆栈。
-- 所有数据读取端点统一执行命令检查：`/status`、`/projects`、`/projects/{id}`、`/goals`、`/goals/{id}`、`/tasks`、`/tasks/{id}`、`/reviews`、`/blockers` 都要求 `status.read`，`/events` 要求 `events.read`，`/discover` 只要求有效凭据。缺少读取命令时返回 403 `FORBIDDEN`，不会因为目标或项目在范围内而放行。
+- 所有数据读取端点统一执行命令检查：`/status`、`/projects`、`/projects/{id}`、`/goals`、`/goals/{id}`、`/tasks`、`/tasks/{id}`、`/artifacts/{id}`、`/reviews`、`/blockers` 都要求 `status.read`，`/events` 要求 `events.read`，`/discover` 只要求有效凭据。缺少读取命令时返回 403 `FORBIDDEN`，不会因为目标或项目在范围内而放行。
 
 ## 4. 端点
 
@@ -92,6 +92,7 @@
 | GET | `/goals/{id}` | `status.read` | 目标、任务与当前阻塞 |
 | GET | `/tasks?goalId=&status=` | `status.read` | 任务列表，最多 200 条 |
 | GET | `/tasks/{id}` | `status.read` | 任务、依赖、attempt、artifact、verification、审查与阻塞 |
+| GET | `/artifacts/{id}` | `status.read` | 单文件产物的完整原始内容（base64）与原始字节 SHA-256 |
 | GET | `/reviews?goalId=` | `status.read` | 审查任务与 verification 摘要（含 `reviewTaskId` 关联） |
 | GET | `/blockers?goalId=` | `status.read` | 仅 pending interaction |
 | GET | `/events?goalId=&after=&limit=&wait=` | `events.read` | 按目标增量事件与长轮询 |
@@ -129,6 +130,8 @@
 目标的 `contractVersion` 是当前合同版本，`completedContractVersion` 是最近通过验收的版本。要求或验收变化后，`contractChange.status=pending` 表示等待负责人评估，`deliveryHash` 已指向新合同。任务与核验证据保留其 `goalContractVersion`，任务级审查通过 `reviewedContractVersion` 关联被审交付的版本。负责人确认后，`contractChange.decision` 记录沿用成果和后续工作；历史证据仍可查询。
 
 `GET /reviews` 返回 `reviews`（审查任务视图）与 `verifications`。每条 verification 保留源任务 `taskId`、审查任务 `reviewTaskId`、`kind`（`review` 或 `goal-review`）、`passed`、`summary`、`artifactHash` 与 `createdAt`；`reviewTaskId` 由审查 attempt 关联，批准与退回都会记录。审查是用户按需添加的独立子任务，未配置审查时 `reviews` 为空，表示“未审查”，不是失败。任务视图包含 `reviewScope`（`goal` 或 `task`）与 `passed`。`GET /tasks/{id}` 对审查任务同样返回其 verification（附 `reviewTaskId`），对源任务返回关联审查任务列表。读取仅查询 SQLite，不启动模型。
+
+`GET /artifacts/{id}` 按凭据的目标范围返回已有不可变产物：`artifact`（元数据）、`goalId`、`taskId`、`size`、`encoding: "base64"`、`content`（完整原始字节的 Base64）与 `sha256`（原始字节的 SHA-256，十六进制）。该接口不接受任意本机路径，只接受 artifact ID；跨目标、撤销/过期凭据返回 403/401，无 `status.read` 返回 403 `FORBIDDEN`。blob 缺失或字节数与记录不符分别返回 410 `ARTIFACT_MISSING`、409 `ARTIFACT_CORRUPT`，超过公司 `maxArtifactBytes` 返回 413 `ARTIFACT_TOO_LARGE`。服务端读取前先校验文件大小，读取后还会核对记录中的 `artifact.hash`（Base64 文本摘要），同长度内容损坏同样返回 `ARTIFACT_CORRUPT`。注意：产物元数据里的 `artifact.hash` 是 ACMS 对 Base64 文本计算的摘要，不是原始字节 SHA-256，两者不能互换；完整性校验以 `sha256` 与 `size` 为准。owner 面板的完整下载使用同一 artifact ID 与 `maxArtifactBytes` 边界，只由 DSH owner 连接访问。
 
 ## 5. 幂等
 
