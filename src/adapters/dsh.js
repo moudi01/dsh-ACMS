@@ -154,6 +154,7 @@ export class DshAdapter {
     assert(executionOccupancy(this.company.store, this).used < this.company.policy().maxConcurrent,
       'ACTIVE_LIMIT', '执行资源已满，请等待任务结束后再检测');
     this.activeProbes++;
+    if (this.company.store) this.company.store.transaction(() => this.company.store.event('model.probe.started', String(input.model ?? input.provider ?? 'probe'), { provider: input.provider ?? null, model: input.model ?? null }, OWNER));
     let result, cleanupPending = false; const started = Date.now();
     try {
       const provider = await this.choose(input, { ignoreHealth: true });
@@ -174,7 +175,7 @@ export class DshAdapter {
       cleanupPending = e.cleanupUncertain === true;
       if (signal?.aborted || this.closing || e.code === 'PAIRED_PROBE_UNSUPPORTED') throw e;
       result = { status: 'unavailable', reason: diagnosticMessage(e), code: String(e.code ?? 'MODEL_CHECK_FAILED') };
-    } finally { if (!cleanupPending) this.activeProbes--; }
+    } finally { if (!cleanupPending) { this.activeProbes--; if (this.company.store) this.company.store.transaction(() => this.company.store.event('model.probe.finished', String(input.model ?? input.provider ?? 'probe'), { provider: input.provider ?? null, model: input.model ?? null }, OWNER)); } }
     result = { ...result, id: this.healthKey(input), checkedAt: new Date().toISOString(), latencyMs: Date.now() - started };
     if (this.company.store) this.company.store.transaction(() => { this.company.store.put('modelHealth', result); this.company.store.event('model.checked', result.id, { status: result.status }, OWNER); });
     return result;

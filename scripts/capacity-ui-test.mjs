@@ -2,7 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { startPreview } from './preview-server.mjs';
-import { OWNER } from '../src/core/util.js';
+import { OWNER, SYSTEM } from '../src/core/util.js';
 
 // Issue #47 acceptance: the overview reads the host capacity snapshot, lists
 // every occupancy kind with an entry point, and covers task, integration,
@@ -16,6 +16,9 @@ const agent = command('agent.save', { name: '容量夹具执行员', role: 'work
 const goal = command('goal.create', { projectId: project.id, title: '容量夹具目标', description: '执行容量验收夹具。', acceptance: '容量与关联入口可核对。', plan: false });
 const running = command('task.create', { goalId: goal.id, title: '运行中的任务' });
 const cleaning = command('task.create', { goalId: goal.id, title: '待清理核对的集成任务' });
+// The running task also belongs to the same agent as the conversation below,
+// so a fallback to "this agent's running task" would open the wrong session.
+store.put('tasks', { ...store.require('tasks', running.id), agentId: agent.id });
 const startedAt = new Date().toISOString();
 store.put('attempts', { id: 'attempt_capacity_running', taskId: running.id, goalId: goal.id, agentId: agent.id, role: 'worker', kind: 'work', status: 'running', startedAt });
 store.put('attempts', { id: 'attempt_capacity_cleanup', taskId: cleaning.id, goalId: goal.id, agentId: agent.id, role: 'worker', kind: 'work', status: 'completed', cleanupPending: true, startedAt });
@@ -61,7 +64,20 @@ try {
 
   await entry(/容量夹具执行员/).click();
   await expect(page.getByRole('heading', { name: `与 ${agent.name} 对话` })).toBeVisible();
+  await expect(page.locator('#acms-chat-context')).toHaveValue('');
+  await expect(page.locator('.acms-conversation')).not.toContainText('请选择这个智能体负责的任务');
   await page.getByLabel('关闭会话').click();
+
+  await entry(/Git 集成/).click();
+  await expect(page.locator('.acms-drawer')).toContainText('待清理核对的集成任务');
+  await page.getByLabel('关闭任务详情').click();
+
+  // A cleanup confirmation is announced as a host event, so the panel updates
+  // without a manual refresh and the pending slot disappears.
+  store.put('attempts', { ...store.require('attempts', 'attempt_capacity_cleanup'), cleanupPending: false });
+  store.transaction(() => store.event('attempt.cleanup.confirmed', 'attempt_capacity_cleanup', { taskId: cleaning.id }, SYSTEM));
+  await expect(panel).toContainText('4 / 6', { timeout: 8000 });
+  await expect(phase('待清理核对')).toContainText('0');
 
   await entry(/模型连通性检测/).click();
   await expect(page.getByRole('heading', { name: '模型列表' })).toBeVisible();

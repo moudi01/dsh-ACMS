@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { executionCapacity, executionOccupancy, capacityBlockReason } from '../src/core/execution-capacity.js';
+import { executionCapacity, executionOccupancy, capacityBlockReason, CAPACITY_LABELS, CAPACITY_PHASES } from '../src/core/execution-capacity.js';
+import { fixture, until } from './helpers.js';
 
 const store = data => ({ list: name => data[name] ?? [] });
 const policy = value => ({ maxConcurrent: 4, controlSlots: 1, ...value });
@@ -59,7 +60,7 @@ test('待清理的集成与任务占用分别计入且共用同一阶段', () =>
   assert.equal(capacity.phases.cleanupPending, 1);
 });
 
-test('多种活动混合时总占用等于各类之和，且同一活动只计一次', () => {
+test('存储与 live 映射重叠时同一活动只计一次，混合占用等于各类之和', () => {
   const tasks = [
     { id: 'task_running', goalId: 'goal_1', title: 'Running task', status: 'running' },
     { id: 'task_integration', goalId: 'goal_2', title: 'Integration task', status: 'integrating' },
@@ -99,4 +100,32 @@ test('缺少上限字段时保持未知而不是伪造空闲名额', () => {
   assert.equal(capacity.limit, null);
   assert.equal(capacity.free, null);
   assert.equal(capacityBlockReason(capacity), '');
+});
+
+test('阶段与界面标签来自同一份定义', () => {
+  assert.deepEqual(CAPACITY_PHASES, Object.keys(CAPACITY_LABELS));
+  assert.deepEqual(CAPACITY_PHASES, ['running', 'stopping', 'cleanupPending', 'integrating', 'chat', 'probe']);
+});
+
+test('同一任务的待清理尝试与待集成记录是两个独立槽位，与调度器一致', () => {
+  const tasks = [{ id: 'task_both', goalId: 'goal_1', title: 'Both', status: 'integrating' }];
+  const attempts = [{ id: 'attempt_cleanup', taskId: 'task_both', status: 'completed', cleanupPending: true }];
+  const integrations = [{ id: 'integration_pending', taskId: 'task_both', phase: 'checking' }];
+  const capacity = executionCapacity(store({ tasks, attempts, integrations }), {}, null, policy());
+  assert.equal(capacity.used, 2);
+  assert.equal(capacity.counts.attempt, 1);
+  assert.equal(capacity.counts.integration, 1);
+  assert.equal(executionOccupancy(store({ tasks, attempts, integrations }), {}, null).used, capacity.used);
+});
+
+test('清理确认事件后容量快照释放，且事件写入与状态更新同事务', async t => {
+  const f = await fixture(t);
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.get('tasks', task.id)?.status === 'succeeded');
+  const confirmed = f.store.page(0, 500).entries.filter(entry => entry.type === 'attempt.cleanup.confirmed');
+  assert.ok(confirmed.length >= 1, 'cleanup confirmation is observable through the event stream');
+  const capacity = executionCapacity(f.store, f.adapter, f.engine.live, f.company.policy());
+  assert.equal(capacity.used, 0);
+  assert.equal(capacity.phases.cleanupPending, 0);
 });

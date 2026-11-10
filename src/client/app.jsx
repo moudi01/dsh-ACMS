@@ -9,6 +9,7 @@ import { activeViewTasks, compareActivity, completedTasks, isCompleted, orderByA
 import { goalSummary } from '../core/hierarchy.js';
 import { goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason } from '../core/task-actions.js';
+import { CAPACITY_LABELS } from '../core/execution-capacity.js';
 import { entityDeletionReason } from '../core/entity-actions.js';
 import { EntityDrawer, EntityTrash, ChangeHistory, entityLabels } from './entities.jsx';
 import { ConversationWindow } from './conversation.jsx';
@@ -18,7 +19,6 @@ const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', 
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
 const tabs = [['overview', '公司总览', '◈'], ['projects', '项目与目标', '▱'], ['tasks', '任务工作台', '▤'], ['agents', '组织管理', '♧'], ['models', '模型列表', '◇'], ['workflows', '目标模板', '⇢'], ['artifacts', '产物与验收', '▧'], ['access', '外部接入', '⇄'], ['settings', '公司设置', '⚙']];
 const terminal = ['succeeded', 'cancelled', 'archived'];
-const CAPACITY_LABELS = { running: '运行中', stopping: '正在停止', cleanupPending: '待清理核对', integrating: 'Git 集成', chat: '独立对话', probe: '模型检测' };
 const openGoal = goal => !['succeeded', 'cancelled', 'archived'].includes(goal.status);
 function date(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'; }
 function Badge({ status }) { return <span className="acms-badge" data-status={status}><i />{LABEL[status] ?? status}</span>; }
@@ -55,7 +55,7 @@ export function App() {
   const { data, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
   const [scope, setScope] = useState({}); const [entityView, setEntityView] = useState(null);
   const [conversation, setConversation] = useState(null);
-  const chat = (agentId, taskId = null) => setConversation({ agentId, taskId: taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null });
+  const chat = (agentId, taskId = null, exact = false) => setConversation({ agentId, taskId: exact ? (taskId ?? null) : (taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null) });
   const navigate = (kind, id) => { setModal(null); setSelected(kind === 'task' ? id : null); setEntityView(kind === 'task' ? null : { kind, id }); };
   const selectTask = id => navigate('task', id);
   const [busy, setBusy] = useState(false); const [notice, setNotice] = useState(''); const [actionError, setActionError] = useState('');
@@ -137,7 +137,7 @@ function CapacityPanel({ capacity, data, select, chat, openModels }) {
     <div className="acms-capacity-entries">
       {!entries.length && <p className="acms-sectionnote">当前没有执行占用。</p>}
       {tasks.map(entry => <button key={`${entry.kind}:${entry.id}`} className="acms-capacity-entry" onClick={() => select(entry.taskId)}><span>{entry.kind === 'integration' ? '集成' : '任务'}</span><b>{data.tasks.find(task => task.id === entry.taskId)?.title ?? entry.taskId}</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>查看任务 ↗</small></button>)}
-      {chats.map((entry, index) => entry.agentId ? <button key={`chat:${entry.conversationId ?? index}`} className="acms-capacity-entry" onClick={() => chat(entry.agentId)}><span>对话</span><b>{data.agents.find(agent => agent.id === entry.agentId)?.name ?? entry.agentId}</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>打开对话 ↗</small></button> : <div key={`chat:${index}`} className="acms-capacity-entry" data-static="true"><span>对话</span><b>独立对话</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>暂无关联入口</small></div>)}
+      {chats.map((entry, index) => entry.agentId ? <button key={`chat:${entry.messageId ?? entry.conversationId ?? index}`} className="acms-capacity-entry" onClick={() => chat(entry.agentId, entry.taskId ?? null, true)}><span>对话</span><b>{data.agents.find(agent => agent.id === entry.agentId)?.name ?? entry.agentId}</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>打开对话 ↗</small></button> : <div key={`chat:${entry.messageId ?? entry.conversationId ?? index}`} className="acms-capacity-entry" data-static="true"><span>对话</span><b>独立对话</b><em>{CAPACITY_LABELS[entry.phase] ?? entry.phase}</em><small>暂无关联入口</small></div>)}
       {Array.from({ length: probeCount }, (_, index) => <button key={`probe:${index}`} className="acms-capacity-entry" onClick={openModels}><span>检测</span><b>模型连通性检测</b><em>模型检测</em><small>打开模型列表 ↗</small></button>)}
     </div>
   </section>;

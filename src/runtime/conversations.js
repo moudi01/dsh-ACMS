@@ -150,7 +150,7 @@ export class Conversations {
         'CHAT_CAPACITY', '执行资源已满，消息未发送；请稍后重试');
       this.adapter.activeChats = (this.adapter.activeChats ?? 0) + 1;
       jobCounted = true;
-      this.adapter.activeChatDetails.set(chat.id, { conversationId: chat.id, agentId: chat.agentId, taskId: null, messageId: message.id, phase: 'chat' });
+      this.adapter.activeChatDetails.set(message.id, { conversationId: chat.id, agentId: chat.agentId, taskId: null, messageId: message.id, phase: 'chat' });
       this.update(message.id, { status: 'sending' });
       reply = this.store.transaction(() => this.save({ id: id('message'), conversationId: chat.id, agentId: chat.agentId, taskId: null,
         role: 'assistant', text: '', status: 'streaming', replyTo: message.id }));
@@ -171,10 +171,10 @@ export class Conversations {
     } catch(error) {
       cleanupPending = error.cleanupUncertain === true;
       if (cleanupPending) { this.quarantined.add(message.id);
-        this.adapter.activeChatDetails.set(chat.id, { conversationId: chat.id, agentId: chat.agentId, taskId: null, messageId: message.id, phase: 'cleanupPending' }); }
+        this.adapter.activeChatDetails.set(message.id, { conversationId: chat.id, agentId: chat.agentId, taskId: null, messageId: message.id, phase: 'cleanupPending' }); }
       const patch = { status:controller.signal.aborted ? 'interrupted' : 'failed', cleanupPending, error:limitText(error.message) };
       this.update(message.id, patch); if(reply) this.update(reply.id,patch);
-    } finally { clearTimeout(timer); if(jobCounted && !cleanupPending) { this.adapter.activeChats--; this.adapter.activeChatDetails.delete(chat.id); } }
+    } finally { clearTimeout(timer); if(jobCounted && !cleanupPending) { this.adapter.activeChats--; this.adapter.activeChatDetails.delete(message.id); } }
   }
   stop(conversationId) {
     this.store.require('conversations', conversationId); this.jobs.get(conversationId)?.controller.abort(new Error('所有者停止了本次回复'));

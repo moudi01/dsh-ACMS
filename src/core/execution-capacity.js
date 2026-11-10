@@ -3,7 +3,11 @@ import { integrationPending } from './task-actions.js';
 
 // Phases are deliberately small and stable: the host snapshot and the panel
 // must describe the same occupancy in the same terms.
-export const CAPACITY_PHASES = ['running', 'stopping', 'cleanupPending', 'integrating', 'chat', 'probe'];
+export const CAPACITY_LABELS = {
+  running: '运行中', stopping: '正在停止', cleanupPending: '待清理核对',
+  integrating: 'Git 集成', chat: '独立对话', probe: '模型检测',
+};
+export const CAPACITY_PHASES = Object.keys(CAPACITY_LABELS);
 
 function liveParts(store, live) {
   const attempts = store?.list('attempts').filter(a => !a.legacyBatch && (isLiveAttempt(a) || live?.has(a.id))) ?? [];
@@ -55,10 +59,10 @@ export function executionCapacity(store, adapter, live, policy) {
   const chatDetails = [...(adapter?.activeChatDetails?.values?.() ?? [])].slice(0, chatCount);
   for (const detail of chatDetails) {
     entries.push({ kind: 'chat', phase: detail.phase ?? 'chat', conversationId: detail.conversationId ?? null,
-      agentId: detail.agentId ?? null, messageId: detail.messageId ?? null });
+      agentId: detail.agentId ?? null, taskId: detail.taskId ?? null, messageId: detail.messageId ?? null });
   }
   for (let index = chatDetails.length; index < chatCount; index += 1) {
-    entries.push({ kind: 'chat', phase: 'chat', conversationId: null, agentId: null, messageId: null });
+    entries.push({ kind: 'chat', phase: 'chat', conversationId: null, agentId: null, taskId: null, messageId: null });
   }
   const probeCount = Math.max(0, adapter?.activeProbes ?? 0);
   for (let index = 0; index < probeCount; index += 1) entries.push({ kind: 'probe', phase: 'probe' });
