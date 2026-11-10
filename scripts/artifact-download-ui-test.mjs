@@ -2,6 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { startPreview } from './preview-server.mjs';
+import { digest } from '../src/core/util.js';
 
 // Issue #35 acceptance: the panel downloads the complete original file, while
 // the text preview stays bounded. Binary bytes and Unicode names are preserved.
@@ -14,8 +15,8 @@ const emptyBlob = path.join(server.dataDir, 'artifacts', 'ui-empty-blob');
 await mkdir(path.dirname(blob), { recursive: true });
 await writeFile(blob, bytes);
 await writeFile(emptyBlob, Buffer.alloc(0));
-server.company.store.put('artifacts', { id: 'artifact_ui_download', taskId: task.id, attemptId: 'attempt_ui_download', path: '交付/UI 二进制.bin', title: 'UI 二进制交付', hash: 'acms-base64-digest', bytes: bytes.length, blob });
-server.company.store.put('artifacts', { id: 'artifact_ui_empty', taskId: task.id, attemptId: 'attempt_ui_empty', path: '交付/空文件.txt', title: 'UI 空文件交付', hash: 'acms-empty-digest', bytes: 0, blob: emptyBlob });
+server.company.store.put('artifacts', { id: 'artifact_ui_download', taskId: task.id, attemptId: 'attempt_ui_download', path: '交付/UI 二进制.bin', title: 'UI 二进制交付', hash: digest(bytes.toString('base64')), bytes: bytes.length, blob });
+server.company.store.put('artifacts', { id: 'artifact_ui_empty', taskId: task.id, attemptId: 'attempt_ui_empty', path: '交付/空文件.txt', title: 'UI 空文件交付', hash: digest(''), bytes: 0, blob: emptyBlob });
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1100 }, colorScheme: 'light', acceptDownloads: true });

@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { assert, OWNER } from '../core/util.js';
+import { assert, digest, OWNER } from '../core/util.js';
 import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
 
@@ -15,7 +15,8 @@ function downloadName(value) {
 }
 function contentDisposition(name) {
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'artifact';
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16).toUpperCase());
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 function downloadMime(value) {
   const extension = String(value ?? '').toLowerCase().match(/\.[a-z0-9]+$/)?.[0];
@@ -102,12 +103,18 @@ export function createRoutes(runtime) {
       const artifact = company.store.get('artifacts', artifactId);
       assert(artifact, 'NOT_FOUND', 'Artifact not found');
       const limit = company.policy().maxArtifactBytes;
-      assert(Number.isFinite(artifact.bytes) && artifact.bytes <= limit, 'ARTIFACT_TOO_LARGE', 'Artifact exceeds the company size limit');
+      assert(Number.isSafeInteger(artifact.bytes) && artifact.bytes >= 0, 'ARTIFACT_CORRUPT', 'Artifact record has an invalid byte count');
+      assert(artifact.bytes <= limit, 'ARTIFACT_TOO_LARGE', 'Artifact exceeds the company size limit');
+      let stat;
+      try { stat = await fs.stat(artifact.blob); }
+      catch { assert(false, 'ARTIFACT_MISSING', 'Artifact blob is missing'); }
+      assert(stat.isFile() && stat.size === artifact.bytes, 'ARTIFACT_CORRUPT', 'Artifact byte count does not match its record');
       let bytes;
       try { bytes = await fs.readFile(artifact.blob); }
       catch { assert(false, 'ARTIFACT_MISSING', 'Artifact blob is missing'); }
       assert(bytes.length === artifact.bytes, 'ARTIFACT_CORRUPT', `Artifact byte count mismatch: expected ${artifact.bytes}, found ${bytes.length}`);
       assert(bytes.length <= limit, 'ARTIFACT_TOO_LARGE', 'Artifact exceeds the company size limit');
+      if (artifact.hash) assert(digest(bytes.toString('base64')) === artifact.hash, 'ARTIFACT_CORRUPT', 'Artifact content does not match its recorded digest');
       const filename = downloadName(artifact.path);
       return new Response(bytes, { status: 200, headers: {
         'content-type': downloadMime(artifact.path), 'content-length': String(bytes.length),

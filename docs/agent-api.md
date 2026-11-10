@@ -131,7 +131,7 @@
 
 `GET /reviews` 返回 `reviews`（审查任务视图）与 `verifications`。每条 verification 保留源任务 `taskId`、审查任务 `reviewTaskId`、`kind`（`review` 或 `goal-review`）、`passed`、`summary`、`artifactHash` 与 `createdAt`；`reviewTaskId` 由审查 attempt 关联，批准与退回都会记录。审查是用户按需添加的独立子任务，未配置审查时 `reviews` 为空，表示“未审查”，不是失败。任务视图包含 `reviewScope`（`goal` 或 `task`）与 `passed`。`GET /tasks/{id}` 对审查任务同样返回其 verification（附 `reviewTaskId`），对源任务返回关联审查任务列表。读取仅查询 SQLite，不启动模型。
 
-`GET /artifacts/{id}` 按凭据的目标范围返回已有不可变产物：`artifact`（元数据）、`goalId`、`taskId`、`size`、`encoding: "base64"`、`content`（完整原始字节的 Base64）与 `sha256`（原始字节的 SHA-256，十六进制）。该接口不接受任意本机路径，只接受 artifact ID；跨目标、撤销/过期凭据返回 403/401，无 `status.read` 返回 403 `FORBIDDEN`。blob 缺失或字节数与记录不符分别返回 410 `ARTIFACT_MISSING`、409 `ARTIFACT_CORRUPT`，超过公司 `maxArtifactBytes` 返回 413 `ARTIFACT_TOO_LARGE`。注意：产物元数据里的 `artifact.hash` 是 ACMS 对 Base64 文本计算的摘要，不是原始字节 SHA-256，两者不能互换；完整性校验以 `sha256` 与 `size` 为准。owner 面板的完整下载使用同一 artifact ID 与 `maxArtifactBytes` 边界，只由 DSH owner 连接访问。
+`GET /artifacts/{id}` 按凭据的目标范围返回已有不可变产物：`artifact`（元数据）、`goalId`、`taskId`、`size`、`encoding: "base64"`、`content`（完整原始字节的 Base64）与 `sha256`（原始字节的 SHA-256，十六进制）。该接口不接受任意本机路径，只接受 artifact ID；跨目标、撤销/过期凭据返回 403/401，无 `status.read` 返回 403 `FORBIDDEN`。blob 缺失或字节数与记录不符分别返回 410 `ARTIFACT_MISSING`、409 `ARTIFACT_CORRUPT`，超过公司 `maxArtifactBytes` 返回 413 `ARTIFACT_TOO_LARGE`。服务端读取前先校验文件大小，读取后还会核对记录中的 `artifact.hash`（Base64 文本摘要），同长度内容损坏同样返回 `ARTIFACT_CORRUPT`。注意：产物元数据里的 `artifact.hash` 是 ACMS 对 Base64 文本计算的摘要，不是原始字节 SHA-256，两者不能互换；完整性校验以 `sha256` 与 `size` 为准。owner 面板的完整下载使用同一 artifact ID 与 `maxArtifactBytes` 边界，只由 DSH owner 连接访问。
 
 ## 5. 幂等
 

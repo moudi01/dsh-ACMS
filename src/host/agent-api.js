@@ -3,7 +3,7 @@ import http from "node:http";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { AcmsError, asBusyError, assert, now } from "../core/util.js";
+import { AcmsError, asBusyError, assert, digest, now } from "../core/util.js";
 import { assertCredentialActive, findCredentialByToken, goalAllowed, GOAL_CONTROL_COMMANDS, projectAllowed, stableActor } from "../core/agent-identity.js";
 import { sanitizePreferences } from "../core/model-selection.js";
 import { goalControlView } from "../core/goal-control.js";
@@ -455,10 +455,15 @@ async function dispatch(runtime, state, request, context) {
     const goal = company.store.get("goals", task.goalId);
     assert(goal && goalAllowed(credential, goal, { write: false }), "SCOPE_DENIED", "Requested artifact is outside this credential scope");
     const limit = company.policy().maxArtifactBytes;
-    assert(Number.isFinite(artifact.bytes) && artifact.bytes <= limit, "ARTIFACT_TOO_LARGE", "Artifact exceeds the company size limit");
+    assert(Number.isSafeInteger(artifact.bytes) && artifact.bytes >= 0, "ARTIFACT_CORRUPT", "Artifact record has an invalid byte count");
+    assert(artifact.bytes <= limit, "ARTIFACT_TOO_LARGE", "Artifact exceeds the company size limit");
+    let stat;
+    try { stat = await fs.stat(artifact.blob); } catch { throw new AcmsError("ARTIFACT_MISSING", "Artifact blob is missing"); }
+    assert(stat.isFile() && stat.size === artifact.bytes, "ARTIFACT_CORRUPT", "Artifact byte count does not match its record");
     let bytes;
     try { bytes = await fs.readFile(artifact.blob); } catch { throw new AcmsError("ARTIFACT_MISSING", "Artifact blob is missing"); }
     assert(bytes.length === artifact.bytes, "ARTIFACT_CORRUPT", "Artifact byte count does not match its record");
+    if (artifact.hash) assert(digest(bytes.toString("base64")) === artifact.hash, "ARTIFACT_CORRUPT", "Artifact content does not match its recorded digest");
     return { value: { artifact: artifactView(artifact), goalId: goal.id, taskId: task.id, size: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex"), encoding: "base64", content: bytes.toString("base64") } };
   }

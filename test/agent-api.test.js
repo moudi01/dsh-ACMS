@@ -13,7 +13,7 @@ import { Store } from "../src/core/store.js";
 import { Company } from "../src/core/domain.js";
 import { createAgentApi } from "../src/host/agent-api.js";
 import { createRoutes } from "../src/host/http.js";
-import { OWNER } from "../src/core/util.js";
+import { OWNER, digest } from "../src/core/util.js";
 
 async function apiFixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "acms-agent-api-"));
@@ -593,6 +593,7 @@ test("writes an atomic discovery document without secrets and removes it on clos
 test("enforces status.read and events.read on every scoped read endpoint", async t => {
   const f = await apiFixture(t);
   const task = f.owner("task.create", { goalId: f.goal.id, title: "Readable", description: "x", acceptance: "x" });
+  const artifact = await putAgentArtifact(f, f.goal, "artifact_read_command", Buffer.from([1, 2, 3]));
   const submitOnly = f.credential({ goalIds: [f.goal.id], commands: ["goal.submit"] });
   const reads = [
     "/status?goalId=" + f.goal.id,
@@ -602,6 +603,7 @@ test("enforces status.read and events.read on every scoped read endpoint", async
     "/goals/" + f.goal.id,
     "/tasks?goalId=" + f.goal.id,
     "/tasks/" + task.id,
+    "/artifacts/" + artifact.id,
     "/reviews?goalId=" + f.goal.id,
     "/blockers?goalId=" + f.goal.id,
     "/events?goalId=" + f.goal.id,
@@ -772,7 +774,7 @@ async function putAgentArtifact(f, goal, id, bytes) {
   const blob = path.join(f.dataDir, "artifacts", id);
   await mkdir(path.dirname(blob), { recursive: true });
   await writeFile(blob, bytes);
-  return f.store.put("artifacts", { id, taskId: task.id, attemptId: "attempt_" + id, path: "交付/中文 文件.txt", title: "交付", hash: "acms-base64-digest", bytes: bytes.length, blob });
+  return f.store.put("artifacts", { id, taskId: task.id, attemptId: "attempt_" + id, path: "交付/中文 文件.txt", title: "交付", hash: digest(bytes.toString("base64")), bytes: bytes.length, blob });
 }
 
 test("artifact read returns authorized raw bytes with digests and rejects other scopes or revoked credentials", async t => {
@@ -787,6 +789,8 @@ test("artifact read returns authorized raw bytes with digests and rejects other 
   assert.equal(read.body.value.size, bytes.length);
   assert.equal(read.body.value.encoding, "base64");
   assert.equal(read.body.value.sha256, createHash("sha256").update(bytes).digest("hex"));
+  assert.equal(read.body.value.artifact.hash, digest(bytes.toString("base64")));
+  assert.notEqual(read.body.value.artifact.hash, read.body.value.sha256);
   assert.deepEqual(Buffer.from(read.body.value.content, "base64"), bytes);
 
   const sibling = f.owner("goal.create", { title: "Sibling goal", description: "x", acceptance: "x", projectId: f.project.id, plan: false });
