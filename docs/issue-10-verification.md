@@ -32,7 +32,7 @@ pwsh -File .\scripts\uninstall.ps1 -TargetProfile desktop -RemoveCodexProvider
 - `docs/agent-conversations.md`：补充独立对话历史传递与任务线程续接的边界。
 - `README.md`：统一上下文续接表述为执行入口声明的上下文能力。
 - `scripts/docs-consistency.mjs`：无依赖检查器，校验 PowerShell 命令参数与脚本声明一致、脚本参数已在运行说明记录、文档相对链接有效、引用的 `scripts/*` 文件存在、暂停章节包含四个动作及清理语义。
-- `test/docs-consistency.test.js`：覆盖参数解析、命令分隔、反引号续行、`text-evidence` 摘录豁免、fence 边界、未知参数、未记录参数、失效链接、缺失脚本、暂停标签与仓库自检，共 15 项。
+- `test/docs-consistency.test.js`：覆盖参数解析、命令分隔、反引号续行（含无空格续行与首行行号）、`text-evidence` 摘录豁免、fence 边界、未知参数、未记录参数、失效链接、缺失脚本、暂停标签与仓库自检，共 17 项。
 - `package.json` / `.github/workflows/ci.yml`：新增 `npm run check:docs` 并在 CI 中执行。
 
 ## 3. 命令与结果
@@ -41,11 +41,11 @@ pwsh -File .\scripts\uninstall.ps1 -TargetProfile desktop -RemoveCodexProvider
 |---|---|---|
 | `node scripts/check.mjs` | 退出 0：Syntax and package contract checks passed. | 全仓库语法与包契约 |
 | `node scripts/docs-consistency.mjs` | 退出 0：文档一致性检查通过 | 命令参数、参数记录、脚本引用、相对链接、暂停语义 |
-| `node --test test/docs-consistency.test.js` | 15 项通过，0 失败 | 检查器正负夹具 |
-| `npm test` | 484 项通过，0 失败，耗时约 143 秒 | 核心、运行库与新增文档检查测试 |
+| `node --test test/docs-consistency.test.js` | 17 项通过，0 失败 | 检查器正负夹具 |
+| `npm test` | 486 项通过，0 失败，耗时约 143 秒 | 核心、运行库与新增文档检查测试 |
 | `npm run build` | 退出 0：Built lib/client.js | 客户端构建；客户端源码未改，生成产物与已提交版本仅行尾差异，未纳入提交 |
 
-以上结果来自复核修订后的工作树；初版 `bbecc92` 的基线复现与同类命令结果一致，复核修订只修正文档措辞、新增 2 项检查器测试并增强多行命令与大小写解析。PR 推送后 GitHub Actions 会以最终 head 重新运行同一组命令；CI 结果以 PR 页面为准，本文件不预判。
+以上结果来自复核修订后的工作树；初版 `bbecc92` 的基线复现与同类命令结果一致。复核修订分两轮：`1d0b03b` 修正暂停语义并新增 2 项检查器测试；`b1ac6ed` 修复 fence 合并边界、补无空格续行与命令首行定位，再新增 5 项测试。最终检查器测试 17 项、全套 486 项。PR 推送后 GitHub Actions 会以最终 head 重新运行同一组命令；CI 结果以 PR 页面为准，本文件不预判。
 
 ## 4. 验收标准对照
 
@@ -54,7 +54,7 @@ pwsh -File .\scripts\uninstall.ps1 -TargetProfile desktop -RemoveCodexProvider
 - [x] 任务上下文取决于入口能力：README、架构、运行与配对文档统一为“执行入口声明的上下文能力”；独立对话历史传递与任务线程续接分开描述，人员留任不映射为续接。
 - [x] 文档统一且检查失效路径/链接：检查器校验相对链接和 `scripts/*` 引用；基线无既有失效项，新增检查防止后续漂移。
 - [x] 命令示例/参数与关键文档链接检查加入 CI：`.github/workflows/ci.yml` 增加 `npm run check:docs`。
-- [x] 验证记录注明提交、日期与范围：本文件记录 `bbecc92`、2026-11-10、真实本机结果与未覆盖项，未沿用其他入口或其他分支的历史成功结论。
+- [x] 验证记录注明提交、日期与范围：本文件记录初版 `bbecc92`、复核修订 `1d0b03b` 与 `b1ac6ed`、2026-11-10、真实本机结果与未覆盖项，未沿用其他入口或其他分支的历史成功结论。
 
 ## 5. 范围与限制
 
@@ -72,4 +72,5 @@ pwsh -File .\scripts\uninstall.ps1 -TargetProfile desktop -RemoveCodexProvider
 - **编辑与清理的先后**：初版写成“等待清理确认后再编辑”。实际 `task.edit` 会立即保存修改，并把执行中的旧轮次置为 `stopRequested=ready`、递增 `generation`（`src/core/domain.js`、`src/core/entity-management.js`、`src/client/app.jsx`），清理确认后按新要求继续。修订后按实际顺序描述。
 - **补充边界**：单任务暂停默认级联审查子任务；目标级 `afterCurrent` 暂停可在清理确认前把任务置为 `paused`，但资源占位保留到清理确认。
 - **检查器增强**：支持反引号续行的多行命令，Windows 下大小写不敏感的脚本名解析；证据摘录改用 `text-evidence` 标记，普通 `text` 代码块不再豁免，避免借摘录隐藏可执行命令。
-- **第二轮复审修复**：复审发现第一版续行合并可能吞掉相邻 fence（行内代码以反引号结尾、证据块以续行结尾两种布局），已改为先按物理行识别 fence，只在下一行不是 fence 分隔符时合并反引号续行，并补 3 项 fence 边界与普通 `text` 块回归测试。测试总数增至 15 项。
+- **第二轮复审修复**：复审发现第一版续行合并可能吞掉相邻 fence（行内代码以反引号结尾、证据块以续行结尾两种布局），已改为先按物理行识别 fence，只在下一行不是 fence 分隔符时合并反引号续行，并补 3 项 fence 边界与普通 `text` 块回归测试。
+- **第三轮复审修复**：fenced 代码块内允许无空格反引号续行，普通段落仍要求反引号前有空白以避免误合并行内代码；多行命令的错误行号改为指向命令首行；补 2 项测试。最终检查器测试 17 项。

@@ -113,6 +113,40 @@ test('反引号续行的多行命令参数仍被校验', () => {
   assert.deepEqual(commands[0].params, ['TargetProfile', 'BogusParam']);
 });
 
+test('fenced PowerShell 中无空格反引号续行也被识别', () => {
+  const text = [
+    '```powershell',
+    'pwsh -File .\\scripts\\install.ps1 -TargetProfile desktop`',
+    '  -BogusParam',
+    '```',
+  ].join('\n');
+  const commands = extractPowerShellCommands(text);
+  assert.equal(commands.length, 1);
+  assert.deepEqual(commands[0].params, ['TargetProfile', 'BogusParam']);
+});
+
+test('多行命令的错误行号指向命令首行', async () => {
+  const operations = [
+    '# ops',
+    '',
+    '```powershell',
+    'pwsh -File .\\scripts\\install.ps1 -TargetProfile desktop `',
+    '  -BogusParam',
+    '```',
+    '',
+    '## 暂停、停止与恢复',
+    '暂停公司、恢复调度、单任务暂停、停止在途执行；清理；reconciling',
+  ].join('\n');
+  const root = await fixture({ 'docs/operations.md': operations });
+  try {
+    const errors = await checkCommandParams(root);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /docs\/operations\.md:4:/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('行内代码以反引号结尾时不吞掉紧随的 fence', () => {
   const text = [
     '先运行 `npm run check`',

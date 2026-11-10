@@ -15,10 +15,15 @@ const PAUSE_TERMS = ['暂停公司', '恢复调度', '单任务暂停', '停止�
 
 const toPosix = value => value.split(path.sep).join('/');
 const isFence = line => /^\s*```/.test(line);
-// A PowerShell continuation uses a backtick preceded by whitespace. Requiring
-// that separator avoids mistaking an inline-code line that ends with a
-// closing backtick for a continuation.
-const isContinuation = line => !isFence(line) && /[ \t]`\s*$/.test(line);
+const fenceInfo = line => {
+  const match = /^\s*```\s*([A-Za-z0-9_-]*)\s*$/.exec(line);
+  return match ? match[1].toLowerCase() : '';
+};
+// Backtick continuations are unambiguous inside a fenced code block. In prose,
+// require whitespace before the backtick so an inline-code line ending with a
+// closing backtick is not merged into the next paragraph.
+const isContinuation = (line, insideFence) => !isFence(line) &&
+  (insideFence ? /`\s*$/.test(line) : /[ \t]`\s*$/.test(line));
 
 async function exists(target) {
   try {
@@ -67,15 +72,21 @@ export function parsePowerShellParams(text) {
 function logicalLines(text) {
   const raw = text.split(/\r?\n/);
   const merged = [];
+  let inFence = false;
   for (let index = 0; index < raw.length; index += 1) {
-    let current = raw[index];
-    // Never merge a fence delimiter, and never consume the line that starts a
-    // fence, so the fence state stays aligned with the physical document.
-    while (isContinuation(current) && index + 1 < raw.length && !isFence(raw[index + 1])) {
-      current = current.replace(/[ \t]`\s*$/, ' ') + raw[index + 1];
+    const line = raw[index];
+    if (isFence(line)) {
+      merged.push({ line: index + 1, text: line });
+      inFence = !inFence;
+      continue;
+    }
+    const start = index;
+    let current = line;
+    while (isContinuation(current, inFence) && index + 1 < raw.length && !isFence(raw[index + 1])) {
+      current = current.replace(/`\s*$/, ' ') + raw[index + 1];
       index += 1;
     }
-    merged.push({ line: index + 1, text: current });
+    merged.push({ line: start + 1, text: current });
   }
   return merged;
 }
