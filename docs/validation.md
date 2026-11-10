@@ -11,6 +11,7 @@
 ```powershell
 npm ci
 npm run check
+npm run check:docs
 npm test
 npm run build
 npm run test:ui
@@ -22,6 +23,8 @@ npm run test:budget-ui
 ```
 
 核心测试覆盖权限、幂等命令、任务依赖、独立审查、返工、并发与预算、工作区隔离、Git 集成、进程清理和重启恢复。Codex 运行库测试使用本地模拟 app-server 验证初始化、会话续接、即时消息、错误返回、租约及子进程回收。
+
+文档一致性检查（`scripts/docs-consistency.mjs`）验证安装/卸载命令参数与脚本声明一致、文档引用的脚本存在、相对链接有效，并确认运行说明分别描述暂停公司、恢复调度、单任务暂停和停止在途执行。Issue #10 的提交版本、日期与模拟/真实范围记录见 [issue #10 验证记录](issue-10-verification.md)。
 
 依赖图范围投影（`test/graph.test.js`、`scripts/graph-isolation-ui-test.mjs`）使用两个项目、各自多个目标的静态夹具，验证默认聚焦、项目/目标分区与计数、折叠状态跨数据刷新保留、隐藏前置任务的可展开占位、空范围与深链接范围；并断言筛选与折叠不修改任务状态或依赖，模型调用为 0。
 

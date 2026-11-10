@@ -49,6 +49,7 @@
     "build": "node scripts/build.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.js packages/codex-runtime/test/*.test.mjs",
     "check": "node scripts/check.mjs",
+    "check:docs": "node scripts/docs-consistency.mjs",
     "demo": "node scripts/demo.mjs",
     "agent": "node scripts/acms-agent.mjs",
     "test:ui": "node scripts/ui-test.mjs",
