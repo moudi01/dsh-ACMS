@@ -2,7 +2,7 @@
 
 - Issue：[P2][交付] 提供完整产物下载与授权读取，保留二进制原始字节（https://github.com/moudi01/dsh-ACMS/issues/35）
 - 仓库基线：`origin/main` `4687a3b2e4bc8eaed6aeafb38d2ff396d876ebf6`（Merge pull request #60）
-- 实现提交：见本 PR 的实现提交（本记录在提交后补记 SHA）
+- 实现提交：`08246e3`（分支 `codex/issue-35-artifact-download`）；本记录提交只补记该 SHA
 - 验证日期：2026-11-10（Asia/Shanghai）
 - 验证环境：Windows；Node.js `v24.22.0`；npm `11.19.1`；本机 Chrome（UI 下载检查）。未安装或升级运行中的 DSH，未调用真实模型。
 
