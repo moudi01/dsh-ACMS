@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, unlink } from 'node:fs/promises';
+import path from 'node:path';
 import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
@@ -14,8 +16,10 @@ import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/ru
 import { classifyEnvironment, environmentFailure } from './preflight.js';
 import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './environment-gate.js';
 import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-control.js';
+import { readCommandCleanup } from './host-command.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
+const checkReceipt = (engine, commandId) => path.join(engine.workspaces.dataDir, 'check-receipts', commandId + '.json');
 export class Engine {
   constructor(company, adapter, workspaces, options = {}) {
     this.company = company; this.store = company.store; this.adapter = adapter; this.workspaces = workspaces;
@@ -58,7 +62,12 @@ export class Engine {
       if (legacyTask?.legacyBatch || legacyTask?.workflowSnapshot) continue;
       let fact;
       try {
-        fact = pending.deferredReplayAt ? { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' } :
+        const check = pending.hostCheck;
+        const cleanup = check ? await readCommandCleanup(checkReceipt(this, check.id)) : null;
+        if (check && cleanup) await this.clearHostCheck(pending.id, check.id);
+        fact = check && !cleanup
+          ? { status: 'unknown', reason: `宿主检查 ${check.checkId} 的进程树清理尚未确认`, actions: ['refresh-receipt', 'inspect-execution'] }
+          : pending.deferredReplayAt ? { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' } :
           await this.adapter.reconcile?.(pending) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
       }
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
@@ -111,17 +120,29 @@ export class Engine {
         });
         continue;
       }
+      let hostCleanupFailure;
       if (fact.status === 'completed') {
+        const controller = new AbortController();
         try {
           this.store.transaction(() => { this.store.put('attempts', { ...previous, recoveredFinishedAt: fact.finishedAt }); });
-          await this.accept(previous, fact.result, new AbortController().signal);
-          this.store.transaction(() => { this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false, cleanupUncertain: false, recovery: { status: 'completed', reason: fact.reason } }); this.company.releaseTemporaryAgent(previous.agentId); this.store.event('attempt.result.recovered', previous.id, { taskId: previous.taskId }, SYSTEM); });
+          const promise = this.accept(previous, fact.result, controller.signal);
+          this.live.set(previous.id, { taskId: previous.taskId, controller, promise });
+          await promise;
+          this.store.transaction(() => { this.fenced(); this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false, cleanupUncertain: false, recovery: { status: 'completed', reason: fact.reason } }); this.company.releaseTemporaryAgent(previous.agentId); this.store.event('attempt.result.recovered', previous.id, { taskId: previous.taskId }, SYSTEM); });
           continue;
-        } catch (e) { fact.status = 'unknown'; fact.reason = `Recovered result needs inspection: ${e.message}`; delete fact.result; }
+        } catch (e) {
+          if (e.cleanupUncertain) hostCleanupFailure = e;
+          const stopped = controller.signal.aborted && clean && !hostCleanupFailure && !this.store.require('attempts', previous.id).hostCheck;
+          fact = stopped ? { status: 'stopped', cleanupConfirmed: true, reason: e.message } :
+            { status: 'unknown', reason: `Recovered result needs inspection: ${e.message}` };
+        } finally { this.live.delete(previous.id); }
       }
       this.store.transaction(() => {
+        this.fenced();
+        const latest = this.store.require('attempts', previous.id);
         const task = this.store.require('tasks', previous.taskId);
-        this.store.put('attempts', { ...previous, resultAccepted: accepted, acceptedTaskStatus: previous.acceptedTaskStatus ?? (accepted && task.status !== 'reconciling' ? task.status : null), status: fact.status === 'stopped' ? 'interrupted' : 'reconciling', cleanupPending: fact.status !== 'stopped', cleanupUncertain: fact.status === 'stopped' ? false : previous.cleanupUncertain, recovery: fact });
+        this.store.put('attempts', { ...latest, resultAccepted: accepted, acceptedTaskStatus: previous.acceptedTaskStatus ?? (accepted && task.status !== 'reconciling' ? task.status : null), status: fact.status === 'stopped' ? 'interrupted' : 'reconciling', cleanupPending: fact.status !== 'stopped', cleanupUncertain: fact.status === 'stopped' ? false : latest.cleanupUncertain, recovery: fact,
+          ...(hostCleanupFailure ? { cleanupUncertain: true, cleanupError: hostCleanupFailure.message, cleanupDetails: hostCleanupFailure.cleanup ?? null } : {}) });
         if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration) this.store.put('tasks', { ...task, status: fact.status === 'stopped' ? (task.stopRequested ?? 'ready') : 'reconciling', stopRequested: fact.status === 'stopped' ? null : task.stopRequested });
         this.store.event('attempt.recovery', previous.id, { taskId: task.id, fact }, SYSTEM);
       });
@@ -474,12 +495,14 @@ export class Engine {
       const output = parseResult(raw); this.conversations?.finished(attempt, output); await this.accept(attempt, output, controller.signal);
     } catch (error) {
       if (error.cleanupUncertain) cleanupFailure = error;
-      if (deliveredResult && activation?.provider?.startsWith('paired:')) recoveryFailure = Object.assign(new Error(`结果已返回，但尚未可靠入库：${error.message}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
+      const discardResult = deliveredResult && controller.signal.aborted &&
+        (this.closing || this.store.get('tasks', attempt.taskId)?.stopRequested);
+      if (deliveredResult && !discardResult && activation?.provider?.startsWith('paired:')) recoveryFailure = Object.assign(new Error(`结果已返回，但尚未可靠入库：${error.message}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
       // Adapter bookkeeping can fail after the receipt is committed but before
       // activation.result resolves. Only a clean stopped receipt permits retry;
       // otherwise retain the slot, including when progress cannot be inspected.
       const saved = this.store.get('attempts', attempt.id);
-      if (!attempt.deferredReplayAt && !cleanupFailure && !recoveryFailure && saved?.execution && saved.provider?.startsWith('paired:')) {
+      if (!discardResult && !attempt.deferredReplayAt && !cleanupFailure && !recoveryFailure && saved?.execution && saved.provider?.startsWith('paired:')) {
         let fact;
         try { fact = await this.adapter.reconcile?.(saved); } catch {}
         if (fact?.status !== 'stopped' || fact.cleanupConfirmed !== true) {
@@ -522,7 +545,7 @@ export class Engine {
         });
       } catch (e) {
         this.lastError = `Cleanup: ${e.message}`;
-        this.store.transaction(() => {
+        if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
           const saved = this.store.require('attempts', attempt.id), task = this.store.require('tasks', attempt.taskId);
           this.store.put('attempts', { ...saved, acceptedTaskStatus: saved.acceptedTaskStatus ?? (saved.resultAccepted ? task.status : null), status: 'reconciling', cleanupPending: true, cleanupUncertain: true, cleanupError: e.message, cleanupDetails: e.cleanup ?? saved.cleanupDetails ?? null });
           this.store.put('tasks', { ...task, status: 'reconciling' });
@@ -560,6 +583,45 @@ export class Engine {
         return true;
       });
       if (!parked) return this.accept(attempt, output, signal);
+    }
+  }
+  async clearHostCheck(attemptId, commandId) {
+    this.store.transaction(() => {
+      this.fenced();
+      const current = this.store.require('attempts', attemptId);
+      if (current.hostCheck?.id === commandId) this.store.put('attempts', { ...current, hostCheck: null });
+    });
+    await unlink(checkReceipt(this, commandId)).catch(() => {});
+  }
+  async runHostCheck(attempt, command, args, cwd, { checkId, signal, ...options }) {
+    const commandId = id('command');
+    const cleanupReceipt = checkReceipt(this, commandId);
+    await mkdir(path.dirname(cleanupReceipt), { recursive: true });
+    const stop = () => {
+      const task = this.store.require('tasks', attempt.taskId);
+      if (task.stopRequested) this.live.get(attempt.id)?.controller.abort(new Error(task.stopRequested));
+    };
+    const beforeStart = () => {
+      signal.throwIfAborted();
+      this.currentAttemptTask(attempt, true);
+    };
+    this.store.transaction(() => {
+      beforeStart();
+      const saved = this.store.require('attempts', attempt.id);
+      assert(!saved.hostCheck, 'CLEANUP_PENDING', 'Previous host check cleanup must be confirmed');
+      this.store.put('attempts', { ...saved, hostCheck: { id: commandId, checkId, startedAt: now() } });
+    });
+    this.store.events.on('event', stop);
+    let cleanupUnknown = false;
+    try {
+      stop();
+      return await this.workspaces.runDeliveryCheck(command, args, cwd, { ...options, signal, cleanupReceipt, beforeStart });
+    } catch (error) {
+      cleanupUnknown = !!error.cleanupUncertain;
+      throw error;
+    } finally {
+      this.store.events.off('event', stop);
+      if (!cleanupUnknown && this.store.ownsLease(this.owner, this.epoch)) await this.clearHostCheck(attempt.id, commandId);
     }
   }
   async acceptOutput(attempt, output, signal) {
@@ -636,7 +698,8 @@ export class Engine {
     if (task.kind === 'plan' || task.kind === 'coordination' || output.outcome === 'decomposed') { this.acceptPlan(task, attempt, output); return; }
     if (task.kind === 'review') { await this.acceptReview(task, attempt, output); return; }
     assert(output.outcome === 'completed', 'INVALID_RESULT', 'Execution did not submit a completed result');
-    const collected = await this.workspaces.collect(task, { ...attempt, signal }, output.artifacts ?? []);
+    const collected = await this.workspaces.collect(task, { ...attempt, signal }, output.artifacts ?? [],
+      (command, args, cwd, options) => this.runHostCheck(attempt, command, args, cwd, options));
     signal.throwIfAborted(); this.fenced();
     const environmentFailures = collected.checks.filter(c => !c.passed && !c.timedOut)
       .map(c => classifyEnvironment({ message: (c.stderr ?? '') + '\n' + (c.stdout ?? '') })).filter(Boolean);
