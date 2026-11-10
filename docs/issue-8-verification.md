@@ -3,6 +3,7 @@
 - Issue：[P2][运维] 提供一致性备份恢复与运行数据保留策略（https://github.com/moudi01/dsh-ACMS/issues/8）
 - 仓库基线：`origin/main` `8f7a4453763ac5dada48cda7a412e4f82caaa664`（Merge pull request #61）
 - 实现提交：`0b4eb51`（分支 `codex/issue-8-backup`）；本记录提交只补记该 SHA
+- 复核修订提交：`c3329de`（修复嵌套数据库保留、全量校验、空间估算、集成目录保护与恢复路径改写；本记录提交只补记该 SHA）
 - 验证日期：2026-11-11（Asia/Shanghai）
 - 验证环境：Windows；Node.js `v24.22.0`；npm `11.19.1`。未安装或升级运行中的 DSH，未调用真实模型。
 
