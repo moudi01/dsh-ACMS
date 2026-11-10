@@ -96,7 +96,7 @@ export class WorkspaceManager {
     assert(st.size <= this.company.policy().maxArtifactBytes, 'ARTIFACT_TOO_LARGE', 'Artifact exceeds the company size limit');
     return actual;
   }
-  async collect(task, attempt, declared) {
+  async collect(task, attempt, declared, invoke = runContained) {
     await verifyCollaboration(task.workspace);
     assert(Array.isArray(declared) && declared.length <= 100, 'INVALID_ARTIFACTS', 'At most 100 artifacts may be submitted');
     if (task.requiresArtifacts) assert(declared.length > 0, 'MISSING_ARTIFACTS', 'This task requires a concrete deliverable');
@@ -112,8 +112,9 @@ export class WorkspaceManager {
     const project = this.company.store.require('projects', task.projectId); const checkResults = [];
     for (const checkId of task.checkIds) {
       const check = (task.checksSnapshot ?? project.checks).find(c => c.id === checkId); assert(check, 'UNKNOWN_CHECK', `Configured check ${checkId} is missing from the task contract`);
-      const result = await run(check.command, check.args, task.workspace.path, { timeout: check.timeoutMs ?? 120000, signal: attempt.signal });
-      checkResults.push({ id: check.id, command: check.command, args: check.args, passed: result.code === 0 && !result.timedOut, ...result });
+      const result = await invoke(check.command, check.args, task.workspace.path, { timeout: check.timeoutMs ?? 120000, signal: attempt.signal, checkId });
+      checkResults.push({ id: check.id, command: check.command, args: check.args,
+        passed: result.cleanupConfirmed === true && result.code === 0 && !result.timedOut, ...result });
     }
     const changeSet = await this.captureChanges(task);
     return { artifacts, checks: checkResults, changeSet, hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash })), changeSet }) };
@@ -212,6 +213,9 @@ export class WorkspaceManager {
     }
   }
   runIntegrationCommand(command, args, cwd, options) {
+    return runContained(command, args, cwd, options);
+  }
+  runDeliveryCheck(command, args, cwd, options) {
     return runContained(command, args, cwd, options);
   }
   async inspectIntegration(record, invoke) {

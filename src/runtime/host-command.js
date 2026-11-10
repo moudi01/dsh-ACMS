@@ -28,16 +28,16 @@ async function persistCleanup(file, proof) {
 }
 
 // The Windows supervisor writes its own receipt even if the host disappears.
-// Auto-merge requires the same verified Windows containment as paired runners.
+// Trusted host commands require the same verified Windows containment as paired runners.
 export async function runContained(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, cleanupReceipt, beforeStart } = {}) {
-  signal?.throwIfAborted();
   const executable = command === 'node' ? process.execPath : command;
-  if (process.platform !== 'win32') {
-    throw Object.assign(new Error('Automatic integration requires verified process containment on Windows'), { code: 'INTEGRATION_CONTAINMENT_UNSUPPORTED' });
-  }
   const runMs = Number.isSafeInteger(timeout) && timeout > 0 ? Math.min(timeout, 2147483647) : 120000;
   let child;
   try {
+    signal?.throwIfAborted();
+    if (process.platform !== 'win32') {
+      throw Object.assign(new Error('Trusted host commands require verified process containment on Windows'), { code: 'INTEGRATION_CONTAINMENT_UNSUPPORTED' });
+    }
     const argv = [await windowsExecutable(executable, cwd), ...args];
     child = await startOwnedProcess({ argv, cwd, runMs, cleanupReceipt }, { signal, beforeStart: () => beforeStart?.(argv[0]) });
   } catch (error) {
@@ -59,7 +59,8 @@ export async function runContained(command, args, cwd, { signal, timeout = 12000
     const result = await Promise.race([child.done, stopped.promise]);
     await persistCleanup(cleanupReceipt, result.cleanup);
     signal?.throwIfAborted();
-    return { code: result.exitCode, signal: result.signal, timedOut: timedOut || result.cleanup.reason === 'Owned job run deadline exceeded', stdout, stderr };
+    return { code: result.exitCode, signal: result.signal, timedOut: timedOut || result.cleanup.reason === 'Owned job run deadline exceeded',
+      stdout, stderr, cleanupConfirmed: true };
   } catch (error) {
     if (error.noProcessStarted) await persistCleanup(cleanupReceipt, { confirmed: true, exitCode: 1, notStarted: true });
     throw error;
