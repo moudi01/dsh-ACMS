@@ -104,11 +104,11 @@ node scripts/restore-backup.mjs --backup <backupDir> --target <emptyDir>
 node scripts/prune-data.mjs --data-dir <dataDir> --days 30   # 保留 dry-run，不删除
 ```
 
-- 数据库使用 SQLite `VACUUM INTO` 生成一致性快照（覆盖 WAL），并做 `integrity_check`；其余文件按原始字节 SHA-256 写入 `backup-manifest.json`，`--verify` 会检查大小、摘要、数据库完整性和多余文件。raw-byte SHA-256 与 ACMS 的 `artifact.hash`（Base64 文本摘要）不能互换。
-- 默认排除可重建目录 `node_modules`、`.git`、`.cache`、`diagnostics` 与 `company.db-wal/shm`；排除项在清单和恢复生成的 `REBUILD.md` 中带重建方法。`pairing/` 含外部配对 runner 信息，默认不进入备份，需在新环境重新配对（`--include-pairing` 需所有者自行评估敏感性）。`conversations/` 与 `artifacts/` 可能包含私有内容，计划阶段会明确告警。
-- 恢复目标必须是空目录；脚本先校验清单再复制，拒绝覆盖已有数据。恢复后的在途执行进入 `reconciling`，只能“重新读取回执”，不要重跑、删除锁或改数据库；配对与依赖按 `REBUILD.md` 重建。
-- `prune-data.mjs` 只做 dry-run：列出超过保留期限的 `workspaces/`、`reviews/`、`integration/`、`diagnostics/` 副本及空间；仍被未完成任务、运行中执行或待清理占位引用的目录会标记保护，不会出现在可清理列表。实际删除仍由所有者按现有授权流程执行。
-- 首版仅支持当前本机数据目录，不包含云备份、跨设备同步、源项目仓库、认证文件或外部模型配对令牌。
+- 数据库使用 SQLite `VACUUM INTO` 生成一致性快照（覆盖 WAL），并做 `integrity_check`；计划中的空间需求包含数据库快照估算（主库 + WAL），并按目标卷可用空间判断。其余文件按原始字节 SHA-256 写入 `backup-manifest.json`，`--verify` 会做全量遍历，检查大小、摘要、数据库完整性、多余文件与符号链接。raw-byte SHA-256 与 ACMS 的 `artifact.hash`（Base64 文本摘要）不能互换。
+- 默认排除可重建目录 `node_modules`、`.git`（工作副本 worktree 的 `.git` 文件也排除）、`.cache`、`diagnostics`；只排除数据目录顶层的 `company.db`/`-wal`/`-shm`（由一致快照替代），历史备份目录或交付物中嵌套的 `company.db` 会正常备份。排除项在清单和恢复生成的 `REBUILD.md` 中带重建方法。`pairing/` 含外部配对 runner 信息，默认不进入备份，需在新环境重新配对（`--include-pairing` 需所有者自行评估敏感性）。`conversations/` 与 `artifacts/` 可能包含私有内容，计划阶段会明确告警。
+- 恢复目标必须是空目录；脚本先校验清单再复制，拒绝覆盖已有数据。恢复时会把数据库实体中指向旧数据目录的绝对路径（任务工作副本、artifact blob 等）改写为新目录，并更新恢复清单；数据库外的项目源路径保持不变。恢复后的在途执行进入 `reconciling`，只能“重新读取回执”，不要重跑、删除锁或改数据库；配对与依赖按 `REBUILD.md` 重建。历史事件/命令文本中的旧路径作为审计记录保留，不改写。
+- `prune-data.mjs` 只做 dry-run：按目录树内最新修改时间列出超过保留期限的 `workspaces/`、`reviews/`、`integration/`、`diagnostics/` 副本及空间；仍被未完成任务、运行中执行、待清理占位或在途集成的 task/integration ID 引用的目录会标记保护，不会出现在可清理列表。只读打开 WAL 数据库可能由 SQLite 生成瞬时 `-shm/-wal` 辅助文件，不修改业务数据。实际删除仍由所有者按现有授权流程执行。
+- 备份为有界内存读取（单个文件受现有 `maxArtifactBytes` 约束），不保留原始 mtime/文件模式；恢复后的文件按私有内容权限写入。首版仅支持当前本机数据目录，不包含云备份、跨设备同步、源项目仓库、认证文件或外部模型配对令牌。
 
 ## 异常恢复
 

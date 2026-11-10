@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 const CANDIDATE_DIRS = ['workspaces', 'reviews', 'integration', 'diagnostics'];
 const TERMINAL = new Set(['succeeded', 'cancelled', 'archived', 'deleted']);
 const LIVE_ATTEMPT = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
+const PENDING_INTEGRATION = new Set(['preparing', 'checking', 'applying', 'reconciling']);
 
 function parseArgs(argv) {
   const args = { dataDir: null, days: 30, json: false };
@@ -31,19 +32,32 @@ async function size(target) {
   for (const entry of await fs.readdir(target, { withFileTypes: true })) total += await size(path.join(target, entry.name));
   return total;
 }
+async function newestMtime(target) {
+  const stat = await fs.lstat(target);
+  if (!stat.isDirectory()) return stat.mtimeMs;
+  let newest = stat.mtimeMs;
+  for (const entry of await fs.readdir(target, { withFileTypes: true })) newest = Math.max(newest, await newestMtime(path.join(target, entry.name)));
+  return newest;
+}
 
 export async function prunePlan({ dataDir, days = 30 }) {
   const root = path.resolve(dataDir);
   const databasePath = path.join(root, 'company.db');
   const database = new DatabaseSync(databasePath, { readOnly: true });
-  const protectedWorkspaces = new Map();
+  const protectedIds = new Map();
   try {
-    const rows = database.prepare("SELECT collection, id, body FROM entities WHERE collection IN ('tasks','attempts')").all();
+    const rows = database.prepare("SELECT collection, id, body FROM entities WHERE collection IN ('tasks','attempts','integrations')").all();
     for (const row of rows) {
       const body = JSON.parse(row.body);
-      const activeTask = row.collection === 'tasks' && !TERMINAL.has(body.status);
-      const liveAttempt = row.collection === 'attempts' && (LIVE_ATTEMPT.has(body.status) || body.cleanupPending === true);
-      if (activeTask || liveAttempt) protectedWorkspaces.set(row.collection === 'tasks' ? row.id : body.taskId, row.collection);
+      if (row.collection === 'tasks' && !TERMINAL.has(body.status)) protectedIds.set(body.id, `未完成任务（${body.status}）`);
+      if (row.collection === 'attempts' && (LIVE_ATTEMPT.has(body.status) || body.cleanupPending === true)) {
+        protectedIds.set(body.id, `运行中/待清理执行（${body.status}）`);
+        if (body.taskId) protectedIds.set(body.taskId, `运行中/待清理执行（${body.status}）`);
+      }
+      if (row.collection === 'integrations' && PENDING_INTEGRATION.has(body.phase)) {
+        protectedIds.set(body.id, `在途集成（${body.phase}）`);
+        if (body.taskId) protectedIds.set(body.taskId, `在途集成（${body.phase}）`);
+      }
     }
   } finally { database.close(); }
   const cutoff = Date.now() - days * 86400000;
@@ -57,11 +71,11 @@ export async function prunePlan({ dataDir, days = 30 }) {
       const absolute = path.join(base, entry.name);
       const relative = `${directory}/${entry.name}`;
       if (entry.isSymbolicLink()) { protectedEntries.push({ path: relative, reason: '符号链接，需所有者核对目标后手动处理' }); continue; }
-      const stat = await fs.lstat(absolute);
-      const ageDays = (Date.now() - stat.mtimeMs) / 86400000;
+      const newest = await newestMtime(absolute);
+      const ageDays = (Date.now() - newest) / 86400000;
       if (ageDays < days) continue;
-      const owner = [...protectedWorkspaces.keys()].find(id => entry.name.includes(id));
-      if (owner) { protectedEntries.push({ path: relative, reason: `仍被未完成任务/执行引用（${owner}），不能清理`, ageDays: Number(ageDays.toFixed(1)) }); continue; }
+      const owner = [...protectedIds.keys()].find(id => entry.name.includes(id));
+      if (owner) { protectedEntries.push({ path: relative, reason: `仍被${protectedIds.get(owner)}引用（${owner}），不能清理`, ageDays: Number(ageDays.toFixed(1)) }); continue; }
       candidates.push({ path: relative, bytes: await size(absolute), ageDays: Number(ageDays.toFixed(1)) });
     }
   }

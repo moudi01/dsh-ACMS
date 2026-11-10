@@ -15,7 +15,6 @@ const EXCLUDED_DIRS = [
   { name: '.cache', reason: '可重建缓存', rebuild: '按需重新生成' },
   { name: 'diagnostics', reason: '模型检测隔离目录，可重建', rebuild: '需要时重新执行模型连通性检测' },
 ];
-const EXCLUDED_FILES = new Set(['company.db', 'company.db-wal', 'company.db-shm']);
 const SENSITIVE = [
   { name: 'pairing', reason: '外部配对 runner 与邀请回执（含本机运行入口信息）', rebuild: '在目标环境重新配对外部 agent；配对令牌不进入备份' },
 ];
@@ -28,7 +27,21 @@ const isInside = (root, target) => {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 };
+async function realTarget(target) {
+  const resolved = path.resolve(target);
+  try { return await fs.realpath(resolved); }
+  catch { const parent = path.dirname(resolved); return parent === resolved ? resolved : path.join(await realTarget(parent), path.basename(resolved)); }
+}
 async function exists(target) { try { await fs.lstat(target); return true; } catch { return false; } }
+async function nearestExisting(target) {
+  let current = path.resolve(target);
+  while (!(await exists(current))) { const parent = path.dirname(current); if (parent === current) break; current = parent; }
+  return current;
+}
+async function volumeFree(target) {
+  try { const stat = await fs.statfs(await nearestExisting(target)); return stat.bsize * stat.bavail; }
+  catch { return null; }
+}
 
 async function dirSize(target) {
   let total = 0;
@@ -57,9 +70,12 @@ async function walk(root) {
         await visit(absolute); continue;
       }
       if (entry.isFile()) {
-        if (EXCLUDED_FILES.has(entry.name)) {
+        if (relative === '.git' || relative.endsWith('/.git')) {
+          excluded.push({ path: relative, bytes: (await fs.lstat(absolute)).size, reason: 'worktree 的 .git 文件记录源项目绝对路径', rebuild: '由源项目当前提交重新创建隔离工作副本' }); continue;
+        }
+        if (['company.db', 'company.db-wal', 'company.db-shm'].includes(relative)) {
           excluded.push({ path: relative, bytes: (await fs.lstat(absolute)).size,
-            reason: entry.name === 'company.db' ? '数据库由一致性快照替代' : 'WAL/SHM 由一致性数据库快照覆盖',
+            reason: relative === 'company.db' ? '数据库由一致性快照替代' : 'WAL/SHM 由一致性数据库快照覆盖',
             rebuild: '从备份中的 company.db 恢复，不需要单独复制' }); continue;
         }
         const stat = await fs.lstat(absolute);
@@ -75,7 +91,7 @@ export async function planBackup({ dataDir, out, includePairing = false }) {
   const source = path.resolve(dataDir);
   if (!(await exists(path.join(source, 'company.db')))) throw new Error(`ACMS database not found under ${source}`);
   const target = path.resolve(out ?? `${source}-backup-${new Date().toISOString().replace(/[:.]/g, '-')}`);
-  if (isInside(source, target)) throw new Error('Backup target must be outside the ACMS data directory');
+  if (isInside(await realTarget(source), await realTarget(target))) throw new Error('Backup target must be outside the ACMS data directory');
   const { files: walkedFiles, excluded } = await walk(source);
   const files = includePairing ? walkedFiles : walkedFiles.filter(file => !file.path.startsWith('pairing/'));
   for (const item of SENSITIVE) {
@@ -87,14 +103,23 @@ export async function planBackup({ dataDir, out, includePairing = false }) {
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
   excluded.sort((a, b) => a.path.localeCompare(b.path));
-  const totals = { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: excluded.reduce((sum, item) => sum + item.bytes, 0) };
-  let freeBytes = null;
-  try { const stat = await fs.statfs(source); freeBytes = stat.bsize * stat.bavail; } catch { /* optional capacity hint */ }
+  const databaseBytes = (await fs.lstat(path.join(source, 'company.db'))).size;
+  const walBytes = await exists(path.join(source, 'company.db-wal')) ? (await fs.lstat(path.join(source, 'company.db-wal'))).size : 0;
+  const shmBytes = await exists(path.join(source, 'company.db-shm')) ? (await fs.lstat(path.join(source, 'company.db-shm'))).size : 0;
+  // VACUUM INTO can materialise pages currently sitting in the WAL, so the
+  // plan must reserve at least the main database plus its WAL.
+  const estimatedDatabaseBytes = Math.max(databaseBytes, databaseBytes + walBytes);
+  const totals = { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0),
+    excludedBytes: excluded.reduce((sum, item) => sum + item.bytes, 0), requiredBytes: files.reduce((sum, file) => sum + file.bytes, 0) + estimatedDatabaseBytes };
+  const freeBytes = await volumeFree(target);
   const warnings = [];
   for (const item of PRIVATE_WARNINGS) if (await exists(path.join(source, item.name))) warnings.push(item.message);
   if (!includePairing && await exists(path.join(source, 'pairing'))) warnings.push('pairing 目录默认排除：外部模型需要在新环境重新配对');
-  if (freeBytes !== null && freeBytes < totals.bytes * 1.1) warnings.push(`可用空间不足：需要约 ${totals.bytes} 字节，当前可用 ${freeBytes} 字节`);
-  return { format: FORMAT, mode: 'plan', createdAt: new Date().toISOString(), source, target, includePairing, database: { file: 'company.db', bytes: (await fs.lstat(path.join(source, 'company.db'))).size }, files, excluded, warnings, totals, space: { freeBytes, requiredBytes: totals.bytes, sufficient: freeBytes === null || freeBytes >= totals.bytes * 1.1 } };
+  if (freeBytes !== null && freeBytes < totals.requiredBytes * 1.1) warnings.push(`目标卷可用空间不足：需要约 ${totals.requiredBytes} 字节，当前可用 ${freeBytes} 字节`);
+  return { format: FORMAT, mode: 'plan', createdAt: new Date().toISOString(), source, target, includePairing,
+    database: { file: 'company.db', sourceBytes: databaseBytes, walBytes, estimatedBytes: estimatedDatabaseBytes },
+    files, excluded, warnings, totals,
+    space: { freeBytes, requiredBytes: totals.requiredBytes, sufficient: freeBytes === null || freeBytes >= totals.requiredBytes * 1.1 } };
 }
 
 async function snapshotDatabase(source, destination) {
@@ -112,7 +137,7 @@ async function snapshotDatabase(source, destination) {
 
 export async function applyBackup(plan) {
   const { source, target } = plan;
-  if (isInside(source, target)) throw new Error('Backup target must be outside the ACMS data directory');
+  if (isInside(await realTarget(source), await realTarget(target))) throw new Error('Backup target must be outside the ACMS data directory');
   if (await exists(target)) { const entries = await fs.readdir(target).catch(() => []); if (entries.length) throw new Error(`Backup target is not empty: ${target}`); }
   await fs.mkdir(target, { recursive: true });
   const database = await snapshotDatabase(path.join(source, 'company.db'), path.join(target, 'company.db'));
@@ -128,12 +153,32 @@ export async function applyBackup(plan) {
   const manifest = {
     format: FORMAT, createdAt: plan.createdAt, source, includePairing: plan.includePairing === true,
     database, files, excluded: plan.excluded, warnings: plan.warnings,
-    totals: { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: plan.totals.excludedBytes },
+    totals: { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: plan.totals.excludedBytes,
+      databaseBytes: database.bytes, requiredBytes: files.reduce((sum, file) => sum + file.bytes, 0) + database.bytes },
     note: 'Raw-byte SHA-256 is used for backup integrity. ACMS artifact.hash uses sha256(base64 text) and is not interchangeable.',
   };
   const manifestBytes = Buffer.from(JSON.stringify(manifest, null, 2) + '\n');
   await fs.writeFile(path.join(target, 'backup-manifest.json'), manifestBytes, { mode: 0o600 });
-  return { ...plan, mode: 'apply', database, files, manifestSha256: sha256(manifestBytes) };
+  return { ...plan, mode: 'apply', database, files, totals: manifest.totals, manifestSha256: sha256(manifestBytes) };
+}
+
+// Full traversal for verification: unlike the backup walk this never applies
+// exclusions and reports symlinks, so an extra hidden file cannot pass.
+async function walkAll(root) {
+  const files = [];
+  const symlinks = [];
+  async function visit(directory) {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).split(path.sep).join('/');
+      const stat = await fs.lstat(absolute);
+      if (stat.isSymbolicLink()) { symlinks.push({ path: relative }); continue; }
+      if (stat.isDirectory()) { await visit(absolute); continue; }
+      files.push({ path: relative, bytes: stat.size, file: absolute });
+    }
+  }
+  await visit(root);
+  return { files, symlinks };
 }
 
 export async function verifyBackup(backupDir) {
@@ -146,17 +191,20 @@ export async function verifyBackup(backupDir) {
   const errors = [];
   const check = async (relative, expected) => {
     const absolute = path.join(root, ...relative.split('/'));
-    let bytes;
-    try { bytes = await fs.readFile(absolute); }
+    let stat;
+    try { stat = await fs.lstat(absolute); }
     catch { errors.push(`${relative}: missing`); return; }
+    if (stat.isSymbolicLink() || !stat.isFile()) { errors.push(`${relative}: not a regular file`); return; }
+    const bytes = await fs.readFile(absolute);
     if (bytes.length !== expected.bytes) errors.push(`${relative}: size ${bytes.length} != ${expected.bytes}`);
     if (sha256(bytes) !== expected.sha256) errors.push(`${relative}: sha256 mismatch`);
   };
   await check(manifest.database.file, manifest.database);
   for (const file of manifest.files) await check(file.path, file);
   const known = new Set(['backup-manifest.json', 'REBUILD.md', manifest.database.file, ...manifest.files.map(file => file.path)]);
-  const { files: existing } = await walk(root);
+  const { files: existing, symlinks } = await walkAll(root);
   for (const file of existing) if (!known.has(file.path)) errors.push(`${file.path}: unexpected file`);
+  for (const link of symlinks) errors.push(`${link.path}: unexpected symlink`);
   if (errors.length) return { ok: false, errors };
   const database = new DatabaseSync(path.join(root, manifest.database.file));
   try { const row = database.prepare('PRAGMA integrity_check').get(); if (row?.integrity_check !== 'ok') errors.push(`database integrity: ${row?.integrity_check}`); }
@@ -164,6 +212,11 @@ export async function verifyBackup(backupDir) {
   return { ok: errors.length === 0, errors, manifest };
 }
 
+function valueArg(argv, index, flag) {
+  const value = argv[index];
+  if (value === undefined || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+  return value;
+}
 function parseArgs(argv) {
   const args = { apply: false, json: false, includePairing: false, verify: null, dataDir: null, out: null };
   for (let index = 0; index < argv.length; index += 1) {
@@ -171,9 +224,9 @@ function parseArgs(argv) {
     if (value === '--apply') args.apply = true;
     else if (value === '--json') args.json = true;
     else if (value === '--include-pairing') args.includePairing = true;
-    else if (value === '--verify') args.verify = argv[++index];
-    else if (value === '--data-dir') args.dataDir = argv[++index];
-    else if (value === '--out') args.out = argv[++index];
+    else if (value === '--verify') args.verify = valueArg(argv, ++index, '--verify');
+    else if (value === '--data-dir') args.dataDir = valueArg(argv, ++index, '--data-dir');
+    else if (value === '--out') args.out = valueArg(argv, ++index, '--out');
     else throw new Error(`Unknown argument: ${value}`);
   }
   return args;
