@@ -13,7 +13,7 @@ function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
   return digest({
     root: project.repoRoot, mode: project.mode, status: project.status ?? null, autoMerge: project.autoMerge,
-    checks: project.checks, allowedRoots: engine.company.policy().allowedProjectRoots,
+    checks: project.checks, preparation: project.preparation ?? null, allowedRoots: engine.company.policy().allowedProjectRoots,
   });
 }
 

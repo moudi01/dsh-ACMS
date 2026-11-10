@@ -2,7 +2,8 @@ import { access, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { cleanupError, startOwnedProcess } from './owned-process.js';
 
-async function windowsExecutable(command, cwd) {
+export async function resolveHostExecutable(command, cwd) {
+  if (command === 'node') return process.execPath;
   const locations = /[/\\]/.test(command) ? [path.resolve(cwd, command)] :
     (process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map(dir => path.resolve(dir.replace(/^"|"$/g, ''), command));
   for (const location of locations) {
@@ -29,8 +30,7 @@ async function persistCleanup(file, proof) {
 
 // The Windows supervisor writes its own receipt even if the host disappears.
 // Trusted host commands require the same verified Windows containment as paired runners.
-export async function runContained(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, cleanupReceipt, beforeStart } = {}) {
-  const executable = command === 'node' ? process.execPath : command;
+export async function runContained(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, cleanupReceipt, beforeStart, env } = {}) {
   const runMs = Number.isSafeInteger(timeout) && timeout > 0 ? Math.min(timeout, 2147483647) : 120000;
   let child;
   try {
@@ -38,8 +38,9 @@ export async function runContained(command, args, cwd, { signal, timeout = 12000
     if (process.platform !== 'win32') {
       throw Object.assign(new Error('Trusted host commands require verified process containment on Windows'), { code: 'INTEGRATION_CONTAINMENT_UNSUPPORTED' });
     }
-    const argv = [await windowsExecutable(executable, cwd), ...args];
-    child = await startOwnedProcess({ argv, cwd, runMs, cleanupReceipt }, { signal, beforeStart: () => beforeStart?.(argv[0]) });
+    const argv = [await resolveHostExecutable(command, cwd), ...args];
+    child = await startOwnedProcess({ argv, cwd, runMs, cleanupReceipt, env, replaceEnv: env !== undefined },
+      { signal, beforeStart: () => beforeStart?.(argv[0]) });
   } catch (error) {
     if (!error.cleanupUncertain) await persistCleanup(cleanupReceipt, { confirmed: true, exitCode: 1, notStarted: true });
     throw error;

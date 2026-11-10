@@ -10,6 +10,7 @@ import { deleteEntity, restoreEntity, recordChange, restartForChange } from './e
 import { goalRuntimeLimit, goalRuntimeSpent } from './runtime-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
+import { normalizePreparation } from './project-preparation.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
@@ -138,12 +139,16 @@ export class Company {
     for (const c of checks) {
       text(c.id, 'check.id', 100); text(c.command, 'check.command', 4096);
       assert(Array.isArray(c.args) && c.args.every(v => typeof v === 'string'), 'INVALID_INPUT', 'Check arguments must be an array');
+      assert(c.inputs === undefined || (Array.isArray(c.inputs) && c.inputs.length <= 40 &&
+        c.inputs.every(file => typeof file === 'string' && file.trim() && file.length <= 4096 && !file.includes('\0'))),
+      'INVALID_INPUT', 'Check inputs must be an array of file paths');
       assert(c.requiredPackages === undefined || (Array.isArray(c.requiredPackages) && c.requiredPackages.length <= 20 &&
         c.requiredPackages.every(value => typeof value === 'string' && packageName.test(value))), 'INVALID_INPUT', 'requiredPackages must contain valid Node package names');
     }
-    const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false, ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
+    const preparation = args.preparation === undefined ? previous?.preparation ?? null : normalizePreparation(args.preparation);
+    const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false, ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
-    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'autoMerge'], actor);
+    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge'], actor);
     this.store.event('project.saved', project.id, {}, actor); return project;
   }
   editGoal(args, actor) {

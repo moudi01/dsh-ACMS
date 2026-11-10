@@ -5,6 +5,7 @@ import { digest, packageName } from '../core/util.js';
 import { windowsDirectoryAccess } from './owned-process.js';
 
 const guidance = {
+  preparation: ['项目依赖准备失败', '请核对锁文件、离线缓存或准备命令，修正后由所有者请求重试。'],
   package: ['缺少 Node 依赖', '请通过已批准的依赖准备流程在任务工作副本中提供此包。'],
   program: ['执行程序不可用', '请核对执行程序或配对入口，修正路径后重新预检。'],
   directory: ['目录不可用', '请核对所列目录及当前宿主身份的访问权限。'],
@@ -183,5 +184,5 @@ export async function inspectHost(workspaces, task, previous) {
     ...programs.filter(item => item.status === 'missing').map(item => environmentFailure('program', item.subject, true)),
     ...packages.filter(item => item.status === 'missing').map(item => environmentFailure('package', item.subject, true)),
   ];
-  return { directories, programs, packages, failures };
+  return { directories, programs, packages, failures, preparationVersion: digest(project.preparation ?? null) };
 }

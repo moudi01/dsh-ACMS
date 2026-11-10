@@ -4,8 +4,12 @@ import { spawn, spawnSync } from 'node:child_process';
 import { runContained } from './host-command.js';
 import { AcmsError, assert, digest } from '../core/util.js';
 import { publishCollaboration, syncCollaboration, verifyCollaboration, isCollaborationPath } from './collaboration.js';
+import { deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
+import { checkIdentity, copyProject, inputFingerprint, prepareDependencies, verifyInCopy } from './project-environment.js';
 
 export function inside(root, target) { const rel = path.relative(root, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); }
+const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
+const excludeDependencies = ':(exclude,glob,icase)**/node_modules/**';
 export async function run(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000 } = {}) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
@@ -53,7 +57,7 @@ export class WorkspaceManager {
       const sourceTask = this.company.store.require('tasks', task.reviewOf);
       const destination = path.join(this.dataDir, 'reviews', task.id);
       await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.cp(sourceTask.workspace.path, destination, { recursive: true, force: false, errorOnExist: true, filter: async item => !['.git', 'node_modules', '.codex', '.env', 'auth.json', 'credentials.json'].includes(path.basename(item)) && !(await fs.lstat(item)).isSymbolicLink() });
+      await copyProject(sourceTask.workspace.path, destination, { collaboration: true });
       return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration: sourceTask.workspace.collaboration };
     }
     const project = this.company.store.require('projects', task.projectId); const source = await this.validateProject(project);
@@ -64,11 +68,7 @@ export class WorkspaceManager {
       await git(['worktree', 'add', '-b', branch, destination, head], source);
       return syncCollaboration(this.company, project, task, { path: destination, source, branch, baseCommit: head, mode: 'git' });
     }
-    const ignore = new Set(['.git', 'node_modules', '.acms', '.codex', '.aws', '.ssh', 'auth.json', 'credentials.json']);
-    await fs.cp(source, destination, { recursive: true, dereference: false, errorOnExist: true, force: false, filter: async item => {
-      const name = path.basename(item); if (ignore.has(name) || name.startsWith('.env')) return false;
-      return !(await fs.lstat(item)).isSymbolicLink();
-    } });
+    await copyProject(source, destination);
     return syncCollaboration(this.company, project, task, { path: destination, source, mode: 'copy' });
   }
   async prepareGoalReview(task) {
@@ -100,9 +100,12 @@ export class WorkspaceManager {
     await verifyCollaboration(task.workspace);
     assert(Array.isArray(declared) && declared.length <= 100, 'INVALID_ARTIFACTS', 'At most 100 artifacts may be submitted');
     if (task.requiresArtifacts) assert(declared.length > 0, 'MISSING_ARTIFACTS', 'This task requires a concrete deliverable');
+    const source = task.workspace.path;
+    const inputHash = task.checkIds.length ? await inputFingerprint(source, attempt.signal) : null;
     const artifacts = [];
     for (const item of declared) {
       assert(!isCollaborationPath(path.normalize(item.path ?? '')), 'ARTIFACT_PATH', '.acms 是固定输入，交付物请写入普通任务文档');
+      assert(!dependencyPath(path.normalize(item.path ?? '')), 'ARTIFACT_PATH', 'Installed dependencies are workspace inputs and cannot be delivered');
       const filename = await this.safeFile(task.workspace.path, item.path); const bytes = await fs.readFile(filename);
       const hash = digest(bytes.toString('base64')); const blob = path.join(this.dataDir, 'artifacts', hash);
       await fs.mkdir(path.dirname(blob), { recursive: true });
@@ -110,21 +113,66 @@ export class WorkspaceManager {
       artifacts.push({ id: `artifact_${attempt.id}_${artifacts.length}`, taskId: task.id, attemptId: attempt.id, path: item.path, title: item.title ?? item.path, hash, bytes: bytes.length, blob });
     }
     const project = this.company.store.require('projects', task.projectId); const checkResults = [];
+    const guard = () => assert(digest(this.company.store.require('projects', task.projectId).preparation ?? null) === digest(project.preparation ?? null),
+      'PREPARATION_CHANGED', 'Owner preparation configuration changed');
+    const evidence = task.checkIds.length ? this.company.store.list('verifications').filter(v => v.kind === 'checks' && v.taskId === task.id).flatMap(v => v.checks) : [];
     for (const checkId of task.checkIds) {
       const check = (task.checksSnapshot ?? project.checks).find(c => c.id === checkId); assert(check, 'UNKNOWN_CHECK', `Configured check ${checkId} is missing from the task contract`);
-      const result = await invoke(check.command, check.args, task.workspace.path, { timeout: check.timeoutMs ?? 120000, signal: attempt.signal, checkId });
-      checkResults.push({ id: check.id, command: check.command, args: check.args,
-        passed: result.cleanupConfirmed === true && result.code === 0 && !result.timedOut, ...result });
+      const identity = await checkIdentity(check, source, project.preparation, attempt.signal).catch(error => {
+        if (!project.preparation || error.code !== 'ENOENT') throw error;
+        return null;
+      });
+      const cached = identity?.reusable && evidence.findLast(item => item.id === check.id && item.reusable === true && item.passed &&
+        item.cleanupConfirmed === true && item.inputHash === inputHash && item.inputUnchanged === true && item.checkVersion === identity.version);
+      checkResults.push(cached ? { ...cached, reused: true } : await verifyInCopy({ dataDir: this.dataDir, source,
+        inputHash, check, preparation: project.preparation, identity, signal: attempt.signal,
+        invoke: (command, args, cwd, options) => invoke(command, args, cwd, { ...options, guard }) }));
     }
     const changeSet = await this.captureChanges(task);
+    if (inputHash) guard();
+    if (inputHash) assert(await inputFingerprint(source, attempt.signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Delivery inputs changed during verification');
     return { artifacts, checks: checkResults, changeSet, hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash })), changeSet }) };
+  }
+  prepareEnvironment(task, spec, invoke, signal) {
+    return prepareDependencies(this.dataDir, task.workspace.path, spec, invoke, signal);
+  }
+  async reviewEvidence(task, signal, { checkReviewCopy = true } = {}) {
+    const targets = task.reviewOf ? [task.reviewOf] : (task.reviewTargets ?? []).map(target => target.id);
+    const store = this.company.store;
+    const rows = store.list('verifications');
+    const evidence = {};
+    for (const id of targets) {
+      const source = store.require('tasks', id);
+      const row = rows.findLast(v => v.kind === 'checks' && v.taskId === id && v.artifactHash === source.artifactHash &&
+        v.taskGeneration === deliveryGeneration(source) && v.goalContractVersion === taskContractVersion(source));
+      if (!row?.checks?.some(check => check.checkVersion) || !source.workspace) continue;
+      const cwd = source.workspace.path;
+      const inputHash = await inputFingerprint(cwd, signal);
+      if (task.reviewOf && checkReviewCopy && await inputFingerprint(task.workspace.path, signal) !== inputHash) continue;
+      const project = store.require('projects', source.projectId);
+      const checks = [];
+      for (const item of row.checks) {
+        const check = project.checks.find(check => check.id === item.id);
+        if (!check || item.reusable !== true || !item.passed || item.cleanupConfirmed !== true ||
+            item.inputHash !== inputHash || item.inputUnchanged !== true) continue;
+        const identity = await checkIdentity(check, cwd, project.preparation, signal).catch(error => {
+          signal?.throwIfAborted();
+          return null;
+        });
+        if (!identity?.reusable || identity.version !== item.checkVersion) continue;
+        const { stdout, stderr, preparation, ...summary } = item;
+        checks.push(summary);
+      }
+      if (checks.length) evidence[id] = { artifactHash: row.artifactHash, inputHash, checks };
+    }
+    return evidence;
   }
   async captureChanges(task, invoke = run) {
     if (task.workspace.mode !== 'git') return null;
     const cwd = task.workspace.path;
-    const tracked = await git(['diff', '--name-only', '-z', task.workspace.baseCommit ?? 'HEAD', '--'], cwd, undefined, invoke);
-    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z'], cwd, undefined, invoke);
-    const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n)))].sort();
+    const tracked = await git(['diff', '--name-only', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, undefined, invoke);
+    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, undefined, invoke);
+    const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)))].sort();
     assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
     const files = [];
     for (const name of names) {
@@ -180,7 +228,7 @@ export class WorkspaceManager {
     execution.checkpoint({ targetRoot, targetHead, targetRef });
     const withEvidence = (error, facts = {}) => Object.assign(error, { integrationEvidence: { code: error.code ?? null, targetHead, ...facts } });
     if (targetStatus) throw withEvidence(new AcmsError('TARGET_DIRTY', 'Source project has uncommitted changes; integration is blocked'), { statusHash: digest(targetStatus) });
-    await getGit(['add', '--all', '--', '.', ':(exclude).acms'], task.workspace.path);
+    await getGit(['add', '--all', '--', '.', ':(exclude).acms', excludeDependencies], task.workspace.path);
     const changes = await getGit(['diff', '--cached', '--name-only'], task.workspace.path);
     if (changes) await getGit(['-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost', 'commit', '-m', `ACMS: ${task.title.replace(/[\r\n]/g, ' ')}`], task.workspace.path);
     const commit = await getGit(['rev-parse', 'HEAD'], task.workspace.path);
@@ -193,9 +241,10 @@ export class WorkspaceManager {
       const integratedCommit = await getGit(['rev-parse', 'HEAD'], candidate);
       execution.checkpoint({ phase: 'checking', commit, candidate, integratedCommit });
       const checks = [];
+      const inputHash = project.checks.length ? await inputFingerprint(candidate) : null;
       for (const check of project.checks) {
-        const r = await invoke(check.command, check.args, candidate, { timeout: check.timeoutMs ?? 120000 });
-        checks.push({ id: check.id, passed: r.code === 0 && !r.timedOut, ...r });
+        checks.push(await verifyInCopy({ dataDir: path.dirname(candidate), source: candidate,
+          inputHash, check, preparation: project.preparation, invoke }));
       }
       assert(checks.every(c => c.passed), 'INTEGRATION_CHECK_FAILED', 'Candidate integration failed checks; source was not changed', { checks, commit, candidate });
       assert(await getGit(['rev-parse', 'HEAD'], candidate) === integratedCommit &&

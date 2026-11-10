@@ -17,6 +17,7 @@ import { classifyEnvironment, environmentFailure } from './preflight.js';
 import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './environment-gate.js';
 import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-control.js';
 import { readCommandCleanup } from './host-command.js';
+import { preparationForTask } from '../core/project-preparation.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 const checkReceipt = (engine, commandId) => path.join(engine.workspaces.dataDir, 'check-receipts', commandId + '.json');
@@ -68,6 +69,8 @@ export class Engine {
         const saved = this.store.require('attempts', pending.id);
         if (saved.hostCheck) {
           fact = { status: 'unknown', reason: `宿主检查 ${saved.hostCheck.checkId} 的进程树清理尚未确认`, actions: ['refresh-receipt', 'inspect-execution'] };
+        } else if (saved.preparingHost) {
+          fact = { status: 'stopped', cleanupConfirmed: true, reason: '宿主依赖准备已清理，模型尚未启动' };
         } else if (saved.deferredReplayAt) {
           fact = saved.hostCheckCleanup?.replayAt === saved.deferredReplayAt
             ? { status: 'stopped', cleanupConfirmed: true, reason: `已核实回放期间宿主检查 ${saved.hostCheckCleanup.checkId} 的清理回执` }
@@ -443,12 +446,17 @@ export class Engine {
         return;
       }
       const agent = this.store.require('agents', attempt.agentId);
+      const preparationFor = () => preparationForTask(this.store.require('projects', task.projectId), task);
+      const preparation = preparationFor();
+      const guardPreparation = () => assert(digest(preparationFor() ?? null) === digest(preparation ?? null),
+        'PREPARATION_CHANGED', 'Owner preparation configuration changed');
       preflight = await inspectEnvironment(this, task, agent);
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
       this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
-      if (preflight.failures.length) {
-        this.acceptEnvironment(attempt, task, preflight, false);
+      const initialFailures = preparation ? preflight.failures.filter(f => f.code !== 'package') : preflight.failures;
+      if (initialFailures.length) {
+        this.acceptEnvironment(attempt, task, { ...preflight, failures: initialFailures }, false);
         return;
       }
       preparingWorkspace = true;
@@ -464,6 +472,29 @@ export class Engine {
       });
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
+      if (preparation) {
+        assertGoalOpen(this.store.require('goals', task.goalId));
+        guardPreparation();
+        this.store.transaction(() => {
+          task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
+          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preparingHost: true });
+        });
+        try {
+          const evidence = await this.workspaces.prepareEnvironment(task, preparation,
+            (command, args, cwd, options) => this.runHostCheck(attempt, command, args, cwd, { ...options, guard: guardPreparation }),
+            controller.signal);
+          controller.signal.throwIfAborted();
+          this.currentAttemptTask(attempt);
+          this.store.transaction(() => {
+            attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preparation: evidence });
+          });
+        } catch (error) {
+          if (!error.environmentFailure || controller.signal.aborted) throw error;
+          this.acceptEnvironment(attempt, task, { failures: [error.environmentFailure],
+            report: { ...preflight.report, host: { ...preflight.report.host, preparationFailure: error.evidence } } }, false);
+          return;
+        }
+      }
       let modelContext;
       if (agent.role === 'manager') { try { modelContext = await this.adapter.modelContext?.(task.requirements); } catch (e) { this.lastError = '无法读取模型候选：' + e.message; } }
       controller.signal.throwIfAborted();
@@ -477,19 +508,28 @@ export class Engine {
         return;
       }
       assertGoalOpen(this.store.require('goals', task.goalId));
+      guardPreparation();
+      const hostEvidence = task.kind === 'review' ? await this.workspaces.reviewEvidence(task, controller.signal) : undefined;
+      controller.signal.throwIfAborted();
+      task = this.currentAttemptTask(attempt);
+      this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
+      guardPreparation();
       this.store.transaction(() => {
-        attempt = this.store.put('attempts', { ...attempt, status: 'running', environment: preflight.report });
+        if (attempt.preparingHost) task = this.store.put('tasks', { ...task, attempts: task.attempts + 1 });
+        attempt = this.store.put('attempts', { ...attempt, status: 'running', preparingHost: false, environment: preflight.report,
+          ...(hostEvidence ? { hostEvidence } : {}) });
         this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
       });
       controller.signal.throwIfAborted();
       const assertCurrent = () => {
         const current = this.currentAttemptTask(attempt);
         assertGoalOpen(this.store.require('goals', current.goalId));
+        guardPreparation();
         return current;
       };
       task = assertCurrent();
       activation = await this.adapter.start({ task, attempt, agent, routeSelection: preflight.selection,
-        prompt: promptFor(this.company, task, attempt, { modelContext }), signal: controller.signal,
+        prompt: promptFor(this.company, task, attempt, { modelContext, hostEvidence }), signal: controller.signal,
         assertCurrent, onAccepted: () => this.conversations?.accepted(attempt) });
       this.store.transaction(() => {
         this.fenced();
@@ -607,7 +647,7 @@ export class Engine {
     });
     await unlink(checkReceipt(this, commandId)).catch(() => {});
   }
-  async runHostCheck(attempt, command, args, cwd, { checkId, signal, ...options }) {
+  async runHostCheck(attempt, command, args, cwd, { checkId, signal, guard, ...options }) {
     const commandId = id('command');
     const cleanupReceipt = checkReceipt(this, commandId);
     await mkdir(path.dirname(cleanupReceipt), { recursive: true });
@@ -617,6 +657,7 @@ export class Engine {
     };
     const beforeStart = () => {
       signal.throwIfAborted();
+      guard?.();
       return this.currentAttemptTask(attempt, true);
     };
     const admitted = this.store.transaction(() => {
@@ -727,10 +768,25 @@ export class Engine {
     }
     assert(output.outcome !== 'coordinated', 'INVALID_RESULT', 'Only a coordination task can be coordinated');
     if (task.kind === 'plan' || task.kind === 'coordination' || output.outcome === 'decomposed') { this.acceptPlan(task, attempt, output); return; }
-    if (task.kind === 'review') { await this.acceptReview(task, attempt, output); return; }
+    if (task.kind === 'review') {
+      const supplied = attempt.hostEvidence ?? {};
+      if (Object.keys(supplied).length) {
+        const current = await this.workspaces.reviewEvidence(task, signal, { checkReviewCopy: false });
+        assert(Object.keys(supplied).every(id => digest(current[id] ?? null) === digest(supplied[id])),
+          'STALE_REVIEW', 'Host evidence changed after review dispatch');
+      }
+      await this.acceptReview(task, attempt, output); return;
+    }
     assert(output.outcome === 'completed', 'INVALID_RESULT', 'Execution did not submit a completed result');
-    const collected = await this.workspaces.collect(task, { ...attempt, signal }, output.artifacts ?? [],
-      (command, args, cwd, options) => this.runHostCheck(attempt, command, args, cwd, options));
+    let collected;
+    try {
+      collected = await this.workspaces.collect(task, { ...attempt, signal }, output.artifacts ?? [],
+        (command, args, cwd, options) => this.runHostCheck(attempt, command, args, cwd, options));
+    } catch (error) {
+      if (!error.environmentFailure) throw error;
+      await this.acceptRuntimeEnvironment(attempt, task, [error.environmentFailure], signal, error.evidence);
+      return;
+    }
     signal.throwIfAborted(); this.fenced();
     const environmentFailures = collected.checks.filter(c => !c.passed && !c.timedOut)
       .map(c => classifyEnvironment({ message: (c.stderr ?? '') + '\n' + (c.stdout ?? '') })).filter(Boolean);
@@ -744,7 +800,7 @@ export class Engine {
       for (const artifact of collected.artifacts) this.store.put('artifacts', artifact);
       this.store.put('verifications', { id: id('verification'), taskId: task.id, attemptId: attempt.id, artifactHash: collected.hash, goalContractVersion: attempt.goalContractVersion ?? 1, taskGeneration: attempt.taskGeneration, kind: 'checks', passed: checksPassed, checks: collected.checks });
     });
-    assert(checksPassed, 'CHECK_FAILED', `Configured acceptance checks failed: ${collected.checks.filter(c => !c.passed).map(c => `${c.id}: ${c.stderr || c.stdout || c.code}`).join('\n').slice(0, 6000)}`, { checks: collected.checks });
+    assert(checksPassed, 'CHECK_FAILED', `Configured acceptance checks failed: ${collected.checks.filter(c => !c.passed).map(c => `${c.id}: ${c.reason || c.stderr || c.stdout || c.code}`).join('\n').slice(0, 6000)}`, { checks: collected.checks });
     this.store.transaction(() => {
       task = this.currentAttemptTask(attempt, true);
       task = this.store.put('tasks', { ...task, deliveryGeneration: attempt.taskGeneration, artifactIds: collected.artifacts.map(a => a.id), artifactHash: collected.hash, changeSet: collected.changeSet, summary: output.summary ?? '', status: 'integrating', integrationPending: true, lastAuthorId: attempt.agentId });
@@ -756,18 +812,19 @@ export class Engine {
     this.store.transaction(() => {
       task = this.currentAttemptTask(attempt, true);
       if (task.status === 'reconciling') task = this.store.put('tasks', { ...task, status: 'running' });
-      if (!executed) task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
+      if (!executed && !attempt.preparingHost) task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
       this.store.put('attempts', { ...this.store.require('attempts', attempt.id), environment: report, preflightOnly: !executed });
       const finished = this.finishAttempt(attempt, executed ? 'completed' : 'failed', failures.map(f => f.reason).join('；'));
       if (!executed) this.store.put('attempts', { ...finished, cleanupPending: false });
       holdEnvironment(this, task, failures, report);
     });
   }
-  async acceptRuntimeEnvironment(attempt, task, failures, signal) {
+  async acceptRuntimeEnvironment(attempt, task, failures, signal, preparationFailure) {
     const previous = this.store.get('attempts', attempt.id)?.environment;
     const observed = await inspectEnvironment(this, task, this.store.require('agents', attempt.agentId), { failures },
       previous ? { report: { ...previous.runtime } } : undefined);
     signal.throwIfAborted();
+    if (preparationFailure) observed.report.host.preparationFailure = preparationFailure;
     this.acceptEnvironment(attempt, task, { report: observed.report,
       failures: [...new Map([...failures, ...observed.failures].map(f => [f.fingerprint, f])).values()] }, true);
   }
@@ -835,8 +892,9 @@ export class Engine {
     this.store.transaction(() => {
       const task = this.store.require('tasks', attempt.taskId); const stopped = task.stopRequested;
       if (!ACTIVE.has(this.store.require('attempts', attempt.id).status)) return;
+      const previousAttempts = attempt.preparingHost ? task.attempts : Math.max(0, task.attempts - 1);
       const failure = !aborted && !error.cleanupUncertain && !error.recoveryRequired && classifyEnvironment(error, preparingWorkspace ? 'workspace' : null);
-      const staleRoute = error.code === 'ROUTE_PREFLIGHT_STALE';
+      const staleRoute = ['ROUTE_PREFLIGHT_STALE', 'PREPARATION_CHANGED'].includes(error.code);
       const keepDeferred = !!attempt.deferredReplayAt && (stopped === 'paused' || this.closing);
       // Replay owns no new model process. Keep its payload and command identity
       // until the host check can be reconciled with its own receipt.
@@ -860,13 +918,13 @@ export class Engine {
         const beforeDispatch = error.code === 'GOAL_PAUSED';
         const retry = beforeDispatch || task.attempts < this.company.policy().maxAttempts;
         this.store.put('tasks', { ...task, status: retry ? 'ready' : 'failed', feedback: failure?.reason ?? error.message,
-          attempts: beforeDispatch ? Math.max(0, task.attempts - 1) : task.attempts,
+          attempts: beforeDispatch ? previousAttempts : task.attempts,
           retryAt: retry && !beforeDispatch ? Date.now() + 1000 * task.attempts : null });
         this.store.event('attempt.failed', attempt.id, { taskId: task.id, code: error.code, retry }, SYSTEM);
         return;
       }
       if (error.code === 'OWNER_STEER' && !stopped && !this.closing) {
-        this.store.put('tasks', { ...task, status: 'ready', resumeOnStart: false, stopRequested: null, retryAt: null, attempts: Math.max(0, task.attempts - 1) });
+        this.store.put('tasks', { ...task, status: 'ready', resumeOnStart: false, stopRequested: null, retryAt: null, attempts: previousAttempts });
         this.store.event('attempt.owner.steered', attempt.id, { taskId: task.id }, OWNER);
         return;
       }
@@ -878,7 +936,7 @@ export class Engine {
             this.store.put('notifications', { ...notification, status: 'pending', attemptId: null, deliveredAt: null });
           }
         }
-        this.store.put('tasks', { ...task, status: 'ready', retryAt: null, attempts: Math.max(0, task.attempts - 1) });
+        this.store.put('tasks', { ...task, status: 'ready', retryAt: null, attempts: previousAttempts });
         this.store.event('attempt.route.recheck', attempt.id, { taskId: task.id }, SYSTEM);
         return;
       }

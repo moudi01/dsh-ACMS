@@ -88,6 +88,7 @@ const duration = ms => ms == null ? '未知' : (ms / 1000).toLocaleString('zh-CN
 export function EnvironmentFacts({ report, modelHealth }) {
   const runtime = report?.runtime ?? report;
   const limits = runtime?.limits;
+  const preparation = report?.host?.preparationFailure;
   const host = [...(report?.host?.directories ?? []), ...(report?.host?.programs ?? []), ...(report?.host?.packages ?? [])];
   return <dl className="acms-definition">
     <dt>执行入口</dt><dd>{states[runtime?.entry] ?? '未知'}</dd>
@@ -95,6 +96,11 @@ export function EnvironmentFacts({ report, modelHealth }) {
     <dt>工具授权</dt><dd>{states[runtime?.authorization] ?? '未知'}</dd>
     <dt>模型实测</dt><dd>{states[modelHealth?.status ?? runtime?.modelVerification?.status] ?? '未知'}</dd>
     {host.map(item => <React.Fragment key={item.subject}><dt>{item.subject}</dt><dd>{states[item.status] ?? '未知'}</dd></React.Fragment>)}
+    {preparation && <>
+      <dt>依赖准备命令</dt><dd><code>{[preparation.command, ...(preparation.args ?? [])].join(' ')}</code></dd>
+      <dt>准备退出状态</dt><dd>{preparation.timedOut ? '已超时' : preparation.code ?? preparation.errorCode}</dd>
+      {preparation.log && <><dt>准备日志指纹</dt><dd><code>{preparation.log.hash}</code></dd></>}
+    </>}
     {limits && <>
       <dt>公司单次时限</dt><dd>{duration(limits.companyMs)}</dd>
       <dt>runner 总时限</dt><dd>{duration(limits.runnerMs)}{limits.runnerSource === 'declared' ? '（配对声明）' : limits.runnerSource === 'acms' ? '（ACMS 配置）' : ''}</dd>
