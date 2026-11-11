@@ -165,6 +165,9 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
   assert.ok(!redactActivityText('{"token":"INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('{\\"token\\":\\"INDEPENDENT_FAKE_SECRET\\"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('{"password":"abc\\"INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('{"password":"abc,INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('{"password":"abc}INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('{\\"password\\":\\"abc,INDEPENDENT_FAKE_SECRET\\"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('access_token=INDEPENDENT_FAKE_SECRET').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('Authorization: Basic RkFLRV9TRUNSRVQ=').includes('RkFLRV9TRUNSRVQ'));
   const bearer = redactActivityText('Authorization: Bearer INDEPENDENT_FAKE_SECRET');

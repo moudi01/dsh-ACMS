@@ -80,15 +80,17 @@ const MAX_BUDGET = 6000;
  */
 export function redactActivityText(value) {
   if (typeof value !== 'string') return value;
-  // Escaped JSON (\"key\":\"value\") is common in serialized event payloads.
-  const text = value.replace(/\\"/g, '"');
-  return text
-    .replace(/(["'])(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*:\s*[^,}\n]+/gi, (_match, quote, key) => `${quote}${key}${quote}: [已隐藏]`)
+  // Quoted JSON keys/values may be plain (`"token":"..."`) or escaped through
+  // another serialization layer (`\"token\":\"...\"`). The quoted value pattern
+  // consumes escaped quotes and separators so a secret containing `,` or `}`
+  // cannot leak its suffix.
+  return value
+    .replace(/(\\?["'])(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*:\s*(\\?"(?:[^"\\]|\\.)*\\?"|\\?'(?:[^'\\]|\\.)*\\?'|[^\n,;}]+)/gi, (_match, quote, key) => `${quote}${key}${quote}: [已隐藏]`)
     .replace(/\bAuthorization\s*[:=]\s*(?:(?:Basic|Bearer)\s+)?[A-Za-z0-9._~+/=-]{8,}/gi, 'Authorization: [已隐藏]')
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [已隐藏]')
     .replace(/\bBasic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [已隐藏]')
     .replace(/\b(acms_ag_|ghp_|github_pat_|sk-)[A-Za-z0-9_-]{8,}/g, '[已隐藏]')
-    .replace(/\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\b(\s*[:=]\s*)[^\n,;}]+/gi, (_match, key, separator) => `${key}${separator}[已隐藏]`);
+    .replace(/\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\b(\s*[:=]\s*)[^\n;}]+/gi, (_match, key, separator) => `${key}${separator}[已隐藏]`);
 }
 
 /** Redact secrets and bound every value before it reaches the panel. */

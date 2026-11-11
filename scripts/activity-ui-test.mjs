@@ -33,7 +33,7 @@ try {
   server.engine.block(blockedTask, 'human', '当前没有可用的品牌文件。', '请提供品牌素材，或确认沿用默认样式。');
   const interaction = server.company.snapshot().interactions.find(item => item.taskId === blockedTask.id && item.status === 'pending');
   command('interaction.answer', { id: interaction.id, answer: '沿用默认样式。', expectedRevision: interaction.revision });
-  if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围：{\\"token\\":\\"FAKE_UI_SECRET\\"}', '请确认本次交付范围。');
+  if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围：{\\"token\\":\\"FAKE,UI}SECRET\\"}', '请确认本次交付范围。');
 
   const review = store.put('tasks', { id: 'task_review_demo', goalId: goal.id, projectId, title: `审查：${reviewedTask.title}`, description: '', acceptance: '', kind: 'review', status: 'succeeded', reviewOf: reviewedTask.id, dependencies: [], createdAt: iso(-30_000) });
   insertEvent(iso(-20_000), 'review.decided', review.id, goal.id, { actor: 'reviewer', principalKind: 'agent', body: { taskId: reviewedTask.id, scope: 'task', decision: 'approve', artifactHash: 'a'.repeat(64), actorRole: 'reviewer', actorName: '质量审查员' } });
@@ -77,7 +77,7 @@ try {
       const pendingEntry = page.locator('.acms-activity-entry').filter({ hasText: `任务「${pendingTask.title}」已阻塞` }).first();
       await expect(pendingEntry).toBeVisible();
       await expect(pendingEntry).toContainText('待你回复');
-      await expect(pendingEntry).not.toContainText('FAKE_UI_SECRET');
+      await expect(pendingEntry).not.toContainText('FAKE,UI}SECRET');
       await expect(pendingEntry).toContainText('已隐藏');
       await pendingEntry.getByRole('button', { name: '回复待处理问题 →' }).click();
       await expect(page.getByRole('dialog')).toContainText('回复阻塞问题');
