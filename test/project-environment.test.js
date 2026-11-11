@@ -80,13 +80,16 @@ test('offline lockfile preparation works in a Git worktree, in the check copy an
   assert.match(check.log.hash, /^[a-f0-9]{64}$/);
 });
 
-test('an empty offline cache blocks before model dispatch without consuming a retry', windows, async t => {
+test('an empty offline cache blocks before model dispatch without consuming a retry', { ...windows, timeout: 60000 }, async t => {
   const f = await fixture(t);
   const { cacheSeed, ...preparation } = await offlinePackage(f);
   f.command('project.save', { id: f.project.id, preparation });
   const task = f.task();
   await f.start();
-  const blocked = await until(() => f.store.require('tasks', task.id).environmentBlock, 12000);
+  // The preparation command itself may take up to 12 seconds. Observing its
+  // settled blocker must also allow workspace setup and owned-process cleanup
+  // on Windows CI; the exit-code assertion below still rejects command timeouts.
+  const blocked = await until(() => f.store.require('tasks', task.id).environmentBlock, 30000);
   assert.equal(blocked.failures[0].code, 'preparation');
   assert.equal(blocked.report.host.preparationFailure.code, 1);
   assert.equal(f.store.require('tasks', task.id).attempts, 0);

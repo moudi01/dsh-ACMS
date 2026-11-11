@@ -12,6 +12,11 @@ export const api = {
   pairing: input => request('pairing', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
   snapshot: signal => request('state', { signal }),
   events: (after, signal) => request(`events?after=${after}`, { signal }),
+  activity: (query = {}, signal) => {
+    const params = new URLSearchParams();
+    for (const key of ['before', 'after', 'limit', 'projectId', 'goalId', 'taskId']) if (query[key] !== undefined && query[key] !== null && query[key] !== '') params.set(key, query[key]);
+    return request(`activity?${params.toString()}`, { signal });
+  },
   artifact: id => request(`artifact?id=${encodeURIComponent(id)}`),
   directories: directory => request(`directories?path=${encodeURIComponent(directory)}`),
   modelDetails: (input, signal) => request('model-details', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input), signal }),

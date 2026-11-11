@@ -14,10 +14,11 @@ import { entityDeletionReason } from '../core/entity-actions.js';
 import { EntityDrawer, EntityTrash, ChangeHistory, entityLabels } from './entities.jsx';
 import { ConversationWindow } from './conversation.jsx';
 import { AccessPage } from './access.jsx';
+import { ActivityPage } from './activity.jsx';
 
 const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', preparing: '准备中', reviewing: '待审查', integrating: '集成中', succeeded: '已完成', failed: '失败', paused: '已暂停', stopping: '停止中', cancelled: '已取消', archived: '已归档', reconciling: '待核对', completed: '执行结束', interrupted: '已中断', available: '可分配', retired: '已释放', planning: '规划中', active: '进行中', proposed: '提案', pending: '待处理', answered: '已回答', deleted: '已删除' };
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
-const tabs = [['overview', '公司总览', '◈'], ['projects', '项目与目标', '▱'], ['tasks', '任务工作台', '▤'], ['agents', '组织管理', '♧'], ['models', '模型列表', '◇'], ['workflows', '目标模板', '⇢'], ['artifacts', '产物与验收', '▧'], ['access', '外部接入', '⇄'], ['settings', '公司设置', '⚙']];
+const tabs = [['overview', '公司总览', '◈'], ['activity', '动态日志', '◷'], ['projects', '项目与目标', '▱'], ['tasks', '任务工作台', '▤'], ['agents', '组织管理', '♧'], ['models', '模型列表', '◇'], ['workflows', '目标模板', '⇢'], ['artifacts', '产物与验收', '▧'], ['access', '外部接入', '⇄'], ['settings', '公司设置', '⚙']];
 const terminal = ['succeeded', 'cancelled', 'archived'];
 const openGoal = goal => !['succeeded', 'cancelled', 'archived'].includes(goal.status);
 function date(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'; }
@@ -100,6 +101,7 @@ export function App() {
           <section className="acms-panel"><div className="acms-sectionhead"><h2>最近的执行</h2><span className="acms-muted">执行结束后会自动进入检查与交付</span></div><RunTable attempts={data.attempts.slice(-8).reverse()} data={data} select={selectTask} navigate={navigate} /></section>
         </>}
         {tab === 'projects' && <ProjectsPage data={data} navigate={navigate} select={selectTask} open={open} scope={scope} act={safeAct} busy={busy} onGoal={(projectId, goalId, options = {}) => { setScope({ projectId, goalId, ...(options.completed ? { completed: true } : {}) }); setTab('tasks'); }} />}
+        {tab === 'activity' && <ActivityPage data={data} select={selectTask} navigate={navigate} updated={updated} open={open} />}
         {tab === 'runs' && <><PageHead title="当前执行" description="占用口径与调度器一致：任务执行、Git 集成、独立对话和模型检测各占一个名额。" /><CapacityPanel capacity={data.runtime.capacity} data={data} select={selectTask} chat={chat} openModels={() => setTab('models')} /><section className="acms-panel"><div className="acms-sectionhead"><h2>任务执行明细</h2><span className="acms-muted">点击任务查看执行详情</span></div><RunTable attempts={active} data={data} select={selectTask} navigate={navigate} /></section></>}
         {tab === 'inbox' && <><PageHead title="待处理事项" description="只处理需要你提供材料或作出决定的分支。" />{!pending.length && <Empty title="暂无待处理事项" />}{pending.map(i => <section className="acms-panel" key={i.id}><button className="text" onClick={() => selectTask(i.taskId)}>{data.tasks.find(t => t.id === i.taskId)?.title}</button><p>{i.question}</p><button onClick={() => open('answer', i)}>查看并回复</button></section>)}</>}
         {tab === 'tasks' && <Tasks navigate={navigate} data={data} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={() => setScope({})} />}

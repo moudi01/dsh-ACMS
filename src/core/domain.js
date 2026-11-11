@@ -149,7 +149,7 @@ export class Company {
     const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false, ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
     if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge'], actor);
-    this.store.event('project.saved', project.id, {}, actor); return project;
+    this.store.event('project.saved', project.id, { created: !previous }, actor); return project;
   }
   editGoal(args, actor) {
     this.owner(actor); const previous = this.store.require('goals', args.id);
@@ -303,8 +303,25 @@ export class Company {
       }
     }
     if (status === goal.status) return goal;
-    const saved = this.store.put('goals', { ...goal, status, ...(status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {}) });
-    this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, { from: goal.status, status }, actor);
+    const completed = status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {};
+    const saved = this.store.put('goals', { ...goal, status, ...completed });
+    const delivered = status === 'succeeded' ? deliveredWork(this.store, goal) : [];
+    const reviewCandidate = status === 'succeeded' ? this.latestGoalReview(goalId) : null;
+    // Only a passed review bound to this exact delivery is evidence for the
+    // completion event; an older/cancelled review must not be relabelled.
+    const finalReview = reviewCandidate && reviewCandidate.status === 'succeeded' && reviewCandidate.passed === true &&
+      reviewCandidate.deliveryHash === saved.completedDeliveryHash ? reviewCandidate : null;
+    this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, {
+      from: goal.status, status,
+      ...(status === 'succeeded' ? {
+        contractVersion: saved.completedContractVersion, deliveryHash: saved.completedDeliveryHash,
+        delivery: delivered.map(task => ({
+          id: task.id, title: task.title, artifactHash: task.artifactHash ?? null,
+          artifactIds: task.artifactIds ?? [], generation: deliveryGeneration(task), contractVersion: taskContractVersion(task),
+        })),
+        ...(finalReview ? { review: { taskId: finalReview.id, passed: finalReview.passed === true, deliveryHash: finalReview.deliveryHash ?? null } } : {}),
+      } : {}),
+    }, actor);
     return saved;
   }
   deliveryHash(goalId) {
@@ -512,7 +529,7 @@ export class Company {
     const saved = this.store.put('agents', { ...previous, id: previous?.id ?? id('agent'), name: text(args.name ?? previous?.name, 'name', 200), description: args.description ?? previous?.description ?? '', role, provider, model, llmProvider, reasoningEffort, grants, temporary: args.temporary ?? previous?.temporary ?? false, status: args.status ?? previous?.status ?? 'available' }, args.expectedRevision);
     if (actor.kind === 'agent' && !previous) this.store.put('agents', { ...saved, goalId: actor.goalId });
     if (previous) recordChange(this, 'agent', previous, saved, ['name', 'description', 'role', 'provider', 'model', 'reasoningEffort', 'temporary'], actor);
-    this.store.event('agent.saved', saved.id, {}, actor); return this.store.require('agents', saved.id);
+    this.store.event('agent.saved', saved.id, { created: !previous }, actor); return this.store.require('agents', saved.id);
   }
   publishWorkflow(args, actor) {
     // A template describes how a whole goal is implemented. It is an owner

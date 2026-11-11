@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { assert, digest, OWNER } from '../core/util.js';
+import { ACTIVITY_MAX_LIMIT } from '../core/activity.js';
 import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
 
@@ -91,6 +92,30 @@ export function createRoutes(runtime) {
       const url = new URL(request.url); const after = Number(url.searchParams.get('after') ?? 0);
       assert(Number.isSafeInteger(after) && after >= 0, 'CURSOR', 'Invalid event cursor');
       return json(await waitForEvents(company.store, after, request.signal));
+    },
+    '/api/acms/activity': async request => {
+      const url = new URL(request.url);
+      const cursor = name => {
+        const raw = url.searchParams.get(name);
+        if (raw === null || raw === '') return null;
+        const value = Number(raw);
+        assert(Number.isSafeInteger(value) && value >= 0, 'CURSOR', `Invalid ${name} cursor`);
+        return value;
+      };
+      const before = cursor('before'); const after = cursor('after');
+      assert(!(before !== null && after !== null), 'INVALID_INPUT', 'before and after cannot be combined');
+      const rawLimit = url.searchParams.get('limit');
+      let limit = undefined;
+      if (rawLimit !== null && rawLimit !== '') {
+        limit = Number(rawLimit);
+        assert(Number.isSafeInteger(limit) && limit >= 1 && limit <= ACTIVITY_MAX_LIMIT, 'INVALID_INPUT', `limit must be between 1 and ${ACTIVITY_MAX_LIMIT}`);
+      }
+      const scope = name => {
+        const raw = url.searchParams.get(name);
+        assert(raw === null || (raw.length > 0 && raw.length <= 200), 'INVALID_INPUT', `Invalid ${name}`);
+        return raw ?? null;
+      };
+      return json(company.store.activityPage({ before, after, limit, projectId: scope('projectId'), goalId: scope('goalId'), taskId: scope('taskId') }));
     },
     '/api/acms/artifact': async request => {
       const artifactId = new URL(request.url).searchParams.get('id'); const artifact = company.store.require('artifacts', artifactId);
