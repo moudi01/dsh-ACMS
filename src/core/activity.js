@@ -86,6 +86,9 @@ export function redactActivityText(value) {
   // cannot leak its suffix.
   return value
     .replace(/(\\?["'])(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*:\s*(\\?"(?:[^"\\]|\\.)*\\?"|\\?'(?:[^'\\]|\\.)*\\?'|[^\n,;}]+)/gi, (_match, quote, key) => `${quote}${key}${quote}: [已隐藏]`)
+    // Unclosed/truncated JSON values cannot match a closing quote; redact the
+    // rest of the line rather than leaving the visible secret tail.
+    .replace(/(\\?["'])(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*:\s*\\?"[^\n]*/gi, (_match, quote, key) => `${quote}${key}${quote}: [已隐藏]`)
     .replace(/\bAuthorization\s*[:=]\s*(?:(?:Basic|Bearer)\s+)?[A-Za-z0-9._~+/=-]{8,}/gi, 'Authorization: [已隐藏]')
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [已隐藏]')
     .replace(/\bBasic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [已隐藏]')
@@ -139,7 +142,7 @@ export function activityContext(data = {}) {
 
 const titleOf = (item, fallback) => item?.title ?? item?.name ?? fallback;
 const statusLabel = status => STATUS_LABEL[status] ?? status ?? '未知';
-const shortReason = value => (typeof value === 'string' && value.trim() ? value.trim().slice(0, MAX_STRING) : null);
+const shortReason = value => (typeof value === 'string' && value.trim() ? redactActivityText(value.trim()).slice(0, MAX_STRING) : null);
 const list = (value, limit = 4) => Array.isArray(value) ? value.slice(0, limit) : [];
 
 function goalOf(event, context, task) {
