@@ -162,6 +162,8 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
   assert.equal(described.details.token, '[已隐藏]');
 
   assert.equal(redactActivityText('token=INDEPENDENT_FAKE_SECRET'), 'token=[已隐藏]');
+  assert.ok(!redactActivityText('{"token":"INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('Authorization: Basic RkFLRV9TRUNSRVQ=').includes('RkFLRV9TRUNSRVQ'));
   const bearer = redactActivityText('Authorization: Bearer INDEPENDENT_FAKE_SECRET');
   assert.ok(!bearer.includes('INDEPENDENT_FAKE_SECRET'));
   assert.match(bearer, /已隐藏/);
@@ -172,6 +174,13 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
 
   const legacyAgent = describeActivity({ seq: 6, at: '2026-01-01T00:00:00.000Z', type: 'agent.saved', entityId: 'worker_1', goalId: null, actor: { kind: 'owner', id: 'owner' }, data: {} }, context);
   assert.match(legacyAgent.action, /保存了角色/);
+
+  const secretContext = demoContext();
+  secretContext.agents.set('worker_1', { id: 'worker_1', name: 'Agent token=FAKE_LABEL', role: 'worker' });
+  const labelled = describeActivity({ seq: 7, at: '2026-01-01T00:00:00.000Z', type: 'task.created', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'agent', id: 'worker_1' }, data: { actorRole: 'worker', actorName: 'Agent token=FAKE_LABEL', title: '演示任务' } }, secretContext);
+  assert.ok(!labelled.actor.label.includes('FAKE_LABEL'));
+  assert.ok(!labelled.details.actorName.includes('FAKE_LABEL'));
+  assert.ok(!labelled.action.includes('FAKE_LABEL'));
 });
 
 test('historical actor roles and executors are not rewritten by later edits', () => {
@@ -201,7 +210,7 @@ test('event bodies snapshot the acting agent role and name', async t => {
 });
 
 test('goal completion records the delivered contract version and delivery hash', async t => {
-  const f = await fixture(t); f.task(); await f.start();
+  const f = await fixture(t); const delivered = f.task(); await f.start();
   await until(() => f.store.require('goals', f.goal.id).status === 'succeeded');
   const event = eventsOf(f.store, 'goal.succeeded').at(-1); const body = JSON.parse(event.body);
   assert.equal(typeof body.deliveryHash, 'string');
@@ -209,6 +218,24 @@ test('goal completion records the delivered contract version and delivery hash',
   const described = describeActivity(f.store.eventEntry(event), activityContext(f.company.snapshot()));
   assert.equal(described.evidence.deliveryHash, body.deliveryHash);
   assert.match(described.action, new RegExp(`交付版本 ${body.contractVersion}`));
+  assert.equal(body.delivery.length, 1);
+  assert.equal(body.delivery[0].id, delivered.id);
+  assert.equal(body.delivery[0].artifactHash, f.store.require('tasks', delivered.id).artifactHash);
+  assert.equal(described.delivery.length, 1);
+  assert.equal(described.delivery[0].id, delivered.id);
+});
+
+test('manager-routed blockers keep the executor snapshot', async t => {
+  const f = await fixture(t); const task = f.task(); const record = f.store.require('tasks', task.id);
+  f.engine.block(record, 'integration', '集成冲突', '请处理');
+  const event = eventsOf(f.store, 'blocker.coordinated').at(-1);
+  assert.ok(event, 'manager routing must leave a blocker.coordinated event');
+  const body = JSON.parse(event.body);
+  if (record.agentId) {
+    assert.equal(body.executorId, record.agentId);
+    const described = describeActivity(f.store.eventEntry(event), activityContext(f.company.snapshot()));
+    assert.ok(described.executor?.startsWith('执行者'), 'the executor snapshot must survive manager routing');
+  }
 });
 
 test('activity wording covers cancellation, recovery, rejection and completion', () => {

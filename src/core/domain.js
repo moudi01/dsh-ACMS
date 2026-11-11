@@ -305,9 +305,18 @@ export class Company {
     if (status === goal.status) return goal;
     const completed = status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {};
     const saved = this.store.put('goals', { ...goal, status, ...completed });
+    const delivered = status === 'succeeded' ? deliveredWork(this.store, goal) : [];
+    const finalReview = status === 'succeeded' ? this.latestGoalReview(goalId) : null;
     this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, {
       from: goal.status, status,
-      ...(status === 'succeeded' ? { contractVersion: saved.completedContractVersion, deliveryHash: saved.completedDeliveryHash } : {}),
+      ...(status === 'succeeded' ? {
+        contractVersion: saved.completedContractVersion, deliveryHash: saved.completedDeliveryHash,
+        delivery: delivered.map(task => ({
+          id: task.id, title: task.title, artifactHash: task.artifactHash ?? null,
+          artifactIds: task.artifactIds ?? [], generation: deliveryGeneration(task), contractVersion: taskContractVersion(task),
+        })),
+        ...(finalReview ? { review: { taskId: finalReview.id, passed: finalReview.passed === true, deliveryHash: finalReview.deliveryHash ?? null } } : {}),
+      } : {}),
     }, actor);
     return saved;
   }

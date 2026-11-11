@@ -182,6 +182,9 @@ export function coordinateBlocker(engine, task, { kind, reason, question = "", e
     const baseKey = key ?? blockerCoordinationKey(current, kind);
     const fact = { kind, reason, evidence };
     const hash = digest(fact);
+    // Snapshot the executor before the blocker changes assignment/status.
+    const executor = current.agentId ? store.get("agents", current.agentId) : null;
+    const executorFields = current.agentId ? { executorId: current.agentId, executorName: executor?.name ?? null, executorRole: executor?.role ?? null } : {};
     const prior = store.list("tasks").filter(t => t.kind === "coordination" && t.coordinationOf === current.id &&
       t.coordinationKey?.startsWith(prefix));
     const open = prior.find(t => ["ready", "running", "blocked", "paused"].includes(t.status));
@@ -195,7 +198,7 @@ export function coordinateBlocker(engine, task, { kind, reason, question = "", e
       if (open.feedbackHash !== hash) {
         store.put("tasks", { ...open, description, feedbackHash: hash, blockerEvidence: fact,
           origin: { ...open.origin, blockerKind: kind, basis: reason } });
-        store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: open.id, reason, evidence, reused: true, updated: true }, SYSTEM, { goalId: current.goalId });
+        store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: open.id, reason, evidence, reused: true, updated: true, ...executorFields }, SYSTEM, { goalId: current.goalId });
       }
       if (current.blocker?.resolutionTaskIds?.includes(open.id) && current.status === "blocked") return current;
       return holdSourceForCoordination(store, current, open);
@@ -224,7 +227,7 @@ export function coordinateBlocker(engine, task, { kind, reason, question = "", e
     // dispatch would spend a model call while the known prerequisite is absent.
     if (kind === "environment") coordination = store.put("tasks", { ...coordination, status: "blocked",
       blocker: { kind: "environment-handoff", reason } });
-    store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: coordination.id, reason, evidence }, SYSTEM, { goalId: current.goalId });
+    store.event("blocker.coordinated", current.id, { blockerKind: kind, route: "manager", coordinationTaskId: coordination.id, reason, evidence, ...executorFields }, SYSTEM, { goalId: current.goalId });
     return holdSourceForCoordination(store, current, coordination);
   });
 }

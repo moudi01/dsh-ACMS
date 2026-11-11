@@ -29,7 +29,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
-  const request = useRef(0); const syncing = useRef(false); const pendingSync = useRef(false); const stateRef = useRef({ items, latestSeq, loaded });
+  const request = useRef(0); const syncing = useRef(false); const pendingSync = useRef(false); const generation = useRef(0); const stateRef = useRef({ items, latestSeq, loaded });
 
   const filters = useMemo(() => ({ projectId: projectId || undefined, goalId: goalId || undefined, taskId: taskId || undefined }), [projectId, goalId, taskId]);
   const filterKey = JSON.stringify(filters);
@@ -51,11 +51,16 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   stateRef.current = { items, latestSeq, loaded };
 
   const loadNewest = async () => {
-    const token = ++request.current; setLoading(true); setError(''); pendingSync.current = false;
+    const token = ++request.current; const gen = ++generation.current; setLoading(true); setError(''); pendingSync.current = false;
     try {
       const page = await api.activity({ ...filters, limit: 50 });
-      if (token !== request.current) return;
-      setItems(page.entries); setNextBefore(page.nextBefore); setLatestSeq(page.latestSeq); setHasMore(page.hasMore); setLoaded(true);
+      if (token !== request.current || gen !== generation.current) return;
+      const merged = mergeEntries(page.entries, stateRef.current.items);
+      stateRef.current = { items: merged, latestSeq: Math.max(stateRef.current.latestSeq, page.latestSeq), loaded: true };
+      setItems(merged); setNextBefore(page.nextBefore); setLatestSeq(previous => Math.max(previous, page.latestSeq)); setHasMore(page.hasMore); setLoaded(true);
+      // Events may have arrived while the first page was loading; synchronize
+      // from the page watermark before declaring the view settled.
+      syncNewer().catch(() => {});
     } catch (cause) {
       if (token !== request.current) return;
       setError(`${cause.code ? `${cause.code} · ` : ''}${cause.message}`);
@@ -85,12 +90,13 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
     if (syncing.current) { pendingSync.current = true; return; }
     if (!stateRef.current.loaded) return;
     syncing.current = true;
+    const gen = generation.current;
     try {
       for (;;) {
         const current = stateRef.current;
         const startedWith = filterKeyRef.current;
         const page = await api.activity({ ...filtersRef.current, after: current.latestSeq, limit: 50 });
-        if (filterKeyRef.current !== startedWith) break;
+        if (gen !== generation.current || filterKeyRef.current !== startedWith) break;
         if (!page.entries.length) break;
         setItems(previous => mergeEntries(previous, page.entries));
         const nextSeq = page.nextAfter ?? current.latestSeq;
@@ -103,7 +109,11 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
       if (pendingSync.current) { pendingSync.current = false; syncNewer().catch(() => {}); }
     }
   };
-  useEffect(() => { loadNewest().catch(() => {}); /* filters changing starts a new durable cursor */ }, [filters]);
+  useEffect(() => {
+    stateRef.current = { items: [], latestSeq: 0, loaded: false };
+    setItems([]); setNextBefore(null); setLatestSeq(0); setHasMore(false); setLoaded(false); setError('');
+    loadNewest().catch(() => {}); /* filters changing starts a new durable cursor */
+  }, [filters]);
   useEffect(() => { syncNewer().catch(() => {}); }, [updated]);
 
   const openSubject = subject => {
@@ -143,9 +153,11 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
           {(activity.project || activity.goal) && <p className="acms-activity-path">{[activity.project?.title, activity.goal?.title].filter(Boolean).join(' › ')}</p>}
           {activity.reason && <p className="acms-activity-reason"><b>原因：</b>{activity.reason}</p>}
           {activity.executor && <p className="acms-muted">相关执行者：{activity.executor}</p>}
+          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>{activity.delivery.map(item => item.id ? <button type="button" key={item.id} className="text acms-activity-open" onClick={() => select(item.id)}>{item.title}{item.artifactHash ? `（${shortHash(item.artifactHash)}）` : ''}</button> : null)}{activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查 →</button>}</div>}
+          {activity.type === 'goal.succeeded' && activity.delivery.length === 0 && <p className="acms-muted">历史事件未记录当次交付清单；只能打开当前目标查看最新证据。</p>}
           {(activity.evidence.artifactHash || activity.evidence.deliveryHash || activity.evidence.integratedCommit) && <p className="acms-activity-evidence">证据：{Object.entries(activity.evidence).map(([key, value]) => <code key={key} title={`${key}: ${value}`}>{key}={shortHash(value)}</code>)}</p>}
         </div>
-        <details className="acms-activity-details"><summary>技术详情</summary><div><dl className="acms-definition"><dt>事件类型</dt><dd>{activity.type}</dd><dt>实体</dt><dd>{activity.subject?.id ?? entry.entityId ?? '—'}</dd><dt>目标</dt><dd>{activity.goal?.id ?? entry.goalId ?? '—'}</dd></dl><pre>{JSON.stringify(activity.details, null, 2)}</pre></div></details>
+        <details className="acms-activity-details"><summary>技术详情</summary><div><dl className="acms-definition"><dt>事件类型</dt><dd>{activity.type}</dd><dt>实体</dt><dd>{activity.subject?.id ?? entry.entityId ?? '—'}</dd><dt>目标</dt><dd>{activity.goal?.id ?? entry.goalId ?? '—'}</dd>{activity.type === 'goal.succeeded' && <><dt>交付清单</dt><dd>{activity.delivery.length ? `${activity.delivery.length} 项${activity.deliveryReview ? ` · 当次审查${activity.deliveryReview.passed ? '通过' : '未通过'}` : ' · 无最终审查记录'}` : '历史事件未记录'}</dd></>}</dl><pre>{JSON.stringify(activity.details, null, 2)}</pre></div></details>
       </article>;
     })}</div>
     {hasMore && <div className="acms-actions acms-activity-more"><button type="button" onClick={() => loadOlder().catch(() => {})} disabled={loading}>{loading ? '正在加载…' : '加载更早的动态'}</button></div>}

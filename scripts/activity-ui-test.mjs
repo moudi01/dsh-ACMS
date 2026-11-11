@@ -32,12 +32,18 @@ try {
   server.engine.block(blockedTask, 'human', '当前没有可用的品牌文件。', '请提供品牌素材，或确认沿用默认样式。');
   const interaction = server.company.snapshot().interactions.find(item => item.taskId === blockedTask.id && item.status === 'pending');
   command('interaction.answer', { id: interaction.id, answer: '沿用默认样式。', expectedRevision: interaction.revision });
-  if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围（token=FAKE_UI_SECRET）。', '请确认本次交付范围。');
+  if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围：{"token":"FAKE_UI_SECRET"}', '请确认本次交付范围。');
 
   const review = store.put('tasks', { id: 'task_review_demo', goalId: goal.id, projectId, title: `审查：${reviewedTask.title}`, description: '', acceptance: '', kind: 'review', status: 'succeeded', reviewOf: reviewedTask.id, dependencies: [], createdAt: iso(-30_000) });
   insertEvent(iso(-20_000), 'review.decided', review.id, goal.id, { actor: 'reviewer', principalKind: 'agent', body: { taskId: reviewedTask.id, scope: 'task', decision: 'approve', artifactHash: 'a'.repeat(64), actorRole: 'reviewer', actorName: '质量审查员' } });
   insertEvent(iso(-15_000), 'goal.submitted', goal.id, goal.id, { actor: 'credential_demo', principalKind: 'user-agent', onBehalfOf: { kind: 'owner', id: 'owner' }, body: {} });
-  insertEvent(iso(-10_000), 'attempt.failed', 'attempt_demo', goal.id, { body: { taskId: reviewedTask.id, code: 'PROVIDER_FAILED', message: '模拟执行环境失败' } });
+  insertEvent(iso(-10_000), 'attempt.failed', 'attempt_demo', goal.id, { body: { taskId: reviewedTask.id, code: 'PROVIDER_FAILED', message: 'Authorization: Basic RkFLRV9TRUNSRVQ=' } });
+
+  const doneGoal = command('goal.create', { projectId, title: '已交付目标', description: '已交付', acceptance: '已交付', plan: false });
+  const doneTask = command('task.create', { goalId: doneGoal.id, title: '已交付示例' });
+  store.put('tasks', { ...store.require('tasks', doneTask.id), status: 'succeeded', artifactHash: 'c'.repeat(64), artifactIds: [] });
+  store.put('goals', { ...store.require('goals', doneGoal.id), status: 'succeeded', completedContractVersion: 1, completedDeliveryHash: 'b'.repeat(64) });
+  insertEvent(iso(-5_000), 'goal.succeeded', doneGoal.id, doneGoal.id, { body: { from: 'active', status: 'succeeded', contractVersion: 1, deliveryHash: 'b'.repeat(64), delivery: [{ id: doneTask.id, title: '已交付示例', artifactHash: 'c'.repeat(64), artifactIds: [], generation: 1, contractVersion: 1 }] } });
 
   const secondProject = command('project.save', { name: '第二项目', repoRoot: server.source, mode: 'copy' });
   const secondGoal = command('goal.create', { projectId: secondProject.id, title: '第二目标', description: '第二目标', acceptance: '第二目标', plan: false });
@@ -87,7 +93,18 @@ try {
     await expect(externalEntry.locator('.acms-activity-actor')).toHaveText('外部智能体（代表所有者）');
     const failedEntry = page.locator('.acms-activity-entry').filter({ hasText: '执行失败' }).first();
     await expect(failedEntry).toBeVisible();
-    await expect(failedEntry).toContainText('模拟执行环境失败');
+    await expect(failedEntry).not.toContainText('RkFLRV9TRUNSRVQ');
+    await expect(failedEntry).toContainText('已隐藏');
+
+    // 3b. Goal completion keeps the delivered version and exposes per-delivery evidence.
+    const completedEntry = page.locator('.acms-activity-entry').filter({ hasText: '目标「已交付目标」完成（交付版本 1）' }).first();
+    await expect(completedEntry).toBeVisible();
+    await expect(completedEntry).toContainText('交付证据');
+    const deliveryButton = completedEntry.getByRole('button', { name: /已交付示例/ }).first();
+    await expect(deliveryButton).toBeVisible();
+    await deliveryButton.click();
+    await expect(page.locator('.acms-drawer')).toContainText('已交付示例');
+    await page.getByRole('button', { name: '关闭任务详情' }).click();
 
     // 4. Technical details expand on demand and stay bounded.
     await reviewEntry.locator('summary').click();
