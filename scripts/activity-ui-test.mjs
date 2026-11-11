@@ -47,7 +47,7 @@ try {
   store.put('artifacts', { id: 'artifact_delivered', taskId: doneTask.id, attemptId: 'attempt_demo_done', path: 'deliverable.txt', title: '交付文件', hash: 'd'.repeat(64), bytes: 22, blob: artifactBlob });
   store.put('tasks', { ...store.require('tasks', doneTask.id), status: 'succeeded', artifactHash: 'd'.repeat(64), artifactIds: ['artifact_delivered'] });
   store.put('goals', { ...store.require('goals', doneGoal.id), status: 'succeeded', completedContractVersion: 1, completedDeliveryHash: 'b'.repeat(64) });
-  insertEvent(iso(-5_000), 'goal.succeeded', doneGoal.id, doneGoal.id, { body: { from: 'active', status: 'succeeded', contractVersion: 1, deliveryHash: 'b'.repeat(64), delivery: [{ id: doneTask.id, title: '已交付示例', artifactHash: 'd'.repeat(64), artifactIds: ['artifact_delivered'], generation: 1, contractVersion: 1 }] } });
+  insertEvent(iso(-5_000), 'goal.succeeded', doneGoal.id, doneGoal.id, { body: { from: 'active', status: 'succeeded', contractVersion: 1, deliveryHash: 'b'.repeat(64), delivery: [{ id: doneTask.id, title: '已交付示例', artifactHash: 'd'.repeat(64), artifactIds: ['artifact_delivered'], generation: 1, contractVersion: 1 }], review: { taskId: 'task_review_demo', passed: true, deliveryHash: 'stale' } } });
 
   const secondProject = command('project.save', { name: '第二项目 token=FAKE_OPTION_SECRET', repoRoot: server.source, mode: 'copy' });
   const secondGoal = command('goal.create', { projectId: secondProject.id, title: '第二目标', description: '第二目标', acceptance: '第二目标', plan: false });
@@ -106,6 +106,8 @@ try {
     const completedEntry = page.locator('.acms-activity-entry').filter({ hasText: '目标「已交付目标」完成（交付版本 1）' }).first();
     await expect(completedEntry).toBeVisible();
     await expect(completedEntry).toContainText('交付证据');
+    await expect(completedEntry).toContainText('历史审查记录与当次交付不一致');
+    await expect(completedEntry.getByRole('button', { name: '查看当次审查记录 →' })).toHaveCount(0);
     await expect(completedEntry.getByRole('button', { name: /打开任务/ })).toHaveCount(0);
     const artifactButton = completedEntry.getByRole('button', { name: /打开产物「交付文件」/ }).first();
     await expect(artifactButton).toBeVisible();

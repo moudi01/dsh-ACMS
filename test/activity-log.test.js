@@ -164,6 +164,7 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
   assert.equal(redactActivityText('token=INDEPENDENT_FAKE_SECRET'), 'token=[已隐藏]');
   assert.ok(!redactActivityText('{"token":"INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('{\\"token\\":\\"INDEPENDENT_FAKE_SECRET\\"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('{"password":"abc\\"INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('access_token=INDEPENDENT_FAKE_SECRET').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('Authorization: Basic RkFLRV9TRUNSRVQ=').includes('RkFLRV9TRUNSRVQ'));
   const bearer = redactActivityText('Authorization: Bearer INDEPENDENT_FAKE_SECRET');
@@ -235,6 +236,21 @@ test('goal completion ignores stale or cancelled reviews', async t => {
   await until(() => f.store.require('goals', f.goal.id).status === 'succeeded');
   const body = JSON.parse(eventsOf(f.store, 'goal.succeeded').at(-1).body);
   assert.equal(body.review, undefined, 'a cancelled/old review must not be attached to this completion');
+});
+
+test('goal completion review evidence must match the delivered hash and pass', () => {
+  const context = demoContext();
+  context.tasks.set('task_goal_review', { id: 'task_goal_review', title: '最终审查', status: 'succeeded', passed: true, reviewScope: 'goal' });
+  const base = { seq: 1, at: '2026-01-01T00:00:00.000Z', type: 'goal.succeeded', entityId: 'goal_1', goalId: 'goal_1', actor: { kind: 'system', id: 'scheduler' }, data: { contractVersion: 1, deliveryHash: 'HASH_A', delivery: [{ id: 'task_1', title: '演示任务', artifactHash: 'A', artifactIds: [], generation: 1, contractVersion: 1 }], review: { taskId: 'task_goal_review', passed: true, deliveryHash: 'HASH_A' } } };
+  const valid = describeActivity(base, context);
+  assert.equal(valid.deliveryReview.taskId, 'task_goal_review');
+  assert.equal(valid.deliveryReviewStale, false);
+  const stale = describeActivity({ ...base, data: { ...base.data, review: { ...base.data.review, deliveryHash: 'HASH_B' } } }, context);
+  assert.equal(stale.deliveryReview, null);
+  assert.equal(stale.deliveryReviewStale, true);
+  const unpassed = describeActivity({ ...base, data: { ...base.data, review: { ...base.data.review, passed: false } } }, context);
+  assert.equal(unpassed.deliveryReview, null);
+  assert.equal(unpassed.deliveryReviewStale, true);
 });
 
 test('manager-routed blockers keep the executor snapshot', async t => {
