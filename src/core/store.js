@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { EventEmitter } from "node:events";
 import { asBusyError, assert, digest, now } from "./util.js";
+import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from "./activity.js";
 
 export const SCHEMA_VERSION = "2";
 
@@ -150,6 +151,89 @@ export class Store {
   page(after = 0, limit = 200) {
     const entries = this.db.prepare("SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?").all(after, limit).map(r => ({ seq: r.seq, at: r.at, type: r.type, entityId: r.entity_id, actor: r.actor, ...JSON.parse(r.body) }));
     return { entries, nextCursor: entries.at(-1)?.seq ?? after, latestCursor: this.cursor() };
+  }
+  /**
+   * Owner-facing business activity (issue #18), read backwards from the newest
+   * matching event. `before` pages older entries; `after` pages newer entries
+   * (used to prepend events that arrived while the panel was open). Both modes
+   * share the same allow-list and scope filters, keep a durable sequence cursor
+   * and never touch or duplicate stored events.
+   */
+  activityPage(options = {}) {
+    const limit = Math.max(1, Math.min(ACTIVITY_MAX_LIMIT, Number.isSafeInteger(options.limit) ? options.limit : ACTIVITY_DEFAULT_LIMIT));
+    const latest = this.cursor();
+    const ascending = Number.isSafeInteger(options.after);
+    const start = ascending ? options.after : (Number.isSafeInteger(options.before) ? options.before : latest + 1);
+    const upper = latest;
+    const marks = ACTIVITY_EVENT_TYPES.map(() => "?").join(",");
+    const select = this.db.prepare(`SELECT * FROM events WHERE seq ${ascending ? ">" : "<"} ? AND seq <= ? AND type IN (${marks}) ORDER BY seq ${ascending ? "ASC" : "DESC"} LIMIT ?`);
+    const lookup = this.activityLookup();
+    const matches = row => this.activityMatches(row, options, lookup);
+    const chunk = Math.min(500, Math.max(100, limit * 4));
+    const rows = []; let cursor = start;
+    while (rows.length < limit) {
+      const page = select.all(cursor, upper, ...ACTIVITY_EVENT_TYPES, chunk);
+      if (!page.length) break;
+      for (const row of page) {
+        cursor = row.seq;
+        if (!matches(row)) continue;
+        rows.push(row);
+        if (rows.length >= limit) break;
+      }
+      if (page.length < chunk) break;
+    }
+    const probeFrom = rows.length ? cursor : start;
+    let hasMore = false; let probeCursor = probeFrom;
+    for (;;) {
+      const page = select.all(probeCursor, upper, ...ACTIVITY_EVENT_TYPES, chunk);
+      if (!page.length) break;
+      hasMore = page.some(matches);
+      probeCursor = page.at(-1).seq;
+      if (hasMore || page.length < chunk) break;
+    }
+    if (!rows.length) hasMore = false;
+    return {
+      entries: rows.map(row => this.eventEntry(row)),
+      nextBefore: rows.at(-1)?.seq ?? start,
+      nextAfter: rows.at(-1)?.seq ?? start,
+      latestSeq: latest,
+      hasMore,
+      hasOlder: !ascending ? hasMore : undefined,
+      hasNewer: ascending ? hasMore : undefined,
+      direction: ascending ? "newer" : "older",
+    };
+  }
+  activityLookup() {
+    const tasks = this.list("tasks"); const goals = this.list("goals"); const projects = this.list("projects");
+    return {
+      tasks: new Map(tasks.map(item => [item.id, item])),
+      goals: new Map(goals.map(item => [item.id, item])),
+      projects: new Map(projects.map(item => [item.id, item])),
+      attemptTask: new Map(this.list("attempts").map(item => [item.id, item.taskId])),
+      interactionTask: new Map(this.list("interactions").map(item => [item.id, item.taskId])),
+      reviewOf: new Map(tasks.filter(item => item.reviewOf).map(item => [item.id, item.reviewOf])),
+      goalOfTask: new Map(tasks.map(item => [item.id, item.goalId])),
+      projectOfGoal: new Map(goals.map(item => [item.id, item.projectId])),
+    };
+  }
+  activityMatches(row, options, lookup) {
+    let body = {}; try { body = JSON.parse(row.body); } catch { body = {}; }
+    const entityId = row.entity_id ?? null;
+    let taskId = body.taskId ?? null;
+    if (!taskId && entityId?.startsWith("task_")) taskId = entityId;
+    if (!taskId && entityId?.startsWith("attempt_")) taskId = lookup.attemptTask.get(entityId) ?? null;
+    if (!taskId && entityId?.startsWith("interaction_")) taskId = lookup.interactionTask.get(entityId) ?? null;
+    if (!taskId && body.sourceTaskId) taskId = body.sourceTaskId;
+    const reviewSource = entityId?.startsWith("task_") ? lookup.reviewOf.get(entityId) ?? null : null;
+    let goalId = row.goal_id ?? body.goalId ?? body.sourceGoalId ?? null;
+    if (!goalId && entityId?.startsWith("goal_")) goalId = entityId;
+    if (!goalId && taskId) goalId = lookup.goalOfTask.get(taskId) ?? null;
+    if (!goalId && reviewSource) goalId = lookup.goalOfTask.get(reviewSource) ?? null;
+    const projectId = (goalId && lookup.projectOfGoal.get(goalId)) ?? (entityId?.startsWith("project_") ? entityId : null) ?? body.projectId ?? null;
+    if (options.projectId && projectId !== options.projectId) return false;
+    if (options.goalId && goalId !== options.goalId && entityId !== options.goalId && body.goalId !== options.goalId) return false;
+    if (options.taskId && taskId !== options.taskId && reviewSource !== options.taskId && body.sourceTaskId !== options.taskId && body.reviewTaskId !== options.taskId) return false;
+    return true;
   }
   pageScoped(options = {}) {
     const after = Number(options.after ?? 0); const limit = Math.max(1, Math.min(200, Number(options.limit ?? 100)));

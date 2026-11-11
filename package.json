@@ -57,6 +57,7 @@
     "test:structure": "node scripts/structure-test.mjs",
     "test:graph-ui": "node scripts/graph-isolation-ui-test.mjs",
     "test:display": "node scripts/display-defaults-ui-test.mjs",
+    "test:activity": "node scripts/activity-ui-test.mjs",
     "test:capacity": "node scripts/capacity-ui-test.mjs",
     "test:goal-priority": "node scripts/goal-priority-ui-test.mjs",
     "test:artifact-download": "node scripts/artifact-download-ui-test.mjs",

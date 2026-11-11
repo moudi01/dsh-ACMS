@@ -21,6 +21,7 @@ jobs:
       - run: npm run test:structure
       - run: npm run test:graph-ui
       - run: npm run test:display
+      - run: npm run test:activity
       - run: npm run test:capacity
       - run: npm run test:goal-priority
       - run: npm run test:artifact-download
