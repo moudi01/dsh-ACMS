@@ -163,6 +163,8 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
 
   assert.equal(redactActivityText('token=INDEPENDENT_FAKE_SECRET'), 'token=[已隐藏]');
   assert.ok(!redactActivityText('{"token":"INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('{\\"token\\":\\"INDEPENDENT_FAKE_SECRET\\"}').includes('INDEPENDENT_FAKE_SECRET'));
+  assert.ok(!redactActivityText('access_token=INDEPENDENT_FAKE_SECRET').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('Authorization: Basic RkFLRV9TRUNSRVQ=').includes('RkFLRV9TRUNSRVQ'));
   const bearer = redactActivityText('Authorization: Bearer INDEPENDENT_FAKE_SECRET');
   assert.ok(!bearer.includes('INDEPENDENT_FAKE_SECRET'));
@@ -222,7 +224,17 @@ test('goal completion records the delivered contract version and delivery hash',
   assert.equal(body.delivery[0].id, delivered.id);
   assert.equal(body.delivery[0].artifactHash, f.store.require('tasks', delivered.id).artifactHash);
   assert.equal(described.delivery.length, 1);
+  assert.equal(described.deliveryTotal, 1);
   assert.equal(described.delivery[0].id, delivered.id);
+});
+
+test('goal completion ignores stale or cancelled reviews', async t => {
+  const f = await fixture(t); f.task();
+  f.store.put('tasks', { id: 'task_stale_review', goalId: f.goal.id, projectId: f.project.id, title: '旧的整体审查', description: '', acceptance: '', kind: 'review', status: 'cancelled', reviewScope: 'goal', deliveryHash: 'old-delivery', passed: false, dependencies: [], createdAt: new Date().toISOString() });
+  await f.start();
+  await until(() => f.store.require('goals', f.goal.id).status === 'succeeded');
+  const body = JSON.parse(eventsOf(f.store, 'goal.succeeded').at(-1).body);
+  assert.equal(body.review, undefined, 'a cancelled/old review must not be attached to this completion');
 });
 
 test('manager-routed blockers keep the executor snapshot', async t => {

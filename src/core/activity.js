@@ -80,13 +80,15 @@ const MAX_BUDGET = 6000;
  */
 export function redactActivityText(value) {
   if (typeof value !== 'string') return value;
-  return value
-    .replace(/(["'])(token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,}]+)/gi, (_match, quote, key) => `${quote}${key}${quote}: [已隐藏]`)
+  // Escaped JSON (\"key\":\"value\") is common in serialized event payloads.
+  const text = value.replace(/\\"/g, '"');
+  return text
+    .replace(/(["'])(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,}]+)/gi, (_match, quote, key) => `${quote}${key}${quote}: [已隐藏]`)
     .replace(/\bAuthorization\s*[:=]\s*(?:(?:Basic|Bearer)\s+)?[A-Za-z0-9._~+/=-]{8,}/gi, 'Authorization: [已隐藏]')
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [已隐藏]')
     .replace(/\bBasic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [已隐藏]')
     .replace(/\b(acms_ag_|ghp_|github_pat_|sk-)[A-Za-z0-9_-]{8,}/g, '[已隐藏]')
-    .replace(/\b(token|secret|password|passwd|credential|authorization|api[-_]?key)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, (_match, key, separator) => `${key}${separator}[已隐藏]`);
+    .replace(/\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, (_match, key, separator) => `${key}${separator}[已隐藏]`);
 }
 
 /** Redact secrets and bound every value before it reaches the panel. */
@@ -358,14 +360,16 @@ export function describeActivity(event, context = activityContext()) {
   if (typeof event.data?.integration?.integratedCommit === 'string') evidence.integratedCommit = event.data.integration.integratedCommit;
   if (typeof event.data?.reviewTaskId === 'string') evidence.reviewTaskId = event.data.reviewTaskId;
   if (typeof event.data?.coordinationTaskId === 'string') evidence.coordinationTaskId = event.data.coordinationTaskId;
-  const delivery = Array.isArray(event.data?.delivery) ? event.data.delivery.slice(0, 50).map(item => ({
+  const deliverySource = Array.isArray(event.data?.delivery) ? event.data.delivery : [];
+  const delivery = deliverySource.slice(0, 100).map(item => ({
     id: typeof item?.id === 'string' ? item.id : null,
     title: redactActivityText(item?.title ?? '交付任务'),
     artifactHash: typeof item?.artifactHash === 'string' ? item.artifactHash : null,
-    artifactIds: Array.isArray(item?.artifactIds) ? item.artifactIds.slice(0, 20) : [],
+    artifactIds: Array.isArray(item?.artifactIds) ? item.artifactIds.slice(0, 100) : [],
     generation: item?.generation ?? item?.deliveryGeneration ?? null,
     contractVersion: item?.contractVersion ?? null,
-  })) : [];
+  }));
+  const deliveryTotal = deliverySource.length;
   const deliveryReview = event.data?.review && typeof event.data.review === 'object' ? {
     taskId: typeof event.data.review.taskId === 'string' ? event.data.review.taskId : null,
     passed: event.data.review.passed === true,
@@ -385,6 +389,7 @@ export function describeActivity(event, context = activityContext()) {
     goal: goal ? { id: goal.id, title: redactActivityText(goal.title ?? '') } : null,
     project: project ? { id: project.id, title: redactActivityText(project.name ?? '') } : null,
     delivery,
+    deliveryTotal,
     deliveryReview,
     action: redactActivityText(action),
     reason: reason ? redactActivityText(reason.slice(0, MAX_STRING)) : null,

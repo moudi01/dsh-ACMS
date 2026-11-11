@@ -138,6 +138,7 @@
 .acms-activity-reason b{font-weight:650}
 .acms-activity-evidence{margin:0;display:flex;gap:6px;flex-wrap:wrap;font-size:11px;color:var(--acms-muted)}
 .acms-activity-delivery{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--acms-muted)}
+.acms-activity-delivery-item{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .acms-activity-evidence code{background:var(--acms-soft);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
 .acms-activity-details{border-top:1px dashed var(--acms-line);padding-top:6px}
 .acms-activity-details>summary{cursor:pointer;font-size:12px;color:var(--acms-muted)}

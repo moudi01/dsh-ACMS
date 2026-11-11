@@ -306,7 +306,11 @@ export class Company {
     const completed = status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {};
     const saved = this.store.put('goals', { ...goal, status, ...completed });
     const delivered = status === 'succeeded' ? deliveredWork(this.store, goal) : [];
-    const finalReview = status === 'succeeded' ? this.latestGoalReview(goalId) : null;
+    const reviewCandidate = status === 'succeeded' ? this.latestGoalReview(goalId) : null;
+    // Only a passed review bound to this exact delivery is evidence for the
+    // completion event; an older/cancelled review must not be relabelled.
+    const finalReview = reviewCandidate && reviewCandidate.status === 'succeeded' && reviewCandidate.passed === true &&
+      reviewCandidate.deliveryHash === saved.completedDeliveryHash ? reviewCandidate : null;
     this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, {
       from: goal.status, status,
       ...(status === 'succeeded' ? {

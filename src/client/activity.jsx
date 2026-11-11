@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
-import { activityContext, describeActivity } from '../core/activity.js';
+import { activityContext, describeActivity, redactActivityText } from '../core/activity.js';
 
 const timeOf = value => {
   const parsed = value ? new Date(value) : null;
@@ -39,6 +39,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   const goals = useMemo(() => (data.goals ?? []).filter(goal => !projectId || goal.projectId === projectId), [data.goals, projectId]);
   const tasks = useMemo(() => (data.tasks ?? []).filter(task => (!projectId || task.projectId === projectId) && (!goalId || task.goalId === goalId)), [data.tasks, projectId, goalId]);
   const pendingByTask = useMemo(() => new Map((data.interactions ?? []).filter(item => item.status === 'pending').map(item => [item.taskId, item])), [data.interactions]);
+  const artifactsById = useMemo(() => new Map((data.artifacts ?? []).map(item => [item.id, item])), [data.artifacts]);
   const latestBlockSeq = useMemo(() => {
     const map = new Map();
     for (const entry of items) {
@@ -128,9 +129,9 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
     <div className="acms-pagehead"><div><div className="acms-eyebrow">BUSINESS ACTIVITY</div><h1>动态日志</h1><p>按真实业务事件记录谁创建、阻塞、审查和完成了工作；轮询、心跳和技术流水不会进入这里。</p></div>
       <div className="acms-actions"><button type="button" onClick={() => loadNewest().catch(() => {})} disabled={loading}>刷新动态</button></div></div>
     <div className="acms-toolbar">
-      <select aria-label="筛选动态项目" value={projectId} onChange={event => changeProject(event.target.value)}><option value="">全部项目</option>{(data.projects ?? []).map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select>
-      <select aria-label="筛选动态目标" value={goalId} onChange={event => changeGoal(event.target.value)}><option value="">全部目标</option>{goals.map(goal => <option key={goal.id} value={goal.id}>{goal.title}</option>)}</select>
-      <select aria-label="筛选动态任务" value={taskId} onChange={event => setTaskId(event.target.value)}><option value="">全部任务</option>{tasks.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}</select>
+      <select aria-label="筛选动态项目" value={projectId} onChange={event => changeProject(event.target.value)}><option value="">全部项目</option>{(data.projects ?? []).map(project => <option key={project.id} value={project.id}>{redactActivityText(project.name)}</option>)}</select>
+      <select aria-label="筛选动态目标" value={goalId} onChange={event => changeGoal(event.target.value)}><option value="">全部目标</option>{goals.map(goal => <option key={goal.id} value={goal.id}>{redactActivityText(goal.title)}</option>)}</select>
+      <select aria-label="筛选动态任务" value={taskId} onChange={event => setTaskId(event.target.value)}><option value="">全部任务</option>{tasks.map(task => <option key={task.id} value={task.id}>{redactActivityText(task.title)}</option>)}</select>
       <span className="acms-muted">已显示 {items.length} 条</span>
     </div>
     {error && <div className="acms-alert error" role="alert">{error}</div>}
@@ -153,11 +154,11 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
           {(activity.project || activity.goal) && <p className="acms-activity-path">{[activity.project?.title, activity.goal?.title].filter(Boolean).join(' › ')}</p>}
           {activity.reason && <p className="acms-activity-reason"><b>原因：</b>{activity.reason}</p>}
           {activity.executor && <p className="acms-muted">相关执行者：{activity.executor}</p>}
-          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>{activity.delivery.map(item => item.id ? <button type="button" key={item.id} className="text acms-activity-open" onClick={() => select(item.id)}>{item.title}{item.artifactHash ? `（${shortHash(item.artifactHash)}）` : ''}</button> : null)}{activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查 →</button>}</div>}
+          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>{activity.delivery.map(item => <span key={item.id ?? item.title} className="acms-activity-delivery-item"><span>{item.title}（版本 {item.contractVersion ?? '未知'}、代次 {item.generation ?? '未知'}）</span>{item.artifactIds.map(id => artifactsById.get(id)).filter(Boolean).map(artifact => <button type="button" key={artifact.id} className="text acms-activity-open" onClick={() => open('artifact', artifact)}>打开产物「{artifact.title ?? artifact.path}」 →</button>)}{!item.artifactIds.some(id => artifactsById.has(id)) && item.artifactHash && <code title={item.artifactHash}>产物 {shortHash(item.artifactHash)}</code>}</span>)}{activity.deliveryTotal > activity.delivery.length && <span className="acms-muted">仅显示前 {activity.delivery.length}/{activity.deliveryTotal} 项</span>}{activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查记录 →</button>}</div>}
           {activity.type === 'goal.succeeded' && activity.delivery.length === 0 && <p className="acms-muted">历史事件未记录当次交付清单；只能打开当前目标查看最新证据。</p>}
           {(activity.evidence.artifactHash || activity.evidence.deliveryHash || activity.evidence.integratedCommit) && <p className="acms-activity-evidence">证据：{Object.entries(activity.evidence).map(([key, value]) => <code key={key} title={`${key}: ${value}`}>{key}={shortHash(value)}</code>)}</p>}
         </div>
-        <details className="acms-activity-details"><summary>技术详情</summary><div><dl className="acms-definition"><dt>事件类型</dt><dd>{activity.type}</dd><dt>实体</dt><dd>{activity.subject?.id ?? entry.entityId ?? '—'}</dd><dt>目标</dt><dd>{activity.goal?.id ?? entry.goalId ?? '—'}</dd>{activity.type === 'goal.succeeded' && <><dt>交付清单</dt><dd>{activity.delivery.length ? `${activity.delivery.length} 项${activity.deliveryReview ? ` · 当次审查${activity.deliveryReview.passed ? '通过' : '未通过'}` : ' · 无最终审查记录'}` : '历史事件未记录'}</dd></>}</dl><pre>{JSON.stringify(activity.details, null, 2)}</pre></div></details>
+        <details className="acms-activity-details"><summary>技术详情</summary><div><dl className="acms-definition"><dt>事件类型</dt><dd>{activity.type}</dd><dt>实体</dt><dd>{activity.subject?.id ?? entry.entityId ?? '—'}</dd><dt>目标</dt><dd>{activity.goal?.id ?? entry.goalId ?? '—'}</dd>{activity.type === 'goal.succeeded' && <><dt>交付清单</dt><dd>{activity.deliveryTotal ? `${activity.deliveryTotal} 项${activity.deliveryReview ? ` · 当次审查${activity.deliveryReview.passed ? '通过' : '未通过'}` : ' · 无最终审查记录'}` : '历史事件未记录'}</dd></>}</dl><pre>{JSON.stringify(activity.details, null, 2)}</pre></div></details>
       </article>;
     })}</div>
     {hasMore && <div className="acms-actions acms-activity-more"><button type="button" onClick={() => loadOlder().catch(() => {})} disabled={loading}>{loading ? '正在加载…' : '加载更早的动态'}</button></div>}
