@@ -29,10 +29,11 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
-  const request = useRef(0); const syncing = useRef(false); const stateRef = useRef({ items, latestSeq, loaded });
+  const request = useRef(0); const syncing = useRef(false); const pendingSync = useRef(false); const stateRef = useRef({ items, latestSeq, loaded });
 
   const filters = useMemo(() => ({ projectId: projectId || undefined, goalId: goalId || undefined, taskId: taskId || undefined }), [projectId, goalId, taskId]);
   const filterKey = JSON.stringify(filters);
+  const filtersRef = useRef(filters); filtersRef.current = filters;
   const filterKeyRef = useRef(filterKey); filterKeyRef.current = filterKey;
   const context = useMemo(() => activityContext(data), [data]);
   const goals = useMemo(() => (data.goals ?? []).filter(goal => !projectId || goal.projectId === projectId), [data.goals, projectId]);
@@ -50,7 +51,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   stateRef.current = { items, latestSeq, loaded };
 
   const loadNewest = async () => {
-    const token = ++request.current; setLoading(true); setError('');
+    const token = ++request.current; setLoading(true); setError(''); pendingSync.current = false;
     try {
       const page = await api.activity({ ...filters, limit: 50 });
       if (token !== request.current) return;
@@ -69,7 +70,10 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
       const page = await api.activity({ ...filters, before: nextBefore, limit: 50 });
       if (token !== request.current) return;
       setItems(previous => mergeEntries(previous, page.entries));
-      setNextBefore(page.nextBefore); setLatestSeq(previous => Math.max(previous, page.latestSeq)); setHasMore(page.hasMore);
+      setNextBefore(page.nextBefore); setHasMore(page.hasMore);
+      // An older page must never move the newer-event watermark: it does not
+      // contain the events that arrived while it was being read.
+      if (page.latestSeq > latestSeq) syncNewer().catch(() => {});
     } catch (cause) {
       if (token !== request.current) return;
       setError(`${cause.code ? `${cause.code} · ` : ''}${cause.message}`);
@@ -77,19 +81,30 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
       if (token === request.current) setLoading(false);
     }
   };
+  const syncNewer = async () => {
+    if (syncing.current) { pendingSync.current = true; return; }
+    if (!stateRef.current.loaded) return;
+    syncing.current = true;
+    try {
+      for (;;) {
+        const current = stateRef.current;
+        const startedWith = filterKeyRef.current;
+        const page = await api.activity({ ...filtersRef.current, after: current.latestSeq, limit: 50 });
+        if (filterKeyRef.current !== startedWith) break;
+        if (!page.entries.length) break;
+        setItems(previous => mergeEntries(previous, page.entries));
+        const nextSeq = page.nextAfter ?? current.latestSeq;
+        setLatestSeq(previous => Math.max(previous, nextSeq));
+        stateRef.current = { ...current, latestSeq: Math.max(current.latestSeq, nextSeq) };
+        if (!page.hasNewer) break;
+      }
+    } finally {
+      syncing.current = false;
+      if (pendingSync.current) { pendingSync.current = false; syncNewer().catch(() => {}); }
+    }
+  };
   useEffect(() => { loadNewest().catch(() => {}); /* filters changing starts a new durable cursor */ }, [filters]);
-  useEffect(() => {
-    const current = stateRef.current;
-    if (!current.loaded || !current.items.length || syncing.current) return;
-    let cancelled = false; syncing.current = true;
-    const startedWith = filterKey;
-    api.activity({ ...filters, after: current.latestSeq, limit: 50 }).then(page => {
-      if (cancelled || filterKeyRef.current !== startedWith || !page.entries.length) return;
-      setItems(previous => mergeEntries(previous, page.entries));
-      setLatestSeq(previous => Math.max(previous, page.nextAfter ?? current.latestSeq));
-    }).catch(() => {}).finally(() => { syncing.current = false; });
-    return () => { cancelled = true; };
-  }, [updated]);
+  useEffect(() => { syncNewer().catch(() => {}); }, [updated]);
 
   const openSubject = subject => {
     if (!subject) return;

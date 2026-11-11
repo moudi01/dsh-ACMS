@@ -122,9 +122,15 @@ export class Store {
     const at = now(); const principal = actor?.id ?? "system";
     const principalKind = ["owner", "agent", "system", "user-agent"].includes(actor?.kind) ? actor.kind : principal === "scheduler" ? "system" : "agent";
     const onBehalfOf = actor?.kind === "user-agent" && actor.onBehalfOf ? JSON.stringify(actor.onBehalfOf) : null;
-    const goalId = options.goalId ?? this.goalOf(entityId, body);
-    const r = this.db.prepare("INSERT INTO events(at,type,entity_id,goal_id,actor,principal_kind,on_behalf_of,body) VALUES (?,?,?,?,?,?,?,?)").run(at, type, entityId, goalId, principal, principalKind, onBehalfOf, JSON.stringify(body));
-    const event = { seq: Number(r.lastInsertRowid), at, type, entityId, goalId, actor: principal, principalKind, onBehalfOf: actor?.kind === "user-agent" ? actor.onBehalfOf ?? null : null, ...body };
+    // Freeze the acting agent's role/name in the event itself. The live agent
+    // record can be edited later; the log must answer "who did this then".
+    const content = actor?.kind === "agent" ? (() => {
+      const agent = this.get("agents", principal);
+      return agent ? { ...body, actorRole: agent.role, actorName: agent.name } : body;
+    })() : body;
+    const goalId = options.goalId ?? this.goalOf(entityId, content);
+    const r = this.db.prepare("INSERT INTO events(at,type,entity_id,goal_id,actor,principal_kind,on_behalf_of,body) VALUES (?,?,?,?,?,?,?,?)").run(at, type, entityId, goalId, principal, principalKind, onBehalfOf, JSON.stringify(content));
+    const event = { seq: Number(r.lastInsertRowid), at, type, entityId, goalId, actor: principal, principalKind, onBehalfOf: actor?.kind === "user-agent" ? actor.onBehalfOf ?? null : null, ...content };
     this.pending.push(event); return event;
   }
   /**

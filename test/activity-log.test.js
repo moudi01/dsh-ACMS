@@ -4,12 +4,12 @@ import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fixture } from './helpers.js';
+import { fixture, until } from './helpers.js';
 import { Store } from '../src/core/store.js';
 import { Company } from '../src/core/domain.js';
-import { OWNER } from '../src/core/util.js';
+import { OWNER, SYSTEM } from '../src/core/util.js';
 import { createRoutes } from '../src/host/http.js';
-import { ACTIVITY_EVENT_TYPES, activityContext, describeActivity, sanitizeActivityData } from '../src/core/activity.js';
+import { ACTIVITY_EVENT_TYPES, activityContext, describeActivity, redactActivityText, sanitizeActivityData } from '../src/core/activity.js';
 
 const insertEvent = (store, { at = new Date().toISOString(), type, entityId, goalId, actor = 'scheduler', principalKind = 'system', onBehalfOf = null, body = {} }) =>
   store.db.prepare('INSERT INTO events(at,type,entity_id,goal_id,actor,principal_kind,on_behalf_of,body) VALUES (?,?,?,?,?,?,?,?)')
@@ -122,13 +122,13 @@ test('activity describes the real actor and never guesses an unknown agent', () 
   assert.equal(owner.actor.label, '所有者');
   assert.equal(owner.subject.title, '演示目标');
 
-  const blocked = describeActivity({ seq: 2, at: '2026-01-01T00:00:01.000Z', type: 'task.blocked', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'system', id: 'scheduler' }, data: { kind: 'human', reason: '缺少品牌文件' } }, context);
+  const blocked = describeActivity({ seq: 2, at: '2026-01-01T00:00:01.000Z', type: 'task.blocked', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'system', id: 'scheduler' }, data: { kind: 'human', reason: '缺少品牌文件', executorId: 'worker_1', executorName: '执行员甲', executorRole: 'worker' } }, context);
   assert.equal(blocked.actor.label, '调度器');
   assert.equal(blocked.executor, '执行者 · 执行员甲');
   assert.equal(blocked.subject.id, 'task_1');
   assert.match(blocked.reason, /缺少品牌文件/);
 
-  const reviewed = describeActivity({ seq: 3, at: '2026-01-01T00:00:02.000Z', type: 'review.decided', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'agent', id: 'reviewer_1' }, decision: 'approve', data: { taskId: 'task_1', scope: 'task' } }, context);
+  const reviewed = describeActivity({ seq: 3, at: '2026-01-01T00:00:02.000Z', type: 'review.decided', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'agent', id: 'reviewer_1' }, decision: 'approve', data: { taskId: 'task_1', scope: 'task', actorRole: 'reviewer', actorName: '审查员乙' } }, context);
   assert.equal(reviewed.actor.label, '审查者 · 审查员乙');
   assert.match(reviewed.action, /审查通过/);
 
@@ -160,6 +160,55 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
 
   const described = describeActivity({ seq: 4, at: '2026-01-01T00:00:00.000Z', type: 'task.changed', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'owner', id: 'owner' }, data: { fields: ['title'], token: 'leak-me' } }, context);
   assert.equal(described.details.token, '[已隐藏]');
+
+  assert.equal(redactActivityText('token=INDEPENDENT_FAKE_SECRET'), 'token=[已隐藏]');
+  const bearer = redactActivityText('Authorization: Bearer INDEPENDENT_FAKE_SECRET');
+  assert.ok(!bearer.includes('INDEPENDENT_FAKE_SECRET'));
+  assert.match(bearer, /已隐藏/);
+  const leaked = describeActivity({ seq: 5, at: '2026-01-01T00:00:00.000Z', type: 'attempt.failed', entityId: 'attempt_1', goalId: 'goal_1', actor: { kind: 'system', id: 'scheduler' }, data: { taskId: 'task_1', message: 'Authorization: Bearer INDEPENDENT_FAKE_SECRET' } }, context);
+  assert.ok(!leaked.reason.includes('INDEPENDENT_FAKE_SECRET'));
+  assert.match(leaked.reason, /已隐藏/);
+  assert.ok(!JSON.stringify(leaked.details).includes('INDEPENDENT_FAKE_SECRET'));
+
+  const legacyAgent = describeActivity({ seq: 6, at: '2026-01-01T00:00:00.000Z', type: 'agent.saved', entityId: 'worker_1', goalId: null, actor: { kind: 'owner', id: 'owner' }, data: {} }, context);
+  assert.match(legacyAgent.action, /保存了角色/);
+});
+
+test('historical actor roles and executors are not rewritten by later edits', () => {
+  const context = demoContext();
+  // The live agent record and the task assignment changed after the event.
+  context.agents.set('worker_1', { id: 'worker_1', name: '执行员甲', role: 'manager' });
+  context.tasks.set('task_1', { ...context.tasks.get('task_1'), agentId: 'worker_2' });
+  context.agents.set('worker_2', { id: 'worker_2', name: '执行员乙', role: 'worker' });
+
+  const blocked = describeActivity({ seq: 1, at: '2026-01-01T00:00:00.000Z', type: 'task.blocked', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'system', id: 'scheduler' }, data: { kind: 'human', reason: '缺少材料', executorId: 'worker_1', executorName: '执行员甲', executorRole: 'worker' } }, context);
+  assert.equal(blocked.executor, '执行者 · 执行员甲');
+
+  const created = describeActivity({ seq: 2, at: '2026-01-01T00:00:00.000Z', type: 'task.created', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'agent', id: 'worker_1' }, data: { actorRole: 'worker', actorName: '执行员甲', title: '演示任务' } }, context);
+  assert.equal(created.actor.label, '执行者 · 执行员甲');
+
+  const legacy = describeActivity({ seq: 3, at: '2026-01-01T00:00:00.000Z', type: 'task.created', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'agent', id: 'worker_1' }, data: { title: '演示任务' } }, context);
+  assert.match(legacy.actor.label, /历史角色未记录/);
+  assert.equal(legacy.executor, null);
+});
+
+test('event bodies snapshot the acting agent role and name', async t => {
+  const f = await fixture(t); const agent = f.command('agent.save', { name: 'Snapshot worker', role: 'worker' }); const task = f.task();
+  f.store.transaction(() => f.store.event('task.changed', task.id, { fields: ['title'] }, { kind: 'agent', id: agent.id }));
+  const body = JSON.parse(eventsOf(f.store, 'task.changed').at(-1).body);
+  assert.equal(body.actorRole, 'worker');
+  assert.equal(body.actorName, 'Snapshot worker');
+});
+
+test('goal completion records the delivered contract version and delivery hash', async t => {
+  const f = await fixture(t); f.task(); await f.start();
+  await until(() => f.store.require('goals', f.goal.id).status === 'succeeded');
+  const event = eventsOf(f.store, 'goal.succeeded').at(-1); const body = JSON.parse(event.body);
+  assert.equal(typeof body.deliveryHash, 'string');
+  assert.equal(body.contractVersion, f.store.require('goals', f.goal.id).completedContractVersion);
+  const described = describeActivity(f.store.eventEntry(event), activityContext(f.company.snapshot()));
+  assert.equal(described.evidence.deliveryHash, body.deliveryHash);
+  assert.match(described.action, new RegExp(`交付版本 ${body.contractVersion}`));
 });
 
 test('activity wording covers cancellation, recovery, rejection and completion', () => {

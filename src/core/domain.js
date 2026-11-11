@@ -303,8 +303,12 @@ export class Company {
       }
     }
     if (status === goal.status) return goal;
-    const saved = this.store.put('goals', { ...goal, status, ...(status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {}) });
-    this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, { from: goal.status, status }, actor);
+    const completed = status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {};
+    const saved = this.store.put('goals', { ...goal, status, ...completed });
+    this.store.event(status === 'succeeded' ? 'goal.succeeded' : 'goal.status.changed', goalId, {
+      from: goal.status, status,
+      ...(status === 'succeeded' ? { contractVersion: saved.completedContractVersion, deliveryHash: saved.completedDeliveryHash } : {}),
+    }, actor);
     return saved;
   }
   deliveryHash(goalId) {

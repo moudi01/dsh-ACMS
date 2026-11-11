@@ -73,6 +73,19 @@ const MAX_ITEMS = 20;
 const MAX_DEPTH = 4;
 const MAX_BUDGET = 6000;
 
+/**
+ * Credentials can appear inside otherwise free-form event text (block reasons,
+ * execution errors, summaries), so key-name filtering alone is not enough.
+ * Redact recognizable credential shapes from every displayed string.
+ */
+export function redactActivityText(value) {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [已隐藏]')
+    .replace(/\b(acms_ag_|ghp_|github_pat_|sk-)[A-Za-z0-9_-]{8,}/g, '[已隐藏]')
+    .replace(/\b(token|secret|password|passwd|credential|authorization|api[-_]?key)\b(\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, (_match, key, separator) => `${key}${separator}[已隐藏]`);
+}
+
 /** Redact secrets and bound every value before it reaches the panel. */
 export function sanitizeActivityData(value) {
   const seen = new WeakSet();
@@ -82,7 +95,7 @@ export function sanitizeActivityData(value) {
     if (typeof current === 'string') {
       const bounded = current.length > MAX_STRING ? `${current.slice(0, MAX_STRING)}…` : current;
       budget.remaining -= bounded.length;
-      return bounded;
+      return redactActivityText(bounded);
     }
     if (typeof current === 'number' || typeof current === 'boolean') return current;
     if (depth >= MAX_DEPTH) return '[省略]';
@@ -149,12 +162,6 @@ function goalScopeOf(event, context) {
   const review = event.entityId?.startsWith('task_') ? context.tasks.get(event.entityId) : null;
   return review?.reviewScope === 'goal';
 }
-function agentLabel(agentId, context, fallback = '未知智能体') {
-  if (!agentId) return fallback;
-  const agent = context.agents.get(agentId);
-  if (!agent) return fallback;
-  return `${ROLE_LABEL[agent.role] ?? '智能体'} · ${agent.name}`;
-}
 function actorOf(event, context) {
   const kind = event.actor?.kind ?? 'system';
   const actorId = event.actor?.id ?? 'system';
@@ -165,9 +172,27 @@ function actorOf(event, context) {
     return { kind, id: actorId, label: who ? `外部智能体（代表${who}）` : '外部智能体' };
   }
   if (kind === 'system') return { kind, id: actorId, label: '调度器' };
+  // The role/name stored on the event is the historical fact. The current agent
+  // record is only a display fallback and is explicitly marked when the event
+  // predates role snapshots; it must never rewrite earlier attribution.
+  const storedRole = event.data?.actorRole ?? null;
+  const storedName = event.data?.actorName ?? null;
   const agent = context.agents.get(actorId);
-  if (!agent) return { kind: 'agent', id: actorId, label: '未知智能体' };
-  return { kind: 'agent', id: actorId, name: agent.name, role: agent.role, label: agentLabel(actorId, context) };
+  const name = storedName ?? agent?.name ?? null;
+  if (!storedRole) {
+    if (!name) return { kind: 'agent', id: actorId, name: null, role: null, label: '未知智能体' };
+    return { kind: 'agent', id: actorId, name, role: null, label: `智能体 · ${name}（历史角色未记录）` };
+  }
+  return { kind: 'agent', id: actorId, name, role: storedRole, label: `${ROLE_LABEL[storedRole] ?? '智能体'} · ${name ?? actorId}` };
+}
+function executorOf(event, context) {
+  const id = event.data?.executorId ?? null;
+  if (id) return `${ROLE_LABEL[event.data?.executorRole] ?? '智能体'} · ${event.data?.executorName ?? id}`;
+  if (!event.entityId?.startsWith('attempt_')) return null;
+  const attempt = context.attempts.get(event.entityId);
+  if (!attempt?.agentId) return null;
+  const agent = context.agents.get(attempt.agentId);
+  return `${ROLE_LABEL[attempt.role] ?? '智能体'} · ${agent?.name ?? attempt.agentId}`;
 }
 function subjectOf(event, context, { task, goal, project }) {
   const type = event.type;
@@ -212,7 +237,7 @@ export function describeActivity(event, context = activityContext()) {
   const project = projectOf(event, context, goal);
   const actor = actorOf(event, context);
   const subject = subjectOf(event, context, { task, goal, project });
-  const executor = task?.agentId ? agentLabel(task.agentId, context, null) : null;
+  const executor = executorOf(event, context);
   const review = event.entityId?.startsWith('task_') ? context.tasks.get(event.entityId) : null;
   const goalScope = goalScopeOf(event, context);
   const source = reviewSourceOf(event, context);
@@ -233,7 +258,7 @@ export function describeActivity(event, context = activityContext()) {
     case 'project.restored': action = `恢复了项目「${projectName}」`; break;
     case 'goal.created': action = `创建了目标「${goalTitle}」`; break;
     case 'goal.status.changed': action = `将目标「${goalTitle}」从${statusLabel(event.data?.from)}改为${statusLabel(event.data?.status)}`; break;
-    case 'goal.succeeded': action = `目标「${goalTitle}」完成`; break;
+    case 'goal.succeeded': action = event.data?.contractVersion ? `目标「${goalTitle}」完成（交付版本 ${event.data.contractVersion}）` : `目标「${goalTitle}」完成`; break;
     case 'goal.reopened': action = `目标「${goalTitle}」重新打开`; reason = shortReason(event.data?.reason); break;
     case 'goal.paused': action = event.data?.mode === 'after-current' ? `将在当前执行结束后暂停目标「${goalTitle}」` : `暂停了目标「${goalTitle}」`; reason = shortReason(event.data?.reason); break;
     case 'goal.resumed': action = `恢复了目标「${goalTitle}」`; break;
@@ -305,7 +330,9 @@ export function describeActivity(event, context = activityContext()) {
     case 'attempt.result.recovered': action = `恢复了任务「${reviewTitle}」的已完成回执`; break;
     case 'agent.saved': {
       const agent = context.agents.get(event.entityId);
-      action = event.data?.created === true ? `创建了角色「${agent?.name ?? '未知角色'}」` : `更新了角色「${agent?.name ?? '未知角色'}」`;
+      action = event.data?.created === true ? `创建了角色「${agent?.name ?? '未知角色'}」`
+        : event.data?.created === false ? `更新了角色「${agent?.name ?? '未知角色'}」`
+          : `保存了角色「${agent?.name ?? '未知角色'}」`;
       break;
     }
     case 'agent.released': action = `释放了临时角色「${context.agents.get(event.entityId)?.name ?? '未知角色'}」`; reason = shortReason(event.data?.reason); break;
@@ -337,12 +364,12 @@ export function describeActivity(event, context = activityContext()) {
     category,
     categoryLabel: CATEGORY_LABEL[category] ?? '变更',
     actor,
-    executor: executor && executor !== actor.label ? executor : null,
+    executor: executor && executor !== actor.label ? redactActivityText(executor) : null,
     subject,
     goal: goal ? { id: goal.id, title: goal.title } : null,
     project: project ? { id: project.id, title: project.name } : null,
-    action,
-    reason: reason ? reason.slice(0, MAX_STRING) : null,
+    action: redactActivityText(action),
+    reason: reason ? redactActivityText(reason.slice(0, MAX_STRING)) : null,
     evidence,
     reviewTaskId: event.type.startsWith('review.') && review && review.id !== source?.id ? review.id : null,
     details: sanitizeActivityData({ ...(event.data ?? {}), ...(event.decision !== undefined ? { decision: event.decision } : {}) }),

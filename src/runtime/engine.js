@@ -878,7 +878,9 @@ export class Engine {
     const paused = task.status === 'paused';
     this.store.put('tasks', { ...task, status: paused ? 'paused' : 'blocked', integrationPending: task.integrationPending || task.status === 'integrating', blocker: { kind, reason } });
     this.store.put('interactions', { id: id('interaction'), taskId: task.id, goalId: task.goalId, taskGeneration: task.generation, kind, reason, question, status: 'pending' });
-    this.store.event('task.blocked', task.id, { kind, reason, route: 'owner' }, SYSTEM);
+    // Snapshot the executor at block time; later reassignment must not rewrite history.
+    const executor = task.agentId ? this.store.get('agents', task.agentId) : null;
+    this.store.event('task.blocked', task.id, { kind, reason, route: 'owner', ...(task.agentId ? { executorId: task.agentId, executorName: executor?.name ?? null, executorRole: executor?.role ?? null } : {}) }, SYSTEM);
     return this.store.require('tasks', task.id);
   }
   refreshCoordinationAttempt(task, attempt) {

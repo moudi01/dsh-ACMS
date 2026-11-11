@@ -2,7 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { startPreview } from './preview-server.mjs';
-import { OWNER } from '../src/core/util.js';
+import { OWNER, SYSTEM } from '../src/core/util.js';
 
 // Issue #18 acceptance: the activity log shows who created, blocked, reviewed and
 // completed work, links every entry back to its subject, filters by project/goal/
@@ -32,10 +32,10 @@ try {
   server.engine.block(blockedTask, 'human', '当前没有可用的品牌文件。', '请提供品牌素材，或确认沿用默认样式。');
   const interaction = server.company.snapshot().interactions.find(item => item.taskId === blockedTask.id && item.status === 'pending');
   command('interaction.answer', { id: interaction.id, answer: '沿用默认样式。', expectedRevision: interaction.revision });
-  if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围。', '请确认本次交付范围。');
+  if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围（token=FAKE_UI_SECRET）。', '请确认本次交付范围。');
 
   const review = store.put('tasks', { id: 'task_review_demo', goalId: goal.id, projectId, title: `审查：${reviewedTask.title}`, description: '', acceptance: '', kind: 'review', status: 'succeeded', reviewOf: reviewedTask.id, dependencies: [], createdAt: iso(-30_000) });
-  insertEvent(iso(-20_000), 'review.decided', review.id, goal.id, { actor: 'reviewer', principalKind: 'agent', body: { taskId: reviewedTask.id, scope: 'task', decision: 'approve', artifactHash: 'a'.repeat(64) } });
+  insertEvent(iso(-20_000), 'review.decided', review.id, goal.id, { actor: 'reviewer', principalKind: 'agent', body: { taskId: reviewedTask.id, scope: 'task', decision: 'approve', artifactHash: 'a'.repeat(64), actorRole: 'reviewer', actorName: '质量审查员' } });
   insertEvent(iso(-15_000), 'goal.submitted', goal.id, goal.id, { actor: 'credential_demo', principalKind: 'user-agent', onBehalfOf: { kind: 'owner', id: 'owner' }, body: {} });
   insertEvent(iso(-10_000), 'attempt.failed', 'attempt_demo', goal.id, { body: { taskId: reviewedTask.id, code: 'PROVIDER_FAILED', message: '模拟执行环境失败' } });
 
@@ -65,6 +65,8 @@ try {
       const pendingEntry = page.locator('.acms-activity-entry').filter({ hasText: `任务「${pendingTask.title}」已阻塞` }).first();
       await expect(pendingEntry).toBeVisible();
       await expect(pendingEntry).toContainText('待你回复');
+      await expect(pendingEntry).not.toContainText('FAKE_UI_SECRET');
+      await expect(pendingEntry).toContainText('已隐藏');
       await pendingEntry.getByRole('button', { name: '回复待处理问题 →' }).click();
       await expect(page.getByRole('dialog')).toContainText('回复阻塞问题');
       await page.getByRole('button', { name: '关闭对话框' }).click();
@@ -109,6 +111,11 @@ try {
     await expect.poll(async () => page.locator('.acms-activity-entry').count()).toBeGreaterThan(50);
     const sequenceIds = await page.locator('.acms-activity-entry .acms-activity-head > span.acms-muted').allTextContents();
     expect(new Set(sequenceIds).size).toBe(sequenceIds.length);
+
+    // 6b. Events that arrive while the log is open are drained automatically.
+    const beforeSync = await page.locator('.acms-activity-entry').count();
+    store.transaction(() => { for (let index = 0; index < 3; index += 1) store.event('task.changed', reviewedTask.id, { fields: ['description'] }, SYSTEM); });
+    await expect.poll(async () => page.locator('.acms-activity-entry').count(), { timeout: 15000 }).toBeGreaterThan(beforeSync);
 
     // 7. Reload rebuilds the same visible history from the database.
     await page.reload();
