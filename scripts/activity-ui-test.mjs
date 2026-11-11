@@ -36,6 +36,8 @@ try {
   if (pendingTask) server.engine.block(pendingTask, 'human', '需要确认交付范围：{\\"token\\":\\"FAKE,UI}SECRET\\"}', '请确认本次交付范围。');
   const longReasonTask = command('task.create', { goalId: goal.id, title: '长原因任务' });
   server.engine.block(longReasonTask, 'human', `${'说明'.repeat(240)}{"password":"abcFAKE_LONG_SECRET`, '请确认长原因任务。');
+  const malformedReasonTask = command('task.create', { goalId: goal.id, title: '畸形原因任务' });
+  server.engine.block(malformedReasonTask, 'human', 'error {"password":"prefix,FAKE_MALFORMED_SECRET', '请确认畸形原因任务。');
 
   const review = store.put('tasks', { id: 'task_review_demo', goalId: goal.id, projectId, title: `审查：${reviewedTask.title}`, description: '', acceptance: '', kind: 'review', status: 'succeeded', reviewOf: reviewedTask.id, dependencies: [], createdAt: iso(-30_000) });
   insertEvent(iso(-20_000), 'review.decided', review.id, goal.id, { actor: 'reviewer', principalKind: 'agent', body: { taskId: reviewedTask.id, scope: 'task', decision: 'approve', artifactHash: 'a'.repeat(64), actorRole: 'reviewer', actorName: '质量审查员' } });
@@ -79,6 +81,10 @@ try {
     await expect(longEntry).toBeVisible();
     await expect(longEntry).not.toContainText('FAKE_LONG_SECRET');
     await expect(longEntry).toContainText('已隐藏');
+    const malformedEntry = page.locator('.acms-activity-entry').filter({ hasText: '畸形原因任务」已阻塞' }).first();
+    await expect(malformedEntry).toBeVisible();
+    await expect(malformedEntry).not.toContainText('FAKE_MALFORMED_SECRET');
+    await expect(malformedEntry).toContainText('已隐藏');
     if (pendingTask) {
       const pendingEntry = page.locator('.acms-activity-entry').filter({ hasText: `任务「${pendingTask.title}」已阻塞` }).first();
       await expect(pendingEntry).toBeVisible();

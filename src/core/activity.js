@@ -76,56 +76,24 @@ const MAX_BUDGET = 6000;
 /**
  * Credentials can appear inside otherwise free-form event text (block reasons,
  * execution errors, summaries), so key-name filtering alone is not enough.
- * Redact recognizable credential shapes from every displayed string.
+ *
+ * Policy is fail closed: once a sensitive key appears with a `:`/`=` separator,
+ * hide everything from that key to the end of the string. We deliberately do not
+ * parse JSON-looking text to find the real value boundary. Every boundary-based
+ * variant (quoted value, escaped value, truncation fallback, scanner with
+ * internal quotes) still leaked some adversarial suffix, so imperfect
+ * over-redaction of the remainder of one displayed line is the accepted
+ * trade-off for a guarantee that no suffix after a credential key is shown.
  */
-const QUOTED_SECRET_KEY = /(\\?["'])(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\1\s*:\s*/gi;
-
-/**
- * Replace quoted secret values while scanning the closing quote ourselves.
- * Regex-only matching either stops at an internal quote (leaking the tail of a
- * malformed value) or at a comma/brace inside a valid value; scanning keeps the
- * behavior correct for valid, escaped and truncated JSON-looking text.
- */
-function redactQuotedCredentials(text) {
-  let output = ''; let last = 0; let match;
-  QUOTED_SECRET_KEY.lastIndex = 0;
-  while ((match = QUOTED_SECRET_KEY.exec(text))) {
-    let index = QUOTED_SECRET_KEY.lastIndex; let quote = null;
-    if (text[index] === '\\' && ['"', "'"].includes(text[index + 1])) { quote = text[index + 1]; index += 2; }
-    else if (['"', "'"].includes(text[index])) { quote = text[index]; index += 1; }
-    if (!quote) continue;
-    let end = -1;
-    while (index < text.length) {
-      if (text[index] === '\\' && index + 1 < text.length) { index += 2; continue; }
-      if (text[index] === '\n') break;
-      if (text[index] === quote) { end = index; break; }
-      index += 1;
-    }
-    let cut;
-    if (end === -1) {
-      const lineEnd = text.indexOf('\n', QUOTED_SECRET_KEY.lastIndex);
-      cut = lineEnd === -1 ? text.length : lineEnd;
-    } else {
-      let next = end + 1; while (next < text.length && /\s/.test(text[next])) next += 1;
-      if (text[next] && !',}]'.includes(text[next])) {
-        const lineEnd = text.indexOf('\n', end);
-        cut = lineEnd === -1 ? text.length : lineEnd;
-      } else cut = end + 1;
-    }
-    output += `${text.slice(last, QUOTED_SECRET_KEY.lastIndex)}[已隐藏]`;
-    last = cut; QUOTED_SECRET_KEY.lastIndex = cut;
-  }
-  return output + text.slice(last);
-}
+const SENSITIVE_TEXT = /(\\?["']?)(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|cookie|api[-_]?key)(\\?["']?)(\s*[:=]\s*)[\s\S]*/gi;
 
 export function redactActivityText(value) {
   if (typeof value !== 'string') return value;
-  return redactQuotedCredentials(value)
-    .replace(/\bAuthorization\s*[:=]\s*(?:(?:Basic|Bearer)\s+)?[A-Za-z0-9._~+/=-]{8,}/gi, 'Authorization: [已隐藏]')
+  return value
+    .replace(SENSITIVE_TEXT, (_match, open, key, close, separator) => `${open}${key}${close}${separator}[已隐藏]`)
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [已隐藏]')
     .replace(/\bBasic\s+[A-Za-z0-9+/=]{8,}/gi, 'Basic [已隐藏]')
-    .replace(/\b(acms_ag_|ghp_|github_pat_|sk-)[A-Za-z0-9_-]{8,}/g, '[已隐藏]')
-    .replace(/\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|password|passwd|credential|authorization|api[-_]?key)\b(\s*[:=]\s*)[^\n;}]+/gi, (_match, key, separator) => `${key}${separator}[已隐藏]`);
+    .replace(/\b(acms_ag_|ghp_|github_pat_|sk-)[A-Za-z0-9_-]{8,}/g, '[已隐藏]');
 }
 
 /** Redact secrets and bound every value before it reaches the panel. */

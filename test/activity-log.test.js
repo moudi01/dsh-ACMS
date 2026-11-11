@@ -197,6 +197,38 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
   assert.ok(!labelled.action.includes('FAKE_LABEL'));
 });
 
+test('activity redaction fails closed for adversarial JSON and numeric credential forms', () => {
+  const marker = 'INDEPENDENT_FAKE_SECRET';
+  const inputs = [
+    `error {"password":"prefix,${marker}`,
+    `error {"password":"prefix}${marker}`,
+    JSON.stringify(`{"password":"prefix,${marker}`).slice(1, -1),
+    `error {"password":"prefix",${marker}`,
+    `error {"password":"prefix"}${marker}`,
+    `error {"password":"prefix"]${marker}`,
+    `{"token":"x","other":"${marker}"}`,
+    `{"password":"abc\\"${marker}"}`,
+    `Authorization: Bearer ${marker}`,
+    `access_token=${marker}`,
+  ];
+  for (const input of inputs) {
+    const output = redactActivityText(input);
+    assert.ok(!output.includes(marker), `credential leaked for ${JSON.stringify(input)}: ${output}`);
+  }
+  const basic = Buffer.from('FAKE_BASIC_SECRET').toString('base64');
+  assert.ok(!redactActivityText(`Authorization: Basic ${basic}`).includes(basic));
+  for (const input of ['{"access_token":123456789}', 'access_token=123456789', '{"password":987654321}']) {
+    assert.ok(!/\d{6,}/.test(redactActivityText(input)), `numeric credential leaked for ${JSON.stringify(input)}`);
+  }
+  assert.equal(redactActivityText('token=abc'), 'token=[已隐藏]');
+  assert.equal(redactActivityText('普通阻塞原因'), '普通阻塞原因');
+
+  const context = demoContext();
+  context.agents.set('worker_1', { id: 'worker_1', name: '执行员', role: 'worker' });
+  const malformed = describeActivity({ seq: 10, at: '2026-01-01T00:00:00.000Z', type: 'task.created', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'agent', id: 'worker_1' }, data: { actorRole: 'worker', actorName: `{"password":"prefix,${marker}`, title: '普通任务' } }, context);
+  assert.ok(!JSON.stringify(malformed).includes(marker));
+});
+
 test('historical actor roles and executors are not rewritten by later edits', () => {
   const context = demoContext();
   // The live agent record and the task assignment changed after the event.
