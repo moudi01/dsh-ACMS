@@ -163,8 +163,51 @@ try {
     const afterReload = await page.locator('.acms-activity-entry .acms-activity-head > span.acms-muted').allTextContents();
     expect(new Set(afterReload).size).toBe(afterReload.length);
 
+    // 8. Deleted subjects keep their history, but no longer offer a dead drawer link.
+    const deletedTask = command('task.create', { goalId: goal.id, title: '回收站任务入口' });
+    command('task.delete', { id: deletedTask.id });
+    const deletedGoal = command('goal.create', { projectId, title: '回收站目标入口', description: '待删除目标', acceptance: '待删除目标', plan: false });
+    command('goal.delete', { id: deletedGoal.id });
+    const deletedProject = command('project.save', { name: '回收站项目入口', repoRoot: server.source, mode: 'copy' });
+    command('project.delete', { id: deletedProject.id });
+    const deletedAgent = command('agent.save', { name: '回收站角色入口', role: 'worker' });
+    command('agent.delete', { id: deletedAgent.id });
+    await page.reload();
+    await page.getByRole('button', { name: '动态日志', exact: true }).click();
+    for (const [action, kind] of [
+      ['将任务「回收站任务入口」移入回收站', '任务'],
+      ['移除了目标「回收站目标入口」', '目标'],
+      ['移除了项目「回收站项目入口」', '项目'],
+      ['移除了角色「回收站角色入口」', '角色'],
+    ]) {
+      const entry = page.locator('.acms-activity-entry').filter({ hasText: action }).first();
+      await expect(entry).toBeVisible();
+      await expect(entry).toContainText(`${kind}已移入回收站，无法打开详情`);
+      await expect(entry.getByRole('button', { name: `打开${kind} →` })).toHaveCount(0);
+    }
+
+    // 9. A manual refresh must drain every page after the old cursor, even if
+    // event notifications are delayed and more than 50 entries arrive at once.
+    let heldEventRequest;
+    await page.route('**/api/acms/events*', route => { heldEventRequest = route; });
+    await page.reload();
+    await page.getByRole('button', { name: '动态日志', exact: true }).click();
+    await expect.poll(() => !!heldEventRequest).toBe(true);
+    await expect.poll(async () => page.locator('.acms-activity-entry').count()).toBe(50);
+    const burstSeqs = [];
+    for (let index = 0; index < 75; index += 1) {
+      const result = insertEvent(iso(index), 'task.changed', reviewedTask.id, goal.id, { body: { fields: ['description'] } });
+      burstSeqs.push(Number(result.lastInsertRowid));
+    }
+    await page.getByRole('button', { name: '刷新动态', exact: true }).click();
+    await expect.poll(async () => page.locator('.acms-activity-entry').count()).toBe(125);
+    const refreshedSeqs = await page.locator('.acms-activity-entry .acms-activity-head > span.acms-muted').allTextContents();
+    expect(new Set(refreshedSeqs).size).toBe(refreshedSeqs.length);
+    for (const seq of burstSeqs) expect(refreshedSeqs).toContain(`#${seq}`);
+    await page.unroute('**/api/acms/events*');
+
     expect(server.adapter.calls.length).toBe(0);
-    const report = { passed: true, checked: ['scheduler/owner/reviewer/external-agent attribution', 'blocked reason and executor', 'review conclusion', 'failed execution', 'expandable redacted details', 'project/goal/task filters', 'bounded first page and older paging without duplicates', 'reload keeps the same durable history', 'zero model calls'], projectId, goalId: goal.id, errors };
+    const report = { passed: true, checked: ['scheduler/owner/reviewer/external-agent attribution', 'blocked reason and executor', 'review conclusion', 'failed execution', 'expandable redacted details', 'project/goal/task filters', 'bounded first page and older paging without duplicates', 'reload keeps the same durable history', 'deleted subjects have no dead links', 'refresh drains a 75-event burst', 'zero model calls'], projectId, goalId: goal.id, errors };
     await writeFile('test-results/ui/activity-report.json', JSON.stringify(report, null, 2));
     expect(errors).toEqual([]);
     console.log(JSON.stringify(report, null, 2));

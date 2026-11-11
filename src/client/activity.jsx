@@ -36,6 +36,18 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   const filtersRef = useRef(filters); filtersRef.current = filters;
   const filterKeyRef = useRef(filterKey); filterKeyRef.current = filterKey;
   const context = useMemo(() => activityContext(data), [data]);
+  const available = useMemo(() => ({
+    project: new Set((data.projects ?? []).map(item => item.id)),
+    goal: new Set((data.goals ?? []).map(item => item.id)),
+    task: new Set((data.tasks ?? []).map(item => item.id)),
+    agent: new Set((data.agents ?? []).map(item => item.id)),
+  }), [data.projects, data.goals, data.tasks, data.agents]);
+  const inTrash = useMemo(() => ({
+    task: new Set((data.trash ?? []).map(item => item.id)),
+    project: new Set((data.entityTrash ?? []).filter(item => item.entityKind === 'project').map(item => item.id)),
+    goal: new Set((data.entityTrash ?? []).filter(item => item.entityKind === 'goal').map(item => item.id)),
+    agent: new Set((data.entityTrash ?? []).filter(item => item.entityKind === 'agent').map(item => item.id)),
+  }), [data.trash, data.entityTrash]);
   const goals = useMemo(() => (data.goals ?? []).filter(goal => !projectId || goal.projectId === projectId), [data.goals, projectId]);
   const tasks = useMemo(() => (data.tasks ?? []).filter(task => (!projectId || task.projectId === projectId) && (!goalId || task.goalId === goalId)), [data.tasks, projectId, goalId]);
   const pendingByTask = useMemo(() => new Map((data.interactions ?? []).filter(item => item.status === 'pending').map(item => [item.taskId, item])), [data.interactions]);
@@ -110,6 +122,20 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
       if (pendingSync.current) { pendingSync.current = false; syncNewer().catch(() => {}); }
     }
   };
+  const refreshActivity = async () => {
+    if (!stateRef.current.loaded) return loadNewest();
+    const gen = generation.current;
+    setLoading(true); setError('');
+    try {
+      // Keep the existing cursor and older-page boundary. A newest-page fetch
+      // would skip the middle of a burst larger than one page.
+      await syncNewer();
+    } catch (cause) {
+      if (gen === generation.current) setError(`${cause.code ? `${cause.code} · ` : ''}${cause.message}`);
+    } finally {
+      if (gen === generation.current) setLoading(false);
+    }
+  };
   useEffect(() => {
     stateRef.current = { items: [], latestSeq: 0, loaded: false };
     setItems([]); setNextBefore(null); setLatestSeq(0); setHasMore(false); setLoaded(false); setError('');
@@ -127,7 +153,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
 
   return <>
     <div className="acms-pagehead"><div><div className="acms-eyebrow">BUSINESS ACTIVITY</div><h1>动态日志</h1><p>按真实业务事件记录谁创建、阻塞、审查和完成了工作；轮询、心跳和技术流水不会进入这里。</p></div>
-      <div className="acms-actions"><button type="button" onClick={() => loadNewest().catch(() => {})} disabled={loading}>刷新动态</button></div></div>
+      <div className="acms-actions"><button type="button" onClick={() => refreshActivity().catch(() => {})} disabled={loading}>刷新动态</button></div></div>
     <div className="acms-toolbar">
       <select aria-label="筛选动态项目" value={projectId} onChange={event => changeProject(event.target.value)}><option value="">全部项目</option>{(data.projects ?? []).map(project => <option key={project.id} value={project.id}>{redactActivityText(project.name)}</option>)}</select>
       <select aria-label="筛选动态目标" value={goalId} onChange={event => changeGoal(event.target.value)}><option value="">全部目标</option>{goals.map(goal => <option key={goal.id} value={goal.id}>{redactActivityText(goal.title)}</option>)}</select>
@@ -140,6 +166,8 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
       const activity = describeActivity(entry, context);
       if (!activity) return null;
       const kind = openKind(activity.subject?.kind);
+      const subjectAvailable = kind && available[activity.subject.kind]?.has(activity.subject.id);
+      const subjectInTrash = kind && inTrash[activity.subject.kind]?.has(activity.subject.id);
       const pending = activity.subject?.kind === 'task' && latestBlockSeq.get(activity.subject.id) === activity.seq ? pendingByTask.get(activity.subject.id) : null;
       return <article key={activity.seq} className="acms-activity-entry" data-category={activity.category}>
         <header className="acms-activity-head">
@@ -150,7 +178,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
           <span className="acms-muted">#{activity.seq}</span>
         </header>
         <div className="acms-activity-main">
-          <p className="acms-activity-action">{activity.action}{activity.subject && kind && <button type="button" className="text acms-activity-open" onClick={() => openSubject(activity.subject)}>打开{kind} →</button>}{pending && open && <button type="button" className="text acms-activity-open" onClick={() => open('answer', pending)}>回复待处理问题 →</button>}</p>
+          <p className="acms-activity-action">{activity.action}{subjectAvailable && <button type="button" className="text acms-activity-open" onClick={() => openSubject(activity.subject)}>打开{kind} →</button>}{kind && !subjectAvailable && <span className="acms-muted">{subjectInTrash ? `${kind}已移入回收站，无法打开详情` : `${kind}已不可用，无法打开详情`}</span>}{pending && open && <button type="button" className="text acms-activity-open" onClick={() => open('answer', pending)}>回复待处理问题 →</button>}</p>
           {(activity.project || activity.goal) && <p className="acms-activity-path">{[activity.project?.title, activity.goal?.title].filter(Boolean).join(' › ')}</p>}
           {activity.reason && <p className="acms-activity-reason"><b>原因：</b>{activity.reason}</p>}
           {activity.executor && <p className="acms-muted">相关执行者：{activity.executor}</p>}
