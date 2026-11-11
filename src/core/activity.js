@@ -100,9 +100,11 @@ export function sanitizeActivityData(value) {
   const walk = (current, depth) => {
     if (current === null || current === undefined) return current ?? null;
     if (typeof current === 'string') {
-      const bounded = current.length > MAX_STRING ? `${current.slice(0, MAX_STRING)}…` : current;
+      // Redact the complete value before bounding it: a truncated JSON string
+      // may lose its closing quote and defeat the credential pattern.
+      const bounded = redactActivityText(current);
       budget.remaining -= bounded.length;
-      return redactActivityText(bounded);
+      return bounded.length > MAX_STRING ? `${bounded.slice(0, MAX_STRING)}…` : bounded;
     }
     if (typeof current === 'number' || typeof current === 'boolean') return current;
     if (depth >= MAX_DEPTH) return '[省略]';
@@ -406,7 +408,7 @@ export function describeActivity(event, context = activityContext()) {
     deliveryReview,
     deliveryReviewStale,
     action: redactActivityText(action),
-    reason: reason ? redactActivityText(reason.slice(0, MAX_STRING)) : null,
+    reason: reason ? redactActivityText(reason).slice(0, MAX_STRING) : null,
     evidence,
     reviewTaskId: event.type.startsWith('review.') && review && review.id !== source?.id ? review.id : null,
     details: sanitizeActivityData({ ...(event.data ?? {}), ...(event.decision !== undefined ? { decision: event.decision } : {}) }),

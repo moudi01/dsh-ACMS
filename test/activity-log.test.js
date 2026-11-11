@@ -168,6 +168,10 @@ test('activity degrades honestly for legacy project/agent events and redacts sen
   assert.ok(!redactActivityText('{"password":"abc,INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('{"password":"abc}INDEPENDENT_FAKE_SECRET"}').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('{\\"password\\":\\"abc,INDEPENDENT_FAKE_SECRET\\"}').includes('INDEPENDENT_FAKE_SECRET'));
+  const longJson = `${'说明'.repeat(240)}{"password":"abcINDEPENDENT_FAKE_SECRET"}`;
+  assert.ok(!JSON.stringify(sanitizeActivityData({ reason: longJson })).includes('INDEPENDENT_FAKE_SECRET'));
+  const longDescribed = describeActivity({ seq: 8, at: '2026-01-01T00:00:00.000Z', type: 'task.blocked', entityId: 'task_1', goalId: 'goal_1', actor: { kind: 'system', id: 'scheduler' }, data: { kind: 'human', reason: longJson } }, context);
+  assert.ok(!longDescribed.reason.includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('access_token=INDEPENDENT_FAKE_SECRET').includes('INDEPENDENT_FAKE_SECRET'));
   assert.ok(!redactActivityText('Authorization: Basic RkFLRV9TRUNSRVQ=').includes('RkFLRV9TRUNSRVQ'));
   const bearer = redactActivityText('Authorization: Bearer INDEPENDENT_FAKE_SECRET');
