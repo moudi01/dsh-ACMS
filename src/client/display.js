@@ -10,6 +10,11 @@ import { activityAt } from './graph.js';
 export const COMPLETED_STATUSES = new Set(['succeeded', 'cancelled', 'archived']);
 export const isCompleted = item => COMPLETED_STATUSES.has(item?.status);
 
+// Shared by the overview metric and its destination. Waiting/paused/cleanup
+// reviews are still in the queue; failed and other terminal reviews are not.
+const REVIEW_QUEUE_STATUSES = new Set(['ready', 'preparing', 'running', 'reviewing', 'integrating', 'blocked', 'paused', 'stopping', 'reconciling']);
+export const isQueuedReview = task => task?.kind === 'review' && REVIEW_QUEUE_STATUSES.has(task.status);
+
 /** Newest effective activity first; stable tie-break by id, then creation time. */
 export function compareActivity(a, b) {
   return activityAt(b) - activityAt(a)

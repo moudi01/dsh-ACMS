@@ -130,9 +130,68 @@ try {
   await expect(page.locator('.acms-drawer').getByRole('button', { name: '展开说明' })).toHaveCount(0);
   await page.getByRole('button', { name: '关闭任务详情' }).click();
 
-  // 11. No model calls or business writes from presentation filters.
+  // 11. The overview review queue and all presentation modes share one scope.
+  const reviewGoal = command('goal.create', { projectId, title: '审查队列目标', description: '静态队列', acceptance: '指标与列表一致', plan: false });
+  const reviewFixture = (status, targetGoal = reviewGoal) => {
+    const row = command('task.create', { goalId: targetGoal.id, title: `队列审查 ${status}`, agentId: longTask.agentId });
+    return store.put('tasks', { ...row, kind: 'review', status, reviewScope: 'goal' });
+  };
+  for (const status of ['failed', 'cancelled', 'archived', 'succeeded', 'deleted']) reviewFixture(status);
+  await page.getByRole('button', { name: '公司总览', exact: true }).click();
+  await page.getByRole('button', { name: '刷新', exact: true }).click();
+  const metric = page.getByRole('button', { name: '查看审查进行中', exact: true });
+  await expect(metric.locator('strong')).toHaveText('0');
+  const emptyCursor = store.cursor();
+  await metric.click();
+  await expect(page.getByRole('heading', { name: '当前范围没有进行中的审查' })).toBeVisible();
+  await expect(page.locator('.acms-task-card')).toHaveCount(0);
+  await page.getByRole('button', { name: '清除审查队列筛选', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '活动任务 A', exact: true })).toBeVisible();
+  expect(store.cursor()).toBe(emptyCursor);
+
+  const otherProject = command('project.save', { name: '队列第二项目', repoRoot: server.source, mode: 'copy', checks: [] });
+  const otherGoal = command('goal.create', { projectId: otherProject.id, title: '另一项目审查', description: '跨项目队列', acceptance: '不隐式限于默认项目', plan: false });
+  const activeStatuses = ['ready', 'preparing', 'running', 'reviewing', 'integrating', 'blocked', 'paused', 'stopping', 'reconciling'];
+  const reviews = activeStatuses.map((status, i) => reviewFixture(status, i % 2 ? otherGoal : reviewGoal));
+  const beforeTasks = store.list('tasks'), beforeCursor = store.cursor();
+  await page.getByRole('button', { name: '公司总览', exact: true }).click();
+  await page.getByRole('button', { name: '刷新', exact: true }).click();
+  await expect(metric.locator('strong')).toHaveText('9');
+  await metric.click();
+  await expect(page.getByLabel('筛选项目')).toHaveValue('');
+  await expect(page.locator('.acms-review-queue-filter')).toContainText('当前筛选：审查进行中');
+  await expect(page.locator('.acms-visible-count')).toContainText('可见 9 / 共 9 项');
+  await expect(page.locator('.acms-task-card')).toHaveCount(9);
+  for (const review of reviews) await expect(page.getByRole('heading', { name: review.title, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '活动任务 A', exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('显示审查任务')).toBeDisabled();
+  await page.getByRole('button', { name: '层级', exact: true }).click();
+  expect(await page.locator('.acms-task-title strong').allTextContents()).toEqual(expect.arrayContaining(reviews.map(r => r.title)));
+  await expect(page.locator('.acms-task-title')).toHaveCount(9);
+  await page.getByRole('button', { name: '依赖图', exact: true }).click();
+  await expect(page.locator('.acms-graph-node')).toHaveCount(9);
+  await page.getByRole('button', { name: '看板', exact: true }).click();
+  await page.getByLabel('筛选项目').selectOption(otherProject.id);
+  await expect(page.locator('.acms-task-card')).toHaveCount(4);
+  await page.getByLabel('筛选目标').selectOption(otherGoal.id);
+  await page.getByLabel('搜索任务').fill('队列审查 paused');
+  await expect(page.getByRole('heading', { name: '当前范围没有进行中的审查' })).toBeVisible();
+  await page.getByRole('button', { name: '刷新', exact: true }).click();
+  await expect(page.getByLabel('筛选项目')).toHaveValue(otherProject.id);
+  await page.getByRole('button', { name: '清除审查队列筛选', exact: true }).click();
+  await expect(page.getByLabel('搜索任务')).toHaveValue('');
+  await expect(page.getByLabel('筛选项目')).toHaveValue('');
+  await expect(page.getByLabel('筛选目标')).toHaveValue('');
+  await expect(page.getByRole('heading', { name: '活动任务 A', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '队列审查 failed', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /^已完成（/ }).click();
+  await expect(page.getByRole('button', { name: '队列审查 cancelled', exact: true })).toBeVisible();
+  expect(store.list('tasks')).toEqual(beforeTasks);
+  expect(store.cursor()).toBe(beforeCursor);
+
+  // 12. No model calls or business writes from presentation filters.
   expect(server.adapter.calls.length).toBe(0);
-  const report = { passed: true, checked: ['completed hidden by default with counts', 'completed list search/status filter/details evidence', 'review conclusions linked through attempt ids', 'completed-goal navigation keeps the completed view', 'short text is not truncated without a toggle', 'project/goal/task collapsed defaults', 'keyboard disclosure and refresh persistence', 'long text expand/collapse', 'long list count and expansion', 'task parent activity aggregation', 'activity ordering', 'zero model calls'], projectId, errors };
+  const report = { passed: true, checked: ['completed hidden by default with counts', 'completed list search/status filter/details evidence', 'review conclusions linked through attempt ids', 'completed-goal navigation keeps the completed view', 'short text is not truncated without a toggle', 'project/goal/task collapsed defaults', 'keyboard disclosure and refresh persistence', 'long text expand/collapse', 'long list count and expansion', 'task parent activity aggregation', 'activity ordering', 'review metric excludes terminal states', 'cross-project review queue agrees across board/tree/graph', 'review queue search, refresh, empty state and clear', 'presentation preserves tasks and event cursor', 'zero model calls'], projectId, errors };
   await writeFile('test-results/ui/display-defaults-report.json', JSON.stringify(report, null, 2));
   expect(errors).toEqual([]);
   console.log(JSON.stringify(report, null, 2));

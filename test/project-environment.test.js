@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { runContained } from '../src/runtime/host-command.js';
 import { prepareDependencies } from '../src/runtime/project-environment.js';
-import { fixture, gitProject, until } from './helpers.js';
+import { fixture, gitProject, until, taskWaitDiagnostics } from './helpers.js';
 import { cleanupError } from '../src/runtime/owned-process.js';
 import { environmentFailure } from '../src/runtime/preflight.js';
 
@@ -36,7 +36,7 @@ async function offlinePackage(f) {
   return { command: process.execPath, args: [npmCli], cacheSeed: cache, timeoutMs: 12000 };
 }
 
-test('offline lockfile preparation works in a Git worktree, in the check copy and in an independent reviewer copy', windows, async t => {
+test('offline lockfile preparation works in a Git worktree, in the check copy and in an independent reviewer copy', { ...windows, timeout: 150000 }, async t => {
   const dispatched = [];
   const f = await fixture(t, async input => {
     const { task, prompt } = input;
@@ -64,11 +64,13 @@ test('offline lockfile preparation works in a Git worktree, in the check copy an
     const current = f.store.require('tasks', task.id);
     assert(!current.environmentBlock, JSON.stringify(current.environmentBlock));
     return current.status === 'succeeded';
-  }, 20000);
+  // Includes worktree creation, offline npm preparation, host checks and Git
+  // delivery. Keep the individual preparation timeout unchanged.
+  }, 60000, taskWaitDiagnostics(f, task.id));
   const delivered = f.store.require('tasks', task.id);
   assert(!delivered.changeSet.some(file => file.path.includes('node_modules')));
   const review = f.command('review.request', { id: task.id });
-  await until(() => f.store.require('tasks', review.id).status === 'succeeded', 15000);
+  await until(() => f.store.require('tasks', review.id).status === 'succeeded', 60000, taskWaitDiagnostics(f, review.id));
   assert.equal(f.store.require('tasks', review.id).passed, false);
   assert.equal(f.store.require('tasks', review.id).environmentBlock, undefined);
   assert.notEqual(dispatched[0].task.workspace.path, dispatched[1].task.workspace.path);

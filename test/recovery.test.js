@@ -3,8 +3,13 @@ import assert from 'node:assert/strict';
 import { writeFile, readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { defaultSimulation } from '../src/adapters/simulated.js';
-import { fixture, gitProject, until } from './helpers.js';
+import { fixture, gitProject, until, taskWaitDiagnostics } from './helpers.js';
 import { run } from '../src/runtime/workspaces.js';
+
+// These end-to-end waits include multiple real Git processes and owned-process
+// cleanup. Shared Windows runners can exceed 20s without a product failure.
+const gitFlow = { skip: process.platform !== 'win32', timeout: 150000 };
+const gitWaitMs = 60000;
 
 test('reviewer gets its own writable verification copy while the original delivery stays unchanged', async t => {
   const f = await fixture(t); const task = f.task(); const sourceWorkspace = await f.workspaces.prepare(task, {});
@@ -42,24 +47,24 @@ test('failed acceptance checks are retained as evidence and block independent ap
   const check = f.store.list('verifications')[0].checks[0]; assert.equal(check.code, 2); assert.match(check.stderr, /Owner check rejected/);
   assert(!f.adapter.calls.some(c => c.task.kind === 'review'));
 });
-test('reviewed Git delivery is validated in an isolated candidate then fast-forwarded', { skip: process.platform !== 'win32' }, async t => {
+test('reviewed Git delivery is validated in an isolated candidate then fast-forwarded', gitFlow, async t => {
   const f = await fixture(t); const before = await gitProject(f); const task = f.task(); await f.start();
-  await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded', gitWaitMs, taskWaitDiagnostics(f, task.id));
   const saved = f.store.require('tasks', task.id); assert.equal(saved.integration.status, 'merged');
   assert.notEqual((await run('git', ['rev-parse', 'HEAD'], f.source)).stdout, before);
   assert((await readFile(path.join(f.source, 'deliverable.md'), 'utf8')).length > 0);
   assert(saved.changeSet.some(c => c.path === 'deliverable.md'));
 });
-test('a failed integration candidate opens manager coordination and leaves the source project commit unchanged', { skip: process.platform !== 'win32' }, async t => {
+test('a failed integration candidate opens manager coordination and leaves the source project commit unchanged', gitFlow, async t => {
   const f = await fixture(t); const before = await gitProject(f, [{ id: 'integration-regression', command: 'node', args: ['-e', "process.exit(process.cwd().includes('integration')?1:0)"] }]);
   const task = f.task(); await f.start();
-  const routed = await until(() => f.store.page(0, 1000).entries.find(entry => entry.type === 'blocker.coordinated' && entry.blockerKind === 'integration'), 20000);
+  const routed = await until(() => f.store.page(0, 1000).entries.find(entry => entry.type === 'blocker.coordinated' && entry.blockerKind === 'integration'), gitWaitMs, taskWaitDiagnostics(f, task.id));
   assert.equal(routed.route, 'manager');
   const coordinations = f.store.list('tasks').filter(item => item.kind === 'coordination' && item.coordinationOf === task.id);
   assert.equal(coordinations.length, 1);
   assert.equal(coordinations[0].agentId, 'manager');
   // After the manager decision the same blocker is handed to the owner instead of looping.
-  const blocked = await until(() => { const saved = f.store.require('tasks', task.id); return saved.blocker?.kind === 'integration' ? saved : null; }, 20000);
+  const blocked = await until(() => { const saved = f.store.require('tasks', task.id); return saved.blocker?.kind === 'integration' ? saved : null; }, gitWaitMs, taskWaitDiagnostics(f, task.id));
   assert.equal(f.store.list('tasks').filter(item => item.kind === 'coordination' && item.coordinationOf === task.id).length, 1);
   assert.equal((await run('git', ['rev-parse', 'HEAD'], f.source)).stdout, before);
   // Project registration now creates host-owned collaboration metadata. A failed
@@ -101,7 +106,7 @@ test('template versions are pinned for new goals without rewriting existing ones
 });
 
 
-test('coordinated Git integration uses the existing worktree, artifacts and checks', { skip: process.platform !== 'win32' }, async t => {
+test('coordinated Git integration uses the existing worktree, artifacts and checks', gitFlow, async t => {
   let checkpoint;
   const f = await fixture(t, async input => {
     if (input.task.kind === 'coordination') {
@@ -115,7 +120,7 @@ test('coordinated Git integration uses the existing worktree, artifacts and chec
   await writeFile(path.join(f.source, 'temporary.txt'), 'Block integration until coordination');
   const task = f.task();
   await f.start();
-  await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded', gitWaitMs, taskWaitDiagnostics(f, task.id));
   const final = f.store.require('tasks', task.id);
   assert.equal(final.integration.status, 'merged');
   assert.equal(final.generation, checkpoint.generation);
