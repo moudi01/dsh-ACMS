@@ -17,6 +17,10 @@ await writeFile(blob, bytes);
 await writeFile(emptyBlob, Buffer.alloc(0));
 server.company.store.put('artifacts', { id: 'artifact_ui_download', taskId: task.id, attemptId: 'attempt_ui_download', path: '交付/UI 二进制.bin', title: 'UI 二进制交付', hash: digest(bytes.toString('base64')), bytes: bytes.length, blob });
 server.company.store.put('artifacts', { id: 'artifact_ui_empty', taskId: task.id, attemptId: 'attempt_ui_empty', path: '交付/空文件.txt', title: 'UI 空文件交付', hash: digest(''), bytes: 0, blob: emptyBlob });
+server.company.store.put('verifications', { id: 'verification_ui_archive', taskId: task.id, kind: 'checks', passed: false,
+  checks: [{ id: 'archive:delivery.zip', kind: 'delivery-archive', artifactId: 'artifact_ui_archive', passed: false,
+    archiveSha256: 'a'.repeat(64), manifestSha256: 'b'.repeat(64), errors: [{ code: 'CONTENT_MISMATCH', path: '源码/交接.md',
+      expectedSha256: 'c'.repeat(64), actualSha256: 'd'.repeat(64), expectedBytes: 15, actualBytes: 17 }] }] });
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1100 }, colorScheme: 'light', acceptDownloads: true });
@@ -35,6 +39,15 @@ async function downloadThrough(title, { truncated = true } = {}) {
 }
 try {
   await page.goto(server.url);
+  await page.getByRole('button', { name: '任务工作台', exact: true }).click();
+  await page.getByRole('button', { name: '看板', exact: true }).click();
+  await page.getByRole('heading', { name: task.title, exact: true }).click();
+  await page.getByText('交付归档校验', { exact: true }).click();
+  await expect(page.getByText('源码/交接.md · CONTENT_MISMATCH', { exact: true })).toBeVisible();
+  await expect(page.getByText('c'.repeat(64), { exact: true })).toBeVisible();
+  await expect(page.getByText('d'.repeat(64), { exact: true })).toBeVisible();
+  await expect(page.getByText('预期 15 字节 · 实际 17 字节', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '关闭任务详情' }).click();
   const large = await downloadThrough('UI 二进制交付');
   expect(large.body.equals(bytes)).toBeTruthy();
   expect(large.body.length).toBe(bytes.length);
