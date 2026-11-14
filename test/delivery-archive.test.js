@@ -140,11 +140,15 @@ test('verified archive and provenance reach dependency/review contracts and scop
   assert.equal(artifact.archiveVerification.passed, true);
   const attempt = { id: 'test-prompt', agentId: 'manager' };
   const contract = JSON.parse(promptFor(f.company, downstream, attempt).split('CONTRACT:\n')[1]);
-  assert.deepEqual(contract.inputArtifacts[0].archiveVerification, artifact.archiveVerification);
+  const summary = contract.inputArtifacts[0].archiveVerification;
+  assert.equal(summary.manifest, undefined);
+  assert.equal(summary.archiveSha256, artifact.archiveVerification.archiveSha256);
+  assert.equal(summary.taskId, task.id);
+  assert.deepEqual(summary.manifestReference, { archivePath: artifact.blob, entry: 'acms-delivery.json', sha256: artifact.archiveVerification.manifestSha256 });
   const source = f.store.require('tasks', task.id);
   const review = { ...downstream, kind: 'review', reviewScope: 'goal', reviewTargets: [{ id: task.id }], deliveryHash: 'test' };
   const reviewContract = JSON.parse(promptFor(f.company, review, attempt).split('CONTRACT:\n')[1]);
-  assert.deepEqual(reviewContract.review.targets[0].artifacts[0].archiveVerification, artifact.archiveVerification);
+  assert.deepEqual(reviewContract.review.targets[0].artifacts[0].archiveVerification, summary);
   assert.equal(await f.workspaces.unchanged(source, source.artifactIds), true);
   await writeFile(path.join(source.workspace.path, 'delivery.zip'), deliveryZip(sample, { ...manifestFor(sample), note: 'rebuilt' }));
   assert.equal(await f.workspaces.unchanged(source, source.artifactIds), false);

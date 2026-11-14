@@ -20,12 +20,31 @@ function portablePath(name) {
   return name.normalize('NFC').toUpperCase().toLowerCase();
 }
 
-function recordPathAliases(aliases, name) {
-  const parts = name.split('/');
-  for (let i = 1; i <= parts.length; i++) {
-    const prefix = parts.slice(0, i).join('/'), key = portablePath(prefix), previous = aliases.get(key);
-    requireValue(!previous || previous === prefix, 'PATH_ALIAS_CONFLICT', name, { otherPath: previous });
-    aliases.set(key, prefix);
+// A segment trie validates aliases and file/directory occupancy in O(path length).
+// Implicit parents are recorded too, so insertion order cannot hide a conflict.
+class PathTree {
+  constructor() { this.root = { children: new Map() }; }
+  add(name, directory, conflictCode = 'FILE_DIRECTORY_CONFLICT') {
+    portablePath(name);
+    let node = this.root;
+    for (const part of name.split('/')) {
+      requireValue(!node.file, conflictCode, name, { otherPath: node.path });
+      const key = part.normalize('NFC').toUpperCase().toLowerCase();
+      let child = node.children.get(key);
+      requireValue(!child || child.part === part, 'PATH_ALIAS_CONFLICT', name, { otherPath: child?.part });
+      if (!child) { child = { part, children: new Map() }; node.children.set(key, child); }
+      node = child;
+    }
+    requireValue(directory ? !node.file : !node.children.size && !node.directory, conflictCode, name);
+    node.file = !directory; node.directory = directory; node.path = name;
+  }
+  hasPath(name) {
+    let node = this.root;
+    for (const part of name.split('/')) {
+      node = node.children.get(part.normalize('NFC').toUpperCase().toLowerCase());
+      if (!node) return false;
+    }
+    return true;
   }
 }
 
@@ -53,7 +72,7 @@ function readZip(bytes, limits) {
   requireValue(count !== 65535 && central !== 0xffffffff && centralSize !== 0xffffffff, 'UNSUPPORTED_ZIP64', null);
   requireValue(count <= limits.entries, 'ENTRY_LIMIT', null);
   requireValue(central + centralSize === end, 'INVALID_ZIP_DIRECTORY', null);
-  const records = [], names = new Map(), aliases = new Map(); let p = central, total = 0;
+  const records = [], names = new Map(), paths = new PathTree(); let p = central, total = 0;
   for (let i = 0; i < count; i++) {
     requireValue(p + 46 <= end && bytes.readUInt32LE(p) === 0x02014b50, 'INVALID_ZIP_ENTRY', null);
     const flags = bytes.readUInt16LE(p + 8), method = bytes.readUInt16LE(p + 10), crc = bytes.readUInt32LE(p + 16);
@@ -67,7 +86,7 @@ function readZip(bytes, limits) {
     try { name = decoder.decode(nameBytes); } catch { fail('INVALID_UTF8_PATH', null); }
     const directory = name.endsWith('/'), key = portablePath(directory ? name.slice(0, -1) : name);
     requireValue(!names.has(key), 'DUPLICATE_ZIP_PATH', name, { otherPath: names.get(key) }); names.set(key, name);
-    recordPathAliases(aliases, directory ? name.slice(0, -1) : name);
+    paths.add(directory ? name.slice(0, -1) : name, directory);
     const attributes = bytes.readUInt32LE(p + 38), type = (attributes >>> 16) & 0xf000;
     requireValue([0, 0x8000, 0x4000].includes(type) && !(attributes & 0x400), 'UNSUPPORTED_LINK', name);
     requireValue((type !== 0x4000 || directory) && (type !== 0x8000 || !directory) && (!(attributes & 0x10) || directory), 'ZIP_TYPE_MISMATCH', name);
@@ -115,13 +134,9 @@ function readZip(bytes, limits) {
     requireValue(content.length === size, 'ZIP_SIZE_MISMATCH', name, { expected: size, actual: content.length });
     requireValue(crc32(content) === crc, 'ZIP_CRC_MISMATCH', name);
     if (!directory) files.set(name, { bytes: size, sha256: byteSha256(content), ...(name === MANIFEST_PATH ? { content } : {}) });
-    for (let i = 1, parts = record.key.split('/'); i < parts.length; i++) {
-      const parent = names.get(parts.slice(0, i).join('/'));
-      requireValue(!parent || parent.endsWith('/'), 'FILE_DIRECTORY_CONFLICT', name, { otherPath: parent });
-    }
   }
   requireValue(localEnd === central, 'UNINDEXED_ZIP_CONTENT', null);
-  return { files, names, total };
+  return { files, paths, total };
 }
 
 // The report is evidence for these exact archive bytes, never an approval of
@@ -129,7 +144,7 @@ function readZip(bytes, limits) {
 export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
   const report = { format: ARCHIVE_FORMAT, passed: false, archiveSha256: byteSha256(bytes), errors: [] };
   try {
-    const { files, names, total } = readZip(bytes, limits);
+    const { files, paths, total } = readZip(bytes, limits);
     const manifestFile = files.get(MANIFEST_PATH);
     requireValue(manifestFile, 'MISSING_MANIFEST', MANIFEST_PATH);
     report.manifestSha256 = manifestFile.sha256;
@@ -137,7 +152,7 @@ export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
     try { manifest = JSON.parse(decoder.decode(manifestFile.content)); } catch { fail('INVALID_MANIFEST_JSON', MANIFEST_PATH); }
     requireValue(manifest?.format === ARCHIVE_FORMAT && manifest.hashAlgorithm === 'sha256-bytes' && Array.isArray(manifest.files), 'INVALID_MANIFEST_CONTRACT', MANIFEST_PATH);
     requireValue(manifest.files.length <= limits.entries, 'MANIFEST_ENTRY_LIMIT', MANIFEST_PATH);
-    const listed = new Map(), sources = new Map(), normalized = [], pathAliases = new Map(), sourceAliases = new Map();
+    const listed = new Map(), sources = new Map(), normalized = [], manifestPaths = new PathTree(), sourcePaths = new PathTree();
     const addError = error => { if (report.errors.length < 100) report.errors.push(error); };
     for (const entry of manifest.files) {
       requireValue(entry && typeof entry === 'object', 'INVALID_MANIFEST_ENTRY', MANIFEST_PATH);
@@ -146,11 +161,11 @@ export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
       requireValue(!listed.has(key), 'DUPLICATE_MANIFEST_PATH', entry.path, { otherPath: listed.get(key) });
       requireValue(!sources.has(sourceKey), 'DUPLICATE_SOURCE_PATH', entry.sourcePath);
       listed.set(key, entry.path); sources.set(sourceKey, entry.sourcePath);
-      recordPathAliases(pathAliases, entry.path); recordPathAliases(sourceAliases, entry.sourcePath);
+      manifestPaths.add(entry.path, false); sourcePaths.add(entry.sourcePath, false, 'SOURCE_FILE_DIRECTORY_CONFLICT');
       requireValue(['release', 'evidence', 'deleted'].includes(entry.role), 'INVALID_FILE_ROLE', entry.path);
       if (entry.role === 'deleted') {
         requireValue(entry.bytes === undefined && entry.sha256 === undefined, 'INVALID_DELETION', entry.path);
-        if (names.has(key) || [...names.keys()].some(name => name.startsWith(key + '/'))) addError({ code: 'DELETED_PATH_PRESENT', path: entry.path });
+        if (paths.hasPath(entry.path)) addError({ code: 'DELETED_PATH_PRESENT', path: entry.path });
         normalized.push({ path: entry.path, sourcePath: entry.sourcePath, role: entry.role });
         continue;
       }

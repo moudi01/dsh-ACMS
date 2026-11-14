@@ -50,15 +50,15 @@ const entry = { bytes: bytes.length, sha256: createHash('sha256').update(bytes).
 
 支持单卷、非 ZIP64、stored 或 deflate ZIP，支持数据描述符；非 ASCII 文件名必须设置 UTF-8 标志。拒绝加密、不支持的压缩、链接、Unix 链接扩展、备用 Unicode 路径扩展、隐藏/重叠条目、头部不一致、CRC 错误以及越界路径。v1 不接受自解压 ZIP 或额外的 ZIP 数字签名记录。
 
-路径不能包含反斜杠、绝对路径、盘符、`..`、空分段、控制字符、Windows 设备名或末尾空格/点。重复路径、大小写冲突和 Unicode NFC 等价冲突均拒绝。清单条目与 ZIP 文件名必须精确匹配。
+路径不能包含反斜杠、绝对路径、盘符、`..`、空分段、控制字符、Windows 设备名或末尾空格/点。重复路径、大小写冲突和 Unicode NFC 等价冲突均拒绝。清单条目与 ZIP 文件名必须精确匹配。ZIP 路径与 `sourcePath` 均检查文件/目录冲突，`src` 文件与 `src/file.js` 不能同时出现，无论条目顺序如何。路径树按分段增量校验，不反复扫描全部前缀。
 
-每个包上限为 64 MiB 压缩字节、10,000 个 ZIP 条目、32 MiB 单文件、128 MiB 总解压字节和 2 MiB 清单。公司现有 `maxArtifactBytes` 同时生效，取更小范围。校验器在内存中逐项有界解压并计算摘要，不向任何目标目录解压，不执行包内文件。一次报告最多列出 100 项内容差异；结构损坏会立即停止解析。
+每个包上限为 64 MiB 压缩字节、10,000 个 ZIP 条目、32 MiB 单文件、128 MiB 总解压字节和 2 MiB 清单。公司现有 `maxArtifactBytes` 同时生效，取更小范围。宿主在独立 worker 中逐项有界解压并计算摘要，不阻塞调度事件循环，不向任何目标目录解压，不执行包内文件。暂停/取消沿用执行信号，等待 worker 退出后返回，取消不会产生通过证据。一次报告最多列出 100 项内容差异；结构损坏会立即停止解析。
 
 ## 失败与证据复用
 
 失败保留不可变 artifact blob，并在原有“产物与验收”的检查记录中写入 `archive:<产物路径>`、错误码、路径及预期/实际摘要与大小。宿主不会把失败交付标为已完成或送入集成，后续沿用现有技术失败及返工流程。错误清单与原始包随产物保留；修复后必须提交并重新验证新版本，不能沿用旧批准。
 
-通过的 `artifact.archiveVerification` 包含清单、包/清单字节摘要、数量及宿主绑定的来源版本。下游任务的 `CONTRACT.inputArtifacts`、独立任务/目标审查的产物信息，以及原有授权范围内的外部 API 产物读取均可消费同一份记录。原有审查批准记录仍绑定交付指纹；`passed: true` 只表示归档字节与清单一致，不表示源码完整性、功能正确性或人类/模型审查已批准。
+通过的 `artifact.archiveVerification` 包含清单、包/清单字节摘要、数量及宿主绑定的来源版本。完整报告保存在产物记录中，原有授权范围内的外部 API 产物读取仍返回完整内容。下游任务的 `CONTRACT.inputArtifacts` 及独立任务/目标审查只注入摘要与 `manifestReference`，三处共用每次提示词 16 KiB 的摘要预算；达到预算后省略后续摘要，通过 `archiveEvidenceBudget` 标记。省略不代表批准，产物 ID 和不可变 ZIP 路径仍保留，执行器可按需从该 ZIP 读取 `acms-delivery.json`，与提供的清单字节摘要核对。原有审查批准记录仍绑定交付指纹；`passed: true` 只表示归档字节与清单一致，不表示源码完整性、功能正确性或人类/模型审查已批准。
 
 修改 ZIP 内任意文件、清单元数据或重新打包都会改变外层字节摘要。集成仍检查当前工作副本是否与已交付产物一致。外部发布者应读取不可变 blob，并复核最终将发布的 ZIP，不能把旧报告应用到新包上。
 
@@ -67,6 +67,7 @@ const entry = { bytes: bytes.length, sha256: createHash('sha256').update(bytes).
 ```powershell
 node scripts/verify-delivery-archive.mjs path/to/delivery.zip
 node --test test/delivery-archive.test.js
+node --test test/delivery-archive-review.test.js
 ```
 
 命令输出 JSON 报告，退出码 `0` 为通过、`1` 为校验失败、`2` 为用法或读取失败。自动化测试覆盖中文/混合 Unicode、两种换行、空文件、二进制、缺失/多余/重复项、删除项、清单更新、归档篡改、越界/链接/压缩限制、交付阻断、持久证据、审查/依赖传播和授权读取。测试使用临时数据库及确定性执行器，不调用真实模型。此检查不能发现“中文已变成合法 ASCII 问号”之类内容质量问题（#19），也不能替代多任务成果汇总（#34）。

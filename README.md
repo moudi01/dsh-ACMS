@@ -110,7 +110,7 @@ npm run test:goal-priority # 目标优先级的界面设置、查看与修改
 npm run build     # 生成 lib/client.js
 ```
 
-部署使用 `host-<hash>.mjs`，它按内容哈希引用同目录的 `owned-job-<hash>.cs`；部署与回滚要把两者成对保留、成对切换。
+部署使用 `host-<hash>.mjs`，它按内容哈希引用同目录的 `owned-job-<hash>.cs` 和 `archive-worker-<hash>.mjs`；部署与回滚要保留宿主及其匹配资源，再切换宿主入口。
 
 UI 测试使用临时本机服务模拟 DSH 通道，仅用于测试。生产插件的界面与 API 都由 DSH 提供。真实 DSH 验收方法与范围见 [验证记录](docs/validation.md)。
 

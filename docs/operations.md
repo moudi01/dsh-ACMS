@@ -18,7 +18,7 @@
 ## 模型列表与配对
 
 修改代码后的部署：先运行 `npm run build`，再在项目目录运行 `node scripts/deploy-live.mjs desktop`。DSH 默认仅监视配置文件，单纯修改宿主源码不会加载新代码；部署脚本会生成版本化宿主 bundle、备份配置，并仅切换 ACMS 的宿主入口，其他插件不受影响。存在活动 ACMS 执行时脚本拒绝部署。
-界面更新后按 Ctrl+R 刷新 DSH。部署产物是 `host-<hash>.mjs`，它按内容哈希引用同目录的 `owned-job-<hash>.cs`；部署和回滚必须成对保留、成对切换这两个文件，不能只替换其中一个。其他 profile 可替换最后的 `desktop`，自定义 home 使用 `DSH_HOME`。
+界面更新后按 Ctrl+R 刷新 DSH。部署产物是 `host-<hash>.mjs`，它按内容哈希引用同目录的 `owned-job-<hash>.cs` 和 `archive-worker-<hash>.mjs`；部署和回滚必须保留宿主及其匹配资源，再切换宿主入口。其他 profile 可替换最后的 `desktop`，自定义 home 使用 `DSH_HOME`。
 
 初始模型列表仅包含 DSH 模型目录中的内部模型。内部模型可以选择是否继承 ACMS 调度父代理上下文，常规内部执行每轮新建上下文。外部模型不显示父代理继承开关。
 
