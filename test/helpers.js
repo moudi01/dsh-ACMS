@@ -29,10 +29,22 @@ export async function fixture(t, handler = defaultSimulation) {
     start: async () => { await engine.start(); started = true; },
   };
 }
-export async function until(predicate, timeout = 8000) {
+export async function until(predicate, timeout = 8000, diagnostics) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const value = await predicate(); if (value) return value; await new Promise(r => setTimeout(r, 15)); }
-  throw new Error('Condition not reached within test deadline');
+  const detail = diagnostics ? JSON.stringify(await diagnostics()) : '';
+  throw new Error(`Condition not reached within test deadline (${timeout} ms)${detail ? ': ' + detail : ''}`);
+}
+
+// Only state and event types: enough to distinguish slow native I/O from a
+// stalled workflow, without dumping prompts, command output or credentials.
+export function taskWaitDiagnostics(f, taskId) {
+  return () => {
+    const task = f.store.require('tasks', taskId);
+    return { taskId, status: task.status, blockerKind: task.blocker?.kind, integrationStatus: task.integration?.status,
+      attempts: f.store.list('attempts').filter(a => a.taskId === taskId).map(a => ({ id: a.id, status: a.status, cleanupPending: a.cleanupPending })),
+      recentEvents: f.store.page(Math.max(0, f.store.cursor() - 15), 15).entries.map(e => ({ seq: e.seq, type: e.type, entityId: e.entityId })) };
+  };
 }
 
 export async function gitProject(f, checks = []) {
