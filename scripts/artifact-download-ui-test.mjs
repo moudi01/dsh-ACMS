@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { startPreview } from './preview-server.mjs';
 import { digest } from '../src/core/util.js';
+import { inspectDeliveryText } from '../src/runtime/text-integrity.js';
 
 // Issue #35 acceptance: the panel downloads the complete original file, while
 // the text preview stays bounded. Binary bytes and Unicode names are preserved.
@@ -17,6 +18,10 @@ await writeFile(blob, bytes);
 await writeFile(emptyBlob, Buffer.alloc(0));
 server.company.store.put('artifacts', { id: 'artifact_ui_download', taskId: task.id, attemptId: 'attempt_ui_download', path: '交付/UI 二进制.bin', title: 'UI 二进制交付', hash: digest(bytes.toString('base64')), bytes: bytes.length, blob });
 server.company.store.put('artifacts', { id: 'artifact_ui_empty', taskId: task.id, attemptId: 'attempt_ui_empty', path: '交付/空文件.txt', title: 'UI 空文件交付', hash: digest(''), bytes: 0, blob: emptyBlob });
+const textBytes = Buffer.from('Goal: ????????????????????\nFiles: ????????????????????\nReview: ????????????????????\n');
+const textBlob = path.join(server.dataDir, 'artifacts', 'ui-text-warning'); await writeFile(textBlob, textBytes);
+server.company.store.put('artifacts', { id: 'artifact_ui_text_warning', taskId: task.id, path: '交接.md', title: '交接可读性样例',
+  bytes: textBytes.length, hash: digest(textBytes.toString('base64')), blob: textBlob, textIntegrity: inspectDeliveryText(textBytes) });
 server.company.store.put('verifications', { id: 'verification_ui_archive', taskId: task.id, kind: 'checks', passed: false,
   checks: [{ id: 'archive:delivery.zip', kind: 'delivery-archive', artifactId: 'artifact_ui_archive', passed: false,
     archiveSha256: 'a'.repeat(64), manifestSha256: 'b'.repeat(64), errors: [{ code: 'CONTENT_MISMATCH', path: '源码/交接.md',
@@ -42,6 +47,9 @@ try {
   await page.getByRole('button', { name: '任务工作台', exact: true }).click();
   await page.getByRole('button', { name: '看板', exact: true }).click();
   await page.getByRole('heading', { name: task.title, exact: true }).click();
+  await page.getByText('文本可读性提示（1）', { exact: true }).click();
+  await expect(page.getByText('正文多处密集问号，可能发生字符替换（行 1、2、3）', { exact: true })).toBeVisible();
+  await expect(page.getByText('这是内容异常提示，不是执行环境故障或审查结论。请与原始材料核对；哈希一致不能证明文字可读。', { exact: true })).toBeVisible();
   await page.getByText('交付归档校验', { exact: true }).click();
   await expect(page.getByText('源码/交接.md · CONTENT_MISMATCH', { exact: true })).toBeVisible();
   await expect(page.getByText('c'.repeat(64), { exact: true })).toBeVisible();

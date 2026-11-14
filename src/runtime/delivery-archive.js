@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { crc32, inflateRawSync } from 'node:zlib';
+import { inspectDeliveryText, isProseFile, MAX_TEXT_BYTES } from './text-integrity.js';
 
 export const ARCHIVE_FORMAT = 'acms-delivery/1';
 export const MANIFEST_PATH = 'acms-delivery.json';
@@ -99,7 +100,8 @@ function readZip(bytes, limits) {
     p += 46 + n + x + comment;
   }
   requireValue(p === end, 'INVALID_ZIP_DIRECTORY', null);
-  const files = new Map(); let localEnd = 0;
+  const files = new Map(), textDiagnostics = { inspected: 0, skipped: 0, warnings: [], warningsOmitted: 0 };
+  let localEnd = 0, textBudget = 8 * MAX_TEXT_BYTES;
   // Contiguous local records rule out hidden entries, overlapping entries and
   // self-extracting prefixes that other ZIP readers could interpret differently.
   for (const record of records.sort((a, b) => a.offset - b.offset)) {
@@ -134,9 +136,20 @@ function readZip(bytes, limits) {
     requireValue(content.length === size, 'ZIP_SIZE_MISMATCH', name, { expected: size, actual: content.length });
     requireValue(crc32(content) === crc, 'ZIP_CRC_MISMATCH', name);
     if (!directory) files.set(name, { bytes: size, sha256: byteSha256(content), ...(name === MANIFEST_PATH ? { content } : {}) });
+    if (!directory && isProseFile(name)) {
+      if (size > MAX_TEXT_BYTES || size > textBudget) textDiagnostics.skipped++;
+      else {
+        textBudget -= size; textDiagnostics.inspected++;
+        const report = inspectDeliveryText(content);
+        if (report.status === 'warning') {
+          if (textDiagnostics.warnings.length < 100) textDiagnostics.warnings.push({ path: name, ...report });
+          else textDiagnostics.warningsOmitted++;
+        }
+      }
+    }
   }
   requireValue(localEnd === central, 'UNINDEXED_ZIP_CONTENT', null);
-  return { files, paths, total };
+  return { files, paths, total, textDiagnostics };
 }
 
 // The report is evidence for these exact archive bytes, never an approval of
@@ -144,7 +157,8 @@ function readZip(bytes, limits) {
 export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
   const report = { format: ARCHIVE_FORMAT, passed: false, archiveSha256: byteSha256(bytes), errors: [] };
   try {
-    const { files, paths, total } = readZip(bytes, limits);
+    const { files, paths, total, textDiagnostics } = readZip(bytes, limits);
+    report.textDiagnostics = textDiagnostics;
     const manifestFile = files.get(MANIFEST_PATH);
     requireValue(manifestFile, 'MISSING_MANIFEST', MANIFEST_PATH);
     report.manifestSha256 = manifestFile.sha256;

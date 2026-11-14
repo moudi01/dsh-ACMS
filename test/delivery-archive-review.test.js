@@ -87,6 +87,7 @@ test('isolated host bundle publishes and runs its matching archive worker', asyn
   assert.ok(code.includes('./' + path.basename(built.archiveWorker)));
   const bundled = await import(pathToFileURL(built.filename));
   assert.equal((await bundled.validateDeliveryArchive(deliveryZip([{ name: '中文', data: '字节' }]))).passed, true);
+  assert.equal((await bundled.validateDeliveryText(Buffer.from('中文交接'))).status, 'no-warning');
   const controller = new AbortController(), pending = bundled.validateDeliveryArchive(deliveryZip([]), { signal: controller.signal });
   controller.abort(); await assert.rejects(pending, { name: 'AbortError' });
 });

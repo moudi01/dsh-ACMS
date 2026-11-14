@@ -6,6 +6,14 @@ const workerResource = typeof __ACMS_ARCHIVE_WORKER_RESOURCE__ === 'string'
 // Keep inflation, hashing and path validation off the scheduler's event loop.
 // Settlement always waits for worker exit, including cancellation and errors.
 export async function validateDeliveryArchive(bytes, { signal } = {}) {
+  return validateArtifact('archive', bytes, signal);
+}
+
+export async function validateDeliveryText(bytes, { signal } = {}) {
+  return validateArtifact('text', bytes, signal);
+}
+
+async function validateArtifact(kind, bytes, signal) {
   signal?.throwIfAborted();
   const worker = new Worker(new URL(workerResource, import.meta.url), { execArgv: [] });
   let report, failure;
@@ -23,7 +31,7 @@ export async function validateDeliveryArchive(bytes, { signal } = {}) {
     signal?.throwIfAborted();
     // Transfer an owned copy; the caller still needs the original immutable bytes.
     const input = Uint8Array.from(bytes);
-    worker.postMessage(input, [input.buffer]);
+    worker.postMessage({ kind, bytes: input }, [input.buffer]);
     await exited;
     signal?.throwIfAborted();
     if (failure) throw failure;
