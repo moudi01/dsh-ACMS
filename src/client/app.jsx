@@ -232,6 +232,26 @@ function GraphCanvas({ id, tasks, known, select }) {
     {hidden.length > 0 && <details className="acms-graph-hidden"><summary>{hidden.length} 项前置任务未在此处显示（不是无依赖）</summary><ul>{hidden.map(entry => <li key={`${entry.taskId}-${entry.dependencyId}`}><button type="button" className="text" onClick={() => select(entry.dependencyId)}>{entry.dependencyTitle ?? `前置 ${entry.dependencyId}`}（{entry.taskTitle} 的前置）</button>{entry.dependencyStatus && <Badge status={entry.dependencyStatus} />}</li>)}</ul><p className="acms-sectionnote">这些前置任务被当前筛选隐藏或不在所选范围内；依赖数据未被修改，切回相应范围即可看到连线。</p></details>}
   </div>;
 }
+function TextIntegrityNotices({ artifacts }) {
+  const labels = { TEXT_QUESTION_MARK_LOSS: '正文多处密集问号，可能发生字符替换', TEXT_REPLACEMENT_CHARACTERS: '正文包含多处 Unicode 替换字符',
+    TEXT_INVALID_UTF8: '文件不能按 UTF-8 严格解码', TEXT_ENCODING_NOT_UTF8: '文件使用 UTF-16 标记，需核对交接编码约定' };
+  const reports = artifacts.flatMap(artifact => [
+    ...(artifact.textIntegrity ? [{ path: artifact.path, ...artifact.textIntegrity }] : []),
+    ...(artifact.archiveVerification?.textDiagnostics?.warnings ?? []).map(report => ({ ...report, path: `${artifact.path} → ${report.path}` })),
+    ...(artifact.archiveVerification?.textDiagnostics?.skipped ? [{ path: artifact.path, status: 'not-inspected', skipped: artifact.archiveVerification.textDiagnostics.skipped }] : []),
+    ...(artifact.archiveVerification?.textDiagnostics?.warningsOmitted ? [{ path: artifact.path, status: 'limited', omitted: artifact.archiveVerification.textDiagnostics.warningsOmitted }] : []),
+  ]).filter(report => report.status !== 'no-warning');
+  if (!reports.length) return null;
+  return <details className="acms-alert"><summary>文本可读性提示（{reports.length}）</summary>
+    <p>这是内容异常提示，不是执行环境故障或审查结论。请与原始材料核对；哈希一致不能证明文字可读。</p>
+    {reports.map((report, index) => <div key={index}><strong>{report.path}</strong>
+      {report.status === 'not-inspected' ? <p>超出文本检查范围，尚未检查{report.skipped ? ` ${report.skipped} 个文件` : ''}。</p> : report.status === 'limited' ? <p>另有 {report.omitted} 个文件的提示未展开，请核对原包。</p> : report.warnings.map(warning => <p key={warning.code}>
+        {labels[warning.code] ?? warning.code}{warning.lines?.length ? `（行 ${warning.lines.join('、')}）` : ''}</p>)}
+      {report.sha256 && <small>文件字节 SHA-256：<code>{report.sha256}</code></small>}
+    </div>)}
+  </details>;
+}
+
 function ArchiveChecks({ checks }) {
   const archives = (checks ?? []).filter(check => check.kind === 'delivery-archive');
   if (!archives.length) return null;
@@ -265,7 +285,7 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {task.kind !== 'review' && <ActionButton reason={['integrating', 'reconciling', 'stopping'].includes(task.status) ? '请等待集成、停止或执行核对完成后再编辑。' : ''} onClick={() => open('taskEdit', task)}>编辑任务</ActionButton>}
     {!terminal.includes(task.status) && <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : ''} onClick={() => act('task.cancel', { id: task.id }, '已请求取消任务')}>取消任务</ActionButton>}
     <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : taskDeletionReason(task, data.tasks, data.attempts)} onClick={() => open('deleteTask', task)}>删除任务</ActionButton></div><section><h3>验收标准</h3><CollapsibleText text={task.acceptance} lines={3} label="验收标准" /></section><section><h3>依赖关系</h3>{task.dependencies.length ? task.dependencies.map(id => <div className="acms-dep" key={id}><Badge status={data.tasks.find(t => t.id === id)?.status} /><button className="text" onClick={() => select(id)}>{data.tasks.find(t => t.id === id)?.title}</button></div>) : <p className="acms-muted">无前置依赖</p>}{['ready', 'blocked', 'paused'].includes(task.status) && <button onClick={() => open('dependencies', task)}>调整依赖</button>}</section>
-    <section className="acms-evidence"><h3>产物与验收（{artifacts.length}）</h3>{!artifacts.length && !verifications.length ? <p className="acms-muted">尚无产物或验收记录。</p> : <>{artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}{verifications.slice(-6).reverse().map(verification => <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} /><span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span><small>{verification.summary ?? ''}</small><ArchiveChecks checks={verification.checks} />{verification.checks?.some(check => check.checkVersion) && <details><summary>宿主检查证据</summary><ul>{verification.checks.filter(check => check.checkVersion).map(check => <li key={check.id}>{check.id} · {check.reused ? '复用' : '本次运行'} · 退出码 {check.code ?? '未知'}{check.reason && <p>{check.reason}</p>}<dl className="acms-definition"><dt>命令</dt><dd><code>{[check.command, ...(check.args ?? [])].join(' ')}</code></dd><dt>工作目录</dt><dd><code>{check.cwd}</code></dd><dt>输入版本</dt><dd><code>{check.inputHash}</code></dd><dt>宿主环境</dt><dd><code>{check.environment}</code></dd><dt>日志指纹</dt><dd><code>{check.log?.hash}</code></dd></dl></li>)}</ul></details>}</div>)}</>}</section>
+    <section className="acms-evidence"><TextIntegrityNotices artifacts={artifacts} /><h3>产物与验收（{artifacts.length}）</h3>{!artifacts.length && !verifications.length ? <p className="acms-muted">尚无产物或验收记录。</p> : <>{artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}{verifications.slice(-6).reverse().map(verification => <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} /><span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span><small>{verification.summary ?? ''}</small><ArchiveChecks checks={verification.checks} />{verification.checks?.some(check => check.checkVersion) && <details><summary>宿主检查证据</summary><ul>{verification.checks.filter(check => check.checkVersion).map(check => <li key={check.id}>{check.id} · {check.reused ? '复用' : '本次运行'} · 退出码 {check.code ?? '未知'}{check.reason && <p>{check.reason}</p>}<dl className="acms-definition"><dt>命令</dt><dd><code>{[check.command, ...(check.args ?? [])].join(' ')}</code></dd><dt>工作目录</dt><dd><code>{check.cwd}</code></dd><dt>输入版本</dt><dd><code>{check.inputHash}</code></dd><dt>宿主环境</dt><dd><code>{check.environment}</code></dd><dt>日志指纹</dt><dd><code>{check.log?.hash}</code></dd></dl></li>)}</ul></details>}</div>)}</>}</section>
     {task.feedback && <section><h3>最近反馈</h3><p className="acms-preserve">{task.feedback}</p></section>}
     {goalHold && <p className="acms-sectionnote">{goalHold}</p>}
     {attempts.some(attempt => attempt.resultDeferred) && <p className="acms-sectionnote">已有执行结果等待入库，恢复后将沿用该结果。</p>}

@@ -7,7 +7,8 @@ import { publishCollaboration, syncCollaboration, verifyCollaboration, isCollabo
 import { deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
 import { checkIdentity, copyProject, inputFingerprint, prepareDependencies, verifyInCopy } from './project-environment.js';
 import { ARCHIVE_FORMAT } from './delivery-archive.js';
-import { validateDeliveryArchive } from './archive-validation.js';
+import { validateDeliveryArchive, validateDeliveryText } from './archive-validation.js';
+import { isProseFile } from './text-integrity.js';
 
 export function inside(root, target) { const rel = path.relative(root, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); }
 const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
@@ -113,6 +114,9 @@ export class WorkspaceManager {
       await fs.mkdir(path.dirname(blob), { recursive: true });
       try { await fs.writeFile(blob, bytes, { flag: 'wx' }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
       const artifact = { id: `artifact_${attempt.id}_${artifacts.length}`, taskId: task.id, attemptId: attempt.id, path: item.path, title: item.title ?? item.path, hash, bytes: bytes.length, blob };
+      if (item.archiveFormat === undefined && isProseFile(item.path)) {
+        artifact.textIntegrity = await validateDeliveryText(bytes, { signal: attempt.signal });
+      }
       if (item.archiveFormat !== undefined) {
         const report = item.archiveFormat === ARCHIVE_FORMAT ? await validateDeliveryArchive(bytes, { signal: attempt.signal }) : {
           format: ARCHIVE_FORMAT, passed: false, errors: [{ code: 'UNSUPPORTED_ARCHIVE_FORMAT', path: item.path }],
