@@ -227,7 +227,8 @@ function attemptView(attempt) {
   return { id: attempt.id, taskId: attempt.taskId, agentId: attempt.agentId, status: attempt.status, goalContractVersion: taskContractVersion(attempt), model: attempt.model ?? null, provider: attempt.provider ?? null, llmProvider: attempt.llmProvider ?? null, selection: attempt.selection ?? null, startedAt: attempt.startedAt ?? null, finishedAt: attempt.finishedAt ?? null, summary: attempt.summary ?? null };
 }
 function artifactView(artifact) {
-  return { id: artifact.id, taskId: artifact.taskId, path: artifact.path, title: artifact.title, hash: artifact.hash, bytes: artifact.bytes ?? null, createdAt: artifact.createdAt };
+  return { id: artifact.id, taskId: artifact.taskId, path: artifact.path, title: artifact.title, hash: artifact.hash, bytes: artifact.bytes ?? null, createdAt: artifact.createdAt,
+    ...(artifact.archiveVerification ? { archiveVerification: artifact.archiveVerification } : {}) };
 }
 function verificationView(item) {
   return { id: item.id, taskId: item.taskId, kind: item.kind, goalContractVersion: taskContractVersion(item), taskGeneration: item.taskGeneration ?? null, passed: item.passed === true, summary: item.summary ?? null, artifactHash: item.artifactHash ?? null, createdAt: item.createdAt };
