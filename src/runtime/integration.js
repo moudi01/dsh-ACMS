@@ -62,14 +62,15 @@ function settle(engine, record, { result, error, reason, observed, commandCleanu
       // A replacement excluded the previous delivery. Successful integration
       // of this task under the current contract puts the new delivery back in
       // the goal hash before the scheduler decides which review applies.
-      if (task.kind === 'work' && matchesGoalContract(goal, task, record) && goal.supersededTaskIds?.includes(task.id)) {
-        engine.store.put('goals', { ...goal, supersededTaskIds: goal.supersededTaskIds.filter(id => id !== task.id) });
-      }
+      const replacesDelivery = task.kind === 'work' && matchesGoalContract(goal, task, record) && goal.supersededTaskIds?.includes(task.id);
+      // Persist the need to update the goal alongside the delivery. Review
+      // allocation must happen in a later transaction: Git cannot roll back.
+      engine.store.put('goals', { ...goal, completionPending: goal.status === 'cancelled' ? null : 'delivery',
+        ...(replacesDelivery ? { supersededTaskIds: goal.supersededTaskIds.filter(id => id !== task.id) } : {}) });
       engine.company.releaseTemporaryAgent(task.agentId);
       // Snapshot the executor at delivery time; later reassignment must not rewrite history.
       const executor = task.agentId ? engine.store.get('agents', task.agentId) : null;
       engine.store.event('task.succeeded', task.id, { integration, artifactHash: record.artifactHash, ...(task.agentId ? { executorId: task.agentId, executorName: executor?.name ?? null, executorRole: executor?.role ?? null } : {}) }, SYSTEM);
-      engine.updateGoal(task.goalId);
       return;
     }
     if (stopRequested || engine.closing || retryCheckpoint) {
