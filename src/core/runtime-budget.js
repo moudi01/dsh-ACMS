@@ -1,5 +1,11 @@
+export const MAX_GOAL_RUNTIME_MS = 2147483647;
+
 export function goalRuntimeLimit(goal, policy) {
   return policy.maxGoalRuntimeMs + (goal.runtimeExtraMs ?? 0);
+}
+
+export function canExtendGoalRuntime(goal) {
+  return !!goal && !goal.legacyBatch && ['planning', 'active'].includes(goal.status);
 }
 
 export function goalRuntimeSpent(goal, attempts, now = Date.now()) {

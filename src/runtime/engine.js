@@ -919,7 +919,17 @@ export class Engine {
       }
       if (!stopped && !this.closing && error.code !== 'GOAL_RUNTIME_BUDGET' && this.refreshCoordinationAttempt(task, attempt)) return;
       if (error.code === 'GOAL_RUNTIME_BUDGET' && !stopped && !this.closing) {
-        this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。');
+        const goal = this.store.require('goals', task.goalId);
+        const used = goalRuntimeSpent(goal, this.store.list('attempts'));
+        if (used < goalRuntimeLimit(goal, this.company.policy()) && !task.blocker &&
+            !this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending')) {
+          // An owner extension may have landed after abort but before settlement.
+          // The interrupted attempt still holds its slot until cleanup is confirmed.
+          this.store.put('tasks', { ...task, status: 'ready', attempts: 0, retryAt: null });
+          this.store.event('task.budget.released', task.id, { attemptId: attempt.id }, SYSTEM);
+        } else {
+          this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。');
+        }
         return;
       }
       if (!stopped && !this.closing && goalStopped(this.store.require('goals', task.goalId))) {
