@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, mkdtempDisposable, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -49,57 +49,70 @@ async function describeFile(directory, name) {
   return { name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
 }
 
+async function buildCandidate(staging, commit, workflow) {
+  const source = path.join(staging, 'source');
+  await mkdir(source);
+  const sourceArchive = path.join(staging, 'source.tar');
+  run('git', ['archive', '--format=tar', '--output', sourceArchive, commit], root);
+  run('tar', ['-xf', sourceArchive, '-C', source], staging);
+
+  console.log(`Building release candidate from ${commit}`);
+  install(source);
+  npm(['run', 'build'], source, { stdio: 'inherit' });
+  const [packed] = JSON.parse(npm(['pack', '--json', '--ignore-scripts', '--pack-destination', staging], source));
+  assert(packed?.filename?.endsWith('.tgz') && path.basename(packed.filename) === packed.filename, 'npm pack returned an invalid archive name');
+
+  const members = new Map(packed.files.map(file => [file.path, file.size]));
+  for (const required of ['package.json', 'src/host/index.js', 'src/runtime/owned-job.cs', 'src/runtime/delivery-archive-worker.js',
+    'lib/client.js', 'cordis.patch.yml', 'scripts/install.ps1', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+    'packages/codex-runtime/package.json', 'packages/codex-runtime/lib/index.js', 'packages/codex-runtime/lib/store.js', 'packages/codex-runtime/LICENSE']) {
+    assert(members.get(required) > 0, `Package is missing nonempty ${required}`);
+  }
+
+  console.log('Installing locked dependencies from the extracted candidate');
+  run('tar', ['-xzf', path.join(staging, packed.filename), '-C', staging], staging);
+  const extracted = path.join(staging, 'package');
+  const lockfile = 'package-lock.json';
+  await copyFile(path.join(source, lockfile), path.join(staging, lockfile));
+  await copyFile(path.join(staging, lockfile), path.join(extracted, lockfile));
+  install(extracted);
+  await verifyPackage(extracted);
+
+  const pkg = await readJson(path.join(extracted, 'package.json'));
+  const runtime = await readJson(path.join(extracted, 'packages/codex-runtime/package.json'));
+  const requirements = { node: pkg.engines?.node, dsh: pkg.engines?.dsh, codexCli: runtime.dependencies?.['@openai/codex'] };
+  for (const [name, version] of Object.entries(requirements)) {
+    assert(typeof version === 'string' && version.trim(), `Package must declare its ${name} version requirement`);
+  }
+  const manifest = {
+    schemaVersion: 1,
+    package: { name: pkg.name, version: pkg.version, license: pkg.license },
+    commit,
+    workflow,
+    build: { platform: process.platform, arch: process.arch, node: process.versions.node, npm: npm(['--version'], source).trim() },
+    requirements,
+    checks: ['required package files', 'extracted npm ci', 'host entry', 'DSH client entry', 'Codex runtime entry'],
+    files: await Promise.all([packed.filename, lockfile].map(name => describeFile(staging, name))),
+  };
+
+  const releaseRoot = path.join(root, 'dist', 'release');
+  await mkdir(releaseRoot, { recursive: true });
+  const output = await mkdtemp(path.join(releaseRoot, `${pkg.name}-${pkg.version}-${commit.slice(0, 12)}-`));
+  for (const file of manifest.files) await copyFile(path.join(staging, file.name), path.join(output, file.name));
+  await writeFile(path.join(output, 'release-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  return output;
+}
+
 const commit = run('git', ['rev-parse', 'HEAD'], root).trim();
 const workflow = githubRun(commit);
-await using staging = await mkdtempDisposable(path.join(tmpdir(), 'acms-release-'));
-const source = path.join(staging.path, 'source');
-await mkdir(source);
-const sourceArchive = path.join(staging.path, 'source.tar');
-run('git', ['archive', '--format=tar', '--output', sourceArchive, commit], root);
-run('tar', ['-xf', sourceArchive, '-C', source], staging.path);
-
-console.log(`Building release candidate from ${commit}`);
-install(source);
-npm(['run', 'build'], source, { stdio: 'inherit' });
-const [packed] = JSON.parse(npm(['pack', '--json', '--ignore-scripts', '--pack-destination', staging.path], source));
-assert(packed?.filename?.endsWith('.tgz') && path.basename(packed.filename) === packed.filename, 'npm pack returned an invalid archive name');
-
-const members = new Map(packed.files.map(file => [file.path, file.size]));
-for (const required of ['package.json', 'src/host/index.js', 'src/runtime/owned-job.cs', 'src/runtime/delivery-archive-worker.js',
-  'lib/client.js', 'cordis.patch.yml', 'scripts/install.ps1', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
-  'packages/codex-runtime/package.json', 'packages/codex-runtime/lib/index.js', 'packages/codex-runtime/lib/store.js', 'packages/codex-runtime/LICENSE']) {
-  assert(members.get(required) > 0, `Package is missing nonempty ${required}`);
+const tempRoot = await realpath(tmpdir());
+const staging = await mkdtemp(path.join(tempRoot, 'acms-release-'));
+let output;
+try {
+  output = await buildCandidate(staging, commit, workflow);
+} finally {
+  const target = await realpath(staging);
+  assert(target === staging && path.dirname(target) === tempRoot, 'The release staging directory moved');
+  await rm(target, { recursive: true, force: true, maxRetries: 5 });
 }
-
-console.log('Installing locked dependencies from the extracted candidate');
-run('tar', ['-xzf', path.join(staging.path, packed.filename), '-C', staging.path], staging.path);
-const extracted = path.join(staging.path, 'package');
-const lockfile = 'package-lock.json';
-await copyFile(path.join(source, lockfile), path.join(staging.path, lockfile));
-await copyFile(path.join(staging.path, lockfile), path.join(extracted, lockfile));
-install(extracted);
-await verifyPackage(extracted);
-
-const pkg = await readJson(path.join(extracted, 'package.json'));
-const runtime = await readJson(path.join(extracted, 'packages/codex-runtime/package.json'));
-const requirements = { node: pkg.engines?.node, dsh: pkg.engines?.dsh, codexCli: runtime.dependencies?.['@openai/codex'] };
-for (const [name, version] of Object.entries(requirements)) {
-  assert(typeof version === 'string' && version.trim(), `Package must declare its ${name} version requirement`);
-}
-const manifest = {
-  schemaVersion: 1,
-  package: { name: pkg.name, version: pkg.version, license: pkg.license },
-  commit,
-  workflow,
-  build: { platform: process.platform, arch: process.arch, node: process.versions.node, npm: npm(['--version'], source).trim() },
-  requirements,
-  checks: ['required package files', 'extracted npm ci', 'host entry', 'DSH client entry', 'Codex runtime entry'],
-  files: await Promise.all([packed.filename, lockfile].map(name => describeFile(staging.path, name))),
-};
-
-const releaseRoot = path.join(root, 'dist', 'release');
-await mkdir(releaseRoot, { recursive: true });
-const output = await mkdtemp(path.join(releaseRoot, `${pkg.name}-${pkg.version}-${commit.slice(0, 12)}-`));
-for (const file of manifest.files) await copyFile(path.join(staging.path, file.name), path.join(output, file.name));
-await writeFile(path.join(output, 'release-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 console.log(`Verified release candidate: ${output}`);
