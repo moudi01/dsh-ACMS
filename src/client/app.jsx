@@ -7,7 +7,7 @@ import { ProjectHierarchy, TaskPath, CompletedGoals } from './hierarchy.jsx';
 import { defaultProjectId, graphSections, graphLayout, hiddenDependencies } from './graph.js';
 import { activeViewTasks, compareActivity, completedTasks, isCompleted, isQueuedReview, orderByActivity, verificationsForTask, visibleCounts } from './display.js';
 import { goalSummary } from '../core/hierarchy.js';
-import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS } from '../core/runtime-budget.js';
+import { accruesGoalRuntime, canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS } from '../core/runtime-budget.js';
 import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason } from '../core/task-actions.js';
 import { CAPACITY_LABELS } from '../core/execution-capacity.js';
 import { entityDeletionReason } from '../core/entity-actions.js';
@@ -52,6 +52,15 @@ function useCompany() {
   }, []);
   return { data, error, connected, updated, refresh };
 }
+function useRuntimeClock(running) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const timer = setInterval(() => tick(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+  return Date.now();
+}
 export function App() {
   const { data, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
   const [scope, setScope] = useState({}); const [entityView, setEntityView] = useState(null);
@@ -72,6 +81,12 @@ export function App() {
   const close = () => { setModal(null); setActionError(''); };
   const task = selected && data?.tasks.find(t => t.id === selected);
   const entity = entityView && data?.[`${entityView.kind}s`]?.find(e => e.id === entityView.id);
+  const detailGoalId = entityView?.kind === 'goal' ? entity?.id : null;
+  const budgetGoalId = modal?.type === 'goalRuntime' ? modal.value.id : modal?.type === 'answer' && modal.value.kind === 'budget' ? modal.value.goalId : null;
+  const budgetGoal = budgetGoalId ? data?.goals.find(goal => goal.id === budgetGoalId) : null;
+  const runtimeGoals = [detailGoalId, budgetGoal?.id].filter(Boolean);
+  const liveRuntime = runtimeGoals.length > 0 && data.attempts.some(attempt => runtimeGoals.includes(attempt.goalId) && accruesGoalRuntime(attempt));
+  const runtimeNow = useRuntimeClock(liveRuntime);
   const active = data?.attempts.filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending) ?? [];
   const pending = data?.interactions.filter(i => i.status === 'pending') ?? [];
   return <div className="acms-app">
@@ -114,8 +129,8 @@ export function App() {
       </div>}
     </main>
     {task && <TaskDrawer navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
-    {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={data} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} />}
-    {modal && data && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} />}
+    {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={data} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
+    {modal && data && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
     {conversation && data && <ConversationWindow key={`${conversation.agentId}:${conversation.taskId}`} {...conversation} data={data} close={() => setConversation(null)} />}
   </div>;
 }
@@ -308,7 +323,7 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {interactions.map(i => <section className="acms-alert" key={i.id}><h3>需要补充信息</h3><p>{i.reason}</p><p>{i.question}</p><button onClick={() => open('answer', i)}>回复并继续</button></section>)}
     <section><h3>执行记录</h3>{!attempts.length && <p className="acms-muted">尚未开始执行。</p>}{attempts.map(a => <details className="acms-run" key={a.id}><summary><Badge status={a.status} /><span>{date(a.startedAt)}</span></summary><p className="acms-preserve">{a.summary || '执行进行中'}</p><dl className="acms-definition"><dt>模型</dt><dd>{a.model || '未记录'}</dd><dt>思考深度</dt><dd>{a.reasoningEffort || '外部执行器默认或未公开'}</dd><dt>执行器</dt><dd>{a.provider}</dd><dt>模型通道</dt><dd>{a.llmProvider || a.selection?.chosen?.llmProvider || "未声明"}</dd>{a.selection && <><dt>选择依据</dt><dd>{a.selection.binding?.mode === "explicit" ? "显式绑定" : a.selection.binding?.mode === "preference" ? "用户偏好第 " + ((a.selection.preferenceIndex ?? 0) + 1) + " 项" : "稳定默认顺序"}</dd>{a.selection.fallbacks?.length ? <><dt>回退说明</dt><dd>{(a.selection.fallbacks ?? []).slice(0, 3).map(f => f.model + "：" + f.reason).join("；")}{(a.selection.fallbacks ?? []).length > 3 ? " 等" : ""}</dd></> : null}{a.selection.blocked ? <><dt>候选阻塞</dt><dd>{a.selection.blocked.code}</dd></> : null}</>}<dt>上下文</dt><dd><code>{a.contextKey}</code></dd><dt>工作副本</dt><dd><code>{a.workspace?.path}</code></dd></dl></details>)}</section><ChangeHistory kind="task" id={task.id} data={data} /><section><h3>目标模板</h3><p>{(data.goals.find(g => g.id === task.goalId)?.templateSnapshot?.name) ?? (data.templates ?? []).find(t => t.id === (data.goals.find(g => g.id === task.goalId)?.templateId ?? 'base'))?.name ?? '基础模板'}</p>{task.reviewScope && <p className="acms-muted">审查范围：{task.reviewScope === 'goal' ? '目标整体交付' : '单个交付物'}</p>}<p className="acms-muted">{task.longLived ? '任务完成后保留临时执行人员，便于后续分配' : '任务完成后临时执行人员退出可分配名单；历史记录保留'}</p></section></aside></div>;
 }
-function Editor({ modal, data, close, act, busy, error }) {
+function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }) {
   const { type, value = {} } = modal; const [form, setForm] = useState(() => ({ ...value, ...(type === 'agent' ? initialModelBinding(value, data.runtime) : {}), phases: value.phases ?? [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], checksText: JSON.stringify(value.checks ?? [], null, 2), preparationText: value.preparation ? JSON.stringify(value.preparation, null, 2) : '', dependencies: value.dependencies ?? [], goalId: value.goalId ?? data.goals.find(g => openGoal(g) && !g.executionControl && (!value.projectId || g.projectId === value.projectId))?.id, projectId: value.projectId ?? data.projects[0]?.id, templateId: value.templateId ?? 'base', priority: value.priority ?? 50 }));
   const [localError, setLocalError] = useState(''); const [artifact, setArtifact] = useState(null);
   useEffect(() => { if (type === 'artifact') api.artifact(value.id).then(setArtifact).catch(e => setLocalError(e.message)); }, []);
@@ -320,9 +335,7 @@ function Editor({ modal, data, close, act, busy, error }) {
     ? `合同变更尚未保存。${goalContractCapacityMessage(goalTasksUsed, goalTasksLimit)}` : '';
   const answerPaused = type === 'answer' && data.tasks.find(t => t.id === value.taskId)?.status === 'paused';
   const extendingGoal = type === 'goalRuntime';
-  const budgetGoalId = extendingGoal ? value.id : type === 'answer' && value.kind === 'budget' ? value.goalId : null;
-  const budgetGoal = data.goals.find(g => g.id === budgetGoalId);
-  const budgetUsed = budgetGoal ? goalRuntimeSpent(budgetGoal, data.attempts) : 0;
+  const budgetUsed = budgetGoal ? goalRuntimeSpent(budgetGoal, data.attempts, runtimeNow) : 0;
   const budgetLimit = budgetGoal ? goalRuntimeLimit(budgetGoal, data.policy) : 0;
   const extraMinutes = Number(form.additionalRuntimeMinutes || 0);
   const extraRuntimeMs = extraMinutes * 60000;
@@ -371,7 +384,7 @@ function Editor({ modal, data, close, act, busy, error }) {
   const budgetFields = budgetGoal && <>
     <dl className="acms-definition"><dt>目标</dt><dd>{budgetGoal.title}</dd><dt>累计已用</dt><dd>{(budgetUsed / 60000).toFixed(2)} 分钟</dd><dt>当前累计额度</dt><dd>{(budgetLimit / 60000).toFixed(2)} 分钟</dd><dt>单次执行时限</dt><dd>{(data.policy.turnTimeoutMs / 60000).toFixed(2)} 分钟（分别计算）</dd></dl>
     <Field label="追加目标累计执行额度（分钟）" hint="并行执行按各项执行时间累计。超额时，从实际已用时间起计算追加额度。"><input type="number" min="1" step="1" required={extendingGoal || budgetUsed >= budgetLimit} value={form.additionalRuntimeMinutes ?? ''} onChange={e => change('additionalRuntimeMinutes', e.target.value)} /></Field>
-    {extraMinutes > 0 && <p role="status">预计追加后累计额度：{(projectedLimit / 60000).toFixed(2)} 分钟。</p>}
+    {extraMinutes > 0 && <p>预计追加后累计额度：{(projectedLimit / 60000).toFixed(2)} 分钟。</p>}
   </>;
   return <Modal title={titles[type]} onClose={close} wide={['workflow', 'artifact', 'agent', 'goal'].includes(type)}><form onSubmit={submit}><div className="acms-form-body">
     {(localError || error) && <div className="acms-alert error" role="alert">{localError || error}</div>}

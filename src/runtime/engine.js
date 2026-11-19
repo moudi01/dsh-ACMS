@@ -12,7 +12,7 @@ import { contractVersion, matchesGoalContract } from '../core/goal-contract.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { migrateLegacyForEngine } from '../core/legacy.js';
 import { blockerRoute, ignoresBlocker } from '../core/blocker-policy.js';
-import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
+import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit, pendingGoalTimeBox } from '../core/runtime-budget.js';
 import { classifyEnvironment, environmentFailure } from './preflight.js';
 import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './environment-gate.js';
 import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-control.js';
@@ -215,9 +215,12 @@ export class Engine {
         const hardLimit = goalRuntimeLimit(goal, p);
         const used = spent.get(goal.id) ?? goal.runtimeMs ?? 0;
         if (used >= hardLimit) continue;
-        const boxLimit = goalTimeBoxLimit(goal, p);
-        if (!boxLimit || used < boxLimit) continue;
-        this.ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, p);
+        // Finish an open decision under its original key. After release, the
+        // effective threshold applies to the next warning.
+        const effectiveBoxLimit = goalTimeBoxLimit(goal, p);
+        const pendingBox = pendingGoalTimeBox(goal);
+        if (!effectiveBoxLimit || (!pendingBox && used < effectiveBoxLimit)) continue;
+        this.ensureTimeBoxWarning(goal, used, hardLimit, pendingBox?.boxMs ?? effectiveBoxLimit, p);
       }
       const { attempts: active, integrations: occupiedIntegrations, used } = executionOccupancy(this.store, this.adapter, this.live);
       let free = p.maxConcurrent - used; if (free <= 0) return;
@@ -258,8 +261,7 @@ export class Engine {
         if ((spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
         // While the time-box decision is open, only control work (coordination,
         // review) may proceed; ordinary work waits for the manager's wrap-up.
-        const boxLimit = goalTimeBoxLimit(goal, p);
-        if (boxLimit && !goal.timeBox?.releasedAt && ['work', 'repair', 'plan'].includes(task.kind) && (spent.get(goal.id) ?? goal.runtimeMs ?? 0) >= boxLimit) continue;
+        if (pendingGoalTimeBox(goal) && goalTimeBoxLimit(goal, p) && ['work', 'repair', 'plan'].includes(task.kind)) continue;
         if (task.integrationPending) {
           this.store.transaction(() => {
             this.store.put('tasks', { ...task, status: 'integrating' });

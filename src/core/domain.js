@@ -7,7 +7,7 @@ import { goalSummary, taskSettledForGoal } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
-import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS } from './runtime-budget.js';
+import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS, pendingGoalTimeBox } from './runtime-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
@@ -565,7 +565,7 @@ export class Company {
   saveGoalRuntimeExtension(goal, policy, used, additionalRuntimeMs, actor, source) {
     const limit = goalRuntimeLimit(goal, policy);
     const nextLimit = integer(Math.max(used, limit) + additionalRuntimeMs, 'goalRuntimeLimit', 1000, MAX_GOAL_RUNTIME_MS);
-    const saved = this.store.put('goals', { ...goal, runtimeExtraMs: nextLimit - policy.maxGoalRuntimeMs, timeBox: null });
+    const saved = this.store.put('goals', { ...goal, runtimeExtraMs: nextLimit - policy.maxGoalRuntimeMs, timeBox: pendingGoalTimeBox(goal) });
     const event = this.store.event('goal.runtime.extended', goal.id, { ...source, additionalRuntimeMs, previousLimitMs: limit, nextLimitMs: nextLimit, usedMs: used }, actor);
     return { saved, event };
   }

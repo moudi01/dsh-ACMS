@@ -27,11 +27,11 @@ function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
     {goal.reviewHistory?.length > 0 && <details className="acms-review-history"><summary>历史审查（{goal.reviewHistory.length}）</summary>{goal.reviewHistory.map(item => <div className="acms-review-history-row" key={item.id}><span className="acms-tag">{reviewLabels[item.status] ?? item.status}</span>{item.status === 'succeeded' ? (item.passed ? ' 通过' : ' 未通过') : ''}{item.status === 'cancelled' ? ` 取消：${item.cancelReason || '未填写原因'}` : ''}<small>合同 v{item.goalContractVersion ?? 1} · {item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}</small></div>)}</details>}
   </section>;
 }
-function GoalRuntimeBudget({ goal, data, open, busy }) {
+function GoalRuntimeBudget({ goal, data, open, busy, runtimeNow }) {
   return <section className="acms-review-state" aria-label="目标执行额度">
     <h3>目标执行额度</h3>
     <dl className="acms-definition">
-      <dt>累计已用</dt><dd>{(goalRuntimeSpent(goal, data.attempts) / 60000).toFixed(2)} 分钟</dd>
+      <dt>累计已用</dt><dd>{(goalRuntimeSpent(goal, data.attempts, runtimeNow) / 60000).toFixed(2)} 分钟</dd>
       <dt>当前累计额度</dt><dd>{(goalRuntimeLimit(goal, data.policy) / 60000).toFixed(2)} 分钟</dd>
     </dl>
     {canExtendGoalRuntime(goal) && <ActionButton reason={busy ? '正在保存，请稍候' : ''} onClick={() => open('goalRuntime', goal)}>追加目标执行额度</ActionButton>}
@@ -58,12 +58,12 @@ function GoalControls({ goal, companyPaused, act, open, busy }) {
     </div>}
   </section>;
 }
-export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, act, busy }) {
+export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, act, busy, runtimeNow }) {
   const tasks = entityTasks(kind, entity, data); const goals = data.goals.filter(g => kind === 'project' && g.projectId === entity.id);
   const project = kind === 'goal' ? data.projects.find(p => p.id === entity.projectId) : null;
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label={`${entityLabels[kind]}详情`}><header><span>{entityLabels[kind]}详情</span><button aria-label="关闭详情" onClick={close}>×</button></header><h2>{entity.title ?? entity.name}</h2>{kind === 'goal' && <p className="acms-sectionnote">优先级：{Number.isInteger(entity.priority) ? entity.priority : 50}（0–100；只影响后续跨目标派发顺序）</p>}{project && <button className="text" onClick={() => navigate('project', project.id)}>所属项目：{project.name}</button>}<CollapsibleText text={entity.description} lines={3} label="说明" />{entity.repoRoot && <p><code>{entity.repoRoot}</code></p>}{entity.acceptance && <section><h3>验收标准</h3><CollapsibleText text={entity.acceptance} lines={3} label="验收标准" /></section>}<div className="acms-actions wrap"><button onClick={() => open(kind === 'goal' ? 'goalEdit' : kind, entity)}>编辑{entityLabels[kind]}</button><ActionButton className="danger" reason={entityDeletionReason(kind, entity, data)} onClick={() => open('deleteEntity', { ...entity, entityKind: kind })}>删除{entityLabels[kind]}</ActionButton></div>
     {kind === 'agent' && chat && <button className="primary" onClick={() => chat(entity.id)}>与智能体对话</button>}
-    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} /><GoalReviewState goal={entity} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
+    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalReviewState goal={entity} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
     {goals.length > 0 && <section><h3>所属目标</h3>{goals.map(g => <button className="acms-entity-link" key={g.id} onClick={() => navigate('goal', g.id)}>{g.title} →</button>)}</section>}
     <section><h3>关联任务（{tasks.length}）</h3>{tasks.slice(0, 8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}{tasks.length > 8 && <details><summary>显示其余 {tasks.length - 8} 项</summary>{tasks.slice(8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}</details>}{!tasks.length && <p>暂无关联任务。</p>}</section><ChangeHistory kind={kind} id={entity.id} data={data} /></aside></div>;
 }

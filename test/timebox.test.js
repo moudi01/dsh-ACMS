@@ -73,6 +73,52 @@ test('a host restart does not duplicate the time-box warning or owner question',
   assert.equal(f.store.require('goals', f.goal.id).timeBox?.releasedAt, null);
 });
 
+test('extensions keep one outstanding time-box decision until it is settled', async t => {
+  const f = await fixture(t);
+  f.command('agent.save', { id: 'manager', status: 'retired' });
+  f.command('policy.update', { patch: { goalTimeBoxMs: 60000, maxGoalRuntimeMs: 360000 } });
+  const task = f.task({ title: 'Work waiting for wrap-up' });
+  const materials = f.task({ title: 'Keep the goal open' });
+  f.engine.block(materials, 'human', 'Missing material', 'Please provide the material');
+  const setRuntime = runtimeMs => f.store.transaction(() => f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs }));
+  setRuntime(120000);
+  await f.start();
+  const wrapUp = await until(() => timeboxTasks(f).find(item => item.status === 'blocked'), 15000);
+  const question = f.store.list('interactions').find(item => item.taskId === wrapUp.id && item.status === 'pending');
+  const firstBox = f.store.require('goals', f.goal.id).timeBox;
+  const warnings = () => events(f).filter(event => event.type === 'goal.timebox.warning');
+  const assertHeld = () => {
+    assert.deepEqual(f.store.require('goals', f.goal.id).timeBox, firstBox);
+    assert.deepEqual(timeboxTasks(f).map(item => item.id), [wrapUp.id]);
+    assert.deepEqual(f.store.list('interactions').filter(item => item.kind === 'assignment' && item.status === 'pending').map(item => item.id), [question.id]);
+    assert.equal(warnings().length, 1);
+    assert.equal(f.store.list('attempts').some(attempt => attempt.taskId === task.id), false);
+  };
+
+  // The first extension raises the threshold to the amount already used. The
+  // second raises it beyond current usage while the same decision is still open.
+  for (const expectedExtraMs of [60000, 120000]) {
+    const goal = f.store.require('goals', f.goal.id);
+    f.command('goal.runtime.extend', { id: goal.id, expectedRevision: goal.revision, additionalRuntimeMs: 60000 });
+    await f.engine.tick();
+    assert.equal(f.store.require('goals', f.goal.id).runtimeExtraMs, expectedExtraMs);
+    assertHeld();
+  }
+  await f.engine.stop(); await f.engine.start(); await f.engine.tick();
+  assertHeld();
+
+  f.command('agent.save', { id: 'manager', status: 'available' });
+  f.command('interaction.answer', { id: question.id, answer: '请完成本轮收尾决定' });
+  await until(() => f.store.require('goals', f.goal.id).timeBox?.releasedAt, 15000);
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
+  assert.equal(warnings().length, 1);
+
+  setRuntime(180000);
+  const next = await until(() => warnings().find(event => event.boxLimitMs === 180000), 15000);
+  assert.notEqual(next.coordinationTaskId, wrapUp.id);
+  assert.equal(warnings().length, 2);
+});
+
 test('capacity failure keeps an owner entry and does not stop other goals', async t => {
   const f = await fixture(t);
   f.adapter.delay = 20;
@@ -166,7 +212,8 @@ test('old policies without time-box fields normalize to zero and remain savable'
 test('budget extension clears the old time-box decision so a later box can warn again', async t => {
   const f = await fixture(t);
   const task = f.task({ title: 'Extended goal' });
-  f.store.transaction(() => f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs: f.company.policy().maxGoalRuntimeMs + 1000 }));
+  f.store.transaction(() => f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs: f.company.policy().maxGoalRuntimeMs + 1000,
+    timeBox: { boxMs: 60000, releasedAt: new Date().toISOString() } }));
   f.engine.block(task, 'budget', '目标累计执行时间额度已用完', '请填写追加额度');
   const question = f.store.list('interactions').find(item => item.taskId === task.id && item.status === 'pending');
   f.command('interaction.answer', { id: question.id, answer: '追加额度', additionalRuntimeMs: 120000 });
