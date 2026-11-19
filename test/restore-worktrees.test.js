@@ -21,8 +21,13 @@ async function git(cwd, ...args) {
   return result.stdout.replace(/\r?\n$/, '');
 }
 
-async function makeFixture(t, { candidate = false, receipt = true } = {}) {
+async function makeFixture(t, { candidate = false, receipt = true, dataAlias, linkWorkspace = false } = {}) {
   const f = await fixture(t);
+  if (dataAlias) {
+    const alias = await dataAlias(f);
+    if (!alias) return null;
+    f.workspaces.dataDir = alias;
+  }
   await writeFile(path.join(f.source, 'staged.txt'), 'original\n');
   const head = (await gitProject(f)).trim();
   const task = f.task();
@@ -52,7 +57,13 @@ async function makeFixture(t, { candidate = false, receipt = true } = {}) {
   }
   const backup = path.join(f.root, 'backup');
   const target = path.join(f.root, 'restored');
-  await applyBackup(await planBackup({ dataDir: f.dataDir, out: backup }));
+  if (linkWorkspace) {
+    const parked = path.join(f.root, 'linked-workspace');
+    await rename(workspace.path, parked);
+    await fs.symlink(parked, workspace.path, process.platform === 'win32' ? 'junction' : 'dir');
+  }
+  const dataDir = dataAlias ? await fs.realpath(f.dataDir) : f.dataDir;
+  await applyBackup(await planBackup({ dataDir, out: backup }));
   return { f, head, task, workspace, candidateId, candidates, backup, target };
 }
 
@@ -62,6 +73,9 @@ async function backlink(workspace) {
   return path.normalize((await readFile(path.join(pointer.slice(8), 'gitdir'), 'utf8')).trim());
 }
 
+const canonicalPointer = async workspace => path.join(await fs.realpath(workspace), '.git');
+const assertReady = result => assert.equal(result.startable, true, JSON.stringify(result.worktrees));
+
 test('retained original worktrees prevent host startup until the same target safely resumes', async t => {
   const { f, head, task, workspace, candidateId, candidates: [candidate], backup, target } = await makeFixture(t, { candidate: true });
   const oldWorkspacePointer = await backlink(workspace.path);
@@ -69,11 +83,11 @@ test('retained original worktrees prevent host startup until the same target saf
   const status = await git(workspace.path, 'status', '--porcelain', '--', 'staged.txt', 'local.bin');
   const sourceStatus = await git(f.source, 'status', '--porcelain', '--', '.', ':(exclude).acms');
   const firstCommand = await run('node', [restoreScript, '--backup', backup, '--target', target, '--json'], f.root);
-  assert.equal(firstCommand.code, 2, firstCommand.stderr);
+  assert.equal(firstCommand.code, 2, firstCommand.stderr || firstCommand.stdout);
   const first = JSON.parse(firstCommand.stdout);
   assert.equal(first.startable, false);
   assert.equal(first.worktrees.issues.length, 2);
-  assert(first.worktrees.issues.every(item => item.reason.includes('原工作副本仍在')));
+  assert(first.worktrees.issues.every(item => item.reason.includes('原工作副本仍在')), JSON.stringify(first.worktrees));
   assert.deepEqual(await backlink(path.join(target, 'workspaces', task.id)), oldWorkspacePointer);
   assert.deepEqual(await backlink(path.join(target, 'integration', candidateId)), oldCandidatePointer);
   assert.match(await readFile(path.join(target, 'REBUILD.md'), 'utf8'), /--resume-worktrees/);
@@ -90,13 +104,13 @@ test('retained original worktrees prevent host startup until the same target saf
   const retainedCandidate = path.join(f.root, 'retained-old-candidate');
   await rename(candidate, retainedCandidate);
   const readyCommand = await run('node', [restoreScript, '--target', target, '--resume-worktrees', '--json'], f.root);
-  assert.equal(readyCommand.code, 0, readyCommand.stderr);
+  assert.equal(readyCommand.code, 0, readyCommand.stderr || readyCommand.stdout);
   const ready = JSON.parse(readyCommand.stdout);
-  assert.equal(ready.startable, true);
+  assertReady(ready);
   const restored = path.join(target, 'workspaces', task.id);
   const restoredCandidate = path.join(target, 'integration', candidateId);
-  assert.equal(await backlink(restored), path.join(restored, '.git'));
-  assert.equal(await backlink(restoredCandidate), path.join(restoredCandidate, '.git'));
+  assert.equal(await backlink(restored), await canonicalPointer(restored));
+  assert.equal(await backlink(restoredCandidate), await canonicalPointer(restoredCandidate));
   assert.equal(await git(restored, 'symbolic-ref', '--short', 'HEAD'), workspace.branch);
   assert.equal(await git(restoredCandidate, 'rev-parse', 'HEAD'), head);
   const restoredIndex = await git(restored, 'rev-parse', '--path-format=absolute', '--git-path', 'index');
@@ -137,7 +151,7 @@ test('missing source Git repository can be restored before continuing the same t
   assert.match(result.worktrees.issues[0].reason, /源 Git 仓库不可用/);
   assert.equal((await verifyBackup(target)).ok, true);
   await rename(parked, f.source);
-  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
+  assertReady(await restoreBackup({ target, resumeWorktrees: true }));
   assert.equal(await git(path.join(target, 'workspaces', task.id), 'show', ':staged.txt'), 'staged version');
 });
 
@@ -191,11 +205,11 @@ test('publishing the final manifest can fail without opening the startup gate or
   } finally { fail.mock.restore(); }
 
   const restored = path.join(target, 'workspaces', task.id);
-  assert.equal(await backlink(restored), path.join(restored, '.git'));
+  assert.equal(await backlink(restored), await canonicalPointer(restored));
   await assert.rejects(apply({}, { dataDir: target }), { code: 'RESTORE_WORKTREES_PENDING' });
   assert.match(await readFile(path.join(target, 'REBUILD.md'), 'utf8'), /--resume-worktrees/);
   assert.equal((await verifyBackup(target)).ok, true, 'the pending manifest accounts for a migrated pointer');
-  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
+  assertReady(await restoreBackup({ target, resumeWorktrees: true }));
   assert.equal((await verifyBackup(target)).ok, true);
   assert.equal((await verifyBackup(backup)).ok, true);
 });
@@ -215,13 +229,15 @@ test('a missing staged blob keeps restore pending until it can actually be read'
   await assert.rejects(apply({}, { dataDir: target }), { code: 'RESTORE_WORKTREES_PENDING' });
   assert.equal((await verifyBackup(target)).ok, true);
   await rename(parkedBlob, blob);
-  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
+  assertReady(await restoreBackup({ target, resumeWorktrees: true }));
   assert.equal(await git(path.join(target, 'workspaces', task.id), 'show', ':staged.txt'), 'staged version');
 });
 
 test('a second registry write failure rolls back both administrative paths and pointers', async t => {
   const { f, task, workspace, candidateId, candidates: [candidate], backup, target } = await makeFixture(t, { candidate: true });
   assert.equal((await restoreBackup({ backup, target })).startable, false);
+  const oldWorkspacePointer = await backlink(workspace.path);
+  const oldCandidatePointer = await backlink(candidate);
   await rename(workspace.path, path.join(f.root, 'old-worktree'));
   await rename(candidate, path.join(f.root, 'old-candidate'));
   let writes = 0;
@@ -234,8 +250,57 @@ test('a second registry write failure rolls back both administrative paths and p
     assert.equal(result.startable, false);
     assert.match(result.worktrees.issues[0].reason, /injected second backlink write failure/);
   } finally { fail.mock.restore(); }
-  assert.equal(await backlink(path.join(target, 'workspaces', task.id)), path.join(workspace.path, '.git'));
-  assert.equal(await backlink(path.join(target, 'integration', candidateId)), path.join(candidate, '.git'));
+  assert.equal(await backlink(path.join(target, 'workspaces', task.id)), oldWorkspacePointer);
+  assert.equal(await backlink(path.join(target, 'integration', candidateId)), oldCandidatePointer);
   assert.equal((await verifyBackup(target)).ok, true);
-  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
+  assertReady(await restoreBackup({ target, resumeWorktrees: true }));
+});
+
+test('trusted data-root aliases are canonicalized and the same target can resume through another spelling', async t => {
+  const { f, task, workspace, backup, target } = await makeFixture(t, { dataAlias: async fixture => {
+    const alias = path.join(fixture.root, 'data-alias');
+    await fs.symlink(fixture.dataDir, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    return alias;
+  } });
+  const initial = await restoreBackup({ backup, target });
+  assert.match(initial.worktrees.issues[0].reason, /原工作副本仍在/);
+  await rename(workspace.path, path.join(f.root, 'old-worktree'));
+  const alias = path.join(f.root, 'restored-alias');
+  await fs.symlink(target, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assertReady(await restoreBackup({ target: alias, resumeWorktrees: true }));
+  const restored = path.join(target, 'workspaces', task.id);
+  assert.equal(await backlink(restored), await canonicalPointer(restored));
+  assert.equal(await git(restored, 'show', ':staged.txt'), 'staged version');
+});
+
+test('worktree directory links below a trusted data root are excluded and prevent startup', async t => {
+  const { task, backup, target } = await makeFixture(t, { linkWorkspace: true });
+  const manifest = JSON.parse(await readFile(path.join(backup, 'backup-manifest.json'), 'utf8'));
+  assert(manifest.excluded.some(entry => entry.path === 'workspaces/' + task.id && entry.reason.includes('链接')));
+  const restored = await restoreBackup({ backup, target });
+  assert.equal(restored.startable, false);
+  assert.equal(restored.worktrees.issues[0].path, 'workspaces/' + task.id);
+  assert.match(restored.worktrees.issues[0].reason, /Git 指针/);
+});
+
+test('restore accepts a genuine Windows 8.3 data path when short names are available', { skip: process.platform !== 'win32' }, async t => {
+  const fixture = await makeFixture(t, { dataAlias: async f => {
+    const probe = await run('cmd.exe', ['/d', '/c', 'for %I in (.) do @echo %~sI'], f.root);
+    assert.equal(probe.code, 0, probe.stderr || probe.stdout);
+    const canonical = await fs.realpath(f.root);
+    const short = [f.root, probe.stdout.trim()].find(value => /[\\/][^\\/]*~\d+(?:[\\/]|$)/i.test(value) && path.relative(value, canonical) !== '');
+    if (!short) return null;
+    assert.equal(path.relative(await fs.realpath(short), canonical), '', `short=${short}`);
+    return path.join(short, 'data');
+  } });
+  if (!fixture) { t.skip('Windows volume does not expose a distinct 8.3 short name for the test directory'); return; }
+  const { f, task, workspace, backup } = fixture;
+  const target = path.join(path.dirname(f.workspaces.dataDir), 'restored');
+  const initial = await restoreBackup({ backup, target });
+  assert.match(initial.worktrees.issues[0].reason, /原工作副本仍在/, JSON.stringify(initial.worktrees));
+  await rename(workspace.path, path.join(f.root, 'old-worktree'));
+  assertReady(await restoreBackup({ target, resumeWorktrees: true }));
+  const restored = path.join(target, 'workspaces', task.id);
+  assert.equal(await backlink(restored), await canonicalPointer(restored));
+  assert.equal(await git(restored, 'show', ':staged.txt'), 'staged version');
 });

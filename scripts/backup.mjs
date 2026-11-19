@@ -159,7 +159,7 @@ export async function applyBackup(plan) {
     .map(item => item.reason || JSON.stringify(item) === JSON.stringify(worktreesBefore.get(item.relative)) ? item
       : { relative: item.relative, reason: '备份期间 Git 提交或暂存内容发生变化' });
   const manifest = {
-    format: FORMAT, createdAt: plan.createdAt, source, includePairing: plan.includePairing === true,
+    format: FORMAT, createdAt: plan.createdAt, source, sourceRoot: await fs.realpath(source), includePairing: plan.includePairing === true,
     database, files, excluded: plan.excluded, warnings: plan.warnings, gitWorktrees,
     totals: { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: plan.totals.excludedBytes,
       databaseBytes: database.bytes, requiredBytes: files.reduce((sum, file) => sum + file.bytes, 0) + database.bytes },
@@ -198,11 +198,14 @@ export async function verifyBackup(backupDir) {
   catch (error) { throw new Error(`Cannot read backup manifest: ${error.message}`); }
   if (manifest.format !== FORMAT) throw new Error(`Unsupported backup format: ${manifest.format}`);
   const errors = [];
-  const pendingRestore = manifest.restoredTo === root && manifest.worktreeRecovery && worktreeRestorePending(root);
+  const canonicalRoot = await fs.realpath(root);
+  const registeredRoot = manifest.restoredRoot ?? manifest.restoredTo;
+  const pendingRestore = typeof registeredRoot === 'string' && path.relative(registeredRoot, canonicalRoot) === '' &&
+    manifest.worktreeRecovery && worktreeRestorePending(root);
   const migratedPointers = new Map();
   if (pendingRestore) {
     for (const proof of manifest.gitWorktrees ?? []) {
-      const pointer = relocatedGitPointer(proof, root);
+      const pointer = relocatedGitPointer(proof, canonicalRoot);
       if (pointer) migratedPointers.set(proof.relative + '/.git', pointer);
     }
   }

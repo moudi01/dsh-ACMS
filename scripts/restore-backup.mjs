@@ -33,7 +33,10 @@ export async function restoreBackup({ backup, target, resumeWorktrees = false })
     const verification = await verifyBackup(destination);
     if (!verification.ok) throw new Error(`Restored data verification failed: ${verification.errors.join('; ')}`);
     const { manifest } = verification;
-    if (manifest.restoredTo !== destination || !manifest.worktreeRecovery) throw new Error('--resume-worktrees requires an existing recorded restore target');
+    const registeredRoot = manifest.restoredRoot ?? manifest.restoredTo;
+    if (typeof registeredRoot !== 'string' || path.relative(registeredRoot, await fs.realpath(destination)) !== '' || !manifest.worktreeRecovery) {
+      throw new Error('--resume-worktrees requires an existing recorded restore target');
+    }
     if (worktreeRestorePending(destination)) {
       await completeWorktreeRestore(destination, manifest);
     } else if (!manifest.worktreeRecovery.ready) {
@@ -47,17 +50,20 @@ export async function restoreBackup({ backup, target, resumeWorktrees = false })
   const verification = await verifyBackup(source);
   if (!verification.ok) throw new Error(`Backup verification failed: ${verification.errors.join('; ')}`);
   const { manifest } = verification;
-  if (!path.isAbsolute(manifest.source)) throw new Error('Backup source must be an absolute data directory');
+  const originalRoot = manifest.sourceRoot ?? manifest.source;
+  if (!path.isAbsolute(manifest.source) || !path.isAbsolute(originalRoot)) throw new Error('Backup source must be an absolute data directory');
   let targetEntries = [];
   try { targetEntries = await fs.readdir(destination); } catch { /* new directory */ }
   if (targetEntries.length) throw new Error(`Restore target is not empty: ${destination}`);
   await fs.mkdir(destination, { recursive: true });
   await fs.mkdir(path.join(destination, WORKTREE_RESTORE_HOLD), { mode: 0o700 });
   await fs.cp(source, destination, { recursive: true, errorOnExist: false });
-  const rewritten = rewritePaths(path.join(destination, manifest.database.file), manifest.source, destination);
+  const oldRoots = new Set([manifest.source, originalRoot, ...(manifest.gitWorktrees ?? []).filter(proof => !proof.reason && proof.rootAlias).map(proof => proof.rootAlias)]);
+  const rewritten = rewritePaths(path.join(destination, manifest.database.file), oldRoots, destination);
   manifest.restoredFrom = manifest.source;
   manifest.restoredAt = new Date().toISOString();
   manifest.restoredTo = destination;
+  manifest.restoredRoot = await fs.realpath(destination);
   manifest.rewrittenPaths = rewritten;
   delete manifest.worktreeRecovery;
   await completeWorktreeRestore(destination, manifest);
@@ -75,11 +81,12 @@ async function completeWorktreeRestore(destination, manifest) {
       issues: refs.map(ref => ({ path: ref.relative, reason: '等待核验 Git 工作副本' })) };
     await writeRestoreState(destination, manifest, staging);
   }
-  manifest.worktreeRecovery = await recoverWorktrees(refs, manifest.gitWorktrees, destination, manifest.source, staging);
+  const restoredRoot = manifest.restoredRoot ?? destination;
+  manifest.worktreeRecovery = await recoverWorktrees(refs, manifest.gitWorktrees, restoredRoot, manifest.sourceRoot ?? manifest.source, staging);
   if (manifest.worktreeRecovery.ready) {
     const proofs = new Map((manifest.gitWorktrees ?? []).map(proof => [proof.relative + '/.git', proof]));
     manifest.files = manifest.files.map(file => {
-      const pointer = relocatedGitPointer(proofs.get(file.path), destination);
+      const pointer = relocatedGitPointer(proofs.get(file.path), restoredRoot);
       return pointer ? { ...file, bytes: pointer.length, sha256: sha256(pointer) } : file;
     });
   }
@@ -147,7 +154,7 @@ function report(destination, manifest) {
     rewrittenPaths: manifest.rewrittenPaths, database: manifest.database, worktrees: manifest.worktreeRecovery };
 }
 
-function rewritePaths(databasePath, oldRoot, newRoot) {
+function rewritePaths(databasePath, oldRoots, newRoot) {
   const database = new DatabaseSync(databasePath);
   let rewritten = 0;
   const resolve = value => {
@@ -156,10 +163,13 @@ function rewritePaths(databasePath, oldRoot, newRoot) {
     // fields such as branch names, commits or artifact paths must stay intact
     // even when the restore process happens to run from the old directory.
     if (!path.isAbsolute(value)) return value;
-    const relative = path.relative(path.resolve(oldRoot), path.resolve(value));
-    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) return value;
-    rewritten += 1;
-    return path.join(newRoot, relative);
+    for (const root of oldRoots) {
+      const relative = path.relative(root, value);
+      if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+      rewritten += 1;
+      return path.join(newRoot, relative);
+    }
+    return value;
   };
   const walk = value => {
     if (typeof value === 'string') return resolve(value);

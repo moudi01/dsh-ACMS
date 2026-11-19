@@ -51,6 +51,7 @@ async function gitText(cwd, ...args) {
 }
 
 async function references(databaseFile, root, files) {
+  const canonicalRoot = await fs.realpath(root);
   const database = new DatabaseSync(databaseFile, { readOnly: true });
   let entities;
   try {
@@ -79,15 +80,27 @@ async function references(databaseFile, root, files) {
     const target = candidate ? body.candidate : workspace.path;
     const source = candidate ? body.targetRoot : workspace.source ?? projects.get(body.projectId)?.repoRoot;
     const branch = candidate ? null : 'refs/heads/acms/' + id;
-    const reason = !identifier.test(id) || typeof target !== 'string' || !path.isAbsolute(target) ||
-      !samePath(target, path.join(root, relative)) ? '工作副本路径与 ACMS 登记不匹配'
+    const rootAlias = typeof target === 'string' && path.isAbsolute(target) ? path.dirname(path.dirname(target)) : null;
+    const registeredRoot = rootAlias && samePath(target, path.join(rootAlias, relative))
+      ? await fs.realpath(rootAlias).catch(() => null) : null;
+    const reason = !identifier.test(id) || !registeredRoot || !samePath(registeredRoot, canonicalRoot) ? '工作副本路径与 ACMS 登记不匹配'
       : !hasPointer ? '备份缺少工作副本的 Git 指针'
       : typeof source !== 'string' || !path.isAbsolute(source) ? '缺少源 Git 仓库的绝对路径'
       : !candidate && workspace.branch !== 'acms/' + id ? '任务分支与 ACMS 登记不匹配'
       : null;
-    refs.push({ relative, source, branch, reason, receipts: dependencies.get(id) ?? [] });
+    refs.push({ relative, source, branch, reason, rootAlias, receipts: dependencies.get(id) ?? [] });
   }
   return refs;
+}
+
+async function managedWorkspace(root, relative) {
+  const workspace = path.join(root, relative);
+  const container = await stat(path.dirname(workspace));
+  const directory = await stat(workspace);
+  requireMatch(!container?.isSymbolicLink() && !directory?.isSymbolicLink(), '数据根内的工作副本路径经过链接');
+  requireMatch(container?.isDirectory() && directory?.isDirectory(), '工作副本目录缺失或类型不受支持');
+  requireMatch(samePath(await fs.realpath(workspace), workspace), '数据根内的工作副本路径经过链接');
+  return workspace;
 }
 
 function pointerDirectory(pointerFile) {
@@ -104,7 +117,8 @@ async function sourceGitDirectory(source) {
 
 async function inspect(source, common, admin, branch) {
   const gitDir = await fs.realpath(admin).catch(() => { throw new Error('源仓库的工作副本登记缺失'); });
-  requireMatch(samePath(gitDir, admin) && samePath(path.dirname(gitDir), path.join(common, 'worktrees')),
+  const registry = path.join(common, 'worktrees');
+  requireMatch(samePath(path.dirname(gitDir), registry) && (await stat(registry))?.isDirectory() && (await stat(admin))?.isDirectory(),
     'Git 指针超出源仓库的工作副本登记范围');
   const commonPointer = await textFile(path.join(gitDir, 'commondir'));
   requireMatch(samePath(await fs.realpath(path.resolve(gitDir, commonPointer.text)), common), 'Git 登记关联了其他仓库');
@@ -194,20 +208,21 @@ async function readGitObjects(source, registration) {
 
 export async function backupWorktreeEvidence(databaseFile, root, files) {
   const evidence = [];
+  const canonicalRoot = await fs.realpath(root);
   for (const ref of await references(databaseFile, root, files)) {
-    const { relative, source, branch } = ref;
+    const { relative, source, branch, rootAlias } = ref;
     try {
       requireMatch(!ref.reason, ref.reason);
-      const original = path.join(root, relative);
-      requireMatch(samePath(await fs.realpath(original), original), '原工作副本路径经过链接');
+      const original = await managedWorkspace(canonicalRoot, relative);
       const pointer = await textFile(path.join(original, '.git'));
       const pointerHash = hash(pointer.bytes);
+      const originalAdmin = pointerDirectory(pointer);
       const common = await sourceGitDirectory(source);
-      const { gitDir, head, stageHash, backlink } = await inspect(source, common, pointerDirectory(pointer), branch);
-      requireMatch(samePath(backlink.text, path.join(original, '.git')), 'Git 登记未指向当前工作副本');
+      const { gitDir, head, stageHash, backlink } = await inspect(source, common, originalAdmin, branch);
+      requireMatch(samePath(await fs.realpath(backlink.text), path.join(original, '.git')), 'Git 登记未指向当前工作副本');
       const file = files.get(relative + '/.git');
       requireMatch(!file.sha256 || file.sha256 === pointerHash, '备份期间 Git 指针发生变化');
-      evidence.push({ relative, source, branch, common, gitDir, head, pointerHash, stageHash });
+      evidence.push({ relative, source, branch, rootAlias, common, gitDir, head, pointerHash, stageHash, originalAdmin, originalBacklink: backlink.text });
     } catch (error) {
       evidence.push({ relative, reason: error.message });
     }
@@ -223,10 +238,11 @@ async function restorationPlan(ref, evidence, destination, originalRoot) {
   requireMatch(!ref.reason, ref.reason);
   requireMatch(evidence && !evidence.reason, evidence?.reason ?? '旧备份缺少 Git 暂存证据，请从原环境重新备份');
   requireMatch(evidence.source === ref.source && evidence.branch === ref.branch, '备份 Git 证据与任务登记不一致');
-  const workspace = path.join(destination, ref.relative);
   const original = path.join(originalRoot, ref.relative);
-  requireMatch(!await stat(original), '原工作副本仍在。请停止原宿主，把原副本移到保留位置后继续');
-  requireMatch(samePath(await fs.realpath(workspace), workspace), '恢复工作副本路径经过链接');
+  const originalBacklink = evidence.originalBacklink ?? path.join(original, '.git');
+  requireMatch(!await stat(original) && !await stat(originalBacklink),
+    '原工作副本仍在。请停止原宿主，把原副本移到保留位置后继续');
+  const workspace = await managedWorkspace(destination, ref.relative);
   for (const commandId of ref.receipts) {
     requireMatch(typeof commandId === 'string' && identifier.test(commandId) &&
       await readCommandCleanup(path.join(destination, 'integration-receipts', commandId + '.json')),
@@ -236,7 +252,7 @@ async function restorationPlan(ref, evidence, destination, originalRoot) {
   const pointer = await textFile(targetPointer);
   const newPointer = relocatedGitPointer(evidence, destination);
   requireMatch(newPointer && (pointer.bytes.equals(newPointer) ||
-    (hash(pointer.bytes) === evidence.pointerHash && samePath(pointerDirectory(pointer), evidence.gitDir))),
+    (hash(pointer.bytes) === evidence.pointerHash && samePath(pointerDirectory(pointer), evidence.originalAdmin ?? evidence.gitDir))),
     '恢复工作副本的 Git 指针与备份登记不一致');
   const newAdmin = relocatedAdmin(evidence, destination);
   const common = await sourceGitDirectory(ref.source);
@@ -249,7 +265,7 @@ async function restorationPlan(ref, evidence, destination, originalRoot) {
   }
   const replacement = path.join(workspace, '.git');
   const alreadyLinked = samePath(current.backlink.text, replacement);
-  requireMatch(samePath(current.backlink.text, path.join(original, '.git')) || (!oldExists && alreadyLinked),
+  requireMatch(samePath(current.backlink.text, originalBacklink) || (!oldExists && alreadyLinked),
     'Git 登记已被其他工作副本使用');
   return { ...current, workspace, original, replacement, source: ref.source, alreadyLinked,
     pointer, newPointer, newAdmin, oldAdmin: evidence.gitDir, targetPointer, moved: !oldExists };
