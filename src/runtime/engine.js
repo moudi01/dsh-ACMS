@@ -32,6 +32,7 @@ export class Engine {
     this.intervalMs = options.intervalMs ?? 1000; this.integration = Promise.resolve(); this.queuedIntegrations = new Set(); this.lastError = null;
   }
   async start() {
+    this.store.assertWorktreeRestoreReady();
     this.closing = false;
     this.nextEnvironmentCheck = 0;
     this.epoch = this.store.acquireLease(this.owner);

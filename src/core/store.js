@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { EventEmitter } from "node:events";
 import { asBusyError, assert, digest, now } from "./util.js";
 import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from "./activity.js";
+import { assertWorktreeRestoreReady } from "./restore-safety.js";
 
 export const SCHEMA_VERSION = "2";
 
@@ -26,8 +27,9 @@ export const EFFECTIVE_ACTIVITY_EVENTS = [
 ];
 
 export class Store {
-  constructor(filename) {
+  constructor(filename, { requireWorktreeReady = false } = {}) {
     this.filename = filename;
+    if (requireWorktreeReady) this.assertWorktreeRestoreReady();
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.db = new DatabaseSync(filename);
     this.events = new EventEmitter(); this.events.setMaxListeners(100);
@@ -52,6 +54,10 @@ export class Store {
     this.db.exec("CREATE INDEX IF NOT EXISTS events_entity_at ON events(entity_id, at)");
     if (version && version.value === "1") this.migrateEvents();
     this.db.prepare("INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run("schema", SCHEMA_VERSION);
+  }
+
+  assertWorktreeRestoreReady() {
+    if (this.filename !== ':memory:') assertWorktreeRestoreReady(dirname(this.filename));
   }
   migrateEvents() {
     this.transaction(() => {

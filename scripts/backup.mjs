@@ -7,6 +7,8 @@ import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { backupWorktreeEvidence, relocatedGitPointer } from './restore-worktrees.mjs';
+import { WORKTREE_RESTORE_HOLD, assertWorktreeRestoreReady, worktreeRestorePending } from '../src/core/restore-safety.js';
 
 export const FORMAT = 'acms-backup/1';
 const EXCLUDED_DIRS = [
@@ -71,6 +73,7 @@ async function walk(root) {
         await visit(absolute); continue;
       }
       if (entry.isFile()) {
+        if (relative === 'backup-manifest.json' || relative === 'REBUILD.md') continue;
         if (['company.db', 'company.db-wal', 'company.db-shm'].includes(relative)) {
           excluded.push({ path: relative, bytes: (await fs.lstat(absolute)).size,
             reason: relative === 'company.db' ? '数据库由一致性快照替代' : 'WAL/SHM 由一致性数据库快照覆盖',
@@ -87,6 +90,7 @@ async function walk(root) {
 
 export async function planBackup({ dataDir, out, includePairing = false }) {
   const source = path.resolve(dataDir);
+  assertWorktreeRestoreReady(source);
   if (!(await exists(path.join(source, 'company.db')))) throw new Error(`ACMS database not found under ${source}`);
   const target = path.resolve(out ?? `${source}-backup-${new Date().toISOString().replace(/[:.]/g, '-')}`);
   if (isInside(await realTarget(source), await realTarget(target))) throw new Error('Backup target must be outside the ACMS data directory');
@@ -139,6 +143,9 @@ export async function applyBackup(plan) {
   if (await exists(target)) { const entries = await fs.readdir(target).catch(() => []); if (entries.length) throw new Error(`Backup target is not empty: ${target}`); }
   await fs.mkdir(target, { recursive: true });
   const database = await snapshotDatabase(path.join(source, 'company.db'), path.join(target, 'company.db'));
+  const evidenceFile = path.join(target, database.file);
+  const worktreesBefore = new Map((await backupWorktreeEvidence(evidenceFile, source, new Map(plan.files.map(file => [file.path, file]))))
+    .map(item => [item.relative, item]));
   const files = [];
   for (const file of plan.files) {
     const destination = path.join(target, ...file.path.split('/'));
@@ -148,9 +155,12 @@ export async function applyBackup(plan) {
     await fs.writeFile(destination, bytes, { mode: 0o600 });
     files.push({ path: file.path, bytes: bytes.length, sha256: hash });
   }
+  const gitWorktrees = (await backupWorktreeEvidence(evidenceFile, source, new Map(files.map(file => [file.path, file]))))
+    .map(item => item.reason || JSON.stringify(item) === JSON.stringify(worktreesBefore.get(item.relative)) ? item
+      : { relative: item.relative, reason: '备份期间 Git 提交或暂存内容发生变化' });
   const manifest = {
-    format: FORMAT, createdAt: plan.createdAt, source, includePairing: plan.includePairing === true,
-    database, files, excluded: plan.excluded, warnings: plan.warnings,
+    format: FORMAT, createdAt: plan.createdAt, source, sourceRoot: await fs.realpath(source), includePairing: plan.includePairing === true,
+    database, files, excluded: plan.excluded, warnings: plan.warnings, gitWorktrees,
     totals: { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: plan.totals.excludedBytes,
       databaseBytes: database.bytes, requiredBytes: files.reduce((sum, file) => sum + file.bytes, 0) + database.bytes },
     note: 'Raw-byte SHA-256 is used for backup integrity. ACMS artifact.hash uses sha256(base64 text) and is not interchangeable.',
@@ -162,7 +172,7 @@ export async function applyBackup(plan) {
 
 // Full traversal for verification: unlike the backup walk this never applies
 // exclusions and reports symlinks, so an extra hidden file cannot pass.
-async function walkAll(root) {
+async function walkAll(root, pendingRestore) {
   const files = [];
   const symlinks = [];
   async function visit(directory) {
@@ -171,6 +181,7 @@ async function walkAll(root) {
       const relative = path.relative(root, absolute).split(path.sep).join('/');
       const stat = await fs.lstat(absolute);
       if (stat.isSymbolicLink()) { symlinks.push({ path: relative }); continue; }
+      if (pendingRestore && relative === WORKTREE_RESTORE_HOLD && stat.isDirectory()) continue;
       if (stat.isDirectory()) { await visit(absolute); continue; }
       files.push({ path: relative, bytes: stat.size, file: absolute });
     }
@@ -187,6 +198,17 @@ export async function verifyBackup(backupDir) {
   catch (error) { throw new Error(`Cannot read backup manifest: ${error.message}`); }
   if (manifest.format !== FORMAT) throw new Error(`Unsupported backup format: ${manifest.format}`);
   const errors = [];
+  const canonicalRoot = await fs.realpath(root);
+  const registeredRoot = manifest.restoredRoot ?? manifest.restoredTo;
+  const pendingRestore = typeof registeredRoot === 'string' && path.relative(registeredRoot, canonicalRoot) === '' &&
+    manifest.worktreeRecovery && worktreeRestorePending(root);
+  const migratedPointers = new Map();
+  if (pendingRestore) {
+    for (const proof of manifest.gitWorktrees ?? []) {
+      const pointer = relocatedGitPointer(proof, canonicalRoot);
+      if (pointer) migratedPointers.set(proof.relative + '/.git', pointer);
+    }
+  }
   const pathError = (relative, database = false) => {
     if (typeof relative !== 'string' || !relative) return 'path is missing';
     if (relative.includes('\\')) return 'must use forward slashes';
@@ -210,13 +232,15 @@ export async function verifyBackup(backupDir) {
     catch { errors.push(`${relative}: missing`); return; }
     if (stat.isSymbolicLink() || !stat.isFile()) { errors.push(`${relative}: not a regular file`); return; }
     const bytes = await fs.readFile(absolute);
+    const migrated = migratedPointers.get(relative);
+    if (migrated && bytes.equals(migrated)) return;
     if (bytes.length !== expected.bytes) errors.push(`${relative}: size ${bytes.length} != ${expected.bytes}`);
     if (sha256(bytes) !== expected.sha256) errors.push(`${relative}: sha256 mismatch`);
   };
   await check(manifest.database.file, manifest.database);
   for (const file of manifest.files) await check(file.path, file);
   const known = new Set(['backup-manifest.json', 'REBUILD.md', manifest.database.file, ...manifest.files.map(file => file.path)]);
-  const { files: existing, symlinks } = await walkAll(root);
+  const { files: existing, symlinks } = await walkAll(root, pendingRestore);
   for (const file of existing) if (!known.has(file.path)) errors.push(`${file.path}: unexpected file`);
   for (const link of symlinks) errors.push(`${link.path}: unexpected symlink`);
   if (errors.length) return { ok: false, errors };
