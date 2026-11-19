@@ -53,6 +53,11 @@ export function promptFor(company, task, attempt, options = {}) {
     ...(agent.role === 'manager' ? { managementResults: company.store.list('actionBatches').filter(b => b.taskId === task.id && b.generation === task.generation).map(b => ({ actionBatchId: b.batchId, results: b.results })), managementTurnsRemaining: 4 - (task.managementGeneration === task.generation ? task.managementTurns ?? 0 : 0) } : {}),
     ...(task.kind === 'review' ? { reviewWorkspacePolicy: 'This is a separate verification copy. You may create temporary test files and run checks here. Review the unchanged delivered source and the host-owned check evidence. Never modify the author workspace or original artifact blobs. A reviewer environment failure is a technical blocker, not evidence of a product defect.' } : {}),
     inputArtifacts: inputs, previousFeedback: task.feedback ?? null, userAnswer: task.lastAnswer ?? null,
+    ...(task.workspace?.compositionInput?.inputs?.length ? { selectedGitInputs: {
+      baseCommit: task.workspace.compositionBase, version: task.workspace.compositionInput.version,
+      inputs: task.workspace.compositionInput.inputs,
+      instructions: 'These exact dependency versions are already present in this isolated workspace. The Git branch starts at the pinned source commit. Work from the materialized files and preserve the selected dependency inputs unless the task requires modifying them.',
+    } } : {}),
     ...managerExtras,
     ...(task.workspace?.collaboration ? { collaboration: {
       index: task.workspace.collaboration.index, notes: task.workspace.collaboration.notes,
@@ -101,7 +106,8 @@ function goalReviewEvidence(company, task, goal, hostEvidence, projectArtifact) 
       artifacts: artifacts.map(a => ({ id: a.id, path: a.path, blob: a.blob, title: a.title, hash: a.hash, ...(a.archiveVerification ? { archiveVerification: a.archiveVerification } : {}), ...(a.textIntegrity ? { textIntegrity: a.textIntegrity } : {}) })),
       checks: hostEvidence === undefined ? deliveryChecks(store, row) : hostEvidence[row.id] ?? null };
   });
-  return { scope: 'goal', goal: goal.title, acceptance: goal.acceptance, deliveryHash: task.deliveryHash, targets };
+  return { scope: 'goal', goal: goal.title, acceptance: goal.acceptance, deliveryHash: task.deliveryHash, targets,
+    ...(hostEvidence?.composition ? { candidate: hostEvidence.composition } : {}) };
 }
 
 function buildManagerExtras(company, goal, task) {

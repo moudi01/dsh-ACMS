@@ -82,6 +82,7 @@ export function completeGoalContract(company, task, output, actor, planTasks = n
   }
   const decision = { reason: assessment.reason.trim(), reuse, followUps, decidedBy: actor.id, decidedAt: now() };
   store.put('goals', { ...goal, contractChange: { ...change, status: 'assessed', decision },
+    ...(goal.deliveryMode === 'git-composite' && followUps.length ? { compositionHistory: [...(goal.compositionHistory ?? []), ...followUps] } : {}),
     supersededTaskIds: [...new Set([...(goal.supersededTaskIds ?? []), ...replacements.keys()])] });
   store.event('goal.contract.assessed', goal.id, { contractVersion: contractVersion(goal), coordinationTaskId: task.id, decision }, actor);
   return decision;

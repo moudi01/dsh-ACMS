@@ -35,9 +35,38 @@ function save(engine, record, patch, event) {
   });
 }
 
+function settleCompositionRecheck(engine, record, { result, error, reason, observed, commandCleanupConfirmed, retryCheckpoint }) {
+  const goal = engine.store.require('goals', record.goalId);
+  const request = goal.compositionRecheck;
+  const matches = request?.id === record.compositionRecheckId && request.integrationId === record.id;
+  if (reason) {
+    save(engine, record, { phase: 'reconciling', reason, commandCleanupConfirmed, observed: observed ?? null }, 'integration.reconciling');
+    if (matches) engine.store.put('goals', { ...goal, compositionRecheck: { ...request, status: 'reconciling', reason } });
+    return;
+  }
+  if (!matches || ['cancelled', 'archived', 'deleted'].includes(goal.status)) {
+    save(engine, record, { phase: 'stopped', finishedAt: now() }, 'integration.stopped');
+    if (matches) engine.store.put('goals', { ...goal, compositionRecheck: null });
+    return;
+  }
+  const currentContract = record.goalContractVersion === contractVersion(goal) && goal.contractChange?.status !== 'pending';
+  if (result && currentContract) {
+    save(engine, record, { phase: 'completed', result, finishedAt: now() }, 'integration.completed');
+    engine.store.put('goals', { ...goal, composition: result.composition, compositionRecheck: null, completionPending: 'delivery' });
+    engine.store.event('goal.composition.verified', goal.id, { version: result.composition.version }, SYSTEM);
+    return;
+  }
+  const retry = currentContract && (retryCheckpoint || engine.closing || goalStopped(goal) || engine.company.policy().paused);
+  const failure = currentContract ? error?.message ?? '无法重新核对完整 Git 候选。' : '目标合同已变化，请核对当前输入后重新检查。';
+  save(engine, record, { phase: retry ? 'stopped' : 'failed', reason: retry ? null : failure, finishedAt: now() }, retry ? 'integration.stopped' : 'integration.failed');
+  engine.store.put('goals', { ...goal, compositionRecheck: { ...request, status: retry ? 'queued' : 'failed', reason: retry ? null : failure, integrationId: null } });
+}
+
 function settle(engine, record, { result, error, reason, observed, commandCleanupConfirmed = false, retryCheckpoint = false }) {
   return engine.store.transaction(() => {
     engine.fenced();
+    if (record.compositionRecheckId) return settleCompositionRecheck(engine, record,
+      { result, error, reason, observed, commandCleanupConfirmed, retryCheckpoint });
     const task = engine.store.require('tasks', record.taskId);
     if (task.activeIntegrationId !== record.id) return;
     const stopRequested = task.stopRequested ?? null;
@@ -175,52 +204,62 @@ export function interruptIntegration(engine) {
   const task = engine.store.get('tasks', entry.taskId);
   const policy = engine.company.policy();
   const goal = task && engine.store.get('goals', task.goalId);
-  if (engine.closing || !owns(engine) || task?.stopRequested || task?.status !== 'integrating' ||
+  const taskCurrent = entry.compositionRecheckId ? task?.status === 'succeeded' && goal?.compositionRecheck?.id === entry.compositionRecheckId
+    : task?.status === 'integrating';
+  if (engine.closing || !owns(engine) || task?.stopRequested || !taskCurrent ||
     (goalStopped(goal) && goal.executionControl?.mode !== 'after-current') ||
     (policy.paused && policy.pauseMode !== 'after-current')) {
     entry.controller.abort(new AcmsError('INTEGRATION_STOPPED', '集成在最终合入前停止'));
   }
 }
 
-export async function executeIntegration(engine, taskId) {
+export async function executeIntegration(engine, taskId, compositionRecheckId = null) {
   if (engine.closing || !owns(engine) || engine.company.policy().paused ||
     engine.store.list('integrations').some(integrationPending)) return;
   const task = engine.store.require('tasks', taskId);
-  if (task.status !== 'integrating' || ignoresBlocker(task)) return;
   const goal = engine.store.require('goals', task.goalId);
-  if (goalStopped(goal) || !matchesGoalContract(goal, task) || goal.contractChange?.status === 'pending') return;
+  const eligible = (currentTask, currentGoal) => compositionRecheckId
+    ? currentTask.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId && currentGoal.compositionRecheck.status === 'queued'
+    : currentTask.status === 'integrating' && !ignoresBlocker(currentTask) && matchesGoalContract(currentGoal, currentTask);
+  if (!eligible(task, goal) || goalStopped(goal) || goal.contractChange?.status === 'pending') return;
   if (goalRuntimeSpent(goal, engine.store.list('attempts')) >= goalRuntimeLimit(goal, engine.company.policy())) {
-    engine.block(task, 'budget', '目标累计执行时间额度已用完', '请追加目标执行时间额度后继续。');
+    if (compositionRecheckId) engine.store.put('goals', { ...goal,
+      compositionRecheck: { ...goal.compositionRecheck, status: 'failed', reason: '目标累计执行时间额度已用完，请追加额度后重验。' } });
+    else engine.block(task, 'budget', '目标累计执行时间额度已用完', '请追加目标执行时间额度后继续。');
     return;
   }
   const record = engine.store.transaction(() => {
     engine.fenced();
     const current = engine.store.require('tasks', taskId);
+    const currentGoal = engine.store.require('goals', task.goalId);
     const policy = engine.company.policy();
-    if (current.revision !== task.revision || policy.paused || goalStopped(engine.store.require('goals', task.goalId)) ||
+    if (current.revision !== task.revision || policy.paused || goalStopped(currentGoal) || !eligible(current, currentGoal) ||
       executionOccupancy(engine.store, engine.adapter, engine.live).used >= policy.maxConcurrent) return null;
     const saved = engine.store.put('integrations', {
       id: id('integration'), taskId, goalId: task.goalId, projectId: task.projectId, generation: task.generation,
       artifactHash: task.artifactHash, artifactIds: task.artifactIds, goalContractVersion: contractVersion(goal),
-      contract: contract(engine, task.projectId), phase: 'preparing',
+      contract: contract(engine, task.projectId), phase: 'preparing', ...(compositionRecheckId ? { compositionRecheckId } : {}),
     });
-    engine.store.put('tasks', { ...task, activeIntegrationId: saved.id });
+    if (compositionRecheckId) engine.store.put('goals', { ...currentGoal,
+      compositionRecheck: { ...currentGoal.compositionRecheck, status: 'checking', integrationId: saved.id } });
+    else engine.store.put('tasks', { ...task, activeIntegrationId: saved.id });
     engine.store.event('integration.started', taskId, { integrationId: saved.id, generation: task.generation, artifactHash: task.artifactHash }, SYSTEM);
     return saved;
   });
   if (!record) return;
-  const entry = { id: record.id, taskId, controller: new AbortController(), applying: false };
+  const entry = { id: record.id, taskId, controller: new AbortController(), applying: false, compositionRecheckId };
   engine.activeIntegration = entry;
   const { signal } = entry.controller;
   const isCurrent = () => {
     const current = engine.store.require('tasks', taskId);
     const policy = engine.company.policy();
     const currentGoal = engine.store.require('goals', task.goalId);
+    const taskCurrent = compositionRecheckId ? current.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId &&
+      currentGoal.compositionRecheck.integrationId === record.id && contractVersion(currentGoal) === record.goalContractVersion && currentGoal.contractChange?.status !== 'pending'
+      : current.activeIntegrationId === record.id && current.status === 'integrating' && !ignoresBlocker(current) && matchesGoalContract(currentGoal, current, record);
     return owns(engine) && !engine.closing && !signal.aborted && (!policy.paused || policy.pauseMode === 'after-current') &&
       (!goalStopped(currentGoal) || currentGoal.executionControl?.mode === 'after-current') &&
-      current.activeIntegrationId === record.id && current.status === 'integrating' && !ignoresBlocker(current) &&
-      current.generation === record.generation && current.artifactHash === record.artifactHash &&
-      matchesGoalContract(currentGoal, current, record);
+      taskCurrent && !current.stopRequested && current.generation === record.generation && current.artifactHash === record.artifactHash;
   };
   const guard = () => {
     assert(isCurrent(), 'STALE_INTEGRATION', 'Integration was stopped or replaced');
@@ -260,7 +299,7 @@ export async function executeIntegration(engine, taskId) {
     }
   };
   try {
-    const result = await engine.workspaces.integrate(task, isCurrent, {
+    const execution = {
       id: record.id,
       run: (executable, args, cwd, options) => command(executable, args, cwd, options),
       checkpoint: patch => { guard(); save(engine, record, patch, patch.phase === 'checking' ? 'integration.checking' : null); },
@@ -268,7 +307,9 @@ export async function executeIntegration(engine, taskId) {
         const result = await command('git', ['merge', '--ff-only', candidate], cwd, { timeout: 15000 }, { checks });
         assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || 'Final Git command did not complete cleanly');
       },
-    });
+    };
+    const result = compositionRecheckId ? await engine.workspaces.recheckGoalComposition(goal, task, execution)
+      : await engine.workspaces.integrate(task, isCurrent, execution);
     if (!owns(engine)) return;
     const current = engine.store.require('integrations', record.id);
     if (current.applyStartedAt) await reconcile(engine, current);

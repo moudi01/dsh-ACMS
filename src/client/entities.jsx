@@ -15,6 +15,8 @@ const reviewLabels = { ready: '待执行', running: '进行中', preparing: '准
 function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
   const review = goal.reviewSummary;
   const pending = goal.contractChange?.status === 'pending';
+  const waitingForComposition = goal.deliveryMode === 'git-composite' && !goal.compositionVerified;
+  const recheck = goal.compositionRecheck;
   const active = review && ['ready', 'running', 'preparing', 'blocked', 'paused', 'integrating', 'reconciling', 'stopping'].includes(review.status);
   let capacity = '';
   if (!pending && !active && goal.status === 'active') {
@@ -24,12 +26,17 @@ function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
       capacity = '最终审查等待独立审查员。请在「组织管理」分配可用审查员，或在「公司设置 → 编辑边界」调高「临时人员上限」。';
     }
   }
-  const reason = busy ? '正在保存，请稍候' : goal.status === 'cancelled' ? '目标已取消。' : goal.executionControl ? '请先恢复目标。' : pending ? '请先确认当前目标合同。' : active ? '已有进行中的最终审查，请等待结论。' : capacity || (!(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '');
+  const reason = busy ? '正在保存，请稍候' : goal.status === 'cancelled' ? '目标已取消。' : goal.executionControl ? '请先恢复目标。' : pending ? '请先确认当前目标合同。' : waitingForComposition ? '完整 Git 候选尚未通过联合检查。' : active ? '已有进行中的最终审查，请等待结论。' : capacity || (!(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '');
   return <section className="acms-review-state" aria-label="最终审查状态"><h3>最终审查</h3>
     <p>当前合同 v{goal.contractVersion ?? 1}{goal.completedContractVersion && <> · 最近完成 v{goal.completedContractVersion}</>}</p>
+    {goal.compositionVerified && <details><summary>完整 Git 候选已通过联合检查</summary><dl className="acms-definition"><dt>候选提交</dt><dd><code>{goal.composition.bundle.commit}</code></dd><dt>固定基线</dt><dd><code>{goal.composition.baseCommit}</code></dd><dt>本机交付包</dt><dd><code>{goal.composition.bundle.path}</code></dd></dl></details>}
+    {waitingForComposition && <p className="acms-sectionnote">{recheck?.reason || (recheck ? '完整 Git 候选正在等待重新核验。' : '完整 Git 候选尚未通过联合检查。请查看任务的集成状态。')}</p>}
+    {goal.deliveryMode === 'git-composite' && !pending && !goal.executionControl && goal.status !== 'cancelled' &&
+      goal.taskSummary?.done > 0 && goal.taskSummary.done === goal.taskSummary.total && (!recheck || recheck.status === 'failed') &&
+      <ActionButton reason={busy ? '正在保存，请稍候' : ''} onClick={() => act('goal.composition.recheck', { id: goal.id }, '已排队重新联合检查')}>重新联合检查</ActionButton>}
     {pending && <p className="acms-sectionnote">新要求待确认，普通任务暂不派发。{goal.contractChange.coordinationTaskId ? '等待负责人确认新合同。' : taskCount >= taskLimit ? goalContractCapacityMessage(taskCount, taskLimit) : '等待调度器安排合同确认。'}历史结论适用于当时的合同版本。</p>}
     {capacity && <p role="status" className="acms-sectionnote">{capacity}交付成果已保留，名额恢复后将自动排队。</p>}
-    {!review ? !capacity && <p className="acms-sectionnote">当前交付还没有最终审查任务{goal.reviewHistory?.length ? '（历史审查见下方）' : ''}。{!pending && (goal.status === 'succeeded' && goal.templateSnapshot?.finalReview === false ? '按模板配置未审查。' : '可以基于当前交付发起一次。')}</p> : <><p><span className="acms-tag">{reviewLabels[review.status] ?? review.status}</span>{review.status === 'succeeded' ? (review.passed ? ' 已通过' : ' 未通过（失败证据已保留）') : ''}</p>
+    {!review ? !capacity && !waitingForComposition && <p className="acms-sectionnote">当前交付还没有最终审查任务{goal.reviewHistory?.length ? '（历史审查见下方）' : ''}。{!pending && (goal.status === 'succeeded' && goal.templateSnapshot?.finalReview === false ? '按模板配置未审查。' : '可以基于当前交付发起一次。')}</p> : <><p><span className="acms-tag">{reviewLabels[review.status] ?? review.status}</span>{review.status === 'succeeded' ? (review.passed ? ' 已通过' : ' 未通过（失败证据已保留）') : ''}</p>
       {review.status === 'cancelled' && <><p className="acms-sectionnote">审查已取消：{review.cancelReason || '未填写原因'}（{review.cancelledBy === 'owner' ? '所有者' : review.cancelledBy ?? '未知'}，{review.cancelledAt ? new Date(review.cancelledAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}）。取消不会重开已交付任务，也不会自动重建审查。</p><p className="acms-sectionnote">可以基于当前交付重新发起一次最终审查；交付物变化时会重新核对，不会复用旧结论。</p></>}
       {review.status === 'failed' && <p className="acms-sectionnote">审查执行失败，失败证据已保留；可重新发起。</p>}</>}
     <ActionButton reason={reason} onClick={() => act('review.request', { goalId: goal.id }, '已发起目标最终审查')}>{review?.status === 'cancelled' || review?.status === 'failed' ? '重新发起最终审查' : '发起最终审查'}</ActionButton>
