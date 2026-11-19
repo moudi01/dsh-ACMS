@@ -1,11 +1,11 @@
 // Build artifacts only. No profile, live host or company database access.
 import { build } from 'esbuild';
-import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
+import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 async function matchesPublishedVersion(filename, bytes) {
-  const existing = await readFile(filename).catch(error => {
+  const existing = await fs.readFile(filename).catch(error => {
     if (error.code === 'ENOENT') return null;
     throw error;
   });
@@ -18,13 +18,16 @@ async function publishVersion(filename, bytes) {
   if (await matchesPublishedVersion(filename, bytes)) return;
   const temporary = filename + '.tmp-' + randomUUID();
   try {
-    await writeFile(temporary, bytes, { flag: 'wx', flush: true });
-    if (!await matchesPublishedVersion(filename, bytes)) await rename(temporary, filename);
-  } finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+    await fs.writeFile(temporary, bytes, { flag: 'wx', flush: true });
+    try { await fs.link(temporary, filename); }
+    catch (error) {
+      if (error.code !== 'EEXIST' || !await matchesPublishedVersion(filename, bytes)) throw error;
+    }
+  } finally { await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
 }
 
 export async function buildHost({ root, outDir = path.join(root, 'dist'), entryPoint = 'src/host/index.js' }) {
-  const source = await readFile(path.join(root, 'src/runtime/owned-job.cs'));
+  const source = await fs.readFile(path.join(root, 'src/runtime/owned-job.cs'));
   const resource = `owned-job-${createHash('sha256').update(source).digest('hex')}.cs`;
   const worker = await build({ absWorkingDir: root, entryPoints: ['src/runtime/delivery-archive-worker.js'], platform: 'node',
     format: 'esm', bundle: true, packages: 'external', write: false, target: 'node24' });
@@ -36,7 +39,7 @@ export async function buildHost({ root, outDir = path.join(root, 'dist'), entryP
   const bytes = bundle.outputFiles[0].contents;
   const revision = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
   const filename = path.join(outDir, `host-${revision}.mjs`);
-  await mkdir(outDir, { recursive: true });
+  await fs.mkdir(outDir, { recursive: true });
   // The resource is published before its referencing bundle. Old bundles retain
   // their matching resource for rollback, even when the C# implementation changes.
   await publishVersion(path.join(outDir, resource), source);

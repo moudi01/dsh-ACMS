@@ -3,19 +3,29 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deployLive } from '../scripts/deploy-live.mjs';
+import { buildHost } from '../scripts/host-bundle.mjs';
 import { WORKTREE_RESTORE_HOLD } from '../src/core/restore-safety.js';
 import { fixture } from './helpers.js';
 
 const deployScript = fileURLToPath(new URL('../scripts/deploy-live.mjs', import.meta.url));
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 const exec = promisify(execFile);
 const yaml = filename => filename.replaceAll('\\', '/').replaceAll("'", "''");
 
-async function profile(t) {
+async function profile(t, { separateDatabase = false } = {}) {
   const company = await fixture(t);
+  const dataDir = separateDatabase ? path.join(company.root, 'separate database # %') : company.dataDir;
+  const database = path.join(dataDir, 'company.db');
+  if (separateDatabase) {
+    await mkdir(dataDir);
+    const db = new DatabaseSync(database);
+    try { db.exec('CREATE TABLE entities(collection, id, body)'); } finally { db.close(); }
+  }
   const home = path.join(company.root, 'dsh');
   const profile = 'isolated';
   const profileDir = path.join(home, 'profiles', profile);
@@ -25,12 +35,12 @@ async function profile(t) {
   const patch = path.join(profileDir, 'cordis.patch.yml');
   const original = Buffer.from([
     '# 保留原样', '- id: other-plugin', '  config: { enabled: true }', '# BEGIN ACMS MANAGED CONFIG',
-    '- id: acms', `  name: '${yaml(oldHost)}'`, '  config:', `    dataDir: '${yaml(company.dataDir)}'`,
+    '- id: acms', `  name: '${yaml(oldHost)}'`, '  config:', `    dataDir: '${yaml(dataDir)}'`,
     '# END ACMS MANAGED CONFIG', '# after ACMS', '',
   ].join('\r\n'));
   await writeFile(patch, original);
-  return { ...company, home, profile, profileDir, patch, original, oldHost,
-    backups: path.join(company.dataDir, 'install-backups') };
+  return { ...company, dataDir, database, home, profile, profileDir, patch, original, oldHost,
+    backups: path.join(dataDir, 'install-backups') };
 }
 
 const fakeBuild = f => async () => ({ filename: path.join(f.root, 'host-new.mjs'), revision: 'new' });
@@ -87,6 +97,47 @@ test('a profile edit during build is preserved', async t => {
   } }), /Profile changed/);
   assert.deepEqual(await readFile(f.patch), changed);
   assert.deepEqual(await readdir(f.backups), []);
+});
+
+test('deploy refuses an absent or replaced database without creating or changing it', async t => {
+  for (const replace of [false, true]) {
+    const f = await profile(t, { separateDatabase: true });
+    const original = await readFile(f.database);
+    const held = path.join(f.root, 'preserved-company.db');
+    await assert.rejects(deployLive({ ...f, build: async () => {
+      await rename(f.database, held);
+      if (replace) await writeFile(f.database, original);
+      return fakeBuild(f)();
+    } }), /database moved or was replaced/);
+    assert.deepEqual(await readFile(f.patch), f.original);
+    assert.deepEqual(await readFile(held), original);
+    if (replace) assert.deepEqual(await readFile(f.database), original);
+    else await assert.rejects(stat(f.database), { code: 'ENOENT' });
+    await assert.rejects(readdir(f.backups), { code: 'ENOENT' });
+  }
+});
+
+test('the final database open cannot create a file after an identity check races with relocation', async t => {
+  const f = await profile(t, { separateDatabase: true });
+  const original = await readFile(f.database);
+  const held = path.join(f.root, 'preserved-company.db');
+  const originalStat = fs.statSync;
+  let moved = false;
+  const race = t.mock.method(fs, 'statSync', (filename, ...options) => {
+    const result = originalStat(filename, ...options);
+    if (filename === f.database && !moved && fs.existsSync(f.backups)) {
+      fs.renameSync(f.database, held);
+      moved = true;
+    }
+    return result;
+  });
+  try {
+    await assert.rejects(deployLive({ ...f, build: fakeBuild(f) }), /unable to open database file/);
+  } finally { race.mock.restore(); }
+  assert.equal(moved, true);
+  await assert.rejects(stat(f.database), { code: 'ENOENT' });
+  assert.deepEqual(await readFile(held), original);
+  assert.deepEqual(await readFile(f.patch), f.original);
 });
 
 test('the final publish serializes scheduler admission and a write failure leaves a usable backup', async t => {
@@ -150,4 +201,35 @@ test('an isolated CLI deployment after terminal integration can be rolled back u
   assert.deepEqual(await readFile(f.patch), f.original);
   assert.match(await readFile(f.oldHost, 'utf8'), /oldHost = true/);
   assert.deepEqual(f.store.require('integrations', settled.id), settled);
+});
+
+test('concurrent immutable resource publication keeps the first file or reports conflicting bytes', async t => {
+  for (const match of [true, false]) {
+    const f = await profile(t);
+    const outDir = path.join(f.root, 'host-dist');
+    const link = fs.promises.link;
+    let resource;
+    let firstBytes;
+    let firstStat;
+    const race = t.mock.method(fs.promises, 'link', async (temporary, filename) => {
+      if (path.basename(filename).startsWith('owned-job-')) {
+        resource = filename;
+        firstBytes = match ? await readFile(temporary) : Buffer.from('first publisher had different content');
+        await writeFile(filename, firstBytes, { flag: 'wx' });
+        firstStat = await stat(filename);
+      }
+      return link(temporary, filename);
+    });
+    try {
+      const build = buildHost({ root: projectRoot, outDir });
+      if (match) assert.equal((await build).resource, resource);
+      else await assert.rejects(build, /Existing host artifact differs from its versioned build/);
+    } finally { race.mock.restore(); }
+    assert(resource, 'a competing publisher must reach the no-clobber operation');
+    assert.deepEqual(await readFile(resource), firstBytes);
+    const after = await stat(resource);
+    assert.equal(after.ino, firstStat.ino);
+    assert.equal(after.mtimeMs, firstStat.mtimeMs);
+    assert(!(await readdir(outDir)).some(name => name.includes('.tmp-')));
+  }
 });
