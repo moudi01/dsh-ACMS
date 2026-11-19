@@ -190,7 +190,20 @@ export class Engine {
         await recoverIntegrations(this, task.id);
       }
       await refreshIntegrationReceipts(this);
-      const spent = new Map(this.store.list('goals').map(g => [g.id, goalRuntimeSpent(g, this.store.list('attempts'))]));
+      const goals = this.store.list('goals');
+      for (const goal of goals) {
+        if (!goal.completionPending || goalStopped(goal) || goal.legacyBatch || ['archived', 'deleted'].includes(goal.status)) continue;
+        try {
+          this.store.transaction(() => {
+            this.fenced();
+            this.updateGoal(goal.id);
+          });
+        } catch (error) {
+          this.fenced();
+          this.lastError = `无法更新目标 ${goal.id} 的交付状态：${error.message}`;
+        }
+      }
+      const spent = new Map(goals.map(g => [g.id, goalRuntimeSpent(g, this.store.list('attempts'))]));
       for (const [attemptId, entry] of this.live) {
         const task = this.store.require('tasks', entry.taskId);
         if ((spent.get(task.goalId) ?? 0) >= goalRuntimeLimit(this.store.require('goals', task.goalId), this.company.policy()) && !entry.controller.signal.aborted) entry.controller.abort(Object.assign(new Error('Goal runtime budget exhausted'), { code: 'GOAL_RUNTIME_BUDGET' }));

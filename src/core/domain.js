@@ -285,9 +285,10 @@ export class Company {
   refreshGoal(goalId, actor = SYSTEM) {
     const goal = this.store.require('goals', goalId);
     if (goalStopped(goal) || ['archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
-    const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
+    const goalTasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.status !== 'deleted');
+    const tasks = goalTasks.filter(t => t.kind !== 'review' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
     const complete = tasks.some(t => t.kind === 'work') && tasks.every(task => taskSettledForGoal(task, goal));
-    let status;
+    let status, completionPending = null;
     if (goal.contractChange?.status === 'pending') status = 'active';
     else if (!tasks.length) status = 'empty';
     else if (!complete) status = tasks.some(t => t.kind === 'plan' && !TERMINAL.has(t.status)) ? 'planning' : 'active';
@@ -298,14 +299,26 @@ export class Company {
         const deliveryHash = this.deliveryHash(goalId);
         const review = this.latestGoalReview(goalId);
         if (!review || review.deliveryHash !== deliveryHash) {
-          if (!review || TERMINAL.has(review.status)) this.createGoalReview(goal, deliveryHash);
+          if (!review || TERMINAL.has(review.status)) {
+            if (goalTasks.length >= this.policy().maxTasksPerGoal) completionPending = 'TASK_LIMIT';
+            else {
+              try { this.createGoalReview(goal, deliveryHash); }
+              catch (error) {
+                if (error.code !== 'AGENT_LIMIT') throw error;
+                completionPending = error.code;
+              }
+            }
+          }
           status = 'active';
         } else status = review.status === 'succeeded' && review.passed === true ? 'succeeded' : 'active';
       }
     }
-    if (status === goal.status) return goal;
+    const pendingChanged = (goal.completionPending ?? null) !== completionPending;
+    if (status === goal.status && !pendingChanged) return goal;
     const completed = status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {};
-    const saved = this.store.put('goals', { ...goal, status, ...completed });
+    const saved = this.store.put('goals', { ...goal, status, ...completed, ...(pendingChanged ? { completionPending } : {}) });
+    if (pendingChanged && completionPending) this.store.event('goal.final_review.waiting', goalId, { reason: completionPending }, SYSTEM);
+    if (status === goal.status) return saved;
     const delivered = status === 'succeeded' ? deliveredWork(this.store, goal) : [];
     const reviewCandidate = status === 'succeeded' ? this.latestGoalReview(goalId) : null;
     // Only a passed review bound to this exact delivery is evidence for the
@@ -343,7 +356,7 @@ export class Company {
     // A reviewer must not have authored any reviewed deliverable.
     const reviewer = this.reviewerFor(goal.id, targets.map(t => t.lastAuthorId));
     const review = this.createTask({
-      goalId: goal.id, kind: 'review', title: `最终审查：${goal.title}`,
+      goalId: goal.id, kind: 'review', title: `最终审查：${goal.title}`.slice(0, 300).toWellFormed(),
       description: '按目标模板对目标整体交付成果做一次最终审查。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
       acceptance: goal.acceptance, agentId: reviewer.id, requiresArtifacts: false,
       reviewScope: 'goal', deliveryHash,

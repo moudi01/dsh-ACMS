@@ -54,9 +54,25 @@ try {
   expect(store.require('tasks', task.id).status).toBe('succeeded');
   expect(store.require('tasks', taskReview.id).status).toBe('cancelled');
   expect(store.require('tasks', goalReview.id).status).toBe('cancelled');
+
+  const waiting = command('goal.create', { projectId: project.id, title: '等待最终审查名额', description: '交付一次', acceptance: '需要最终审查', plan: false });
+  const delivered = command('task.create', { goalId: waiting.id, title: '已保留的交付' });
+  command('policy.update', { patch: { maxTasksPerGoal: 1 } });
+  store.transaction(() => {
+    store.put('tasks', { ...delivered, status: 'succeeded', artifactHash: 'waiting-delivery' });
+    server.company.refreshGoal(waiting.id);
+  });
+  await page.reload();
+  await page.locator('.acms-project-group').filter({ hasText: '审查恢复项目' }).locator('summary').first().click({ position: { x: 8, y: 8 } });
+  await page.locator('.acms-goal-group').filter({ hasText: '等待最终审查名额' }).locator('summary .acms-entity-title').click();
+  const waitingReview = goalDrawer.getByLabel('最终审查状态');
+  await expect(waitingReview.getByRole('status')).toContainText('已用 1 项，上限 1 项');
+  await expect(waitingReview.getByRole('status')).toContainText('公司设置 → 编辑边界');
+  await expect(waitingReview.getByRole('button', { name: '发起最终审查' })).toBeDisabled();
+  expect(store.require('tasks', delivered.id).status).toBe('succeeded');
   expect(server.adapter.calls.length).toBe(0);
   expect(errors).toEqual([]);
-  const report = { passed: true, checked: ['cancelled goal review state and rebuild entry', 'cancelled task review state and rebuild entry', 'delivered work unchanged', 'duplicate rebuild avoided while one review is active', 'zero model calls'], goalId: goal.id, taskId: task.id };
+  const report = { passed: true, checked: ['cancelled goal review state and rebuild entry', 'cancelled task review state and rebuild entry', 'delivered work unchanged', 'duplicate rebuild avoided while one review is active', 'goal review explains capacity and where to adjust it', 'zero model calls'], goalId: goal.id, taskId: task.id };
   await writeFile('test-results/ui/review-recovery-report.json', JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {

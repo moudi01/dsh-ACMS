@@ -8,6 +8,7 @@ import { defaultSimulation } from '../src/adapters/simulated.js';
 import { canReconcileTask } from '../src/core/task-actions.js';
 import { run } from '../src/runtime/workspaces.js';
 import { cleanupError } from '../src/runtime/owned-process.js';
+import { executionOccupancy } from '../src/core/execution-capacity.js';
 
 const windows = { skip: process.platform !== 'win32' };
 const crashHost = fileURLToPath(new URL('./fixtures/integration-crash-host.mjs', import.meta.url));
@@ -25,6 +26,103 @@ const pending = async f => {
     return f.store.put('tasks', { ...task, workspace, artifactIds: artifacts.map(a => a.id), artifactHash: hash, changeSet, status: 'integrating', integrationPending: true });
   });
 };
+
+for (const autoMerge of [true, false]) test(`full goal waits for final review without blocking delivery (autoMerge=${autoMerge})`, autoMerge ? windows : {}, async t => {
+  const f = await fixture(t);
+  const before = autoMerge ? (await gitProject(f)).trim() : null;
+  f.command('policy.update', { patch: { maxConcurrent: 1, maxTasksPerGoal: 1 } });
+  const goal = f.command('goal.create', { title: 'Await final review at capacity', description: 'Deliver once', acceptance: 'Review the delivered file', projectId: f.project.id, plan: false });
+  const work = f.task({ goalId: goal.id });
+  const goalState = () => f.store.require('goals', goal.id);
+  const reviews = () => f.store.list('tasks').filter(task => task.kind === 'review' && task.goalId === goal.id);
+  const completed = () => records(f).filter(record => record.taskId === work.id);
+  await f.start();
+  await until(() => goalState().completionPending === 'TASK_LIMIT', 20000);
+  const saved = current(f, work);
+  assert.equal(saved.status, 'succeeded');
+  assert.equal(saved.integration.status, autoMerge ? 'merged' : 'available');
+  assert.equal(goalState().status, 'active');
+  assert.equal(reviews().length, 0);
+  assert.deepEqual(completed().map(row => row.phase), ['completed']);
+  assert.equal(executionOccupancy(f.store, f.adapter, f.engine.live).used, 0);
+  assert.match(await readFile(path.join(saved.workspace.path, 'deliverable.md'), 'utf8'), /Deliver a file/);
+  const committed = autoMerge ? await head(f) : null;
+  if (autoMerge) {
+    assert.notEqual(committed, before);
+    assert.equal(saved.integration.integratedCommit, committed);
+    assert.match(await readFile(sourceDelivery(f), 'utf8'), /Deliver a file/);
+  }
+  const deliveryHash = f.company.deliveryHash(goal.id);
+  await f.engine.stop();
+  // A second goal can still use the same single integration slot while the
+  // first waits. Use a separate directory project to keep its Git HEAD fixed.
+  const otherRoot = path.join(f.root, 'other-source');
+  await mkdir(otherRoot);
+  const otherProject = f.command('project.save', { name: 'Other project', repoRoot: otherRoot, mode: 'copy' });
+  const otherGoal = f.command('goal.create', { title: 'Other goal', description: 'Deliver independently', acceptance: 'File exists', projectId: otherProject.id, templateId: f.template.id, plan: false });
+  const other = f.task({ goalId: otherGoal.id });
+  await f.start();
+  await until(() => f.store.require('goals', otherGoal.id).status === 'succeeded', 15000);
+  assert.equal(current(f, other).status, 'succeeded');
+  assert.equal(goalState().completionPending, 'TASK_LIMIT');
+  assert.equal(reviews().length, 0);
+
+  if (autoMerge) f.command('goal.pause', { id: goal.id });
+  f.command('policy.update', { patch: { maxTasksPerGoal: 2 } });
+  if (autoMerge) {
+    await f.engine.tick();
+    assert.equal(reviews().length, 0);
+    f.command('goal.resume', { id: goal.id });
+  }
+  await until(() => goalState().status === 'succeeded', 15000);
+  assert.equal(goalState().completionPending, null);
+  assert.equal(goalState().completedDeliveryHash, deliveryHash);
+  assert.deepEqual(reviews().map(review => [review.status, review.deliveryHash]), [['succeeded', deliveryHash]]);
+  assert.deepEqual(completed().map(row => row.phase), ['completed']);
+  assert.equal(f.adapter.calls.filter(call => call.task.id === work.id).length, 1);
+  if (autoMerge) assert.equal(await head(f), committed);
+  const events = f.store.page(0, 200).entries;
+  assert.equal(events.filter(event => event.type === 'goal.final_review.waiting' && event.entityId === goal.id).length, 1);
+  assert.equal(events.filter(event => event.type === 'integration.completed' && event.entityId === work.id).length, 1);
+});
+
+test('final review allocation cannot roll back an available delivery', async t => {
+  const f = await fixture(t);
+  const goal = f.command('goal.create', { title: 'A'.repeat(300), description: 'Deliver once', acceptance: 'Review the original delivery', projectId: f.project.id, plan: false });
+  const task = f.task({ goalId: goal.id });
+  const createReview = f.company.createGoalReview.bind(f.company);
+  f.company.createGoalReview = () => { throw new Error('injected review allocation failure'); };
+  await f.start();
+  await until(() => f.engine.lastError?.includes('injected review allocation failure'));
+  assert.equal(current(f, task).status, 'succeeded');
+  assert.deepEqual(records(f).map(row => row.phase), ['completed']);
+  assert.equal(f.store.require('goals', goal.id).completionPending, 'delivery');
+  assert.equal(executionOccupancy(f.store, f.adapter, f.engine.live).used, 0);
+  await f.engine.stop();
+  f.company.createGoalReview = createReview;
+  await f.start();
+  await until(() => f.store.require('goals', goal.id).status === 'succeeded');
+  assert.equal(f.store.list('tasks').filter(item => item.goalId === goal.id && item.kind === 'review').length, 1);
+  assert.deepEqual(records(f).map(row => row.phase), ['completed']);
+});
+
+test('final review waits for an independent reviewer when temporary staff slots are full', async t => {
+  const f = await fixture(t);
+  f.command('policy.update', { patch: { maxTemporaryAgents: 1 } });
+  f.command('agent.save', { id: 'reviewer', name: '质量审查员', role: 'reviewer', status: 'retired' });
+  const goal = f.command('goal.create', { title: 'Wait for an independent reviewer', description: 'Deliver once', acceptance: 'Review the original delivery', projectId: f.project.id, plan: false });
+  const task = f.task({ goalId: goal.id, longLived: true });
+  await f.start();
+  await until(() => f.store.require('goals', goal.id).completionPending === 'AGENT_LIMIT');
+  assert.equal(current(f, task).status, 'succeeded');
+  assert.deepEqual(records(f).map(row => row.phase), ['completed']);
+  assert.equal(f.store.list('agents').filter(agent => agent.temporary && agent.status === 'available').length, 1);
+  f.command('agent.save', { id: 'reviewer', name: '质量审查员', role: 'reviewer', status: 'available' });
+  await until(() => f.store.require('goals', goal.id).status === 'succeeded');
+  const reviews = f.store.list('tasks').filter(item => item.goalId === goal.id && item.kind === 'review');
+  assert.deepEqual(reviews.map(item => item.agentId), ['reviewer']);
+  assert.equal(f.store.require('goals', goal.id).completionPending, null);
+});
 
 async function checkingFixture(t) {
   const f = await fixture(t);
