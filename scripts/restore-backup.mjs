@@ -2,11 +2,13 @@
 // Restore a verified ACMS backup into a new directory. The source backup is
 // never modified; the target must be empty so a restore cannot merge silently.
 import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { verifyBackup, sha256, realTarget, isInside } from './backup.mjs';
-import { hasWorktreeStartupHold, pendingWorktreeRefs, recoverWorktrees, setWorktreeStartupHold } from './restore-worktrees.mjs';
+import { pendingWorktreeRefs, recoverWorktrees, relocatedGitPointer } from './restore-worktrees.mjs';
+import { WORKTREE_RESTORE_HOLD, assertWorktreeRestoreReady, worktreeRestorePending } from '../src/core/restore-safety.js';
 
 function parseArgs(argv) {
   const args = { backup: null, target: null, json: false, resumeWorktrees: false };
@@ -32,23 +34,26 @@ export async function restoreBackup({ backup, target, resumeWorktrees = false })
     if (!verification.ok) throw new Error(`Restored data verification failed: ${verification.errors.join('; ')}`);
     const { manifest } = verification;
     if (manifest.restoredTo !== destination || !manifest.worktreeRecovery) throw new Error('--resume-worktrees requires an existing recorded restore target');
-    if (!manifest.worktreeRecovery.ready) {
-      if (!hasWorktreeStartupHold(path.join(destination, manifest.database.file))) throw new Error('Restored database has no recorded Git worktree startup hold');
+    if (worktreeRestorePending(destination)) {
       await completeWorktreeRestore(destination, manifest);
+    } else if (!manifest.worktreeRecovery.ready) {
+      throw new Error('Restored directory has no recorded Git worktree startup hold');
     }
     return report(destination, manifest);
   }
   const source = path.resolve(backup); const destination = path.resolve(target);
+  assertWorktreeRestoreReady(source);
   if (isInside(await realTarget(source), await realTarget(destination))) throw new Error('Restore target must be outside the backup directory');
   const verification = await verifyBackup(source);
   if (!verification.ok) throw new Error(`Backup verification failed: ${verification.errors.join('; ')}`);
+  const { manifest } = verification;
+  if (!path.isAbsolute(manifest.source)) throw new Error('Backup source must be an absolute data directory');
   let targetEntries = [];
   try { targetEntries = await fs.readdir(destination); } catch { /* new directory */ }
   if (targetEntries.length) throw new Error(`Restore target is not empty: ${destination}`);
   await fs.mkdir(destination, { recursive: true });
+  await fs.mkdir(path.join(destination, WORKTREE_RESTORE_HOLD), { mode: 0o700 });
   await fs.cp(source, destination, { recursive: true, errorOnExist: false });
-  const manifest = verification.manifest;
-  if (!path.isAbsolute(manifest.source)) throw new Error('Backup source must be an absolute data directory');
   const rewritten = rewritePaths(path.join(destination, manifest.database.file), manifest.source, destination);
   manifest.restoredFrom = manifest.source;
   manifest.restoredAt = new Date().toISOString();
@@ -61,21 +66,36 @@ export async function restoreBackup({ backup, target, resumeWorktrees = false })
 
 async function completeWorktreeRestore(destination, manifest) {
   const database = path.join(destination, manifest.database.file);
+  const staging = path.join(destination, WORKTREE_RESTORE_HOLD);
+  if (!(await fs.lstat(staging)).isDirectory()) throw new Error('Git worktree staging directory must be a regular directory');
   const refs = await pendingWorktreeRefs(database, destination, manifest.files);
-  if (refs.length && !manifest.worktreeRecovery) {
-    // Store the startup hold and a verified resumable manifest before any
-    // external Git registry write. A process crash leaves the hold in place.
-    setWorktreeStartupHold(database, true);
+  if (!manifest.worktreeRecovery) {
+    // Publish the resumable manifest before changing any external registration.
     manifest.worktreeRecovery = { ready: false, verified: [],
       issues: refs.map(ref => ({ path: ref.relative, reason: '等待核验 Git 工作副本' })) };
-    await writeRestoreState(destination, manifest);
+    await writeRestoreState(destination, manifest, staging);
   }
-  manifest.worktreeRecovery = await recoverWorktrees(refs, manifest.gitWorktrees, destination, manifest.source);
-  if (manifest.worktreeRecovery.ready) setWorktreeStartupHold(database, false);
-  await writeRestoreState(destination, manifest);
+  manifest.worktreeRecovery = await recoverWorktrees(refs, manifest.gitWorktrees, destination, manifest.source, staging);
+  if (manifest.worktreeRecovery.ready) {
+    const proofs = new Map((manifest.gitWorktrees ?? []).map(proof => [proof.relative + '/.git', proof]));
+    manifest.files = manifest.files.map(file => {
+      const pointer = relocatedGitPointer(proofs.get(file.path), destination);
+      return pointer ? { ...file, bytes: pointer.length, sha256: sha256(pointer) } : file;
+    });
+  }
+  await writeRestoreState(destination, manifest, staging);
+  if (manifest.worktreeRecovery.ready) {
+    for (const entry of await fs.readdir(staging, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^(backup-manifest\.json|REBUILD\.md|pointer)\.acms-[a-f0-9-]{36}$/.test(entry.name)) {
+        throw new Error('Unexpected staged restore entry: ' + entry.name);
+      }
+      await fs.unlink(path.join(staging, entry.name));
+    }
+    await fs.rmdir(staging);
+  }
 }
 
-async function writeRestoreState(destination, manifest) {
+async function writeRestoreState(destination, manifest, staging) {
   const database = path.join(destination, manifest.database.file);
   const check = new DatabaseSync(database);
   try {
@@ -108,8 +128,18 @@ async function writeRestoreState(destination, manifest) {
     for (const verified of manifest.worktreeRecovery.verified) lines.push(`- 已核验 \`${verified}\``);
     for (const item of manifest.worktreeRecovery.issues) lines.push(`- \`${item.path}\` · ${item.reason}`);
   }
-  await fs.writeFile(path.join(destination, 'REBUILD.md'), lines.join('\n'), { mode: 0o600 });
-  await fs.writeFile(path.join(destination, 'backup-manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
+  await publishRestoreFile('backup-manifest.json', JSON.stringify(manifest, null, 2) + '\n', destination, staging);
+  await publishRestoreFile('REBUILD.md', lines.join('\n'), destination, staging);
+}
+
+async function publishRestoreFile(filename, contents, destination, staging) {
+  const temporary = path.join(staging, filename + '.acms-' + randomUUID());
+  try {
+    await fs.writeFile(temporary, contents, { flag: 'wx', flush: true, mode: 0o600 });
+    await fs.rename(temporary, path.join(destination, filename));
+  } finally {
+    await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; });
+  }
 }
 
 function report(destination, manifest) {

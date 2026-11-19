@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -80,6 +81,8 @@ test('retained original worktrees prevent host startup until the same target saf
   assert.equal((await verifyBackup(target)).ok, true, 'blocked host startup must leave the verified copy resumable');
 
   const retained = path.join(f.root, 'retained-old-workspace');
+  const originalPointer = await readFile(path.join(workspace.path, '.git'));
+  const originalIndex = await readFile(await git(workspace.path, 'rev-parse', '--path-format=absolute', '--git-path', 'index'));
   await rename(workspace.path, retained);
   const partial = await restoreBackup({ target, resumeWorktrees: true });
   assert.equal(partial.startable, false);
@@ -96,11 +99,17 @@ test('retained original worktrees prevent host startup until the same target saf
   assert.equal(await backlink(restoredCandidate), path.join(restoredCandidate, '.git'));
   assert.equal(await git(restored, 'symbolic-ref', '--short', 'HEAD'), workspace.branch);
   assert.equal(await git(restoredCandidate, 'rev-parse', 'HEAD'), head);
+  const restoredIndex = await git(restored, 'rev-parse', '--path-format=absolute', '--git-path', 'index');
+  assert.deepEqual(await readFile(restoredIndex), originalIndex);
   assert.equal(await git(restored, 'status', '--porcelain', '--', 'staged.txt', 'local.bin'), status);
   assert.equal(await git(restored, 'show', ':staged.txt'), 'staged version');
   assert.equal(await readFile(path.join(restored, 'staged.txt'), 'utf8'), 'unstaged version\n');
   assert.deepEqual(await readFile(path.join(restored, 'local.bin')), Buffer.from([0, 255, 16]));
   assert.equal(await readFile(path.join(retained, 'staged.txt'), 'utf8'), 'unstaged version\n');
+  assert.deepEqual(await readFile(path.join(retained, '.git')), originalPointer);
+  assert.notEqual((await run('git', ['add', 'staged.txt'], retained)).code, 0, 'the parked copy cannot write the restored index');
+  assert.notEqual((await run('git', ['rev-parse', '--show-toplevel'], retainedCandidate)).code, 0);
+  assert.equal(await git(restored, 'show', ':staged.txt'), 'staged version');
   assert.equal(await git(f.source, 'rev-parse', 'HEAD'), head);
   assert.equal(await git(f.source, 'status', '--porcelain', '--', '.', ':(exclude).acms'), sourceStatus);
   assert.equal((await verifyBackup(target)).ok, true);
@@ -166,4 +175,67 @@ test('older backup format remains verifiable and reports missing Git registratio
   assert.equal(saved.worktrees.issues[0].path, 'workspaces/' + task.id);
   assert.match(saved.worktrees.issues[0].reason, /旧备份缺少 Git 暂存证据/);
   assert.equal((await verifyBackup(target)).ok, true);
+});
+
+test('publishing the final manifest can fail without opening the startup gate or blocking resume', async t => {
+  const { f, task, workspace, backup, target } = await makeFixture(t);
+  assert.equal((await restoreBackup({ backup, target })).startable, false);
+  await rename(workspace.path, path.join(f.root, 'old-worktree'));
+  const originalWrite = fs.writeFile;
+  const fail = t.mock.method(fs, 'writeFile', async (filename, ...args) => {
+    if (path.basename(filename).startsWith('backup-manifest.json.acms-')) throw new Error('injected final manifest write failure');
+    return originalWrite(filename, ...args);
+  });
+  try {
+    await assert.rejects(restoreBackup({ target, resumeWorktrees: true }), /injected final manifest write failure/);
+  } finally { fail.mock.restore(); }
+
+  const restored = path.join(target, 'workspaces', task.id);
+  assert.equal(await backlink(restored), path.join(restored, '.git'));
+  await assert.rejects(apply({}, { dataDir: target }), { code: 'RESTORE_WORKTREES_PENDING' });
+  assert.match(await readFile(path.join(target, 'REBUILD.md'), 'utf8'), /--resume-worktrees/);
+  assert.equal((await verifyBackup(target)).ok, true, 'the pending manifest accounts for a migrated pointer');
+  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
+  assert.equal((await verifyBackup(target)).ok, true);
+  assert.equal((await verifyBackup(backup)).ok, true);
+});
+
+test('a missing staged blob keeps restore pending until it can actually be read', async t => {
+  const { f, task, workspace, backup, target } = await makeFixture(t);
+  const object = await git(workspace.path, 'rev-parse', ':staged.txt');
+  const common = await git(f.source, 'rev-parse', '--path-format=absolute', '--git-common-dir');
+  const blob = path.join(common, 'objects', object.slice(0, 2), object.slice(2));
+  const parkedBlob = path.join(f.root, 'staged-blob');
+  await rename(blob, parkedBlob);
+  await rename(workspace.path, path.join(f.root, 'old-worktree'));
+
+  const result = await restoreBackup({ backup, target });
+  assert.equal(result.startable, false);
+  assert.match(result.worktrees.issues[0].reason, new RegExp(object));
+  await assert.rejects(apply({}, { dataDir: target }), { code: 'RESTORE_WORKTREES_PENDING' });
+  assert.equal((await verifyBackup(target)).ok, true);
+  await rename(parkedBlob, blob);
+  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
+  assert.equal(await git(path.join(target, 'workspaces', task.id), 'show', ':staged.txt'), 'staged version');
+});
+
+test('a second registry write failure rolls back both administrative paths and pointers', async t => {
+  const { f, task, workspace, candidateId, candidates: [candidate], backup, target } = await makeFixture(t, { candidate: true });
+  assert.equal((await restoreBackup({ backup, target })).startable, false);
+  await rename(workspace.path, path.join(f.root, 'old-worktree'));
+  await rename(candidate, path.join(f.root, 'old-candidate'));
+  let writes = 0;
+  const fail = t.mock.method(fs, 'rename', async (from, to) => {
+    if (path.basename(to) === 'gitdir' && ++writes === 2) throw new Error('injected second backlink write failure');
+    return rename(from, to);
+  });
+  try {
+    const result = await restoreBackup({ target, resumeWorktrees: true });
+    assert.equal(result.startable, false);
+    assert.match(result.worktrees.issues[0].reason, /injected second backlink write failure/);
+  } finally { fail.mock.restore(); }
+  assert.equal(await backlink(path.join(target, 'workspaces', task.id)), path.join(workspace.path, '.git'));
+  assert.equal(await backlink(path.join(target, 'integration', candidateId)), path.join(candidate, '.git'));
+  assert.equal((await verifyBackup(target)).ok, true);
+  assert.equal((await restoreBackup({ target, resumeWorktrees: true })).startable, true);
 });

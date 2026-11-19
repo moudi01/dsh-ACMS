@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { EventEmitter } from "node:events";
 import { asBusyError, assert, digest, now } from "./util.js";
 import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from "./activity.js";
+import { assertWorktreeRestoreReady } from "./restore-safety.js";
 
 export const SCHEMA_VERSION = "2";
 
@@ -28,18 +29,9 @@ export const EFFECTIVE_ACTIVITY_EVENTS = [
 export class Store {
   constructor(filename, { requireWorktreeReady = false } = {}) {
     this.filename = filename;
+    if (requireWorktreeReady) this.assertWorktreeRestoreReady();
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.db = new DatabaseSync(filename);
-    if (requireWorktreeReady) {
-      try {
-        const entities = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").get();
-        const hold = entities && this.db.prepare("SELECT 1 FROM entities WHERE collection='restoreSafety' AND id='git-worktrees'").get();
-        assert(!hold, 'RESTORE_WORKTREES_PENDING', '恢复目录的 Git 工作副本仍待核验。请查看该目录的 REBUILD.md 后续接恢复。');
-      } catch (error) {
-        this.db.close();
-        throw error;
-      }
-    }
     this.events = new EventEmitter(); this.events.setMaxListeners(100);
     this.inTransaction = false; this.pending = [];
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
@@ -62,6 +54,10 @@ export class Store {
     this.db.exec("CREATE INDEX IF NOT EXISTS events_entity_at ON events(entity_id, at)");
     if (version && version.value === "1") this.migrateEvents();
     this.db.prepare("INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run("schema", SCHEMA_VERSION);
+  }
+
+  assertWorktreeRestoreReady() {
+    if (this.filename !== ':memory:') assertWorktreeRestoreReady(dirname(this.filename));
   }
   migrateEvents() {
     this.transaction(() => {
