@@ -28,6 +28,9 @@ jobs:
       - run: npm run test:artifact-download
       - run: npm run test:review-recovery
       - run: npm run package:release
+        env:
+          # The packaging command must install native dependencies even with this npm default.
+          npm_config_omit: optional
       - uses: actions/upload-artifact@v4
         with:
           name: acms-release-${{ github.sha }}-${{ github.run_attempt }}

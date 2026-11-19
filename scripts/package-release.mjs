@@ -14,7 +14,7 @@ assert(npmCli, 'Run this script with npm run package:release');
 
 const run = (command, args, cwd, options = {}) => execFileSync(command, args, { cwd, encoding: 'utf8', ...options });
 const npm = (args, cwd, options) => run(process.execPath, [npmCli, ...args], cwd, options);
-const install = cwd => npm(['ci', '--include=dev', '--no-audit', '--no-fund'], cwd, { stdio: 'inherit' });
+const install = cwd => npm(['ci', '--include=dev', '--include=optional', '--no-audit', '--no-fund'], cwd, { stdio: 'inherit' });
 const readJson = async file => JSON.parse(await readFile(file, 'utf8'));
 
 function githubRun(commit) {
@@ -26,12 +26,30 @@ function githubRun(commit) {
     url: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}` };
 }
 
-async function verifyPackage(cwd) {
+async function verifyCodexCli(cwd, runtimeEntry, expectedVersion) {
+  const manifestPath = createRequire(runtimeEntry).resolve('@openai/codex/package.json');
+  const packageDir = path.dirname(manifestPath);
+  const cli = await readJson(manifestPath);
+  const lock = await readJson(path.join(cwd, 'package-lock.json'));
+  const lockPath = path.relative(cwd, packageDir).split(path.sep).join('/');
+  const lockedVersion = lock.packages?.[lockPath]?.version;
+  assert.equal(lockedVersion, expectedVersion, 'Codex CLI lockfile version must match the runtime dependency');
+  assert.equal(cli.version, lockedVersion, 'Installed Codex CLI version must match the lockfile');
+  assert(typeof cli.bin?.codex === 'string' && cli.bin.codex, 'Codex CLI package is missing its launcher');
+  const launcher = path.resolve(packageDir, cli.bin.codex);
+  const reported = run(process.execPath, [launcher, '--version'], cwd, { timeout: 30000, windowsHide: true }).trim();
+  assert.equal(reported, `codex-cli ${lockedVersion}`, 'Codex CLI reported an unexpected version');
+  console.log(`Verified ${reported} from the extracted candidate`);
+  return lockedVersion;
+}
+
+async function verifyPackage(cwd, expectedCodexVersion) {
   const requireFromPackage = createRequire(path.join(cwd, 'package.json'));
   const host = await import(pathToFileURL(requireFromPackage.resolve('dsh-acms')).href);
   assert.equal(host.name, 'acms');
   assert.equal(typeof host.apply, 'function');
-  const codex = await import(pathToFileURL(requireFromPackage.resolve('@acms/codex-runtime')).href);
+  const runtimeEntry = requireFromPackage.resolve('@acms/codex-runtime');
+  const codex = await import(pathToFileURL(runtimeEntry).href);
   assert.equal(typeof codex.startCodexRun, 'function');
   const client = await readFile(requireFromPackage.resolve('dsh-acms/client'), 'utf8');
   let registered = false;
@@ -42,6 +60,7 @@ async function verifyPackage(cwd) {
   } } };
   runInNewContext(client, { window });
   assert(registered, 'Client entry did not register with the DSH module loader');
+  return verifyCodexCli(cwd, runtimeEntry, expectedCodexVersion);
 }
 
 async function describeFile(directory, name) {
@@ -76,7 +95,6 @@ async function buildCandidate(staging, commit, workflow) {
   await copyFile(path.join(source, lockfile), path.join(staging, lockfile));
   await copyFile(path.join(staging, lockfile), path.join(extracted, lockfile));
   install(extracted);
-  await verifyPackage(extracted);
 
   const pkg = await readJson(path.join(extracted, 'package.json'));
   const runtime = await readJson(path.join(extracted, 'packages/codex-runtime/package.json'));
@@ -84,14 +102,15 @@ async function buildCandidate(staging, commit, workflow) {
   for (const [name, version] of Object.entries(requirements)) {
     assert(typeof version === 'string' && version.trim(), `Package must declare its ${name} version requirement`);
   }
+  const codexCli = await verifyPackage(extracted, requirements.codexCli);
   const manifest = {
     schemaVersion: 1,
     package: { name: pkg.name, version: pkg.version, license: pkg.license },
     commit,
     workflow,
-    build: { platform: process.platform, arch: process.arch, node: process.versions.node, npm: npm(['--version'], source).trim() },
+    build: { platform: process.platform, arch: process.arch, node: process.versions.node, npm: npm(['--version'], source).trim(), codexCli },
     requirements,
-    checks: ['required package files', 'extracted npm ci', 'host entry', 'DSH client entry', 'Codex runtime entry'],
+    checks: ['required package files', 'extracted npm ci', 'host entry', 'DSH client entry', 'Codex runtime entry', 'Codex CLI --version'],
     files: await Promise.all([packed.filename, lockfile].map(name => describeFile(staging, name))),
   };
 
