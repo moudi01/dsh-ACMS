@@ -119,6 +119,59 @@ test('extensions keep one outstanding time-box decision until it is settled', as
   assert.equal(warnings().length, 2);
 });
 
+async function cancelExtendedTimeBox(t) {
+  const f = await fixture(t);
+  f.command('agent.save', { id: 'manager', status: 'retired' });
+  f.command('policy.update', { patch: { goalTimeBoxMs: 60000, maxGoalRuntimeMs: 360000 } });
+  const work = f.task({ title: 'Work after a cancelled wrap-up' });
+  f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs: 120000 });
+  await f.start();
+  const original = await until(() => timeboxTasks(f).find(task => task.status === 'blocked'), 15000);
+  const goal = f.store.require('goals', f.goal.id);
+  f.command('goal.runtime.extend', { id: goal.id, expectedRevision: goal.revision, additionalRuntimeMs: 120000 });
+  await f.engine.stop();
+  f.command('task.cancel', { id: original.id, reason: 'Cancel the old wrap-up' });
+  const question = f.store.list('interactions').find(item => item.taskId === original.id);
+  assert.equal(question.status, 'cancelled');
+  assert.equal(f.store.require('tasks', work.id).status, 'ready');
+  assert.equal(f.store.list('attempts').length, 0);
+  return { f, work, original };
+}
+
+test('after restart a cancelled wrap-up below the extended threshold lets ordinary work finish', async t => {
+  const { f, work, original } = await cancelExtendedTimeBox(t);
+  await f.engine.start();
+  await until(() => f.store.require('tasks', work.id).status === 'succeeded', 10000);
+  assert.equal(f.store.require('goals', f.goal.id).status, 'succeeded');
+  assert.equal(f.store.require('goals', f.goal.id).timeBox, null);
+  assert.deepEqual(timeboxTasks(f).map(task => [task.id, task.status]), [[original.id, 'cancelled']]);
+  assert.equal(events(f).filter(event => event.type === 'goal.timebox.warning').length, 1);
+});
+
+test('at the current threshold a cancelled wrap-up is replaced by one actionable decision', async t => {
+  const { f, work, original } = await cancelExtendedTimeBox(t);
+  f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs: 180000 });
+  await f.engine.start();
+  const replacement = await until(() => timeboxTasks(f).find(task => task.id !== original.id && task.status === 'blocked'), 10000);
+  assert.equal(f.store.require('goals', f.goal.id).timeBox.boxMs, 180000);
+
+  // At the same threshold, an older cancelled task with the same key must not be reused.
+  f.command('task.cancel', { id: replacement.id });
+  const current = await until(() => timeboxTasks(f).find(task => task.coordinationKey === replacement.coordinationKey && task.id !== replacement.id && task.status === 'blocked'), 10000);
+  await f.engine.stop(); await f.engine.start(); await f.engine.tick();
+  const pending = f.store.list('interactions').filter(item => item.kind === 'assignment' && item.status === 'pending');
+  assert.deepEqual(pending.map(item => item.taskId), [current.id]);
+  assert.equal(f.store.require('goals', f.goal.id).timeBox.coordinationTaskId, current.id);
+  assert.equal(f.store.list('attempts').length, 0);
+
+  f.command('agent.save', { id: 'manager', status: 'available' });
+  f.command('interaction.answer', { id: pending[0].id, answer: '请完成收尾' });
+  await until(() => f.store.require('tasks', work.id).status === 'succeeded', 15000);
+  assert.equal(f.store.require('goals', f.goal.id).status, 'succeeded');
+  assert.equal(events(f).filter(event => event.type === 'goal.timebox.warning').length, 3);
+  assert.equal(events(f).filter(event => event.type === 'goal.timebox.released').length, 1);
+});
+
 test('capacity failure keeps an owner entry and does not stop other goals', async t => {
   const f = await fixture(t);
   f.adapter.delay = 20;

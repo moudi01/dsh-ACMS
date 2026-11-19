@@ -20,6 +20,9 @@ import { readCommandCleanup } from './host-command.js';
 import { preparationForTask } from '../core/project-preparation.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
+const canContinueTimeBoxTask = (goal, task) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
+  task.goalId === goal.id && !task.contractObsolete && matchesGoalContract(goal, task) &&
+  (!TERMINAL.has(task.status) || task.status === 'failed');
 const checkReceipt = (engine, commandId) => path.join(engine.workspaces.dataDir, 'check-receipts', commandId + '.json');
 export class Engine {
   constructor(company, adapter, workspaces, options = {}) {
@@ -214,13 +217,23 @@ export class Engine {
         if (goalStopped(goal) || ['succeeded', 'archived', 'deleted'].includes(goal.status)) continue;
         const hardLimit = goalRuntimeLimit(goal, p);
         const used = spent.get(goal.id) ?? goal.runtimeMs ?? 0;
-        if (used >= hardLimit) continue;
-        // Finish an open decision under its original key. After release, the
-        // effective threshold applies to the next warning.
         const effectiveBoxLimit = goalTimeBoxLimit(goal, p);
         const pendingBox = pendingGoalTimeBox(goal);
-        if (!effectiveBoxLimit || (!pendingBox && used < effectiveBoxLimit)) continue;
-        this.ensureTimeBoxWarning(goal, used, hardLimit, pendingBox?.boxMs ?? effectiveBoxLimit, p);
+        // A retryable decision keeps its original threshold. Once its task can
+        // no longer be handled, re-evaluate the current threshold from scratch.
+        const taskId = pendingBox?.coordinationTaskId;
+        const obsolete = taskId && !canContinueTimeBoxTask(goal, this.store.get('tasks', taskId));
+        const openBox = obsolete ? null : pendingBox;
+        if (effectiveBoxLimit && used < hardLimit && (openBox || used >= effectiveBoxLimit)) {
+          this.ensureTimeBoxWarning(goal, used, hardLimit, openBox?.boxMs ?? effectiveBoxLimit, p);
+        } else if (obsolete) {
+          this.store.transaction(() => {
+            const current = this.store.require('goals', goal.id);
+            if (pendingGoalTimeBox(current)?.coordinationTaskId !== taskId) return;
+            this.store.put('goals', { ...current, timeBox: null });
+            this.updateGoal(goal.id);
+          });
+        }
       }
       const { attempts: active, integrations: occupiedIntegrations, used } = executionOccupancy(this.store, this.adapter, this.live);
       let free = p.maxConcurrent - used; if (free <= 0) return;
@@ -311,9 +324,10 @@ export class Engine {
   ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, policy) {
     return this.store.transaction(() => {
     const key = timeBoxCoordinationKey(goal.id, boxLimit);
-    const existing = this.store.list('tasks').find(task => task.kind === 'coordination' && task.coordinationKey === key && task.status !== 'deleted');
+    if (goal.timeBox?.key === key && goal.timeBox.releasedAt) return null;
+    const existing = this.store.list('tasks').find(task => task.coordinationKey === key && canContinueTimeBoxTask(goal, task));
     if (existing) {
-      if (goal.timeBox?.key === key && (goal.timeBox.coordinationTaskId === existing.id || goal.timeBox.releasedAt)) return existing;
+      if (goal.timeBox?.key === key && goal.timeBox.coordinationTaskId === existing.id) return existing;
       this.store.put('goals', { ...this.store.require('goals', goal.id), timeBox: { ...(goal.timeBox ?? {}), key, boxMs: boxLimit, warnedAt: existing.createdAt ?? now(), coordinationTaskId: existing.id, releasedAt: null } });
       return existing;
     }

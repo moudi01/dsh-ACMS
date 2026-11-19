@@ -286,7 +286,7 @@ export class Company {
     const goal = this.store.require('goals', goalId);
     if (goalStopped(goal) || ['archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
     const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
-    const complete = tasks.some(t => t.kind === 'work') && tasks.every(taskSettledForGoal);
+    const complete = tasks.some(t => t.kind === 'work') && tasks.every(task => taskSettledForGoal(task, goal));
     let status;
     if (goal.contractChange?.status === 'pending') status = 'active';
     else if (!tasks.length) status = 'empty';
