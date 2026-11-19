@@ -172,6 +172,78 @@ test('at the current threshold a cancelled wrap-up is replaced by one actionable
   assert.equal(events(f).filter(event => event.type === 'goal.timebox.released').length, 1);
 });
 
+for (const requiresRecovery of [false, true]) test(`a running time-box cancellation holds dispatch until ${requiresRecovery ? 'recovery confirms cleanup' : 'dispose confirms cleanup'}`, async t => {
+  const f = await fixture(t);
+  const finishDispose = Promise.withResolvers();
+  const start = f.adapter.start.bind(f.adapter);
+  f.adapter.delay = 30000;
+  f.adapter.start = async input => {
+    const activation = await start(input);
+    if (input.agent.id !== 'manager') return activation;
+    return { ...activation, async dispose() {
+      await finishDispose.promise;
+      await activation.dispose();
+      if (requiresRecovery) throw new Error('Cleanup receipt is not yet available');
+    } };
+  };
+  let confirmed = false;
+  f.adapter.reconcile = async () => confirmed
+    ? { status: 'stopped', cleanupConfirmed: true, reason: 'Verified cleanup' }
+    : { status: 'unknown', reason: 'Missing cleanup receipt' };
+  f.command('policy.update', { patch: { goalTimeBoxMs: 60000, maxGoalRuntimeMs: 360000 } });
+  const work = f.task({ title: 'Work after cleanup' });
+  f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs: 120000 });
+  try {
+    await f.start();
+    const original = await until(() => f.adapter.calls.find(call => call.task.origin?.kind === 'timebox'), 15000);
+    const originalAttempt = () => f.store.require('attempts', original.attempt.id);
+    const manager = f.command('agent.save', { name: 'Replacement manager', role: 'manager' });
+    f.command('agent.save', { id: 'manager', status: 'retired' });
+    if (requiresRecovery) {
+      const goal = f.store.require('goals', f.goal.id);
+      f.command('goal.runtime.extend', { id: goal.id, expectedRevision: goal.revision, additionalRuntimeMs: 120000 });
+    }
+    f.adapter.delay = 10;
+    f.command('task.cancel', { id: original.task.id });
+    await until(() => f.store.require('tasks', original.task.id).status === 'cancelled' && originalAttempt().cleanupPending);
+    await until(() => !f.engine.ticking);
+    await f.engine.tick();
+    assert.equal(f.adapter.active, 1);
+    assert.equal(f.adapter.calls.length, 1);
+    assert.deepEqual(timeboxTasks(f).map(task => task.id), [original.task.id]);
+    assert.equal(f.store.require('tasks', work.id).status, 'ready');
+    assert.equal(f.store.require('tasks', original.task.id).stopRequested, 'cancelled');
+
+    finishDispose.resolve();
+    if (requiresRecovery) {
+      await until(() => originalAttempt().status === 'reconciling' && !f.engine.live.has(original.attempt.id));
+      await f.engine.stop();
+      // A previous host could persist the cancelled task without a stop intent
+      // if it exited after failure settlement while dispose was still pending.
+      const task = f.store.require('tasks', original.task.id);
+      f.store.put('tasks', { ...task, status: 'cancelled', stopRequested: null });
+      await f.engine.start(); await f.engine.tick();
+      assert.equal(originalAttempt().cleanupPending, true);
+      assert.equal(f.adapter.calls.length, 1);
+      confirmed = true;
+      f.command('task.reconcile', { id: original.task.id });
+    }
+    await until(() => f.store.require('tasks', work.id).status === 'succeeded', 15000);
+    assert.equal(originalAttempt().cleanupPending, false);
+    assert.equal(f.store.require('tasks', original.task.id).status, 'cancelled');
+    const wrapUps = f.adapter.calls.filter(call => call.task.origin?.kind === 'timebox');
+    assert.equal(wrapUps.length, requiresRecovery ? 1 : 2);
+    if (!requiresRecovery) {
+      const replacement = wrapUps[1];
+      assert.equal(replacement.agent.id, manager.id);
+      assert.equal(replacement.task.coordinationKey, original.task.coordinationKey);
+      const cleaned = events(f).find(event => event.type === 'attempt.cleanup.confirmed' && event.entityId === original.attempt.id);
+      const claimed = events(f).find(event => event.type === 'attempt.claimed' && event.entityId === replacement.attempt.id);
+      assert.ok(cleaned.seq < claimed.seq);
+    }
+  } finally { finishDispose.resolve(); }
+});
+
 test('capacity failure keeps an owner entry and does not stop other goals', async t => {
   const f = await fixture(t);
   f.adapter.delay = 20;

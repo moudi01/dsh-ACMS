@@ -20,9 +20,10 @@ import { readCommandCleanup } from './host-command.js';
 import { preparationForTask } from '../core/project-preparation.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
-const canContinueTimeBoxTask = (goal, task) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
-  task.goalId === goal.id && !task.contractObsolete && matchesGoalContract(goal, task) &&
-  (!TERMINAL.has(task.status) || task.status === 'failed');
+const holdsTimeBox = (goal, task, occupiedTaskIds) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
+  task.goalId === goal.id && (occupiedTaskIds.has(task.id) ||
+    (!task.contractObsolete && matchesGoalContract(goal, task) && (!TERMINAL.has(task.status) || task.status === 'failed')));
+const recoverStopIntent = task => task.stopRequested ?? (task.status === 'cancelled' && task.origin?.kind === 'timebox' ? 'cancelled' : null);
 const checkReceipt = (engine, commandId) => path.join(engine.workspaces.dataDir, 'check-receipts', commandId + '.json');
 export class Engine {
   constructor(company, adapter, workspaces, options = {}) {
@@ -113,17 +114,17 @@ export class Engine {
         continue;
       }
       const accepted = previous.resultAccepted ?? (previous.status === 'completed' && !previous.resultDeferred);
-      if (currentTask.activeAttemptId === previous.id && currentTask.stopRequested
-        && clean) {
+      const stopIntent = recoverStopIntent(currentTask);
+      if (currentTask.activeAttemptId === previous.id && stopIntent && clean) {
         // A stop intent survives host loss. A clean completed receipt also
         // proves termination, but must not apply a result the owner has stopped.
         this.store.transaction(() => {
           this.finishAttempt(previous, accepted ? 'completed' : 'interrupted', previous.summary);
           this.store.put('attempts', { ...this.store.require('attempts', previous.id), cleanupPending: false, cleanupUncertain: false,
-            recovery: { status: 'stopped', reason: `已确认进程树清理，状态已更新为 ${currentTask.stopRequested}。${fact.reason ?? ''}`, actions: [] } });
-          this.store.put('tasks', { ...currentTask, status: currentTask.stopRequested, stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+            recovery: { status: 'stopped', reason: `已确认进程树清理，状态已更新为 ${stopIntent}。${fact.reason ?? ''}`, actions: [] } });
+          this.store.put('tasks', { ...currentTask, status: stopIntent, stopRequested: null, recoveryRequested: false, resumeOnStart: false });
           this.company.releaseTemporaryAgent(previous.agentId);
-          this.store.event('attempt.stop.recovered', previous.id, { taskId: previous.taskId, status: currentTask.stopRequested }, SYSTEM);
+          this.store.event('attempt.stop.recovered', previous.id, { taskId: previous.taskId, status: stopIntent }, SYSTEM);
         });
         continue;
       }
@@ -160,7 +161,10 @@ export class Engine {
         const task = this.store.require('tasks', previous.taskId);
         this.store.put('attempts', { ...latest, resultAccepted: accepted, acceptedTaskStatus: previous.acceptedTaskStatus ?? (accepted && task.status !== 'reconciling' ? task.status : null), status: fact.status === 'stopped' ? 'interrupted' : 'reconciling', cleanupPending: fact.status !== 'stopped', cleanupUncertain: fact.status === 'stopped' ? false : latest.cleanupUncertain, recovery: fact,
           ...(hostCleanupFailure ? { cleanupUncertain: true, cleanupError: hostCleanupFailure.message, cleanupDetails: hostCleanupFailure.cleanup ?? null } : {}) });
-        if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration) this.store.put('tasks', { ...task, status: fact.status === 'stopped' ? (task.stopRequested ?? 'ready') : 'reconciling', stopRequested: fact.status === 'stopped' ? null : task.stopRequested });
+        if (task.activeAttemptId === previous.id && task.generation === previous.taskGeneration) {
+          const stopIntent = recoverStopIntent(task);
+          this.store.put('tasks', { ...task, status: fact.status === 'stopped' ? (stopIntent ?? 'ready') : 'reconciling', stopRequested: fact.status === 'stopped' ? null : stopIntent });
+        }
         this.store.event('attempt.recovery', previous.id, { taskId: task.id, fact }, SYSTEM);
       });
     }
@@ -211,6 +215,8 @@ export class Engine {
         if (this.company.policy().paused || this.closing) return;
       }
       const p = this.company.policy();
+      const { attempts: active, integrations: occupiedIntegrations, used } = executionOccupancy(this.store, this.adapter, this.live);
+      const occupiedTaskIds = new Set(active.map(attempt => attempt.taskId));
       // Efficiency time box (issue #7): notify the manager once per box without
       // creating a budget interaction. Hard-cap handling stays below.
       for (const goal of this.store.list('goals')) {
@@ -219,13 +225,13 @@ export class Engine {
         const used = spent.get(goal.id) ?? goal.runtimeMs ?? 0;
         const effectiveBoxLimit = goalTimeBoxLimit(goal, p);
         const pendingBox = pendingGoalTimeBox(goal);
-        // A retryable decision keeps its original threshold. Once its task can
-        // no longer be handled, re-evaluate the current threshold from scratch.
+        // Keep the original gate while its decision is actionable or its
+        // execution still owns a slot, including through cancellation cleanup.
         const taskId = pendingBox?.coordinationTaskId;
-        const obsolete = taskId && !canContinueTimeBoxTask(goal, this.store.get('tasks', taskId));
+        const obsolete = taskId && !holdsTimeBox(goal, this.store.get('tasks', taskId), occupiedTaskIds);
         const openBox = obsolete ? null : pendingBox;
         if (effectiveBoxLimit && used < hardLimit && (openBox || used >= effectiveBoxLimit)) {
-          this.ensureTimeBoxWarning(goal, used, hardLimit, openBox?.boxMs ?? effectiveBoxLimit, p);
+          this.ensureTimeBoxWarning(goal, used, hardLimit, openBox?.boxMs ?? effectiveBoxLimit, p, occupiedTaskIds);
         } else if (obsolete) {
           this.store.transaction(() => {
             const current = this.store.require('goals', goal.id);
@@ -235,7 +241,6 @@ export class Engine {
           });
         }
       }
-      const { attempts: active, integrations: occupiedIntegrations, used } = executionOccupancy(this.store, this.adapter, this.live);
       let free = p.maxConcurrent - used; if (free <= 0) return;
       let integrationQueued = occupiedIntegrations > 0 || this.queuedIntegrations.size > 0;
       if (!integrationQueued) {
@@ -255,7 +260,7 @@ export class Engine {
         (goalPriority.get(b.goalId) ?? 50) - (goalPriority.get(a.goalId) ?? 50) || a.createdAt.localeCompare(b.createdAt));
       for (const task of ready) {
         if (free <= 0) break;
-        if (active.some(a => a.taskId === task.id)) continue;
+        if (occupiedTaskIds.has(task.id)) continue;
         const parent = task.parentId ? this.store.get('tasks', task.parentId) : null;
         const coordination = task.kind === 'coordination' ? task : parent?.kind === 'coordination' ? parent : null;
         const source = coordination?.coordinationOf ? this.store.get('tasks', coordination.coordinationOf) : null;
@@ -321,11 +326,11 @@ export class Engine {
       attempts: this.store.list('attempts').filter(attempt => attempt.goalId === goal.id).length,
     };
   }
-  ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, policy) {
+  ensureTimeBoxWarning(goal, used, hardLimit, boxLimit, policy, occupiedTaskIds) {
     return this.store.transaction(() => {
     const key = timeBoxCoordinationKey(goal.id, boxLimit);
     if (goal.timeBox?.key === key && goal.timeBox.releasedAt) return null;
-    const existing = this.store.list('tasks').find(task => task.coordinationKey === key && canContinueTimeBoxTask(goal, task));
+    const existing = this.store.list('tasks').find(task => task.coordinationKey === key && holdsTimeBox(goal, task, occupiedTaskIds));
     if (existing) {
       if (goal.timeBox?.key === key && goal.timeBox.coordinationTaskId === existing.id) return existing;
       this.store.put('goals', { ...this.store.require('goals', goal.id), timeBox: { ...(goal.timeBox ?? {}), key, boxMs: boxLimit, warnedAt: existing.createdAt ?? now(), coordinationTaskId: existing.id, releasedAt: null } });
@@ -1000,7 +1005,10 @@ export class Engine {
         return;
       }
       const retry = !stopped && !this.closing && task.attempts < this.company.policy().maxAttempts;
-      this.store.put('tasks', { ...task, status: stopped ?? (this.closing ? 'paused' : retry ? 'ready' : 'failed'), resumeOnStart: this.closing && !stopped, stopRequested: null, feedback: `${error.code ?? 'EXECUTION_FAILED'}: ${error.message}`, retryAt: retry ? Date.now() + 1000 * task.attempts : null });
+      // Recovery must still know about the cancellation if the host loses the
+      // time-box execution before dispose records cleanup confirmation.
+      const pendingStop = stopped === 'cancelled' && task.origin?.kind === 'timebox' ? stopped : null;
+      this.store.put('tasks', { ...task, status: stopped ?? (this.closing ? 'paused' : retry ? 'ready' : 'failed'), resumeOnStart: this.closing && !stopped, stopRequested: pendingStop, feedback: `${error.code ?? 'EXECUTION_FAILED'}: ${error.message}`, retryAt: retry ? Date.now() + 1000 * task.attempts : null });
       this.store.event('attempt.failed', attempt.id, { taskId: task.id, code: error.code, message: error.message, retry }, SYSTEM);
       if (!retry && !stopped && !this.closing && !task.repairOf && task.kind === 'work') this.scheduleRepair(this.store.require('tasks', task.id), error.message, { code: error.code ?? null });
       else if (!retry && !stopped && !this.closing && task.kind === 'repair') this.coordinateFailure(this.store.require('tasks', task.id), error.message, { code: error.code ?? null });
