@@ -8,23 +8,58 @@ const FORMAT = 'acms-git-bundle/1';
 const branch = 'refs/heads/delivery';
 const oid = value => typeof value === 'string' && /^[a-f0-9]{40}([a-f0-9]{24})?$/.test(value);
 const attributes = '* -text -eol -ident -filter -working-tree-encoding\n';
+const treeOutputLimit = 8 * 1024 * 1024;
 
 function bundlePath(dataDir, sha256) {
   return path.join(dataDir, 'deliveries', sha256 + '.bundle');
 }
 
-function deliveryPath(filename) {
-  const standard = filename.replaceAll('\\', '/');
-  assert(standard && !/[\x00-\x1f:]/.test(standard) && !isCollaborationPath(standard) &&
-    standard.split('/').every(part => part && !['.', '..', '.git', 'node_modules'].includes(part.toLowerCase())),
-  'GIT_DELIVERY_PATH', 'Git delivery paths must be ordinary project files');
-  return standard;
+function projectPath(filename) {
+  const standard = path.posix.normalize(filename.replaceAll('\\', '/'));
+  if (standard && !/[\x00-\x1f:]/.test(standard) && !isCollaborationPath(standard) &&
+    standard.split('/').every(part => part && !['.', '..', '.git', 'node_modules'].includes(part.toLowerCase()))) return standard;
+  return null;
 }
 
-async function fileDigest(filename) {
-  const hash = createHash('sha256');
+function deliveryPath(filename) {
+  const name = projectPath(filename);
+  assert(name, 'GIT_DELIVERY_PATH', 'Git delivery paths must be ordinary project files');
+  return name;
+}
+
+async function fileDigest(filename, { algorithm = 'sha256', prefix = '' } = {}) {
+  const hash = createHash(algorithm).update(prefix);
   for await (const bytes of createReadStream(filename)) hash.update(bytes);
   return hash.digest('hex');
+}
+
+async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination, objectFormat }) {
+  assert(tree.length < treeOutputLimit, 'GIT_DELIVERY_EVIDENCE', 'Git 基准文件清单超过可核对范围。');
+  const staged = [];
+  for (const entry of tree.split('\0').filter(Boolean)) {
+    const blob = entry.match(/^100(?:644|755) blob ([a-f0-9]+)\t(.*)$/s);
+    if (!blob) continue;
+    const [, original, filename] = blob;
+    const name = projectPath(filename);
+    if (!name || files.has(name)) continue;
+    const source = path.join(workspaceRoot, name);
+    const info = await fs.lstat(source).catch(error => {
+      if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null;
+      throw error;
+    });
+    if (!info?.isFile() || await fs.realpath(source) !== source) continue;
+    const digestOptions = { algorithm: objectFormat, prefix: 'blob ' + info.size + '\0' };
+    const materialized = await fileDigest(source, digestOptions);
+    if (materialized === original) continue;
+    // EOL attributes and index hints can make a materialized file differ
+    // from the base blob without appearing in git diff.
+    const target = path.join(destination, name);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.copyFile(source, target);
+    assert(await fileDigest(target, digestOptions) === materialized, 'ARTIFACT_CHANGED', '复制 Git 基准文件时内容已改变。');
+    staged.push(name);
+  }
+  return staged;
 }
 
 async function removeTemporary(directory, parent) {
@@ -112,6 +147,8 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
       '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', '-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost',
       ...args], indexWorktree, gitOptions);
     await build(['read-tree', workspace.baseCommit]);
+    const tree = await git(['ls-tree', '-r', '--full-tree', '-z', workspace.baseCommit], workspace.path, { maxOutput: treeOutputLimit });
+    const materialized = await stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination: indexWorktree, objectFormat });
     for (const [name, entry] of files) {
       if (entry.deleted) continue;
       const file = await safeFile(name);
@@ -122,27 +159,26 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
       await fs.mkdir(path.dirname(destination), { recursive: true });
       await fs.writeFile(destination, bytes, { mode: (await fs.stat(file)).mode & 0o777 });
     }
-    if (files.size) {
+    if (files.size || materialized.length) {
       const pathspec = path.join(temporary, 'pathspec');
-      await fs.writeFile(pathspec, [...files.keys()].join('\0') + '\0');
+      await fs.writeFile(pathspec, [...files.keys(), ...materialized].join('\0') + '\0');
       await build(['add', '--all', '--force', '--pathspec-from-file=' + pathspec, '--pathspec-file-nul']);
     }
-    const tree = await build(['write-tree']);
+    const deliveredTree = await build(['write-tree']);
     // A root commit bundles the complete file tree without relying on the
     // source object database or retaining its history in every backup.
-    const commit = await build(['commit-tree', tree, '-m', `ACMS delivery ${task.id} g${task.generation} ${task.artifactHash}`]);
+    const commit = await build(['commit-tree', deliveredTree, '-m', `ACMS delivery ${task.id} g${task.generation} ${task.artifactHash}`]);
     await build(['update-ref', branch, commit]);
     const bundle = path.join(temporary, 'delivery.bundle');
     await build(['-c', 'pack.threads=1', 'bundle', 'create', bundle, branch]);
     const sha256 = await fileDigest(bundle);
     const { size: bytes } = await fs.stat(bundle);
-    const maxOutput = 4 * 1024 * 1024;
-    const ignored = await git(['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', '.',
-      ':(exclude,icase).acms', ':(exclude,glob,icase)**/node_modules/**'], workspace.path, { maxOutput });
-    // Any ignored file outside the version (including local credentials or
-    // local data) makes the workspace ineligible for automatic cleanup.
-    const coversWorkspace = ignored.length < maxOutput && ignored.split('\0').every(name => !name || files.has(name));
-    const worktreeHash = coversWorkspace ? await gitWorktreeFingerprint(workspace.path) : null;
+    const reconstruction = path.join(temporary, 'reconstruction');
+    await checkoutGitBundle({ path: bundle, commit }, reconstruction, temporary, git);
+    const reconstructedHash = await gitWorktreeFingerprint(reconstruction);
+    const authorHash = await gitWorktreeFingerprint(workspace.path);
+    // Only a match against an independent checkout proves cleanup coverage.
+    const worktreeHash = task.gitDeliveryInputHash && authorHash === reconstructedHash ? authorHash : null;
     const filename = bundlePath(dataDir, sha256);
     await fs.mkdir(path.dirname(filename), { recursive: true });
     // A retry only publishes identically hashed bytes at this path.
@@ -180,7 +216,8 @@ export async function checkoutGitBundle(delivery, destination, cwd, git) {
     await fs.writeFile(path.join(info, 'attributes'), attributes);
     await git(['-c', 'core.hooksPath=' + info, '-c', 'core.autocrlf=false', 'checkout', '--detach', delivery.commit], temporary);
     await fs.rename(temporary, destination);
-  } finally {
-    await removeTemporary(temporary, parent);
+  } catch (error) {
+    if (!error.cleanupUncertain) await removeTemporary(temporary, parent);
+    throw error;
   }
 }

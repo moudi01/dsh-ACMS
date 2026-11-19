@@ -14,6 +14,7 @@ import { prunePlan } from '../scripts/prune-data.mjs';
 const windows = { skip: process.platform !== 'win32' };
 const binary = Buffer.from([0, 10, 13, 128, 255, 0]);
 const newReadme = Buffer.from('delivery\r\nwith original line endings\r\n');
+const stableReadme = Buffer.from('materialized by Git\r\n');
 
 async function git(args, cwd) {
   const result = await run('git', args, cwd);
@@ -44,12 +45,13 @@ test('non-merged Git delivery reconstructs exact bytes after ACMS backup and pro
     await writeFile(path.join(workspace, 'source-only.bin'), binary);
     await writeFile(path.join(workspace, 'declared.log'), 'declared but Git ignored');
     const output = await defaultSimulation(input);
-    output.artifacts.push({ path: 'declared.log', title: 'Ignored declared artifact' });
+    output.artifacts.push({ path: './declared.log', title: 'Ignored declared artifact' });
     return output;
   });
-  await writeFile(path.join(f.source, '.gitattributes'), '*.md text eol=lf\n');
+  await writeFile(path.join(f.source, '.gitattributes'), '*.md text eol=lf\nstable.txt text eol=crlf\n');
   await writeFile(path.join(f.source, '.gitignore'), '*.log\n');
   await writeFile(path.join(f.source, 'remove.txt'), 'old file');
+  await writeFile(path.join(f.source, 'stable.txt'), 'materialized by Git\n');
   const base = (await gitProject(f)).trim();
   f.command('project.save', { id: f.project.id, autoMerge: false });
   const task = f.task();
@@ -62,6 +64,8 @@ test('non-merged Git delivery reconstructs exact bytes after ACMS backup and pro
   assert.equal(delivery.baseCommit, base);
   assert.equal(delivery.artifactHash, saved.artifactHash);
   assert.equal(saved.integration.status, 'available');
+  assert.deepEqual(await readFile(path.join(saved.workspace.path, 'stable.txt')), stableReadme);
+  assert(!saved.changeSet.some(file => file.path === 'stable.txt'));
   assert.equal(await git(['rev-parse', 'HEAD'], f.source), base);
   assert.equal(await git(['status', '--porcelain', '--', '.', ':(exclude).acms'], f.source), '');
   assert.equal(await git(['rev-parse', saved.workspace.branch], f.source), base, 'the workspace branch is not the delivery version');
@@ -111,6 +115,7 @@ test('non-merged Git delivery reconstructs exact bytes after ACMS backup and pro
     await checkoutGitBundle(portable, reconstructed, f.root, git);
     assert.equal(await git(['rev-parse', 'HEAD'], reconstructed), portable.commit);
     assert.deepEqual(await readFile(path.join(reconstructed, 'README.md')), newReadme);
+    assert.deepEqual(await readFile(path.join(reconstructed, 'stable.txt')), stableReadme);
     assert.deepEqual(await readFile(path.join(reconstructed, 'source-only.bin')), binary);
     assert.equal(await readFile(path.join(reconstructed, 'declared.log'), 'utf8'), 'declared but Git ignored');
     await assert.rejects(readFile(path.join(reconstructed, 'remove.txt')), { code: 'ENOENT' });
@@ -164,4 +169,35 @@ test('restart after publishing a Git bundle reuses the version and captures both
   await age(saved.workspace.path);
   assert((await prunePlan({ dataDir: f.dataDir, days: 1 })).protected.some(item => item.path === 'workspaces/' + task.id &&
     item.reason.includes('索引无法核实')));
+});
+
+test('retention requires proof of the reconstructed tree even when the Git index hides local changes', windows, async t => {
+  const f = await fixture(t, async input => {
+    const cwd = input.task.workspace.path;
+    await git(['update-index', '--assume-unchanged', 'tracked.txt'], cwd);
+    await writeFile(path.join(cwd, 'tracked.txt'), 'unique unsaved source\n');
+    await writeFile(path.join(cwd, 'private.log'), 'an ignored file outside the delivery');
+    return defaultSimulation(input);
+  });
+  await writeFile(path.join(f.source, '.gitignore'), '*.log\n');
+  await writeFile(path.join(f.source, 'tracked.txt'), 'committed starter\n');
+  await gitProject(f);
+  f.command('project.save', { id: f.project.id, autoMerge: false });
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 30000, taskWaitDiagnostics(f, task.id));
+  const saved = f.store.require('tasks', task.id);
+  assert(!saved.changeSet.some(file => file.path === 'tracked.txt'));
+  assert(saved.gitDeliveryInputHash);
+  const delivery = await verifiedGitBundle(saved, f.dataDir);
+  assert(delivery);
+  assert.equal(delivery.worktreeHash, null);
+  const rebuilt = path.join(f.root, 'rebuilt');
+  await checkoutGitBundle(delivery, rebuilt, f.root, git);
+  assert.equal(await readFile(path.join(rebuilt, 'tracked.txt'), 'utf8'), 'unique unsaved source\n');
+  await assert.rejects(readFile(path.join(rebuilt, 'private.log')), { code: 'ENOENT' });
+  await age(saved.workspace.path);
+  const plan = await prunePlan({ dataDir: f.dataDir, days: 1 });
+  assert(plan.protected.some(item => item.path === 'workspaces/' + task.id && item.reason.includes('缺少覆盖完整交付')));
+  assert(!plan.candidates.some(item => item.path === 'workspaces/' + task.id));
 });

@@ -115,7 +115,12 @@ export class WorkspaceManager {
     assert(Array.isArray(declared) && declared.length <= 100, 'INVALID_ARTIFACTS', 'At most 100 artifacts may be submitted');
     if (task.requiresArtifacts) assert(declared.length > 0, 'MISSING_ARTIFACTS', 'This task requires a concrete deliverable');
     const source = task.workspace.path;
-    const inputHash = task.checkIds.length ? await inputFingerprint(source, attempt.signal) : null;
+    const project = this.company.store.require('projects', task.projectId);
+    const gitDelivery = task.workspace.mode === 'git' && !project.autoMerge;
+    const inputHash = task.checkIds.length || gitDelivery ? await inputFingerprint(source, attempt.signal).catch(error => {
+      if (gitDelivery && !task.checkIds.length && error.code === 'CHECK_INPUT_LINK') return null;
+      throw error;
+    }) : null;
     const artifacts = [], checkResults = [];
     for (const item of declared) {
       assert(!isCollaborationPath(path.normalize(item.path ?? '')), 'ARTIFACT_PATH', '.acms 是固定输入，交付物请写入普通任务文档');
@@ -141,7 +146,6 @@ export class WorkspaceManager {
       }
       artifacts.push(artifact);
     }
-    const project = this.company.store.require('projects', task.projectId);
     const guard = () => assert(digest(this.company.store.require('projects', task.projectId).preparation ?? null) === digest(project.preparation ?? null),
       'PREPARATION_CHANGED', 'Owner preparation configuration changed');
     const evidence = task.checkIds.length ? this.company.store.list('verifications').filter(v => v.kind === 'checks' && v.taskId === task.id).flatMap(v => v.checks) : [];
@@ -160,8 +164,11 @@ export class WorkspaceManager {
     const changeSet = await this.captureChanges(task);
     if (inputHash) guard();
     if (inputHash) assert(await inputFingerprint(source, attempt.signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Delivery inputs changed during verification');
-    return { artifacts, checks: checkResults, changeSet, hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash,
-      ...(a.archiveVerification ? { archiveFormat: a.archiveVerification.format, archivePassed: a.archiveVerification.passed } : {}) })), changeSet }) };
+    const gitDeliveryInputHash = gitDelivery ? inputHash : null;
+    return { artifacts, checks: checkResults, changeSet, gitDeliveryInputHash,
+      hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash,
+        ...(a.archiveVerification ? { archiveFormat: a.archiveVerification.format, archivePassed: a.archiveVerification.passed } : {}) })),
+      changeSet, ...(gitDeliveryInputHash ? { gitDeliveryInputHash } : {}) }) };
   }
   prepareEnvironment(task, spec, invoke, signal) {
     return prepareDependencies(this.dataDir, task.workspace.path, spec, invoke, signal);
@@ -229,6 +236,7 @@ export class WorkspaceManager {
       try { const bytes = await fs.readFile(await this.safeFile(task.workspace.path, a.path)); if (digest(bytes.toString('base64')) !== a.hash) return false; } catch { return false; }
     }
     if (task.changeSet && digest(await this.captureChanges(task, invoke)) !== digest(task.changeSet)) return false;
+    if (task.gitDeliveryInputHash && await inputFingerprint(task.workspace.path) !== task.gitDeliveryInputHash) return false;
     return true;
   }
   async integrationTarget(root, invoke) {
