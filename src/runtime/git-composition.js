@@ -149,12 +149,20 @@ async function readCachedComposition(filename, dataDir, version, baseCommit, inp
   return bundle ? { ...value, bundle } : null;
 }
 
-async function writeComposition(filename, candidate) {
+async function publishComposition(filename, candidate, dataDir) {
   const temporary = filename + '.tmp-' + randomUUID();
   try {
     const { format, commit, sha256, bytes } = candidate.bundle;
     await fs.writeFile(temporary, JSON.stringify({ ...candidate, bundle: { format, commit, sha256, bytes } }), { flag: 'wx', flush: true });
-    await fs.rename(temporary, filename);
+    try { await fs.link(temporary, filename); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const published = await readCachedComposition(filename, dataDir, candidate.version, candidate.baseCommit, candidate.inputs);
+      assert(published?.tree === candidate.tree && published.contentHash === candidate.contentHash,
+        'COMPOSITE_CONTENT', '同一组合版本已存在，且无法核对为相同的候选内容。');
+      return published;
+    }
+    return candidate;
   } finally { await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
 }
 
@@ -230,8 +238,7 @@ export async function composeGitVersions({ dataDir, source, baseCommit, inputs, 
     assert(contentHash, 'COMPOSITE_CONTENT', '组合候选无法重建为可核对的项目文件。');
     const candidate = { format, version, baseCommit, inputs: rows, tree, contentHash,
       bundle: await storeGitBundle(bundleFile, commit, dataDir) };
-    await writeComposition(filename, candidate);
-    return candidate;
+    return await publishComposition(filename, candidate, dataDir);
   } catch (error) {
     retain = !!error.cleanupUncertain;
     throw error;

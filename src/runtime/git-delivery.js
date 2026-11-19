@@ -125,10 +125,16 @@ export async function storeGitBundle(bundle, commit, dataDir) {
   const sha256 = await fileDigest(bundle);
   const { size: bytes } = await fs.stat(bundle);
   const filename = bundlePath(dataDir, sha256);
+  const delivery = { format: FORMAT, path: filename, sha256, bytes, commit };
   await fs.mkdir(path.dirname(filename), { recursive: true });
-  // A retry only publishes identically hashed bytes at this path.
-  await fs.rename(bundle, filename);
-  return { format: FORMAT, path: filename, sha256, bytes, commit };
+  // Readers may already have the content-addressed file open on Windows.
+  try { await fs.link(bundle, filename); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    assert(await verifiedStoredGitBundle(delivery, dataDir), 'GIT_DELIVERY_EVIDENCE',
+      '同一哈希的持久 Git 交付无法核对，请检查现有交付文件。');
+  }
+  return delivery;
 }
 
 export async function publishGitDelivery({ dataDir, task, artifacts, source, executionId, git, safeFile }) {

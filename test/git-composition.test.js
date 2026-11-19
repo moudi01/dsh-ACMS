@@ -5,6 +5,7 @@ import { mkdir, readFile, writeFile, unlink, readdir, rename, rmdir } from 'node
 import path from 'node:path';
 import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
 import { checkoutComposition, composeGitVersions, selectedGitVersions } from '../src/runtime/git-composition.js';
+import { storeGitBundle } from '../src/runtime/git-delivery.js';
 import { orderedCompositionTasks } from '../src/core/composite-delivery.js';
 import { executionOccupancy } from '../src/core/execution-capacity.js';
 import { run } from '../src/runtime/workspaces.js';
@@ -164,8 +165,25 @@ test('a combined check failure leaves the goal and its final review waiting', as
   }, "const fs=require('node:fs'); if(fs.existsSync('left.txt') && fs.existsSync('right.txt')) process.exit(9)", { finalReview: true });
   const left = f.task({ title: 'left', goalId: goal.id });
   const right = f.task({ title: 'right', goalId: goal.id });
+  const integrations = () => f.store.list('integrations').filter(record => record.goalId === goal.id);
+  const prepare = f.workspaces.prepare.bind(f.workspaces);
+  const preparationErrors = new Map();
+  f.workspaces.prepare = async (task, attempt) => {
+    try { return await prepare(task, attempt); }
+    catch (error) { preparationErrors.set(task.id, error); throw error; }
+  };
   await f.start();
-  const failed = await until(() => f.store.list('integrations').find(record => record.goalId === goal.id && record.phase === 'failed'), 45000);
+  const failed = await until(() => {
+    const failedAttempt = f.store.list('attempts').find(attempt => [left.id, right.id].includes(attempt.taskId) && attempt.status === 'failed');
+    if (failedAttempt) assert.fail(`${taskState(f, { id: failedAttempt.taskId }).title}: ${preparationErrors.get(failedAttempt.taskId)?.stack ?? failedAttempt.summary}`);
+    const failure = integrations().find(record => record.phase === 'failed');
+    if (failure) assert(failure.composition, failure.reason);
+    return failure;
+  }, 45000, () => ({
+    goalStatus: goalState(f, goal).status,
+    tasks: [left, right].map(task => ({ ...taskWaitDiagnostics(f, task.id)(), feedback: taskState(f, task).feedback })),
+    integrations: integrations().map(({ taskId, phase, reason }) => ({ taskId, phase, reason })),
+  }));
   assert.equal(failed.composition.passed, false);
   assert.equal(failed.composition.checks[0].code, 9);
   assert.equal(goalState(f, goal).status, 'active');
@@ -197,6 +215,57 @@ test('composition rejects incompatible same-path edits and reuses an identical m
   assert.match(failed.reason, /冲突.*shared.txt/);
   assert.equal(goalState(f, goal).composition, undefined);
   assert.equal(await readFile(path.join(f.source, 'shared.txt'), 'utf8'), 'base');
+});
+
+test('concurrent candidate builders preserve and reuse the first published bundle and version', async t => {
+  const f = await fixture(t);
+  const baseCommit = (await gitProject(f)).trim();
+  const deliveries = path.join(f.dataDir, 'deliveries');
+  const cache = path.join(deliveries, 'compositions');
+  const lstat = fs.lstat, rename = fs.rename;
+  const firstReads = Promise.withResolvers();
+  let reads = 0, readCompleted = 0;
+  const gate = t.mock.method(fs, 'lstat', async (filename, ...options) => {
+    if (path.dirname(filename) !== cache || reads >= 2) return lstat(filename, ...options);
+    reads++;
+    try { return await lstat(filename, ...options); }
+    finally {
+      if (++readCompleted === 2) firstReads.resolve();
+      await firstReads.promise;
+    }
+  });
+  const writes = new Map();
+  const occupied = t.mock.method(fs, 'rename', async (source, destination) => {
+    if (![cache, deliveries].includes(path.dirname(destination))) return rename(source, destination);
+    // Model a consumer opening the first published file before another builder tries to replace it.
+    if (writes.has(destination)) {
+      await writes.get(destination);
+      throw Object.assign(new Error('published file is open'), { code: 'EPERM' });
+    }
+    const write = rename(source, destination);
+    writes.set(destination, write);
+    return write;
+  });
+  const options = { dataDir: f.dataDir, source: f.source, baseCommit, inputs: [], invoke: run };
+  let first;
+  try {
+    const outcomes = await Promise.allSettled([composeGitVersions(options), composeGitVersions(options)]);
+    const rejected = outcomes.find(outcome => outcome.status === 'rejected');
+    if (rejected) throw rejected.reason;
+    const [left, right] = outcomes.map(outcome => outcome.value);
+    assert.equal(reads, 2);
+    assert.deepEqual(left, right);
+    first = left;
+  } finally { gate.mock.restore(); occupied.mock.restore(); }
+  assert.deepEqual(await composeGitVersions({ ...options, invoke: () => assert.fail('both builders published a single reusable version') }), first);
+
+  const source = path.join(f.root, 'verified.bundle');
+  const bytes = await readFile(first.bundle.path);
+  await writeFile(source, bytes);
+  const corrupt = Buffer.alloc(bytes.length);
+  await writeFile(first.bundle.path, corrupt);
+  await assert.rejects(storeGitBundle(source, first.bundle.commit, f.dataDir), { code: 'GIT_DELIVERY_EVIDENCE' });
+  assert.deepEqual(await readFile(first.bundle.path), corrupt);
 });
 
 test('missing selected bundle blocks preparation without invoking the dependent worker', async t => {
@@ -468,7 +537,9 @@ test('a dependency write failure rolls the parent back to its original file and 
   const actualLink = fs.link;
   let injected = false;
   const fault = t.mock.method(fs, 'link', async (from, to) => {
-    if (scenario.directory() && to === path.join(scenario.directory(), 'module', 'index.cjs')) {
+    const parent = scenario.directory();
+    if (parent && path.basename(to) === 'index.cjs' &&
+      path.relative(path.join(await fs.realpath(parent), 'module', 'index.cjs'), to) === '') {
       injected = true;
       throw Object.assign(new Error('simulated child publication failure'), { code: 'COMPOSITE_DRAFT_CONFLICT' });
     }
@@ -477,8 +548,11 @@ test('a dependency write failure rolls the parent back to its original file and 
   try {
     const { f, task } = scenario;
     await f.start();
-    await until(() => f.store.list('attempts').some(attempt => attempt.taskId === task.id && attempt.preflightOnly && attempt.status === 'failed'),
-      45000, taskWaitDiagnostics(f, task.id));
+    await until(() => {
+      const failed = f.store.list('attempts').find(attempt => attempt.taskId === task.id && attempt.status === 'failed');
+      if (failed) assert(failed.preflightOnly, failed.summary ?? taskState(f, task).feedback);
+      return failed;
+    }, 45000, taskWaitDiagnostics(f, task.id));
     assert.equal(injected, true);
     assert.equal(await readFile(path.join(scenario.directory(), 'module'), 'utf8'), 'original parent module');
     assert.equal(await readFile(path.join(scenario.directory(), 'draft.txt'), 'utf8'), 'retained parent draft');
