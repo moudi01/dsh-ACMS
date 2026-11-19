@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile, unlink, readdir, rename } from 'node:fs/promises';
+import { promises as fs } from 'node:fs';
+import { mkdir, readFile, writeFile, unlink, readdir, rename, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
 import { checkoutComposition, composeGitVersions, selectedGitVersions } from '../src/runtime/git-composition.js';
@@ -364,6 +365,125 @@ test('a child change overlapping a parent draft leaves the parent files and inde
   assert.equal(await git(directory, 'show', ':shared.txt'), 'staged parent intent');
   assert.equal(parentRuns, 1);
   assert.equal(goalState(f, goal).status, 'active');
+});
+
+async function structuralDecomposition(t, { baseline, update, artifact, inspect }) {
+  let directory;
+  const { f, goal } = await setup(t, async input => {
+    if (input.task.kind !== 'work') return { outcome: 'blocked', kind: 'human', reason: 'Fixture waits for the original failure' };
+    if (input.task.title === 'Child') {
+      await update(input.task.workspace.path);
+      return { outcome: 'completed', artifacts: [{ path: artifact }] };
+    }
+    if (!directory) {
+      directory = input.task.workspace.path;
+      await writeFile(fromWorkspace(input, 'draft.txt'), 'retained parent draft');
+      await writeFile(fromWorkspace(input, 'staged.txt'), 'retained parent index');
+      await git(directory, 'add', 'staged.txt');
+      return { outcome: 'decomposed', tasks: [{ key: 'child', title: 'Child', description: 'Update the project shape', acceptance: 'Deliver the validated new path', dependencies: [] }] };
+    }
+    assert.equal(input.task.workspace.path, directory);
+    assert.equal(await readFile(fromWorkspace(input, 'draft.txt'), 'utf8'), 'retained parent draft');
+    assert.equal(await git(directory, 'show', ':staged.txt'), 'retained parent index');
+    await inspect(directory);
+    return { outcome: 'completed', artifacts: [{ path: 'draft.txt' }] };
+  }, 'process.exitCode=0');
+  await baseline(f.source);
+  await git(f.source, 'add', '.');
+  await git(f.source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', 'commit', '-m', 'Pin structural fixture');
+  return { f, goal, task: f.task({ title: 'Parent', goalId: goal.id }), directory: () => directory };
+}
+
+async function completedStructuralCheckout({ f, goal, task }) {
+  await f.start();
+  await until(() => {
+    const failed = f.store.list('attempts').find(item => item.goalId === goal.id && item.status === 'failed');
+    if (failed) assert.fail(failed.summary);
+    const integration = f.store.list('integrations').find(item => item.goalId === goal.id && item.phase === 'failed');
+    if (integration) assert.fail(integration.reason);
+    const recheck = goalState(f, goal).compositionRecheck;
+    if (recheck?.status === 'failed') assert.fail(recheck.reason);
+    return goalState(f, goal).status === 'succeeded';
+  }, 45000, taskWaitDiagnostics(f, task.id));
+  const checkout = path.join(f.root, 'structural-candidate');
+  await checkoutComposition(goalState(f, goal).composition, checkout, f.root, f.dataDir, run);
+  return checkout;
+}
+
+test('child case-only rename preserves the exact spelling and binary bytes in the final Git tree', { skip: process.platform !== 'win32' }, async t => {
+  const bytes = Buffer.from([0, 255, 47, 128]);
+  const inspect = async directory => {
+    const names = await readdir(directory);
+    assert(names.includes('name.bin') && !names.includes('Name.bin'));
+    assert.deepEqual(await readFile(path.join(directory, 'name.bin')), bytes);
+  };
+  const scenario = await structuralDecomposition(t, {
+    baseline: async directory => writeFile(path.join(directory, 'Name.bin'), bytes),
+    update: async directory => git(directory, 'mv', '-f', 'Name.bin', 'name.bin'),
+    artifact: 'name.bin', inspect,
+  });
+  const checkout = await completedStructuralCheckout(scenario);
+  await inspect(checkout);
+  const files = (await git(checkout, 'ls-tree', '-r', '--name-only', '-z', 'HEAD')).split('\0');
+  assert(files.includes('name.bin') && !files.includes('Name.bin'));
+  assert((await readdir(scenario.f.source)).includes('Name.bin'));
+});
+
+test('child delivery supports both directions of file and directory replacement', async t => {
+  for (const toDirectory of [true, false]) {
+    const baseline = async directory => {
+      const module = path.join(directory, 'module');
+      if (toDirectory) return writeFile(module, 'previous file');
+      await mkdir(module);
+      await writeFile(path.join(module, 'old.cjs'), 'previous nested file');
+    };
+    const artifact = toDirectory ? 'module/index.cjs' : 'module';
+    const update = async directory => {
+      const module = path.join(directory, 'module');
+      if (toDirectory) { await unlink(module); await mkdir(module); }
+      else { await unlink(path.join(module, 'old.cjs')); await rmdir(module); }
+      await writeFile(path.join(directory, artifact), 'new input bytes');
+    };
+    const inspect = async directory => assert.equal(await readFile(path.join(directory, artifact), 'utf8'), 'new input bytes');
+    const scenario = await structuralDecomposition(t, { baseline, update, artifact, inspect });
+    const checkout = await completedStructuralCheckout(scenario);
+    await inspect(checkout);
+    const files = (await git(checkout, 'ls-tree', '-r', '--name-only', '-z', 'HEAD')).split('\0');
+    assert(files.includes(artifact));
+    assert(!files.includes(toDirectory ? 'module' : 'module/old.cjs'));
+  }
+});
+
+test('a dependency write failure rolls the parent back to its original file and index', async t => {
+  const scenario = await structuralDecomposition(t, {
+    baseline: directory => writeFile(path.join(directory, 'module'), 'original parent module'),
+    update: async directory => {
+      const module = path.join(directory, 'module');
+      await unlink(module);
+      await mkdir(module);
+      await writeFile(path.join(module, 'index.cjs'), 'new child module');
+    },
+    artifact: 'module/index.cjs', inspect: () => assert.fail('the failed overlay must not dispatch a parent attempt'),
+  });
+  const actualLink = fs.link;
+  let injected = false;
+  const fault = t.mock.method(fs, 'link', async (from, to) => {
+    if (scenario.directory() && to === path.join(scenario.directory(), 'module', 'index.cjs')) {
+      injected = true;
+      throw Object.assign(new Error('simulated child publication failure'), { code: 'COMPOSITE_DRAFT_CONFLICT' });
+    }
+    return actualLink(from, to);
+  });
+  try {
+    const { f, task } = scenario;
+    await f.start();
+    await until(() => f.store.list('attempts').some(attempt => attempt.taskId === task.id && attempt.preflightOnly && attempt.status === 'failed'),
+      45000, taskWaitDiagnostics(f, task.id));
+    assert.equal(injected, true);
+    assert.equal(await readFile(path.join(scenario.directory(), 'module'), 'utf8'), 'original parent module');
+    assert.equal(await readFile(path.join(scenario.directory(), 'draft.txt'), 'utf8'), 'retained parent draft');
+    assert.equal(await git(scenario.directory(), 'show', ':staged.txt'), 'retained parent index');
+  } finally { fault.mock.restore(); }
 });
 
 test('a contract replacement reads its approved historical input without selecting retired outputs', async t => {

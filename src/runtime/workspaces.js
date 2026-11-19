@@ -19,6 +19,24 @@ import { assertGoalOpen } from '../core/goal-control.js';
 export function inside(root, target) { const rel = path.relative(root, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); }
 const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
 const excludeDependencies = ':(exclude,glob,icase)**/node_modules/**';
+
+async function describesReplacedGitLeaf(root, name) {
+  const parts = name.split('/');
+  if (!parts.every(part => part && !['.', '..'].includes(part) && !/[\\:]/.test(part))) return false;
+  let filename = root;
+  for (const [index, part] of parts.entries()) {
+    filename = path.join(filename, part);
+    const info = await fs.lstat(filename).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!info || info.isSymbolicLink()) return false;
+    if (index === parts.length - 1) return info.isDirectory();
+    if (!info.isDirectory()) return info.isFile();
+  }
+  return false;
+}
+
 export async function run(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, env } = {}) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
@@ -126,26 +144,29 @@ export class WorkspaceManager {
     const input = await compose(inputs);
     const destination = path.join(this.dataDir, 'workspaces', task.id);
     const branch = `acms/${task.id}`;
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    const workspaceParent = path.join(await fs.realpath(this.dataDir), 'workspaces');
+    assert(path.relative(await fs.realpath(path.dirname(destination)), workspaceParent) === '' &&
+      (await fs.lstat(path.dirname(destination))).isDirectory(), 'COMPOSITE_WORKSPACE_INCOMPLETE', '工作副本目录经过链接。');
     if (task.workspace) {
       assert(task.workspace.compositionBase === base.commit && path.relative(task.workspace.path, destination) === '',
         'COMPOSITE_BASE', '任务副本与固定 Git 基线不匹配，保留已有文件。');
       const previous = task.workspace.compositionInput ?? await compose([]);
       if (previous.version !== input.version) {
         const actual = await fs.realpath(destination);
-        const expected = path.join(await fs.realpath(path.dirname(destination)), task.id);
+        const expected = path.join(workspaceParent, task.id);
         assert(path.relative(actual, expected) === '' && await getGit(['symbolic-ref', '--short', 'HEAD'], destination) === branch,
           'COMPOSITE_WORKSPACE_INCOMPLETE', '任务副本无法核对，保留已有文件。');
         await updateCompositionWorkspace(previous, input, destination, this.dataDir, invoke, attempt.signal);
       }
       return syncCollaboration(this.company, project, task, { ...task.workspace, compositionInput: input });
     }
-    await fs.mkdir(path.dirname(destination), { recursive: true });
     const existing = await fs.lstat(destination).catch(error => {
       if (error.code === 'ENOENT') return null;
       throw error;
     });
     if (existing) {
-      const directory = path.join(await fs.realpath(path.dirname(destination)), task.id);
+      const directory = path.join(workspaceParent, task.id);
       const matches = existing.isDirectory() && path.relative(await fs.realpath(destination), directory) === '' &&
         await getGit(['symbolic-ref', '--short', 'HEAD'], destination) === branch &&
         await getGit(['rev-parse', '--verify', 'HEAD'], destination) === base.commit;
@@ -317,10 +338,37 @@ export class WorkspaceManager {
     const tracked = await git(['diff', '--name-only', '--no-renames', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
     const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
     assert(tracked.length < maxOutput && untracked.length < maxOutput, 'CHANGE_LIMIT', 'Git change names exceed the delivery limit');
-    const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)))].sort();
-    assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
     const root = await fs.realpath(cwd);
+    const changed = new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)));
     const files = [];
+    let baseLeaves;
+    const readBaseLeaves = async () => {
+      if (!baseLeaves) {
+        const tree = await git(['ls-tree', '-r', '--full-tree', '-z', task.workspace.baseCommit ?? 'HEAD'], cwd, { maxOutput }, invoke);
+        assert(tree.length < maxOutput, 'CHANGE_LIMIT', 'Git baseline names exceed the delivery limit');
+        baseLeaves = new Set(tree.split('\0').map(row => /^100(?:644|755) blob [a-f0-9]+\t(.*)$/s.exec(row)?.[1]).filter(Boolean));
+      }
+      return baseLeaves;
+    };
+    if (process.platform === 'win32' && task.workspace.compositionBase) {
+      // The parent retains its index when selected inputs are applied. Git can
+      // hide a case-only rename whose bytes still match that older index name.
+      for (const name of await readBaseLeaves()) {
+        if (isCollaborationPath(name) || dependencyPath(name)) continue;
+        const actual = await fs.realpath(path.join(root, name)).catch(error => {
+          if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null;
+          throw error;
+        });
+        if (!actual) continue;
+        const spelling = path.relative(root, actual).split(path.sep).join('/');
+        if (spelling !== name && spelling.toLowerCase() === name.toLowerCase()) {
+          changed.add(name);
+          changed.add(spelling);
+        }
+      }
+    }
+    assert(changed.size <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
+    const names = [...changed].sort();
     for (const name of names) {
       try {
         const filename = await this.safeFile(cwd, name);
@@ -331,8 +379,11 @@ export class WorkspaceManager {
           files.push({ path: name, deleted: true });
         } else files.push({ path: name, hash: digest((await fs.readFile(filename)).toString('base64')) });
       } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-        files.push({ path: name, deleted: true });
+        if (error.code === 'ENOENT') { files.push({ path: name, deleted: true }); continue; }
+        if (['ENOTDIR', 'ARTIFACT_PATH'].includes(error.code) && await describesReplacedGitLeaf(root, name)) {
+          if ((await readBaseLeaves()).has(name)) { files.push({ path: name, deleted: true }); continue; }
+        }
+        throw error;
       }
     }
     return files;

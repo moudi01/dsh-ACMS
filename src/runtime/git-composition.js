@@ -71,18 +71,23 @@ async function worktreeEntry(root, relative) {
       if (error.code === 'ENOENT') return null;
       throw error;
     });
-    if (!info) return null;
-    const file = index === parts.length - 1;
-    assert(file ? info.isFile() : info.isDirectory(), 'COMPOSITE_DRAFT_CONFLICT',
-      `依赖更新与父任务已有路径 ${relative} 冲突，工作副本保留。`);
-    if (file) return info;
+    if (!info) return { info: null };
+    assert(info.isFile() || info.isDirectory(), 'COMPOSITE_DRAFT_CONFLICT', `父任务路径 ${relative} 含链接或不支持的文件类型。`);
+    const names = await fs.readdir(path.dirname(filename));
+    if (!names.includes(part)) {
+      const actual = names.find(name => name.toLowerCase() === part.toLowerCase());
+      assert(actual, 'COMPOSITE_DRAFT_CONFLICT', `无法核实父任务路径 ${relative} 的实际拼写。`);
+      return { info: null, obstruction: { relative: [...parts.slice(0, index), actual].join('/'), info } };
+    }
+    if (index === parts.length - 1) return { info };
+    if (!info.isDirectory()) return { info: null, obstruction: { relative: parts.slice(0, index + 1).join('/'), info } };
   }
 }
 
 async function matchesTreeEntry(filename, info, expected) {
   if (!info || !expected) return !info && !expected;
   const algorithm = expected.oid.length === 64 ? 'sha256' : 'sha1';
-  return (process.platform === 'win32' || !!(info.mode & 0o111) === (expected.mode === '100755')) &&
+  return info.isFile() && (process.platform === 'win32' || !!(info.mode & 0o111) === (expected.mode === '100755')) &&
     await fileDigest(filename, { algorithm, prefix: 'blob ' + info.size + '\0' }) === expected.oid;
 }
 
@@ -250,6 +255,7 @@ export async function checkoutComposition(candidate, destination, cwd, dataDir, 
 export async function updateCompositionWorkspace(previous, incoming, workspacePath, dataDir, invoke, signal) {
   const parent = await fs.realpath(path.join(dataDir, 'integration'));
   const temporary = await fs.mkdtemp(path.join(parent, 'composition-update-'));
+  let retain = false;
   try {
     const oldPath = path.join(temporary, 'old-input');
     const newPath = path.join(temporary, 'new-input');
@@ -260,30 +266,121 @@ export async function updateCompositionWorkspace(previous, incoming, workspacePa
     assert(stagedNames.length < treeOutputLimit, 'COMPOSITE_DRAFT_CONFLICT', '父任务暂存清单过大，无法安全更新依赖。');
     const canonical = filename => process.platform === 'win32' ? filename.toLowerCase() : filename;
     const staged = new Set(stagedNames.split('\0').filter(Boolean).map(canonical));
-    const changes = [];
+    const priorDirectories = treeDirectories(before);
+    const nextDirectories = treeDirectories(after);
+    const removals = new Map(), writes = [];
     for (const relative of new Set([...before.keys(), ...after.keys()])) {
       signal?.throwIfAborted();
       const expected = before.get(relative), replacement = after.get(relative);
       if (expected?.oid === replacement?.oid && expected?.mode === replacement?.mode) continue;
       const filename = path.join(root, relative);
-      const info = await worktreeEntry(root, relative);
-      if (await matchesTreeEntry(filename, info, replacement)) continue;
-      assert(!staged.has(canonical(relative)) && await matchesTreeEntry(filename, info, expected), 'COMPOSITE_DRAFT_CONFLICT',
+      const current = await worktreeEntry(root, relative);
+      if (await matchesTreeEntry(filename, current.info, replacement) && (!replacement || !current.obstruction)) continue;
+      if (!replacement && current.info?.isDirectory() && nextDirectories.has(relative)) continue;
+      const obstruction = current.obstruction ?? (current.info?.isDirectory() ? { relative, info: current.info } : null);
+      const file = current.info?.isFile() ? current.info : null;
+      assert(!staged.has(canonical(relative)) && await matchesTreeEntry(filename, file, expected), 'COMPOSITE_DRAFT_CONFLICT',
         `依赖更新与父任务草稿 ${relative} 冲突，工作副本及暂存内容保留。`, { path: relative });
-      changes.push({ relative, filename, expected, replacement });
+      const change = { relative, filename, expected, replacement, obstruction };
+      if (replacement) writes.push(change);
+      else removals.set(relative, change);
     }
-    // Only update the old baseline's unchanged paths. Finished changes already
-    // match the new input so an interrupted overlay can be resumed safely.
-    const stagedFile = path.join(temporary, 'update');
-    for (const { relative, filename, expected, replacement } of changes) {
-      signal?.throwIfAborted();
-      assert(await matchesTreeEntry(filename, await worktreeEntry(root, relative), expected),
-        'COMPOSITE_DRAFT_CONFLICT', `父任务草稿 ${relative} 在依赖更新期间发生变化，已保留该文件。`);
-      if (replacement) {
-        await fs.mkdir(path.dirname(filename), { recursive: true });
-        await fs.copyFile(path.join(newPath, relative), stagedFile);
-        await fs.rename(stagedFile, filename);
-      } else await fs.unlink(filename);
+    const directories = new Map();
+    for (const { obstruction } of writes) {
+      if (!obstruction) continue;
+      if (obstruction.info.isDirectory()) await planDirectoryRemoval(root, obstruction.relative, priorDirectories, removals, directories, staged, canonical);
+      else assert(removals.has(obstruction.relative), 'COMPOSITE_DRAFT_CONFLICT', `父任务路径 ${obstruction.relative} 阻挡依赖更新，保留原文件。`);
     }
-  } finally { await removeTemporary(temporary, parent); }
+    const validate = async (change, expected) => {
+      const state = await worktreeEntry(root, change.relative);
+      assert(!state.obstruction && await matchesTreeEntry(change.filename, state.info, expected), 'COMPOSITE_DRAFT_CONFLICT',
+        `父任务路径 ${change.relative} 在依赖更新期间发生变化。`);
+    };
+    for (const [index, change] of [...removals.values(), ...writes].entries()) {
+      if (change.expected) {
+        await validate(change, change.expected);
+        change.original = path.join(temporary, `original-${index}`);
+        await fs.copyFile(change.filename, change.original);
+        assert(await matchesTreeEntry(change.original, await fs.lstat(change.original), change.expected),
+          'COMPOSITE_DRAFT_CONFLICT', `父任务文件 ${change.relative} 在备份期间发生变化。`);
+      }
+      if (change.replacement) {
+        change.stagedFile = path.join(temporary, `input-${index}`);
+        await fs.copyFile(path.join(newPath, change.relative), change.stagedFile);
+        assert(await matchesTreeEntry(change.stagedFile, await fs.lstat(change.stagedFile), change.replacement),
+          'COMPOSITE_CONTENT', `依赖版本文件 ${change.relative} 在准备期间发生变化。`);
+      }
+    }
+    const undo = [];
+    try {
+      for (const change of removals.values()) {
+        signal?.throwIfAborted();
+        await validate(change, change.expected);
+        await fs.unlink(change.filename);
+        undo.push(() => fs.link(change.original, change.filename));
+      }
+      for (const [relative, mode] of directories) {
+        const directory = path.join(root, relative);
+        const state = await worktreeEntry(root, relative);
+        assert(!state.obstruction && state.info?.isDirectory(), 'COMPOSITE_DRAFT_CONFLICT', `父任务目录 ${relative} 在依赖更新期间发生变化。`);
+        await fs.rmdir(directory);
+        undo.push(() => fs.mkdir(directory, { mode }));
+      }
+      for (const change of writes) {
+        signal?.throwIfAborted();
+        await createWorkspaceDirectories(root, change.relative, undo);
+        await validate(change, change.expected);
+        if (change.expected) await fs.rename(change.stagedFile, change.filename);
+        else await fs.link(change.stagedFile, change.filename);
+        undo.push(async () => {
+          await validate(change, change.replacement);
+          if (change.expected) await fs.rename(change.original, change.filename);
+          else await fs.unlink(change.filename);
+        });
+      }
+    } catch (error) {
+      const failures = [];
+      for (const action of undo.reverse()) {
+        try { await action(); } catch (rollback) { failures.push(rollback.message); }
+      }
+      if (failures.length) {
+        retain = true;
+        throw new AcmsError('COMPOSITE_DRAFT_CONFLICT', `依赖更新未能完整回退，请检查原副本与保留材料 ${temporary}。`, { failures });
+      }
+      throw error;
+    }
+  } finally { if (!retain) await removeTemporary(temporary, parent); }
+}
+
+function treeDirectories(files) {
+  const directories = new Set();
+  for (const filename of files.keys()) {
+    for (let prefix = path.posix.dirname(filename); prefix !== '.'; prefix = path.posix.dirname(prefix)) directories.add(prefix);
+  }
+  return directories;
+}
+
+async function planDirectoryRemoval(root, relative, prior, removals, directories, staged, canonical) {
+  if (directories.has(relative)) return;
+  assert(prior.has(relative) && !staged.has(canonical(relative)), 'COMPOSITE_DRAFT_CONFLICT', `目录 ${relative} 含父任务草稿或暂存内容，保留原副本。`);
+  const directory = path.join(root, relative);
+  for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+    const child = `${relative}/${entry.name}`;
+    if (entry.isDirectory()) await planDirectoryRemoval(root, child, prior, removals, directories, staged, canonical);
+    else assert(entry.isFile() && removals.has(child), 'COMPOSITE_DRAFT_CONFLICT', `路径 ${child} 含父任务草稿，保留原副本。`);
+  }
+  directories.set(relative, (await fs.lstat(directory)).mode & 0o777);
+}
+
+async function createWorkspaceDirectories(root, relative, undo) {
+  const parts = relative.split('/').slice(0, -1);
+  for (let i = 1; i <= parts.length; i++) {
+    const prefix = parts.slice(0, i).join('/');
+    const state = await worktreeEntry(root, prefix);
+    assert(!state.obstruction && (!state.info || state.info.isDirectory()), 'COMPOSITE_DRAFT_CONFLICT', `父任务路径 ${prefix} 阻挡依赖更新。`);
+    if (state.info) continue;
+    const directory = path.join(root, prefix);
+    await fs.mkdir(directory);
+    undo.push(() => fs.rmdir(directory));
+  }
 }
