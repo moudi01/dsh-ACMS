@@ -16,7 +16,7 @@ export const inject = ['connection', 'agents', 'subagents', 'tools'];
 export async function apply(ctx, config = {}) {
   const dataDir = path.resolve(config.dataDir ?? process.env.ACMS_DATA_DIR ?? path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'acms'));
   mkdirSync(dataDir, { recursive: true });
-  const store = new Store(path.join(dataDir, 'company.db')); const company = new Company(store);
+  const store = new Store(path.join(dataDir, 'company.db'), { requireWorktreeReady: true }); const company = new Company(store);
   // Legacy export/isolation runs inside Engine.start after the scheduler lease
   // is held; unconfirmed old processes block startup instead of being released.
   const workspaces = new WorkspaceManager(dataDir, company); const adapter = new DshAdapter(ctx, company, dataDir); const engine = new Engine(company, adapter, workspaces);

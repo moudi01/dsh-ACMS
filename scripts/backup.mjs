@@ -7,6 +7,7 @@ import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { backupWorktreeEvidence } from './restore-worktrees.mjs';
 
 export const FORMAT = 'acms-backup/1';
 const EXCLUDED_DIRS = [
@@ -139,6 +140,9 @@ export async function applyBackup(plan) {
   if (await exists(target)) { const entries = await fs.readdir(target).catch(() => []); if (entries.length) throw new Error(`Backup target is not empty: ${target}`); }
   await fs.mkdir(target, { recursive: true });
   const database = await snapshotDatabase(path.join(source, 'company.db'), path.join(target, 'company.db'));
+  const evidenceFile = path.join(target, database.file);
+  const worktreesBefore = new Map((await backupWorktreeEvidence(evidenceFile, source, new Map(plan.files.map(file => [file.path, file]))))
+    .map(item => [item.relative, item]));
   const files = [];
   for (const file of plan.files) {
     const destination = path.join(target, ...file.path.split('/'));
@@ -148,9 +152,12 @@ export async function applyBackup(plan) {
     await fs.writeFile(destination, bytes, { mode: 0o600 });
     files.push({ path: file.path, bytes: bytes.length, sha256: hash });
   }
+  const gitWorktrees = (await backupWorktreeEvidence(evidenceFile, source, new Map(files.map(file => [file.path, file]))))
+    .map(item => item.reason || JSON.stringify(item) === JSON.stringify(worktreesBefore.get(item.relative)) ? item
+      : { relative: item.relative, reason: '备份期间 Git 提交或暂存内容发生变化' });
   const manifest = {
     format: FORMAT, createdAt: plan.createdAt, source, includePairing: plan.includePairing === true,
-    database, files, excluded: plan.excluded, warnings: plan.warnings,
+    database, files, excluded: plan.excluded, warnings: plan.warnings, gitWorktrees,
     totals: { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: plan.totals.excludedBytes,
       databaseBytes: database.bytes, requiredBytes: files.reduce((sum, file) => sum + file.bytes, 0) + database.bytes },
     note: 'Raw-byte SHA-256 is used for backup integrity. ACMS artifact.hash uses sha256(base64 text) and is not interchangeable.',

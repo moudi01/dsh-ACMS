@@ -26,10 +26,20 @@ export const EFFECTIVE_ACTIVITY_EVENTS = [
 ];
 
 export class Store {
-  constructor(filename) {
+  constructor(filename, { requireWorktreeReady = false } = {}) {
     this.filename = filename;
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.db = new DatabaseSync(filename);
+    if (requireWorktreeReady) {
+      try {
+        const entities = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'").get();
+        const hold = entities && this.db.prepare("SELECT 1 FROM entities WHERE collection='restoreSafety' AND id='git-worktrees'").get();
+        assert(!hold, 'RESTORE_WORKTREES_PENDING', '恢复目录的 Git 工作副本仍待核验。请查看该目录的 REBUILD.md 后续接恢复。');
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+    }
     this.events = new EventEmitter(); this.events.setMaxListeners(100);
     this.inTransaction = false; this.pending = [];
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;

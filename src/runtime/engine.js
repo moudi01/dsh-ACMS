@@ -32,6 +32,8 @@ export class Engine {
     this.intervalMs = options.intervalMs ?? 1000; this.integration = Promise.resolve(); this.queuedIntegrations = new Set(); this.lastError = null;
   }
   async start() {
+    assert(!this.store.get('restoreSafety', 'git-worktrees')?.pending, 'RESTORE_WORKTREES_PENDING',
+      '恢复目录的 Git 工作副本仍待核验。请查看该目录的 REBUILD.md 后续接恢复。');
     this.closing = false;
     this.nextEnvironmentCheck = 0;
     this.epoch = this.store.acquireLease(this.owner);
