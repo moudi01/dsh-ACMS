@@ -6,6 +6,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { gitWorktreeFingerprint, verifiedGitBundle } from '../src/runtime/git-delivery.js';
+import { run } from '../src/runtime/workspaces.js';
 
 const CANDIDATE_DIRS = ['workspaces', 'reviews', 'integration', 'diagnostics'];
 const TERMINAL = new Set(['succeeded', 'cancelled', 'archived', 'deleted']);
@@ -45,17 +47,41 @@ async function newestMtime(target) {
   return newest;
 }
 
+async function incompleteGitDelivery(task, root, workspace) {
+  const gitPointer = await fs.lstat(path.join(workspace, '.git')).catch(() => null);
+  if (task?.workspace?.mode !== 'git' && !task?.workspace?.branch && !gitPointer?.isFile() && !gitPointer?.isSymbolicLink()) return '';
+  const delivery = task && await verifiedGitBundle(task, root);
+  if (!delivery?.worktreeHash) return 'Git 工作副本缺少覆盖完整交付的可验证版本';
+  try {
+    const git = args => run('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args], workspace, { timeout: 10000 });
+    const head = await git(['rev-parse', '--verify', 'HEAD']);
+    const index = await git(['diff', '--cached', '--quiet', '--no-ext-diff', '--no-textconv']);
+    if (head.code === 0 && !head.timedOut && head.stdout.trim() === delivery.workspaceHead &&
+      index.code === 0 && !index.timedOut && await gitWorktreeFingerprint(workspace) === delivery.worktreeHash) return '';
+  } catch { /* Unexpected or unreadable Git state must be preserved. */ }
+  return 'Git 工作副本当前内容或索引无法核实为已归档的交付版本';
+}
+
 export async function prunePlan({ dataDir, days = 30 }) {
   const root = path.resolve(dataDir);
   const databasePath = path.join(root, 'company.db');
   const database = new DatabaseSync(databasePath, { readOnly: true });
   const protectedIds = new Map();
+  const workspaceTasks = new Map();
   try {
     const rows = database.prepare("SELECT collection, id, body FROM entities WHERE collection IN ('tasks','attempts','integrations')").all();
     for (const row of rows) {
       const body = JSON.parse(row.body);
       const id = body.id ?? row.id;
-      if (row.collection === 'tasks' && !TERMINAL.has(body.status)) protectedIds.set(id, `未完成任务（${body.status}）`);
+      if (row.collection === 'tasks') {
+        if (body.workspace?.path) workspaceTasks.set(path.resolve(body.workspace.path), body);
+        if (!TERMINAL.has(body.status)) {
+          protectedIds.set(id, `未完成任务（${body.status}）`);
+          for (const source of [body.reviewOf, ...(body.reviewTargets ?? []).map(target => target.id), ...(body.dependencies ?? [])].filter(Boolean)) {
+            if (!protectedIds.has(source)) protectedIds.set(source, `未完成的依赖或审查（${id}）`);
+          }
+        }
+      }
       if (row.collection === 'attempts' && (LIVE_ATTEMPT.has(body.status) || body.cleanupPending === true)) {
         protectedIds.set(id, `运行中/待清理执行（${body.status}）`);
         if (body.taskId) protectedIds.set(body.taskId, `运行中/待清理执行（${body.status}）`);
@@ -82,6 +108,8 @@ export async function prunePlan({ dataDir, days = 30 }) {
       if (ageDays < days) continue;
       const owner = [...protectedIds.keys()].find(id => entry.name.includes(id));
       if (owner) { protectedEntries.push({ path: relative, reason: `仍被${protectedIds.get(owner)}引用（${owner}），不能清理`, ageDays: Number(ageDays.toFixed(1)) }); continue; }
+      const reason = directory === 'workspaces' ? await incompleteGitDelivery(workspaceTasks.get(absolute), root, absolute) : '';
+      if (reason) { protectedEntries.push({ path: relative, reason, ageDays: Number(ageDays.toFixed(1)) }); continue; }
       candidates.push({ path: relative, bytes: await size(absolute), ageDays: Number(ageDays.toFixed(1)) });
     }
   }

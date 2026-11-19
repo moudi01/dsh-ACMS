@@ -9,6 +9,7 @@ import { checkIdentity, copyProject, inputFingerprint, prepareDependencies, veri
 import { ARCHIVE_FORMAT } from './delivery-archive.js';
 import { validateDeliveryArchive, validateDeliveryText } from './archive-validation.js';
 import { isProseFile } from './text-integrity.js';
+import { checkoutGitBundle, publishGitDelivery, verifiedGitBundle } from './git-delivery.js';
 
 export function inside(root, target) { const rel = path.relative(root, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); }
 const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
@@ -60,6 +61,16 @@ export class WorkspaceManager {
       const sourceTask = this.company.store.require('tasks', task.reviewOf);
       const destination = path.join(this.dataDir, 'reviews', task.id);
       await fs.mkdir(path.dirname(destination), { recursive: true });
+      const missing = await fs.access(sourceTask.workspace.path).then(() => false, error => {
+        if (error.code !== 'ENOENT') throw error;
+        return true;
+      });
+      if (missing) {
+        const delivery = await verifiedGitBundle(sourceTask, this.dataDir);
+        assert(delivery, 'GIT_DELIVERY_MISSING', '原工作副本不可用，且没有可验证的 Git 交付包。');
+        await checkoutGitBundle(delivery, destination, this.dataDir, git);
+        return { path: destination, mode: 'review-copy', artifactHash: task.reviewArtifactHash };
+      }
       await copyProject(sourceTask.workspace.path, destination, { collaboration: true });
       return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration: sourceTask.workspace.collaboration };
     }
@@ -166,7 +177,11 @@ export class WorkspaceManager {
         v.taskGeneration === deliveryGeneration(source) && v.goalContractVersion === taskContractVersion(source));
       if (!row?.checks?.some(check => check.checkVersion) || !source.workspace) continue;
       const cwd = source.workspace.path;
-      const inputHash = await inputFingerprint(cwd, signal);
+      const inputHash = await inputFingerprint(cwd, signal).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (!inputHash) continue;
       if (task.reviewOf && checkReviewCopy && await inputFingerprint(task.workspace.path, signal) !== inputHash) continue;
       const project = store.require('projects', source.projectId);
       const checks = [];
@@ -189,8 +204,11 @@ export class WorkspaceManager {
   async captureChanges(task, invoke = run) {
     if (task.workspace.mode !== 'git') return null;
     const cwd = task.workspace.path;
-    const tracked = await git(['diff', '--name-only', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, undefined, invoke);
-    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, undefined, invoke);
+    const maxOutput = 4 * 1024 * 1024;
+    // A delivery needs both sides of a rename, including the deleted path.
+    const tracked = await git(['diff', '--name-only', '--no-renames', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
+    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
+    assert(tracked.length < maxOutput && untracked.length < maxOutput, 'CHANGE_LIMIT', 'Git change names exceed the delivery limit');
     const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)))].sort();
     assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
     const files = [];
@@ -201,6 +219,10 @@ export class WorkspaceManager {
     return files;
   }
   async unchanged(task, artifactIds, invoke = run) {
+    try { await fs.access(task.workspace.path); } catch (error) {
+      if (error.code !== 'ENOENT') return false;
+      return !!(await verifiedGitBundle(task, this.dataDir));
+    }
     try { await verifyCollaboration(task.workspace); } catch { return false; }
     for (const artifactId of artifactIds) {
       const a = this.company.store.require('artifacts', artifactId);
@@ -235,7 +257,18 @@ export class WorkspaceManager {
   }
   async integrate(task, isCurrent, execution) {
     const project = this.company.store.require('projects', task.projectId);
-    if (!project.autoMerge) return { status: 'available', path: task.workspace.path, branch: task.workspace.branch };
+    if (!project.autoMerge) {
+      const available = { status: 'available', path: task.workspace.path, branch: task.workspace.branch };
+      if (task.workspace.mode !== 'git') return available;
+      const getGit = (args, cwd, options) => git(args, cwd, options, execution.run);
+      const source = await this.validateProject(project, execution.run);
+      assert(await this.unchanged(task, task.artifactIds, execution.run), 'ARTIFACT_CHANGED', 'Git 交付内容已改变。');
+      const artifacts = task.artifactIds.map(id => this.company.store.require('artifacts', id));
+      const delivery = await publishGitDelivery({ dataDir: this.dataDir, task, source, artifacts, executionId: execution.id,
+        git: getGit, safeFile: filename => this.safeFile(task.workspace.path, filename) });
+      assert(await this.unchanged(task, task.artifactIds, execution.run), 'ARTIFACT_CHANGED', '生成交付版本期间，Git 工作副本已改变。');
+      return { ...available, delivery };
+    }
     assert(task.workspace.mode === 'git', 'INTEGRATION_REQUIRED', 'Automatic integration requires a Git project');
     const invoke = execution.run;
     const getGit = (args, cwd) => git(args, cwd, undefined, invoke);

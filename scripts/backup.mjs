@@ -21,6 +21,7 @@ const SENSITIVE = [
 const PRIVATE_WARNINGS = [
   { name: 'conversations', message: 'conversations/ 包含角色回复与私有内容，备份文件按本机私有数据处理' },
   { name: 'artifacts', message: 'artifacts/ 可能包含项目源码或敏感数据，备份文件按本机私有数据处理' },
+  { name: 'deliveries', message: 'deliveries/ 包含 Git 源码交付包，备份文件按本机私有数据处理' },
 ];
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const isInside = (root, target) => {
