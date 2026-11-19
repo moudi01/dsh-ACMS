@@ -71,6 +71,7 @@ git -C <newDir> -c core.autocrlf=false checkout --detach <deliveryCommit>
 ```
 
 交付包位于数据目录的 `deliveries/`，包括该任务的 Git 源码树和已声明产物。整库备份包含交付包，恢复时会迁移其记录路径。仅凭交付包即可重建此次交付。
+稀疏检出导致基准文件缺失时，任务会等待恢复完整检出并重新交付。
 
 ## 旧阶段制数据备份与隔离
 

@@ -201,3 +201,49 @@ test('retention requires proof of the reconstructed tree even when the Git index
   assert(plan.protected.some(item => item.path === 'workspaces/' + task.id && item.reason.includes('缺少覆盖完整交付')));
   assert(!plan.candidates.some(item => item.path === 'workspaces/' + task.id));
 });
+
+for (const flag of ['--assume-unchanged', '--skip-worktree']) test(`Git delivery preserves a deletion concealed by ${flag}`, windows, async t => {
+  const f = await fixture(t, async input => {
+    const cwd = input.task.workspace.path;
+    await git(['update-index', flag, 'tracked.txt'], cwd);
+    await unlink(path.join(cwd, 'tracked.txt'));
+    return defaultSimulation(input);
+  });
+  await writeFile(path.join(f.source, 'tracked.txt'), 'delete in the complete worktree\n');
+  const base = (await gitProject(f)).trim();
+  f.command('project.save', { id: f.project.id, autoMerge: false });
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 30000, taskWaitDiagnostics(f, task.id));
+  const saved = f.store.require('tasks', task.id);
+  assert(!saved.changeSet.some(file => file.path === 'tracked.txt'));
+  const delivery = await verifiedGitBundle(saved, f.dataDir);
+  assert(delivery?.worktreeHash);
+  const rebuilt = path.join(f.root, 'rebuilt');
+  await checkoutGitBundle(delivery, rebuilt, f.root, git);
+  await assert.rejects(readFile(path.join(rebuilt, 'tracked.txt')), { code: 'ENOENT' });
+  assert.equal(await git(['rev-parse', 'HEAD'], f.source), base);
+  await age(saved.workspace.path);
+  assert((await prunePlan({ dataDir: f.dataDir, days: 1 })).candidates.some(item => item.path === 'workspaces/' + task.id));
+});
+
+test('Git delivery explicitly waits for a complete checkout if sparse checkout omits a baseline file', windows, async t => {
+  const f = await fixture(t, async input => {
+    const cwd = input.task.workspace.path;
+    await git(['sparse-checkout', 'set', '--no-cone', '/README.md'], cwd);
+    await assert.rejects(readFile(path.join(cwd, 'tracked.txt')), { code: 'ENOENT' });
+    return defaultSimulation(input);
+  });
+  await writeFile(path.join(f.source, 'tracked.txt'), 'intentionally omitted by sparse checkout\n');
+  const base = (await gitProject(f)).trim();
+  f.command('project.save', { id: f.project.id, autoMerge: false });
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.list('integrations').some(record => record.taskId === task.id && record.phase === 'failed'), 20000,
+    taskWaitDiagnostics(f, task.id));
+  const saved = f.store.require('tasks', task.id);
+  assert.equal(saved.status, 'blocked');
+  assert.equal(saved.integration?.delivery, undefined);
+  assert.match(f.store.list('integrations').find(record => record.taskId === task.id).reason, /稀疏检出.*完整检出后重新交付/);
+  assert.equal(await git(['rev-parse', 'HEAD'], f.source), base);
+});

@@ -33,7 +33,7 @@ async function fileDigest(filename, { algorithm = 'sha256', prefix = '' } = {}) 
   return hash.digest('hex');
 }
 
-async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination, objectFormat }) {
+async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination, objectFormat, sparse }) {
   assert(tree.length < treeOutputLimit, 'GIT_DELIVERY_EVIDENCE', 'Git 基准文件清单超过可核对范围。');
   const staged = [];
   for (const entry of tree.split('\0').filter(Boolean)) {
@@ -47,7 +47,15 @@ async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destinat
       if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null;
       throw error;
     });
-    if (!info?.isFile() || await fs.realpath(source) !== source) continue;
+    if (!info || info.isDirectory()) {
+      assert(!sparse, 'GIT_DELIVERY_SPARSE', '稀疏检出的 Git 工作副本缺少基准文件。请恢复为完整检出后重新交付。');
+      // Explicitly include the missing file in git add's pathspec so it
+      // removes the baseline index entry even if the author index hid it.
+      staged.push(name);
+      continue;
+    }
+    assert(info.isFile() && await fs.realpath(source) === source,
+      'GIT_DELIVERY_PATH', 'Git 基准文件被链接或其他不支持的文件类型替换。');
     const digestOptions = { algorithm: objectFormat, prefix: 'blob ' + info.size + '\0' };
     const materialized = await fileDigest(source, digestOptions);
     if (materialized === original) continue;
@@ -125,6 +133,7 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
   assert(await objectDirectory(workspace.path) === objects, 'GIT_DELIVERY_REPOSITORY', '工作副本不再属于批准的源 Git 仓库。');
   assert(!/[\r\n]/.test(objects), 'GIT_DELIVERY_REPOSITORY', 'Git 对象目录路径不能包含换行。');
   const objectFormat = await git(['rev-parse', '--show-object-format'], workspace.path);
+  const sparse = await git(['config', '--bool', '--default=false', '--get', 'core.sparseCheckout'], workspace.path) === 'true';
   const workspaceHead = await git(['rev-parse', '--verify', 'HEAD'], workspace.path);
   const workspaceRoot = await fs.realpath(workspace.path);
   const integrationRoot = path.join(dataDir, 'integration');
@@ -148,7 +157,7 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
       ...args], indexWorktree, gitOptions);
     await build(['read-tree', workspace.baseCommit]);
     const tree = await git(['ls-tree', '-r', '--full-tree', '-z', workspace.baseCommit], workspace.path, { maxOutput: treeOutputLimit });
-    const materialized = await stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination: indexWorktree, objectFormat });
+    const materialized = await stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination: indexWorktree, objectFormat, sparse });
     for (const [name, entry] of files) {
       if (entry.deleted) continue;
       const file = await safeFile(name);
