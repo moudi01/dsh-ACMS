@@ -126,7 +126,7 @@ G1–G14 是升级前置；G15 是部署执行；G16 是部署后完成条件。
 
 | 编号 | 阶段 | 门槛与所需证据 | 判定条件 |
 | --- | --- | --- | --- |
-| G15 | 部署执行 | 构建部署与版本加载：在合并后 main 的干净隔离检出执行 `npm ci`、`npm run build`、`node scripts/deploy-live.mjs <profile>`；脚本输出 `ACMS host <revision> published to <profile>`；记录 dist/host-<revision>.mjs 的 sha256、dataDir/install-backups 下新生成的配置备份、profile 中 ACMS 入口指向该文件；重启宿主或按 DSH 方式重载并刷新页面，核对宿主加载的是该 revision | 部署日志、revision、文件名与 sha256 一致；profile 入口可复核；宿主加载无插件错误；无法证明加载的是新版本时视为未加载，不得写「通过」。部署脚本的 checkIdle 若因活动执行、reconciling 或 cleanupPending 拒绝，属于部署前阻断，按第 6.1 节停止，不进入回滚；此时 profile 入口尚未改变，但可能已生成 dist 文件，记录即可 |
+| G15 | 部署执行 | 构建部署与版本加载：在合并后 main 的干净隔离检出执行 `npm ci`、`npm run build`、`node scripts/deploy-live.mjs <profile>`；脚本输出 `ACMS host <revision> published to <profile>`；记录 dist/host-<revision>.mjs 的 sha256、输出中的配置备份路径、profile 中 ACMS 入口指向该文件；重启宿主或按 DSH 方式重载并刷新页面，核对宿主加载的是该 revision | 部署日志、revision、文件名与 sha256 一致；profile 入口可复核；宿主加载无插件错误；无法证明加载的是新版本时视为未加载，不得写「通过」。活动执行、对话、Git 集成、待核对的进程清理或工作副本恢复会阻止切换。按第 6.1 节处理并记录 profile 入口及可能已生成的 dist 文件 |
 
 补充：`scripts/deploy-live.mjs` 在开始时执行一次 checkIdle，在写入 profile 前再执行一次。第二次拒绝时仅可能已写入 dist 文件，live profile 未切换；不得把这种情况写成「已部署后回滚」。部署用的检出目录必须持久保留（profile 入口指向该目录的 dist/host-<revision>.mjs），不得在部署后删除，否则下次重载会找不到宿主文件。
 
