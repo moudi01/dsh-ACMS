@@ -46,8 +46,8 @@ export async function runContained(command, args, cwd, { signal, timeout = 12000
     throw error;
   }
   let stdout = '', stderr = '', timedOut = false;
-  child.stdout.on('data', data => { stdout = (stdout + data).slice(-maxOutput); });
-  child.stderr.on('data', data => { stderr = (stderr + data).slice(-maxOutput); });
+  child.stdout.setEncoding('utf8').on('data', data => { stdout = (stdout + data).slice(-maxOutput); });
+  child.stderr.setEncoding('utf8').on('data', data => { stderr = (stderr + data).slice(-maxOutput); });
   child.stdin.end();
   const stopped = Promise.withResolvers();
   const abort = () => {

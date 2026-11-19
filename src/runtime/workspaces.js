@@ -30,14 +30,20 @@ export async function run(command, args, cwd, { signal, timeout = 120000, maxOut
     const timer = setTimeout(() => { timedOut = true; terminate(); }, timeout);
     signal?.addEventListener('abort', terminate, { once: true });
     const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', terminate); };
-    child.stdout.on('data', b => { stdout = (stdout + b).slice(-maxOutput); });
-    child.stderr.on('data', b => { stderr = (stderr + b).slice(-maxOutput); });
+    child.stdout.setEncoding('utf8').on('data', b => { stdout = (stdout + b).slice(-maxOutput); });
+    child.stderr.setEncoding('utf8').on('data', b => { stderr = (stderr + b).slice(-maxOutput); });
     child.once('error', e => { cleanup(); reject(e); });
     child.once('close', async (code, termination) => { cleanup(); await terminating; resolve({ code, signal: termination, timedOut, stdout, stderr }); });
     if (signal?.aborted) terminate();
   });
 }
-async function git(args, cwd, options, invoke = run) { const r = await invoke('git', args, cwd, options); assert(r.code === 0 && !r.timedOut, 'GIT_ERROR', r.stderr || r.stdout || 'Git operation failed', { args }); return r.stdout.trim(); }
+async function git(args, cwd, options, invoke = run) {
+  const result = await invoke('git', args, cwd, options);
+  assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || result.stdout || 'Git operation failed', { args });
+  if (!args.includes('-z')) return result.stdout.trim();
+  assert(!result.stdout || result.stdout.endsWith('\0'), 'GIT_PATH_OUTPUT', 'Git returned an incomplete NUL-delimited list');
+  return result.stdout;
+}
 export class WorkspaceManager {
   constructor(dataDir, company) { this.dataDir = dataDir; this.company = company; }
   async publishProject(project) { await this.validateProject(project); return publishCollaboration(this.company, project); }
@@ -218,10 +224,21 @@ export class WorkspaceManager {
     assert(tracked.length < maxOutput && untracked.length < maxOutput, 'CHANGE_LIMIT', 'Git change names exceed the delivery limit');
     const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)))].sort();
     assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
+    const root = await fs.realpath(cwd);
     const files = [];
     for (const name of names) {
-      try { const filename = await this.safeFile(cwd, name); files.push({ path: name, hash: digest((await fs.readFile(filename)).toString('base64')) }); }
-      catch (e) { if (e.code !== 'ENOENT') throw e; files.push({ path: name, deleted: true }); }
+      try {
+        const filename = await this.safeFile(cwd, name);
+        const spelling = path.relative(root, filename).split(path.sep).join('/');
+        // Windows lookup can find the new spelling for an old Git path.
+        // Keep both exact Git paths when a case-only rename is reported.
+        if (process.platform === 'win32' && spelling !== name && spelling.toLowerCase() === name.toLowerCase()) {
+          files.push({ path: name, deleted: true });
+        } else files.push({ path: name, hash: digest((await fs.readFile(filename)).toString('base64')) });
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        files.push({ path: name, deleted: true });
+      }
     }
     return files;
   }

@@ -247,3 +247,53 @@ test('Git delivery explicitly waits for a complete checkout if sparse checkout o
   assert.match(f.store.list('integrations').find(record => record.taskId === task.id).reason, /稀疏检出.*完整检出后重新交付/);
   assert.equal(await git(['rev-parse', 'HEAD'], f.source), base);
 });
+
+test('Git delivery keeps distinct paths with leading spaces in tracked and untracked results', windows, async t => {
+  const f = await fixture(t, async input => {
+    const cwd = input.task.workspace.path;
+    await writeFile(path.join(cwd, ' created.txt'), 'new path begins with a space\n');
+    await writeFile(path.join(cwd, ' edited.txt'), 'existing path begins with a space\n');
+    return defaultSimulation(input);
+  });
+  await writeFile(path.join(f.source, 'created.txt'), 'ordinary path already in the base\n');
+  await writeFile(path.join(f.source, ' edited.txt'), 'old bytes at the space-prefixed path\n');
+  await gitProject(f);
+  f.command('project.save', { id: f.project.id, autoMerge: false });
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 30000, taskWaitDiagnostics(f, task.id));
+  const saved = f.store.require('tasks', task.id);
+  assert.deepEqual(saved.changeSet.map(file => file.path), [' created.txt', ' edited.txt', 'deliverable.md']);
+  const delivery = await verifiedGitBundle(saved, f.dataDir);
+  assert(delivery?.worktreeHash);
+  const rebuilt = path.join(f.root, 'rebuilt');
+  await checkoutGitBundle(delivery, rebuilt, f.root, git);
+  assert.deepEqual(await readFile(path.join(rebuilt, 'created.txt')), await readFile(path.join(saved.workspace.path, 'created.txt')));
+  assert.equal(await readFile(path.join(rebuilt, ' created.txt'), 'utf8'), 'new path begins with a space\n');
+  assert.equal(await readFile(path.join(rebuilt, ' edited.txt'), 'utf8'), 'existing path begins with a space\n');
+});
+
+test('Git delivery preserves the exact tree name of a Windows case-only rename', windows, async t => {
+  const f = await fixture(t, async input => {
+    await git(['mv', '-f', 'tracked.txt', 'TRACKED.TXT'], input.task.workspace.path);
+    return defaultSimulation(input);
+  });
+  await writeFile(path.join(f.source, 'tracked.txt'), 'same content at the new spelling\n');
+  const base = (await gitProject(f)).trim();
+  f.command('project.save', { id: f.project.id, autoMerge: false });
+  const task = f.task();
+  await f.start();
+  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 30000, taskWaitDiagnostics(f, task.id));
+  const saved = f.store.require('tasks', task.id);
+  assert.deepEqual(saved.changeSet.find(file => file.path === 'tracked.txt'), { path: 'tracked.txt', deleted: true });
+  assert(saved.changeSet.find(file => file.path === 'TRACKED.TXT')?.hash);
+  const delivery = await verifiedGitBundle(saved, f.dataDir);
+  assert(delivery?.worktreeHash);
+  const rebuilt = path.join(f.root, 'rebuilt');
+  await checkoutGitBundle(delivery, rebuilt, f.root, git);
+  const filenames = (await git(['ls-tree', '-r', '--name-only', 'HEAD'], rebuilt)).split(/\r?\n/);
+  assert(filenames.includes('TRACKED.TXT'));
+  assert(!filenames.includes('tracked.txt'));
+  assert.deepEqual(await readFile(path.join(rebuilt, 'TRACKED.TXT')), await readFile(path.join(saved.workspace.path, 'TRACKED.TXT')));
+  assert.equal(await git(['rev-parse', 'HEAD'], f.source), base);
+});

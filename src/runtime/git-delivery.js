@@ -35,7 +35,7 @@ async function fileDigest(filename, { algorithm = 'sha256', prefix = '' } = {}) 
 
 async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination, objectFormat, sparse }) {
   assert(tree.length < treeOutputLimit, 'GIT_DELIVERY_EVIDENCE', 'Git 基准文件清单超过可核对范围。');
-  const staged = [];
+  const modified = [], deleted = [];
   for (const entry of tree.split('\0').filter(Boolean)) {
     const blob = entry.match(/^100(?:644|755) blob ([a-f0-9]+)\t(.*)$/s);
     if (!blob) continue;
@@ -51,7 +51,7 @@ async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destinat
       assert(!sparse, 'GIT_DELIVERY_SPARSE', '稀疏检出的 Git 工作副本缺少基准文件。请恢复为完整检出后重新交付。');
       // Explicitly include the missing file in git add's pathspec so it
       // removes the baseline index entry even if the author index hid it.
-      staged.push(name);
+      deleted.push(name);
       continue;
     }
     assert(info.isFile() && await fs.realpath(source) === source,
@@ -65,9 +65,9 @@ async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destinat
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.copyFile(source, target);
     assert(await fileDigest(target, digestOptions) === materialized, 'ARTIFACT_CHANGED', '复制 Git 基准文件时内容已改变。');
-    staged.push(name);
+    modified.push(name);
   }
-  return staged;
+  return { modified, deleted };
 }
 
 async function removeTemporary(directory, parent) {
@@ -153,11 +153,21 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
     await fs.writeFile(path.join(repository, 'objects', 'info', 'alternates'), objects.replaceAll('\\', '/') + '\n');
     await fs.writeFile(path.join(repository, 'info', 'attributes'), attributes);
     const build = args => git(['--git-dir=' + repository, '--work-tree=' + indexWorktree, '--literal-pathspecs',
-      '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', '-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost',
+      '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', '-c', 'core.ignorecase=false', '-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost',
       ...args], indexWorktree, gitOptions);
     await build(['read-tree', workspace.baseCommit]);
     const tree = await git(['ls-tree', '-r', '--full-tree', '-z', workspace.baseCommit], workspace.path, { maxOutput: treeOutputLimit });
     const materialized = await stageMaterializedBaseFiles({ tree, files, workspaceRoot, destination: indexWorktree, objectFormat, sparse });
+    const pathspec = path.join(temporary, 'pathspec');
+    const addPaths = async paths => {
+      if (!paths.length) return;
+      await fs.writeFile(pathspec, paths.join('\0') + '\0');
+      await build(['add', '--all', '--force', '--pathspec-from-file=' + pathspec, '--pathspec-file-nul']);
+    };
+    // Stage deletions before populating additions to prevent case-insensitive
+    // lookup of a newly copied file from resurrecting an old spelling.
+    await addPaths([...files].filter(([, entry]) => entry.deleted).map(([name]) => name).concat(materialized.deleted));
+    const modified = [...materialized.modified];
     for (const [name, entry] of files) {
       if (entry.deleted) continue;
       const file = await safeFile(name);
@@ -167,12 +177,9 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
       const destination = path.join(indexWorktree, name);
       await fs.mkdir(path.dirname(destination), { recursive: true });
       await fs.writeFile(destination, bytes, { mode: (await fs.stat(file)).mode & 0o777 });
+      modified.push(name);
     }
-    if (files.size || materialized.length) {
-      const pathspec = path.join(temporary, 'pathspec');
-      await fs.writeFile(pathspec, [...files.keys(), ...materialized].join('\0') + '\0');
-      await build(['add', '--all', '--force', '--pathspec-from-file=' + pathspec, '--pathspec-file-nul']);
-    }
+    await addPaths(modified);
     const deliveredTree = await build(['write-tree']);
     // A root commit bundles the complete file tree without relying on the
     // source object database or retaining its history in every backup.
