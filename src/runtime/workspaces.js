@@ -9,6 +9,7 @@ import { checkIdentity, copyProject, inputFingerprint, prepareDependencies, veri
 import { ARCHIVE_FORMAT } from './delivery-archive.js';
 import { validateDeliveryArchive, validateDeliveryText } from './archive-validation.js';
 import { isProseFile } from './text-integrity.js';
+import { checkoutGitBundle, publishGitDelivery, verifiedGitBundle } from './git-delivery.js';
 
 export function inside(root, target) { const rel = path.relative(root, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); }
 const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
@@ -29,14 +30,20 @@ export async function run(command, args, cwd, { signal, timeout = 120000, maxOut
     const timer = setTimeout(() => { timedOut = true; terminate(); }, timeout);
     signal?.addEventListener('abort', terminate, { once: true });
     const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', terminate); };
-    child.stdout.on('data', b => { stdout = (stdout + b).slice(-maxOutput); });
-    child.stderr.on('data', b => { stderr = (stderr + b).slice(-maxOutput); });
+    child.stdout.setEncoding('utf8').on('data', b => { stdout = (stdout + b).slice(-maxOutput); });
+    child.stderr.setEncoding('utf8').on('data', b => { stderr = (stderr + b).slice(-maxOutput); });
     child.once('error', e => { cleanup(); reject(e); });
     child.once('close', async (code, termination) => { cleanup(); await terminating; resolve({ code, signal: termination, timedOut, stdout, stderr }); });
     if (signal?.aborted) terminate();
   });
 }
-async function git(args, cwd, options, invoke = run) { const r = await invoke('git', args, cwd, options); assert(r.code === 0 && !r.timedOut, 'GIT_ERROR', r.stderr || r.stdout || 'Git operation failed', { args }); return r.stdout.trim(); }
+async function git(args, cwd, options, invoke = run) {
+  const result = await invoke('git', args, cwd, options);
+  assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || result.stdout || 'Git operation failed', { args });
+  if (!args.includes('-z')) return result.stdout.trim();
+  assert(!result.stdout || result.stdout.endsWith('\0'), 'GIT_PATH_OUTPUT', 'Git returned an incomplete NUL-delimited list');
+  return result.stdout;
+}
 export class WorkspaceManager {
   constructor(dataDir, company) { this.dataDir = dataDir; this.company = company; }
   async publishProject(project) { await this.validateProject(project); return publishCollaboration(this.company, project); }
@@ -60,6 +67,16 @@ export class WorkspaceManager {
       const sourceTask = this.company.store.require('tasks', task.reviewOf);
       const destination = path.join(this.dataDir, 'reviews', task.id);
       await fs.mkdir(path.dirname(destination), { recursive: true });
+      const missing = await fs.access(sourceTask.workspace.path).then(() => false, error => {
+        if (error.code !== 'ENOENT') throw error;
+        return true;
+      });
+      if (missing) {
+        const delivery = await verifiedGitBundle(sourceTask, this.dataDir);
+        assert(delivery, 'GIT_DELIVERY_MISSING', '原工作副本不可用，且没有可验证的 Git 交付包。');
+        await checkoutGitBundle(delivery, destination, this.dataDir, git);
+        return { path: destination, mode: 'review-copy', artifactHash: task.reviewArtifactHash };
+      }
       await copyProject(sourceTask.workspace.path, destination, { collaboration: true });
       return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration: sourceTask.workspace.collaboration };
     }
@@ -104,7 +121,12 @@ export class WorkspaceManager {
     assert(Array.isArray(declared) && declared.length <= 100, 'INVALID_ARTIFACTS', 'At most 100 artifacts may be submitted');
     if (task.requiresArtifacts) assert(declared.length > 0, 'MISSING_ARTIFACTS', 'This task requires a concrete deliverable');
     const source = task.workspace.path;
-    const inputHash = task.checkIds.length ? await inputFingerprint(source, attempt.signal) : null;
+    const project = this.company.store.require('projects', task.projectId);
+    const gitDelivery = task.workspace.mode === 'git' && !project.autoMerge;
+    const inputHash = task.checkIds.length || gitDelivery ? await inputFingerprint(source, attempt.signal).catch(error => {
+      if (gitDelivery && !task.checkIds.length && error.code === 'CHECK_INPUT_LINK') return null;
+      throw error;
+    }) : null;
     const artifacts = [], checkResults = [];
     for (const item of declared) {
       assert(!isCollaborationPath(path.normalize(item.path ?? '')), 'ARTIFACT_PATH', '.acms 是固定输入，交付物请写入普通任务文档');
@@ -130,7 +152,6 @@ export class WorkspaceManager {
       }
       artifacts.push(artifact);
     }
-    const project = this.company.store.require('projects', task.projectId);
     const guard = () => assert(digest(this.company.store.require('projects', task.projectId).preparation ?? null) === digest(project.preparation ?? null),
       'PREPARATION_CHANGED', 'Owner preparation configuration changed');
     const evidence = task.checkIds.length ? this.company.store.list('verifications').filter(v => v.kind === 'checks' && v.taskId === task.id).flatMap(v => v.checks) : [];
@@ -149,8 +170,11 @@ export class WorkspaceManager {
     const changeSet = await this.captureChanges(task);
     if (inputHash) guard();
     if (inputHash) assert(await inputFingerprint(source, attempt.signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Delivery inputs changed during verification');
-    return { artifacts, checks: checkResults, changeSet, hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash,
-      ...(a.archiveVerification ? { archiveFormat: a.archiveVerification.format, archivePassed: a.archiveVerification.passed } : {}) })), changeSet }) };
+    const gitDeliveryInputHash = gitDelivery ? inputHash : null;
+    return { artifacts, checks: checkResults, changeSet, gitDeliveryInputHash,
+      hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash,
+        ...(a.archiveVerification ? { archiveFormat: a.archiveVerification.format, archivePassed: a.archiveVerification.passed } : {}) })),
+      changeSet, ...(gitDeliveryInputHash ? { gitDeliveryInputHash } : {}) }) };
   }
   prepareEnvironment(task, spec, invoke, signal) {
     return prepareDependencies(this.dataDir, task.workspace.path, spec, invoke, signal);
@@ -166,7 +190,11 @@ export class WorkspaceManager {
         v.taskGeneration === deliveryGeneration(source) && v.goalContractVersion === taskContractVersion(source));
       if (!row?.checks?.some(check => check.checkVersion) || !source.workspace) continue;
       const cwd = source.workspace.path;
-      const inputHash = await inputFingerprint(cwd, signal);
+      const inputHash = await inputFingerprint(cwd, signal).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (!inputHash) continue;
       if (task.reviewOf && checkReviewCopy && await inputFingerprint(task.workspace.path, signal) !== inputHash) continue;
       const project = store.require('projects', source.projectId);
       const checks = [];
@@ -189,24 +217,43 @@ export class WorkspaceManager {
   async captureChanges(task, invoke = run) {
     if (task.workspace.mode !== 'git') return null;
     const cwd = task.workspace.path;
-    const tracked = await git(['diff', '--name-only', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, undefined, invoke);
-    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, undefined, invoke);
+    const maxOutput = 4 * 1024 * 1024;
+    // A delivery needs both sides of a rename, including the deleted path.
+    const tracked = await git(['diff', '--name-only', '--no-renames', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
+    const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
+    assert(tracked.length < maxOutput && untracked.length < maxOutput, 'CHANGE_LIMIT', 'Git change names exceed the delivery limit');
     const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)))].sort();
     assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
+    const root = await fs.realpath(cwd);
     const files = [];
     for (const name of names) {
-      try { const filename = await this.safeFile(cwd, name); files.push({ path: name, hash: digest((await fs.readFile(filename)).toString('base64')) }); }
-      catch (e) { if (e.code !== 'ENOENT') throw e; files.push({ path: name, deleted: true }); }
+      try {
+        const filename = await this.safeFile(cwd, name);
+        const spelling = path.relative(root, filename).split(path.sep).join('/');
+        // Windows lookup can find the new spelling for an old Git path.
+        // Keep both exact Git paths when a case-only rename is reported.
+        if (process.platform === 'win32' && spelling !== name && spelling.toLowerCase() === name.toLowerCase()) {
+          files.push({ path: name, deleted: true });
+        } else files.push({ path: name, hash: digest((await fs.readFile(filename)).toString('base64')) });
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        files.push({ path: name, deleted: true });
+      }
     }
     return files;
   }
   async unchanged(task, artifactIds, invoke = run) {
+    try { await fs.access(task.workspace.path); } catch (error) {
+      if (error.code !== 'ENOENT') return false;
+      return !!(await verifiedGitBundle(task, this.dataDir));
+    }
     try { await verifyCollaboration(task.workspace); } catch { return false; }
     for (const artifactId of artifactIds) {
       const a = this.company.store.require('artifacts', artifactId);
       try { const bytes = await fs.readFile(await this.safeFile(task.workspace.path, a.path)); if (digest(bytes.toString('base64')) !== a.hash) return false; } catch { return false; }
     }
     if (task.changeSet && digest(await this.captureChanges(task, invoke)) !== digest(task.changeSet)) return false;
+    if (task.gitDeliveryInputHash && await inputFingerprint(task.workspace.path) !== task.gitDeliveryInputHash) return false;
     return true;
   }
   async integrationTarget(root, invoke) {
@@ -235,7 +282,18 @@ export class WorkspaceManager {
   }
   async integrate(task, isCurrent, execution) {
     const project = this.company.store.require('projects', task.projectId);
-    if (!project.autoMerge) return { status: 'available', path: task.workspace.path, branch: task.workspace.branch };
+    if (!project.autoMerge) {
+      const available = { status: 'available', path: task.workspace.path, branch: task.workspace.branch };
+      if (task.workspace.mode !== 'git') return available;
+      const getGit = (args, cwd, options) => git(args, cwd, options, execution.run);
+      const source = await this.validateProject(project, execution.run);
+      assert(await this.unchanged(task, task.artifactIds, execution.run), 'ARTIFACT_CHANGED', 'Git 交付内容已改变。');
+      const artifacts = task.artifactIds.map(id => this.company.store.require('artifacts', id));
+      const delivery = await publishGitDelivery({ dataDir: this.dataDir, task, source, artifacts, executionId: execution.id,
+        git: getGit, safeFile: filename => this.safeFile(task.workspace.path, filename) });
+      assert(await this.unchanged(task, task.artifactIds, execution.run), 'ARTIFACT_CHANGED', '生成交付版本期间，Git 工作副本已改变。');
+      return { ...available, delivery };
+    }
     assert(task.workspace.mode === 'git', 'INTEGRATION_REQUIRED', 'Automatic integration requires a Git project');
     const invoke = execution.run;
     const getGit = (args, cwd) => git(args, cwd, undefined, invoke);

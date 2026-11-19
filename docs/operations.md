@@ -60,7 +60,18 @@
 
 公司级、目标级和任务级暂停叠加时，任一层未解除都不会派发。清理未确认的 `reconciling` 占位优先于恢复调度。
 
-源项目应先提交初始 Git 版本。默认保留交付分支，可从产物和任务工作副本查看输出；选择自动集成前明确该项目的验收检查。
+源项目应先提交初始 Git 版本。关闭自动合入时，Git 项目的任务详情会显示交付提交、源基准和本机 Git 交付包。选择自动集成前明确该项目的验收检查。
+
+要从交付包重建，先用 `Get-FileHash -Algorithm SHA256` 对照任务详情中的包摘要，再把包检出到新目录。以下 PowerShell 命令保留交付提交中记录的原始文件字节。
+
+```powershell
+git clone --no-checkout --branch delivery -- <bundle> <newDir>
+'* -text -eol -ident -filter -working-tree-encoding' | Set-Content -Encoding ascii -LiteralPath '<newDir>/.git/info/attributes'
+git -C <newDir> -c core.autocrlf=false checkout --detach <deliveryCommit>
+```
+
+交付包位于数据目录的 `deliveries/`，包括该任务的 Git 源码树和已声明产物。整库备份包含交付包，恢复时会迁移其记录路径。仅凭交付包即可重建此次交付。
+稀疏检出导致基准文件缺失时，任务会等待恢复完整检出并重新交付。
 
 ## 旧阶段制数据备份与隔离
 
@@ -108,6 +119,7 @@ node scripts/prune-data.mjs --data-dir <dataDir> --days 30   # 保留 dry-run，
 - 默认排除可重建目录 `node_modules`、`.git` 目录、`.cache`、`diagnostics`；只排除数据目录顶层的 `company.db`/`-wal`/`-shm`（由一致快照替代），历史备份目录或交付物中嵌套的 `company.db` 会正常备份。git worktree 的 `.git` 指针文件会保留，恢复后工作副本仍可作为 git 仓库继续执行；依赖目录按 `REBUILD.md` 运行 `npm ci` 重建。排除项在清单和恢复生成的 `REBUILD.md` 中带重建方法。`pairing/` 含外部配对 runner 信息，默认不进入备份，需在新环境重新配对（`--include-pairing` 需所有者自行评估敏感性）。`conversations/` 与 `artifacts/` 可能包含私有内容，计划阶段会明确告警。
 - 恢复目标必须是空目录；脚本先校验清单再复制，拒绝覆盖已有数据。恢复时会把数据库实体中指向旧数据目录的绝对路径（任务工作副本、artifact blob 等）改写为新目录，并更新恢复清单；数据库外的项目源路径保持不变。恢复后的在途执行进入 `reconciling`，只能“重新读取回执”，不要重跑、删除锁或改数据库；配对与依赖按 `REBUILD.md` 重建。历史事件/命令文本中的旧路径作为审计记录保留，不改写。
 - `prune-data.mjs` 只做 dry-run：按目录树内最新修改时间（跳过可重建的 `node_modules`/`.git`）列出超过保留期限的 `workspaces/`、`reviews/`、`integration/`、`diagnostics/` 副本及空间；仍被未完成任务、运行中执行、待清理占位或在途集成的 task/integration ID 引用的目录会标记保护，不会出现在可清理列表。只读打开 WAL 数据库后，SQLite 可能在数据目录留下 `-shm/-wal` 辅助文件（例如 32 KiB 的 `-shm` 与 0 B 的 `-wal`）；业务数据不被修改。实际删除仍由所有者按现有授权流程执行。
+- Git 工作副本进入可清理列表前，需要核对当前登记的交付包、索引和从包独立重建后匹配的工作区指纹，并排除在用的审查或依赖。缺少交付包的旧记录、包损坏或存在额外未提交成果时，计划显示保护原因。
 - 备份与恢复目标都会用 realpath 检查，拒绝备份目标位于数据目录内或恢复目标位于备份目录内。备份为整文件读入内存（单个文件大小未额外限制，超大文件会占用等量内存），不保留原始 mtime/文件模式；恢复后的文件按私有内容权限写入。首版仅支持当前本机数据目录，不包含云备份、跨设备同步、源项目仓库、认证文件或外部模型配对令牌。
 
 ## 异常恢复

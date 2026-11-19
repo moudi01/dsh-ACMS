@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { digest, packageName } from '../core/util.js';
 import { windowsDirectoryAccess } from './owned-process.js';
+import { verifiedGitBundle } from './git-delivery.js';
 
 const guidance = {
   preparation: ['项目依赖准备失败', '请核对锁文件、离线缓存或准备命令，修正后由所有者请求重试。'],
@@ -124,8 +125,14 @@ export async function inspectHost(workspaces, task, previous) {
   const cwd = task.workspace?.path;
   const entries = [];
   if (task.reviewScope !== 'goal' && (!task.reviewOf || !cwd)) {
-    const source = task.reviewOf ? workspaces.company.store.get('tasks', task.reviewOf)?.workspace?.path : project.repoRoot;
-    if (source) entries.push({ subject: task.reviewOf ? '被审工作副本' : '项目源目录', path: source, write: false });
+    const reviewed = task.reviewOf ? workspaces.company.store.get('tasks', task.reviewOf) : null;
+    const source = task.reviewOf ? reviewed?.workspace?.path : project.repoRoot;
+    if (source) {
+      const missing = reviewed && await fs.stat(source).then(() => false, error => error.code === 'ENOENT');
+      const delivery = missing && await verifiedGitBundle(reviewed, workspaces.dataDir);
+      entries.push({ subject: delivery ? 'Git 交付包目录' : task.reviewOf ? '被审工作副本' : '项目源目录',
+        path: delivery ? path.dirname(delivery.path) : source, write: false });
+    }
   }
   if (!cwd && project.mode === 'git' && !task.reviewOf && task.reviewScope !== 'goal') {
     const gitDir = path.join(project.repoRoot, '.git');
