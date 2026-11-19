@@ -10,6 +10,12 @@ import { Engine } from '../src/runtime/engine.js';
 import { SimulatedAdapter, defaultSimulation } from '../src/adapters/simulated.js';
 import { OWNER } from '../src/core/util.js';
 
+// Hosted Windows runners can be slow to observe the same scheduled state.
+// Explicit test bounds still apply when a test supplies its own timeout.
+const hostedWindows = process.platform === 'win32' && process.env.GITHUB_ACTIONS === 'true' &&
+  process.env.RUNNER_ENVIRONMENT === 'github-hosted';
+const stateWaitMs = hostedWindows ? 24000 : 8000;
+
 export async function fixture(t, handler = defaultSimulation) {
   const root = await mkdtemp(path.join(tmpdir(), 'acms-test-')); const source = path.join(root, 'source'); const dataDir = path.join(root, 'data');
   await mkdir(source); await writeFile(path.join(source, 'README.md'), '# Isolated ACMS test fixture\n');
@@ -29,11 +35,19 @@ export async function fixture(t, handler = defaultSimulation) {
     start: async () => { await engine.start(); started = true; },
   };
 }
-export async function until(predicate, timeout = 8000, diagnostics) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) { const value = await predicate(); if (value) return value; await new Promise(r => setTimeout(r, 15)); }
+export async function until(predicate, timeout = stateWaitMs, diagnostics) {
+  const started = performance.now();
+  let polls = 0;
+  while (performance.now() - started < timeout) {
+    polls += 1;
+    const value = await predicate();
+    if (value) return value;
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+  const elapsed = Math.round(performance.now() - started);
   const detail = diagnostics ? JSON.stringify(await diagnostics()) : '';
-  throw new Error(`Condition not reached within test deadline (${timeout} ms)${detail ? ': ' + detail : ''}`);
+  const condition = predicate.toString().replace(/\s+/g, ' ').slice(0, 180);
+  throw new Error(`Condition not reached within test deadline (${timeout} ms). Observed ${polls} polls in ${elapsed} ms while checking ${condition}${detail ? '\nState ' + detail : ''}`);
 }
 
 // Only state and event types: enough to distinguish slow native I/O from a

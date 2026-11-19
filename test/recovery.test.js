@@ -191,7 +191,7 @@ test('editing goal acceptance invalidates the integration checkpoint before coor
   assert.equal(edited.integrationPending, false);
   f.command('company.resume');
 
-  await until(() => f.store.require('tasks', task.id).status === 'succeeded');
+  await until(() => f.store.require('tasks', task.id).status === 'succeeded', undefined, taskWaitDiagnostics(f, task.id));
   const delivered = f.store.require('tasks', task.id);
   const calls = f.adapter.calls.filter(call => call.task.id === task.id);
   assert.deepEqual(calls.map(call => call.attempt.taskGeneration), [blocked.generation, edited.generation]);

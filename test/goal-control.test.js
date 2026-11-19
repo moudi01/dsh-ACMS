@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fixture, until } from './helpers.js';
+import { fixture, taskWaitDiagnostics, until } from './helpers.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 
 const taskState = (f, task) => f.store.require('tasks', task.id);
@@ -89,7 +89,11 @@ test('graceful pause drains the planner, persists its result, and applies it onc
   await f.start();
   assert.equal(taskState(f, plan).status, 'paused');
   control(f, 'resume', goal);
-  await until(() => goalState(f, goal).status === 'succeeded');
+  const plannerDiagnostics = taskWaitDiagnostics(f, plan.id);
+  await until(() => goalState(f, goal).status === 'succeeded', undefined, () => ({
+    ...plannerDiagnostics(), goalStatus: goalState(f, goal).status,
+    taskStatuses: f.store.list('tasks').filter(task => task.goalId === goal.id).map(task => ({ id: task.id, kind: task.kind, status: task.status })),
+  }));
   assert.equal(f.store.list('plans').filter(row => row.goalId === goal.id).length, 1);
   assert.equal(f.adapter.calls.filter(call => call.task.id === plan.id).length, 1);
   assert.equal(f.store.list('attempts').filter(attempt => attempt.taskId === plan.id).length, 1);

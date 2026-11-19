@@ -17,8 +17,10 @@
 
 ## 模型列表与配对
 
-修改代码后的部署：先运行 `npm run build`，再在项目目录运行 `node scripts/deploy-live.mjs desktop`。DSH 默认仅监视配置文件，单纯修改宿主源码不会加载新代码；部署脚本会生成版本化宿主 bundle、备份配置，并仅切换 ACMS 的宿主入口，其他插件不受影响。存在活动 ACMS 执行时脚本拒绝部署。
+修改代码后的部署：先暂停调度并等待在途工作结束，运行 `npm run build`，再在项目目录运行 `node scripts/deploy-live.mjs desktop`。DSH 默认仅监视配置文件，单纯修改宿主源码不会加载新代码。部署脚本生成版本化宿主 bundle，在构建前和切换 ACMS 入口前分别检查任务执行、对话、Git 集成及工作副本恢复状态。存在在途集成、待核对的清理或未完成的工作副本恢复时，按报错中的集成编号或恢复说明处理，再重新运行。
 界面更新后按 Ctrl+R 刷新 DSH。部署产物是 `host-<hash>.mjs`，它按内容哈希引用同目录的 `owned-job-<hash>.cs` 和 `archive-worker-<hash>.mjs`；部署和回滚必须保留宿主及其匹配资源，再切换宿主入口。其他 profile 可替换最后的 `desktop`，自定义 home 使用 `DSH_HOME`。
+
+切换前的配置保存在 `<dataDir>/install-backups/`，部署输出会打印本次备份路径。配置发布失败时保留切换前的入口。已切换后如需回退，先停止宿主，在备份中核对旧 ACMS 入口及对应宿主文件，再把该入口恢复到当前 profile，保留其他插件配置。涉及数据版本的回退按[发布检查清单](iteration-1-release-checklist.md)核对兼容性及备份。
 
 初始模型列表仅包含 DSH 模型目录中的内部模型。内部模型可以选择是否继承 ACMS 调度父代理上下文，常规内部执行每轮新建上下文。外部模型不显示父代理继承开关。
 
