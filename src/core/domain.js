@@ -7,7 +7,7 @@ import { goalSummary, taskSettledForGoal } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
-import { goalRuntimeLimit, goalRuntimeSpent } from './runtime-budget.js';
+import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS, pendingGoalTimeBox } from './runtime-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
@@ -64,6 +64,7 @@ export class Company {
         'project.delete': () => deleteEntity(this, 'project', args, actor),
         'project.restore': () => restoreEntity(this, 'project', args, actor),
         'goal.edit': () => this.editGoal(args, actor),
+        'goal.runtime.extend': () => this.extendGoalRuntime(args, actor),
         'goal.pause': () => controlGoal(this, args, actor, 'pause'),
         'goal.resume': () => controlGoal(this, args, actor, 'resume'),
         'goal.cancel': () => controlGoal(this, args, actor, 'cancel'),
@@ -285,7 +286,7 @@ export class Company {
     const goal = this.store.require('goals', goalId);
     if (goalStopped(goal) || ['archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
     const tasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.kind !== 'review' && t.status !== 'deleted' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
-    const complete = tasks.some(t => t.kind === 'work') && tasks.every(taskSettledForGoal);
+    const complete = tasks.some(t => t.kind === 'work') && tasks.every(task => taskSettledForGoal(task, goal));
     let status;
     if (goal.contractChange?.status === 'pending') status = 'active';
     else if (!tasks.length) status = 'empty';
@@ -549,37 +550,54 @@ export class Company {
     this.store.event('template.published', saved.id, { version: saved.version, phases: saved.phases, finalReview: saved.finalReview, reason: args.reason ?? '' }, actor);
     return saved;
   }
+  extendGoalRuntime(args, actor) {
+    assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可以追加目标执行额度。');
+    const goal = this.store.require('goals', args.id);
+    assert(canExtendGoalRuntime(goal), 'GOAL_CLOSED', '只有进行中或规划中的目标可以追加执行额度。');
+    assert(args.expectedRevision === goal.revision, 'CONFLICT', '目标已变化，请刷新后重试。');
+    const additionalRuntimeMs = integer(args.additionalRuntimeMs, 'additionalRuntimeMs', 1, MAX_GOAL_RUNTIME_MS);
+    const policy = this.policy();
+    const used = goalRuntimeSpent(goal, this.store.list('attempts'));
+    const { saved, event } = this.saveGoalRuntimeExtension(goal, policy, used, additionalRuntimeMs, actor, {});
+    this.releaseBudgetWaits(goal.id, actor, { extensionSeq: event.seq });
+    return saved;
+  }
+  saveGoalRuntimeExtension(goal, policy, used, additionalRuntimeMs, actor, source) {
+    const limit = goalRuntimeLimit(goal, policy);
+    const nextLimit = integer(Math.max(used, limit) + additionalRuntimeMs, 'goalRuntimeLimit', 1000, MAX_GOAL_RUNTIME_MS);
+    const saved = this.store.put('goals', { ...goal, runtimeExtraMs: nextLimit - policy.maxGoalRuntimeMs, timeBox: pendingGoalTimeBox(goal) });
+    const event = this.store.event('goal.runtime.extended', goal.id, { ...source, additionalRuntimeMs, previousLimitMs: limit, nextLimitMs: nextLimit, usedMs: used }, actor);
+    return { saved, event };
+  }
   answer(args, actor) {
     if (actor.kind === "user-agent") assertUserAgentAnswer(this, args, actor); else this.owner(actor);
     const interaction = this.store.require("interactions", args.id); assert(interaction.status === "pending", "ALREADY_ANSWERED", "Interaction already answered");
     const task = this.store.require('tasks', interaction.taskId);
     assert(['blocked', 'paused'].includes(task.status) && !task.stopRequested && (interaction.taskGeneration ?? task.generation) === task.generation, 'INTERACTION_STALE', '此问题已失效，不能通过历史回复重新启动任务');
-    const additionalRuntimeMs = integer(args.additionalRuntimeMs ?? 0, 'additionalRuntimeMs', 0, 2147483647);
+    const additionalRuntimeMs = integer(args.additionalRuntimeMs ?? 0, 'additionalRuntimeMs', 0, MAX_GOAL_RUNTIME_MS);
     assert(interaction.kind === 'budget' || additionalRuntimeMs === 0, 'INVALID_INPUT', '只有目标时间额度问题可以追加执行额度');
     if (interaction.kind === 'budget') {
       const goal = this.store.require('goals', task.goalId), policy = this.policy();
       const used = goalRuntimeSpent(goal, this.store.list('attempts')), limit = goalRuntimeLimit(goal, policy);
       assert(additionalRuntimeMs > 0 || used < limit, 'GOAL_BUDGET_EXHAUSTED', '目标累计执行额度仍已用完。请填写追加额度，或先增加公司目标基础额度；修改单次执行时限或仅回复“继续”不能解除此阻塞。');
-      if (additionalRuntimeMs) {
-        const nextLimit = integer(Math.max(used, limit) + additionalRuntimeMs, 'goalRuntimeLimit', 1000, 2147483647);
-        this.store.put('goals', { ...goal, runtimeExtraMs: nextLimit - policy.maxGoalRuntimeMs, timeBox: null });
-        this.store.event('goal.runtime.extended', goal.id, { interactionId: interaction.id, additionalRuntimeMs, previousLimitMs: limit, nextLimitMs: nextLimit, usedMs: used }, actor);
-      }
+      if (additionalRuntimeMs) this.saveGoalRuntimeExtension(goal, policy, used, additionalRuntimeMs, actor, { interactionId: interaction.id });
     }
     const saved = this.store.put('interactions', { ...interaction, status: 'answered', answer: text(args.answer, 'answer'), ...(additionalRuntimeMs ? { additionalRuntimeMs } : {}) }, args.expectedRevision);
     this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : 'ready', lastAnswer: saved.answer, integrationPending: task.integrationPending ?? (interaction.kind === 'integration' && !!task.artifactHash), blocker: null, attempts: 0, retryAt: null });
-    if (interaction.kind === 'budget') this.releaseBudgetWaits(task.goalId, saved.id, actor);
+    if (interaction.kind === 'budget') this.releaseBudgetWaits(task.goalId, actor, { interactionId: saved.id });
     this.store.event('interaction.answered', interaction.id, { taskId: task.id }, actor); return saved;
   }
-  releaseBudgetWaits(goalId, interactionId, actor) {
+  releaseBudgetWaits(goalId, actor, source) {
+    const interactions = this.store.list('interactions').filter(i => i.status === 'pending');
+    const resolution = source.interactionId ? { resolvedBy: source.interactionId } : { resolvedByEventSeq: source.extensionSeq };
     for (const task of this.store.list('tasks')) {
       if (task.goalId !== goalId || task.blocker?.kind !== 'budget' || !['blocked', 'paused'].includes(task.status) || task.stopRequested) continue;
-      const pending = this.store.list('interactions').filter(i => i.taskId === task.id && i.status === 'pending');
+      const pending = interactions.filter(i => i.taskId === task.id);
       if (pending.some(i => i.kind !== 'budget' || (i.taskGeneration ?? task.generation) !== task.generation)) continue;
-      for (const wait of pending) this.store.put('interactions', { ...wait, status: 'cancelled', reason: '目标累计执行额度已恢复，额度等待自动解除', resolvedBy: interactionId });
+      for (const wait of pending) this.store.put('interactions', { ...wait, status: 'cancelled', reason: '目标累计执行额度已恢复，额度等待自动解除', ...resolution });
       const ready = task.dependencies.every(id => { const dependency = this.store.require('tasks', id); return dependency.status === 'succeeded'; });
       this.store.put('tasks', { ...task, status: task.status === 'paused' ? 'paused' : ready ? 'ready' : 'blocked', blocker: null, attempts: 0, retryAt: null });
-      this.store.event('task.budget.released', task.id, { interactionId }, actor);
+      this.store.event('task.budget.released', task.id, source, actor);
     }
   }
   reconcile(args, actor) {

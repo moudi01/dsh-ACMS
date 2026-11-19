@@ -1,10 +1,24 @@
+export const MAX_GOAL_RUNTIME_MS = 2147483647;
+
 export function goalRuntimeLimit(goal, policy) {
   return policy.maxGoalRuntimeMs + (goal.runtimeExtraMs ?? 0);
 }
 
+export function canExtendGoalRuntime(goal) {
+  return !!goal && !goal.legacyBatch && ['planning', 'active'].includes(goal.status);
+}
+
+export function pendingGoalTimeBox(goal) {
+  return goal.timeBox?.releasedAt ? null : goal.timeBox ?? null;
+}
+
+export function accruesGoalRuntime(attempt) {
+  return attempt.status === 'preparing' || attempt.status === 'running';
+}
+
 export function goalRuntimeSpent(goal, attempts, now = Date.now()) {
   return (goal.runtimeMs ?? 0) + attempts
-    .filter(a => a.goalId === goal.id && ['preparing', 'running'].includes(a.status))
+    .filter(a => a.goalId === goal.id && accruesGoalRuntime(a))
     .reduce((sum, a) => sum + Math.max(0, now - Date.parse(a.deferredReplayAt ?? a.startedAt)), 0);
 }
 

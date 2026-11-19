@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { fixture, until } from './helpers.js';
-import { OWNER } from '../src/core/util.js';
-import { goalTimeBoxLimit } from '../src/core/runtime-budget.js';
+import { OWNER, SYSTEM } from '../src/core/util.js';
+import { Company } from '../src/core/domain.js';
+import { Store } from '../src/core/store.js';
+import { stableActor } from '../src/core/agent-identity.js';
+import { goalRuntimeLimit, goalTimeBoxLimit, MAX_GOAL_RUNTIME_MS } from '../src/core/runtime-budget.js';
 
 test('time box limit keeps efficiency box, extension and wrap-up reserve separate', () => {
   const base = { maxGoalRuntimeMs: 1000, goalTimeBoxMs: 600, timeBoxReserveMs: 100 };
@@ -93,4 +96,129 @@ test('a live budget interruption does not start repair and can resume with an ex
   await until(() => f.store.require('tasks', task.id).status === 'succeeded');
   assert.equal(f.store.require('attempts', interrupted.id).status, 'interrupted');
   assert.equal(f.store.list('attempts').filter(a => a.taskId === task.id && a.status === 'completed').length, 1);
+});
+
+test('an owner can extend a running goal once, with parallel usage and a durable audit', async t => {
+  const f = await fixture(t);
+  const policy = f.company.policy();
+  const first = f.task(), second = f.task({ title: 'Parallel task' });
+  const other = f.command('goal.create', { projectId: f.project.id, title: 'Other goal', description: 'Other', acceptance: 'Other', plan: false });
+  const now = Date.now();
+  t.mock.timers.enable({ apis: ['Date'], now });
+  f.store.transaction(() => {
+    f.store.put('goals', { ...f.store.require('goals', f.goal.id), runtimeMs: 60000 });
+    for (const [task, elapsed] of [[first, 10000], [second, 20000]]) {
+      f.store.put('attempts', { id: randomUUID(), taskId: task.id, goalId: task.goalId, startedAt: new Date(now - elapsed).toISOString(), status: 'running' });
+    }
+  });
+  const before = f.store.require('goals', f.goal.id);
+  const args = { id: before.id, expectedRevision: before.revision, additionalRuntimeMs: 3600000 };
+  const requestId = randomUUID();
+  const saved = f.command('goal.runtime.extend', args, OWNER, requestId);
+  assert.equal(goalRuntimeLimit(saved, policy), policy.maxGoalRuntimeMs + args.additionalRuntimeMs);
+  assert.equal(saved.runtimeMs, 60000);
+  assert.equal(f.store.list('attempts').every(a => a.status === 'running'), true);
+  assert.deepEqual(f.company.policy(), policy);
+  assert.deepEqual(f.store.require('goals', other.id), other);
+  assert.equal(f.store.list('interactions').length, 0);
+
+  const reopened = new Store(f.store.filename);
+  try {
+    assert.deepEqual(new Company(reopened).command(OWNER, requestId, 'goal.runtime.extend', args, { meta: true }), { value: saved, replayed: true });
+    const extensions = reopened.page().entries.filter(e => e.type === 'goal.runtime.extended');
+    assert.equal(extensions.length, 1);
+    const [event] = extensions;
+    assert.equal(event.actor, OWNER.id);
+    assert.equal(event.entityId, before.id);
+    assert.equal(event.usedMs, 90000);
+    assert.equal(event.previousLimitMs, policy.maxGoalRuntimeMs);
+    assert.equal(event.nextLimitMs, goalRuntimeLimit(saved, policy));
+  } finally { reopened.close(); }
+});
+
+test('goal extensions enforce owner authorization, revisions, and the hard limit', async t => {
+  const f = await fixture(t);
+  const goal = f.store.require('goals', f.goal.id);
+  const args = { id: goal.id, expectedRevision: goal.revision, additionalRuntimeMs: 60000 };
+  const { credential } = f.command('agentCredential.create', { name: 'Owner delegate', projectIds: [f.project.id] });
+  const manager = f.store.require('agents', 'manager');
+  f.store.transaction(() => f.store.put('agents', { ...manager, grants: [...manager.grants, 'goal.runtime.extend'] }));
+  assert.throws(() => f.command('goal.runtime.extend', args, stableActor(credential)), { code: 'FORBIDDEN' });
+  assert.throws(() => f.command('goal.runtime.extend', args, { kind: 'agent', id: manager.id, goalId: goal.id }), { code: 'OWNER_REQUIRED' });
+  assert.throws(() => f.command('goal.runtime.extend', args, SYSTEM), { code: 'OWNER_REQUIRED' });
+  assert.throws(() => f.command('goal.runtime.extend', { ...args, expectedRevision: undefined }), { code: 'CONFLICT' });
+  assert.throws(() => f.command('goal.runtime.extend', { ...args, expectedRevision: goal.revision - 1 }), { code: 'CONFLICT' });
+  for (const amount of [0, -1, 0.5, '60000', MAX_GOAL_RUNTIME_MS]) {
+    assert.throws(() => f.command('goal.runtime.extend', { ...args, additionalRuntimeMs: amount }), { code: 'INVALID_INPUT' });
+  }
+  assert.deepEqual(f.store.require('goals', goal.id), goal);
+  f.command('goal.cancel', { id: goal.id });
+  assert.throws(() => f.command('goal.runtime.extend', { ...args, expectedRevision: f.store.require('goals', goal.id).revision }), { code: 'GOAL_CLOSED' });
+});
+
+test('a direct extension releases only budget waits and keeps paused work and cleanup fences', async t => {
+  const f = await fixture(t);
+  const budget = f.task(), paused = f.task({ title: 'Paused' }), material = f.task({ title: 'Materials' });
+  const cleanup = f.task({ title: 'Cleanup' });
+  exhaust(f);
+  const question = waitForBudget(f, budget);
+  waitForBudget(f, paused);
+  f.command('task.pause', { id: paused.id });
+  f.engine.block(material, 'human', '缺少材料', '请提供材料');
+  const held = f.store.transaction(() => {
+    f.store.put('tasks', { ...cleanup, status: 'reconciling' });
+    return f.store.put('attempts', { id: randomUUID(), goalId: f.goal.id, taskId: cleanup.id, status: 'reconciling', cleanupPending: true });
+  });
+  const control = f.command('goal.pause', { id: f.goal.id, afterCurrent: true }).executionControl;
+  const before = f.store.require('goals', f.goal.id);
+  f.command('goal.runtime.extend', { id: before.id, expectedRevision: before.revision, additionalRuntimeMs: 60000 });
+  const extension = f.store.page().entries.find(e => e.type === 'goal.runtime.extended');
+  const released = f.store.require('interactions', question.id);
+  assert.equal(released.status, 'cancelled');
+  assert.equal(released.resolvedByEventSeq, extension.seq);
+  assert.deepEqual(f.store.require('goals', f.goal.id).executionControl, control);
+  assert.equal(f.store.require('tasks', budget.id).status, 'ready');
+  assert.equal(f.store.require('tasks', paused.id).status, 'paused');
+  assert.equal(f.store.require('tasks', material.id).blocker.kind, 'human');
+  assert.equal(f.store.require('tasks', cleanup.id).status, 'reconciling');
+  assert.deepEqual(f.store.require('attempts', held.id), held);
+});
+
+test('an extension arriving during a budget abort allows resumption after confirmed cleanup', async t => {
+  const f = await fixture(t);
+  f.command('policy.update', { patch: { maxGoalRuntimeMs: 60000, maxAttempts: 1 } });
+  f.adapter.delay = 10000;
+  const settle = Promise.withResolvers(), clean = Promise.withResolvers();
+  const originalStart = f.adapter.start.bind(f.adapter);
+  f.adapter.start = async input => {
+    const activation = await originalStart(input);
+    if (f.adapter.calls.length !== 1) return activation;
+    activation.result = activation.result.catch(async error => { await settle.promise; throw error; });
+    const dispose = activation.dispose;
+    activation.dispose = async () => { await clean.promise; await dispose(); };
+    return activation;
+  };
+  const task = f.task();
+  try {
+    await f.start();
+    await until(() => f.adapter.calls.length === 1);
+    const first = f.adapter.calls[0];
+    f.store.transaction(() => f.store.put('attempts', { ...f.store.require('attempts', first.attempt.id), startedAt: new Date(Date.now() - 65000).toISOString() }));
+    await until(() => first.signal.aborted);
+    assert.equal(first.signal.reason.code, 'GOAL_RUNTIME_BUDGET');
+
+    const goal = f.store.require('goals', f.goal.id);
+    f.command('goal.runtime.extend', { id: goal.id, expectedRevision: goal.revision, additionalRuntimeMs: 60000 });
+    f.adapter.delay = 0;
+    settle.resolve();
+    await until(() => f.store.require('attempts', first.attempt.id).cleanupPending);
+    await f.engine.tick();
+    assert.equal(f.adapter.calls.length, 1);
+    assert.equal(f.store.list('interactions').some(i => i.kind === 'budget'), false);
+
+    clean.resolve();
+    await until(() => f.store.require('tasks', task.id).status === 'succeeded');
+    assert.equal(f.store.require('attempts', first.attempt.id).status, 'interrupted');
+    assert.equal(f.adapter.calls.length, 2);
+  } finally { settle.resolve(); clean.resolve(); }
 });

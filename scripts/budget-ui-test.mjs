@@ -8,6 +8,7 @@ const server = await startPreview({ seed: false });
 const command = (name, args) => server.company.command(OWNER, randomUUID(), name, args);
 const project = command('project.save', { name: 'Budget fixture', repoRoot: server.source, mode: 'copy', checks: [] });
 const goal = command('goal.create', { title: '累计额度续跑测试', description: 'Isolated test', acceptance: 'Reviewed files', projectId: project.id, plan: false });
+const early = command('goal.create', { title: '提前追加额度测试', description: 'Isolated test', acceptance: 'Reviewed files', projectId: project.id, plan: false });
 const used = server.company.policy().maxGoalRuntimeMs + 1000;
 server.company.store.transaction(() => server.company.store.put('goals', { ...goal, runtimeMs: used }));
 const tasks = ['额度任务一', '额度任务二'].map(title => command('task.create', { goalId: goal.id, title }));
@@ -34,7 +35,81 @@ try {
   await expect.poll(() => tasks.every(t => server.company.store.require('tasks', t.id).status === 'succeeded')).toBe(true);
   expect(server.company.store.require('goals', goal.id).runtimeExtraMs).toBe(3601000);
   expect(server.company.store.require('tasks', material.id).blocker.kind).toBe('human');
+
+  await page.getByRole('button', { name: '项目与目标' }).click();
+  await page.locator('.acms-project-group > summary').click();
+  await page.getByRole('button', { name: early.title, exact: true }).click();
+  const budget = page.getByRole('region', { name: '目标执行额度' });
+  const extend = budget.getByRole('button', { name: '追加目标执行额度' });
+  await expect(budget).toContainText('240.00 分钟');
+  await extend.click();
+  const confirm = dialog.getByRole('button', { name: '确认追加' });
+  await expect(confirm).toBeDisabled();
+  const minutes = dialog.getByLabel('追加目标累计执行额度（分钟）');
+  await minutes.fill('0.5');
+  await expect(confirm).toBeDisabled();
+  await minutes.fill('30');
+  await expect(dialog).toContainText('270.00 分钟');
+  await dialog.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(budget).toContainText('240.00 分钟');
+  await extend.click();
+  await minutes.fill('30');
+  await page.setViewportSize({ width: 375, height: 820 });
+  await expect(dialog).toBeInViewport();
+  await expect(minutes).toBeFocused();
+  await page.screenshot({ path: 'test-results/ui/budget-extension.png' });
+  await confirm.click();
+  await expect(dialog).toHaveCount(0);
+  await expect(budget).toContainText('270.00 分钟');
+  expect(server.company.store.require('goals', early.id).runtimeExtraMs).toBe(1800000);
+  expect(server.company.store.list('interactions').some(i => i.goalId === early.id)).toBe(false);
   expect(errors).toEqual([]);
-  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, bothTasksReviewed: true, materialGatePreserved: true, browserErrors: errors }, null, 2));
-  console.log('Budget reply: explicit target allowance, automatic sibling resumption, independent review and preserved material gate passed.');
+  await verifyLiveBudget(browser);
+  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, earlyExtensionMinutes: 30, bothTasksReviewed: true, materialGatePreserved: true, liveUsageWithoutEvents: true, browserErrors: errors }, null, 2));
+  console.log('Budget UI: early extension, explicit budget reply, preserved material gate, and live usage without events passed.');
 } finally { await browser.close(); await server.close(); }
+
+async function verifyLiveBudget(browser) {
+  const preview = await startPreview({ seed: false, startEngine: false });
+  const livePage = await browser.newPage();
+  try {
+    const { store } = preview.company;
+    const create = (name, args) => preview.company.command(OWNER, randomUUID(), name, args);
+    create('policy.update', { patch: { maxGoalRuntimeMs: 360000 } });
+    const project = create('project.save', { name: 'Live budget fixture', repoRoot: preview.source, mode: 'copy' });
+    const goal = create('goal.create', { projectId: project.id, title: '运行中用量测试', description: 'Isolated test', acceptance: 'Reviewed files', plan: false });
+    const task = create('task.create', { goalId: goal.id, title: 'Running without progress events' });
+    const time = Date.now();
+    store.transaction(() => {
+      store.put('tasks', { ...task, status: 'running' });
+      store.put('attempts', { id: randomUUID(), goalId: goal.id, taskId: task.id, agentId: task.agentId, kind: task.kind, status: 'running', startedAt: new Date(time - 60000).toISOString() });
+    });
+    const cursor = store.cursor();
+    let snapshots = 0;
+    livePage.on('request', request => { if (new URL(request.url()).pathname === '/api/acms/state') snapshots++; });
+    await livePage.clock.install({ time });
+    await livePage.goto(preview.url);
+    await livePage.locator('.acms-project-group > summary').click();
+    await livePage.getByRole('button', { name: goal.title, exact: true }).click();
+    const budget = livePage.getByRole('region', { name: '目标执行额度', includeHidden: true });
+    const used = root => root.getByText('累计已用', { exact: true }).locator('xpath=following-sibling::dd[1]');
+    const minutes = async locator => Number.parseFloat((await locator.textContent()).match(/\d+(?:\.\d+)?(?= 分钟)/)?.[0]);
+    await expect(used(budget)).toBeVisible();
+    const initialUsage = await minutes(used(budget));
+    await livePage.clock.fastForward(120000);
+    await expect.poll(() => minutes(used(budget))).toBeGreaterThanOrEqual(initialUsage + 1.9);
+
+    await budget.getByRole('button', { name: '追加目标执行额度' }).click();
+    const dialog = livePage.getByRole('dialog');
+    await dialog.getByLabel('追加目标累计执行额度（分钟）').fill('2');
+    const projection = dialog.getByText(/^预计追加后累计额度/);
+    await expect(projection).toContainText('8.00 分钟');
+    await livePage.clock.fastForward(300000);
+    await expect.poll(() => minutes(used(dialog))).toBeGreaterThanOrEqual(8);
+    const updatedUsage = await minutes(used(dialog));
+    expect(await minutes(used(budget))).toBeCloseTo(updatedUsage, 1);
+    await expect.poll(() => minutes(projection)).toBeGreaterThanOrEqual(10);
+    expect(store.cursor()).toBe(cursor);
+    expect(snapshots).toBe(1);
+  } finally { await livePage.close(); await preview.close(); }
+}
