@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import { registerHooks } from 'node:module';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Company } from '../src/core/domain.js';
 import { Store } from '../src/core/store.js';
 import { createRoutes } from '../src/host/http.js';
@@ -13,6 +15,7 @@ import { acquireBareDeliveryFence, bareFenceRef, releaseBareDeliveryFence } from
 import { inside, run, WorkspaceManager } from '../src/runtime/workspaces.js';
 import { applyBackup, planBackup } from '../scripts/backup.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
+import { buildHost } from '../scripts/host-bundle.mjs';
 import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
 
 const basisRef = 'refs/heads/delivery';
@@ -30,8 +33,8 @@ async function git(cwd, ...args) {
   return output.stdout.trim();
 }
 
-function ownerRoutes(runtime) {
-  const handlers = new Map(createRoutes(runtime).map(route => [route.path, route]));
+function ownerRoutes(runtime, registered = createRoutes(runtime)) {
+  const handlers = new Map(registered.map(route => [route.path, route]));
   const post = (route, body) => handlers.get(`/api/acms/${route}`).fetch(new Request(`http://127.0.0.1/api/acms/${route}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   }));
@@ -387,6 +390,52 @@ test('bare fence recovery before marker publication preserves foreign Git metada
   assert.equal(await fs.readFile(otherIndexLock, 'utf8'), 'other Git process\n');
   assert.equal(await git(target, 'rev-parse', basisRef), base);
   assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+});
+
+test('the isolated deployed host loads its versioned policy hook and confirms a bare branch', { skip: process.platform !== 'win32' }, async t => {
+  const s = await setupBare(t);
+  const { f, base, target, confirmArgs } = s;
+  await f.start();
+  const selection = await s.ready();
+  await f.engine.stop();
+
+  const outDir = path.join(f.root, 'host-dist');
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const built = await buildHost({ root, outDir });
+  const helperBytes = await fs.readFile(built.bareTransactionHook);
+  const helper = `bare-transaction-hook-${createHash('sha256').update(helperBytes).digest('hex')}.mjs`;
+  assert.equal(path.basename(built.bareTransactionHook), helper);
+  assert.deepEqual((await fs.readdir(outDir)).sort(), [built.filename, built.resource, built.archiveWorker, built.bareTransactionHook]
+    .map(filename => path.basename(filename)).sort());
+  const installed = path.join(await fs.realpath(f.root), 'installed-host');
+  assert(inside(await fs.realpath(f.root), await fs.realpath(outDir)));
+  await fs.rename(outDir, installed);
+
+  // The DSH plugin's declared external SDK packages normally resolve from the
+  // installation. Only redirect those packages to this test's installed SDK.
+  // The helper starts in a separate Node process with no test resolver.
+  const sdk = registerHooks({ resolve(specifier, context, next) {
+    return next(specifier, specifier.startsWith('@deepseek-ai/') ? { ...context, parentURL: import.meta.url } : context);
+  } });
+  let apply;
+  try { ({ apply } = await import(pathToFileURL(path.join(installed, path.basename(built.filename))).href)); }
+  finally { sdk.deregister(); }
+  const routes = [];
+  let dispose;
+  const ctx = { effect: fn => { dispose = fn(); }, connection: { fetch: { register: route => routes.push(route) } },
+    tools: { register() {} }, subagents: { providers: new Map() }, subprocess: { spawn() { assert.fail('unexpected external executor'); } } };
+  try {
+    await apply(ctx, { dataDir: f.dataDir });
+    const published = ownerRoutes(null, routes);
+    const chosen = await success(await published.preview({ goalId: s.goal.id, targetMode: 'bare', basisRef,
+      version: selection.version, deliveryHash: selection.deliveryHash }));
+    await success(await published.decision('confirm', confirmArgs(chosen)));
+    const applied = await s.waitMerge('applied');
+    assert.equal(await git(target, 'rev-parse', basisRef), applied.result.integratedCommit);
+    assert.equal(await git(target, 'rev-parse', basisRef + '^{tree}'), chosen.selection.tree);
+    assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+    await absentFences(target);
+  } finally { await dispose?.(); }
 });
 
 test('owner waits for required review, previews a new branch from the chosen basis and confirms the exact Git tree once', async t => {

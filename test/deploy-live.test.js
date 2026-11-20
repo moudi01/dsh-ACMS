@@ -186,8 +186,8 @@ test('an isolated CLI deployment after terminal integration can be rolled back u
   assert.equal(edited.replace(/  name: '[^\r\n]*'/, `  name: '${yaml(f.oldHost)}'`), f.original.toString('utf8'));
   const bundle = edited.match(/  name: '([^\r\n]+)'/)?.[1].replaceAll("''", "'");
   const bundleSource = await readFile(bundle, 'utf8');
-  const resources = new Set(bundleSource.match(/(?:owned-job-[a-f0-9]{64}\.cs|archive-worker-[a-f0-9]{64}\.mjs)/g));
-  assert.equal(resources.size, 2);
+  const resources = new Set(bundleSource.match(/(?:owned-job-[a-f0-9]{64}\.cs|(?:archive-worker|bare-transaction-hook)-[a-f0-9]{64}\.mjs)/g));
+  assert.equal(resources.size, 3);
   const files = [bundle, ...[...resources].map(name => path.join(path.dirname(bundle), name))];
   const times = await Promise.all(files.map(async filename => (await stat(filename)).mtimeMs));
   const repeated = await exec(process.execPath, args, options);
@@ -200,6 +200,7 @@ test('an isolated CLI deployment after terminal integration can be rolled back u
   await rename(rollback, f.patch);
   assert.deepEqual(await readFile(f.patch), f.original);
   assert.match(await readFile(f.oldHost, 'utf8'), /oldHost = true/);
+  assert.deepEqual(await Promise.all(files.map(async filename => (await stat(filename)).mtimeMs)), times);
   assert.deepEqual(f.store.require('integrations', settled.id), settled);
 });
 

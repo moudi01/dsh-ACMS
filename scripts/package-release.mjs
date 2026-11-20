@@ -82,7 +82,7 @@ async function buildCandidate(staging, commit, workflow) {
   assert(packed?.filename?.endsWith('.tgz') && path.basename(packed.filename) === packed.filename, 'npm pack returned an invalid archive name');
 
   const members = new Map(packed.files.map(file => [file.path, file.size]));
-  for (const required of ['package.json', 'src/host/index.js', 'src/runtime/owned-job.cs', 'src/runtime/delivery-archive-worker.js',
+  for (const required of ['package.json', 'src/host/index.js', 'src/runtime/owned-job.cs', 'src/runtime/delivery-archive-worker.js', 'src/runtime/bare-transaction-hook.js',
     'lib/client.js', 'cordis.patch.yml', 'scripts/install.ps1', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
     'packages/codex-runtime/package.json', 'packages/codex-runtime/lib/index.js', 'packages/codex-runtime/lib/store.js', 'packages/codex-runtime/LICENSE']) {
     assert(members.get(required) > 0, `Package is missing nonempty ${required}`);

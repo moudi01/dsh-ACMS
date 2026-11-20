@@ -19,7 +19,9 @@ cat >/dev/null
 test "$1" = prepared || exit 0
 exec "$ACMS_BARE_NODE" "$ACMS_BARE_HOOK"
 `;
-const bareHook = fileURLToPath(new URL('./bare-transaction-hook.js', import.meta.url)).replaceAll('\\', '/');
+const bareHookResource = typeof __ACMS_BARE_TRANSACTION_HOOK_RESOURCE__ === 'string'
+  ? __ACMS_BARE_TRANSACTION_HOOK_RESOURCE__ : './bare-transaction-hook.js';
+const bareHook = fileURLToPath(new URL(bareHookResource, import.meta.url)).replaceAll('\\', '/');
 const basisRef = value => {
   const ref = text(value, 'basisRef', 1024);
   assert(ref.startsWith('refs/heads/'), 'INVALID_INPUT', '请输入完整本地分支名，例如 refs/heads/main。');
