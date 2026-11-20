@@ -6,6 +6,8 @@ import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
 import { prepareCandidateArchive, readCandidateArchive } from '../runtime/candidate-archive.js';
 import { checkCandidateMergeConfirmation, previewCandidateMerge } from '../runtime/candidate-merge.js';
+import { inspectBareDeliveryTarget } from '../runtime/bare-delivery-target.js';
+import { inside } from '../runtime/workspaces.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -77,13 +79,26 @@ export function createRoutes(runtime) {
     },
     '/api/acms/command': async request => {
       assert(request.method === 'POST', 'METHOD', 'POST required'); const input = await body(request);
-      if (input.name === 'goal.candidate_merge.confirm') await checkCandidateMergeConfirmation(company, workspaces, input.args ?? {}, request.signal);
+      let args = input.args ?? {};
+      if (input.name === 'goal.candidate_merge.confirm') await checkCandidateMergeConfirmation(company, workspaces, args, request.signal);
       if (input.name === 'project.save') {
-        const previous = input.args?.id ? company.store.get('projects', input.args.id) : {};
-        await workspaces.validateProject({ ...previous, ...input.args, mode: input.args?.mode ?? previous?.mode ?? 'git' });
+        const previous = args.id ? company.store.get('projects', args.id) : {};
+        const mode = args.mode ?? previous?.mode ?? 'git';
+        const source = await workspaces.validateProject({ ...previous, ...args, mode });
+        assert(!Object.hasOwn(args, 'deliveryRepository'), 'INVALID_INPUT', '请通过裸交付仓库路径完成主机核对。');
+        if (Object.hasOwn(args, 'deliveryRepoRoot')) {
+          const { deliveryRepoRoot, ...rest } = args;
+          const deliveryRepository = deliveryRepoRoot === null ? null : await inspectBareDeliveryTarget(workspaces, deliveryRepoRoot);
+          assert(!deliveryRepository || (mode === 'git' && !inside(source, deliveryRepository.targetRoot) && !inside(deliveryRepository.targetRoot, source)),
+            'BARE_TARGET_REQUIRED', '裸交付仓库和源 Git 工作目录必须位于独立路径。');
+          args = { ...rest, deliveryRepository };
+        }
       }
-      if (input.name === 'goal.createWithProject') await workspaces.validateProject({ ...input.args?.project, mode: input.args?.project?.mode ?? 'copy' });
-      let result = company.command(OWNER, input.requestId, input.name, input.args ?? {});
+      if (input.name === 'goal.createWithProject') {
+        assert(!Object.hasOwn(args.project ?? {}, 'deliveryRepository'), 'INVALID_INPUT', '请在项目设置中授权裸交付仓库。');
+        await workspaces.validateProject({ ...args.project, mode: args.project?.mode ?? 'copy' });
+      }
+      let result = company.command(OWNER, input.requestId, input.name, args);
       const projectId = input.name === 'project.save' ? result.id : result?.projectId ?? (result?.goalId ? company.store.get('goals', result.goalId)?.projectId : null);
       if (projectId && company.store.get('projects', projectId)?.status !== 'deleted' && workspaces.publishProject) {
         try { await workspaces.publishProject(company.store.require('projects', projectId)); }
@@ -175,7 +190,7 @@ export function createRoutes(runtime) {
       const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : ['NOT_FOUND'].includes(e.code) ? 404
         : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED',
           'CANDIDATE_NOT_READY', 'STALE_CANDIDATE_CONFIRMATION', 'TARGET_CHANGED', 'TARGET_BASE_CHANGED',
-          'TARGET_BRANCH_EXISTS', 'TARGET_REF_UNSUPPORTED'].includes(e.code) ? 409
+          'TARGET_BRANCH_EXISTS', 'TARGET_REF_UNSUPPORTED', 'BARE_TARGET_BUSY', 'BARE_TARGET_CHANGED'].includes(e.code) ? 409
           : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED', 'PROJECT_PATH_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);
     }

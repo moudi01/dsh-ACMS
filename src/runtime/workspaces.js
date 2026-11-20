@@ -664,7 +664,7 @@ export class WorkspaceManager {
     if (ancestry.code === 0 || reflog.split(/\r?\n/).includes(integratedCommit)) {
       return { status: 'merged', proof: ancestry.code === 0 ? 'target-history' : 'target-reflog', actualHead, targetRef, commit, integratedCommit, checks, candidate };
     }
-    if (record.candidateMergeId) return { status: 'target-changed', actualHead, targetRef };
+    if (record.candidateMergeId) return { status: record.targetMode === 'bare' && actualHead === record.basisHead ? 'unchanged' : 'target-changed', actualHead, targetRef };
     const actual = await this.integrationTarget(targetRoot, invoke);
     return { status: actual.targetRef === targetRef && actual.targetHead === targetHead && !actual.targetStatus ? 'unchanged' : 'unknown', actualHead, targetRef };
   }

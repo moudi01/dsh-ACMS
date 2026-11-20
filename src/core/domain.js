@@ -154,9 +154,17 @@ export class Company {
         c.requiredPackages.every(value => typeof value === 'string' && packageName.test(value))), 'INVALID_INPUT', 'requiredPackages must contain valid Node package names');
     }
     const preparation = args.preparation === undefined ? previous?.preparation ?? null : normalizePreparation(args.preparation);
-    const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false, ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
+    if (args.deliveryRepository !== undefined) this.owner(actor);
+    const deliveryRepository = args.deliveryRepository === undefined ? previous?.deliveryRepository : args.deliveryRepository;
+    if (deliveryRepository) {
+      assert((args.mode ?? previous?.mode ?? 'git') === 'git', 'BARE_TARGET_REQUIRED', '裸交付仓库只能关联到 Git 项目。');
+      text(deliveryRepository.targetRoot, 'deliveryRepository.targetRoot', 4096);
+      text(deliveryRepository.targetIdentity, 'deliveryRepository.targetIdentity', 200);
+    }
+    const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false,
+      ...(args.deliveryRepository === undefined ? {} : { deliveryRepository }), ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
-    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge'], actor);
+    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge', 'deliveryRepository'], actor);
     if (previous && compositionCheckContract(project) !== compositionCheckContract(previous)) {
       for (const goal of this.store.list('goals').filter(item => item.projectId === project.id && item.composition && usesComposition(item))) {
         this.refreshGoal(goal.id);
