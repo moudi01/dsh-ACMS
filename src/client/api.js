@@ -13,6 +13,7 @@ export const api = {
   snapshot: signal => request('state', { signal }),
   usageSummary: (scope, groupBy, { after, attemptBefore = Number.MAX_SAFE_INTEGER } = {}) =>
     request(`usage/summary?${new URLSearchParams({ ...scope, groupBy, attemptBefore, ...(after != null ? { after } : {}) })}`),
+  costForecast: goalId => request(`cost/forecast?goalId=${encodeURIComponent(goalId)}`),
   events: (after, signal) => request(`events?after=${after}`, { signal }),
   activity: (query = {}, signal) => {
     const params = new URLSearchParams();

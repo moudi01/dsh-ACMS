@@ -275,6 +275,74 @@ function usdFromMicros(value) {
   return `US$${digits.slice(0, -6)}.${fraction}`;
 }
 
+const forecastReasons = {
+  'no-approved-estimate': '当前没有已通过预算核验的计划估算。',
+  'contract-changed': '目标合同或规划版本已变化。',
+  'quote-stale': '原估算来源已变化或当前无法核对。',
+  'cost-contract-breach': '执行器的实际费用已超过承诺上界。',
+  'awaiting-cost-receipt': '部分执行已清理，实际费用仍待回执。原预留计入已覆盖小计。',
+  'execution-cleanup-pending': '部分执行的清理尚未核对，原预留计入已覆盖小计。',
+  'work-changed': '部分已批准任务被移除或其版本、分派、依赖已变化。',
+  'unpriced-work': '有待完成的任务未纳入这版计划估算。',
+  'unverified-cost': '部分执行缺少可核对的归属和费用预留。',
+  'retry-or-progress-unknown': '部分任务重试或执行进度所需的剩余费用未知。',
+  'dispatch-cost-unverified': '部分待执行任务的当前分派或执行上界无法核对。',
+  'phase-remaining-unknown': '验收或返工的剩余计划预留无法分拆。',
+};
+
+function plannedReserve(phase) {
+  if (!phase) return '未知';
+  if (phase.state === 'finished') return '已结束';
+  if (phase.state === 'unknown') return phase.plannedMicros === null ? '未知' :
+    `剩余未知 · 原计划 ${usdFromMicros(phase.plannedMicros)}`;
+  return usdFromMicros(phase.remainingMicros);
+}
+
+function GoalCostForecast({ goalId, budgetRevision }) {
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const settled = report?.completionBasis === 'settled';
+  const headroomLabel = report?.status === 'over-limit' ?
+    (settled ? '实际超出授权' : '预计超出授权') : (settled ? '结算后预算余裕' : '预计预算余裕');
+  const load = async () => {
+    setLoading(true); setError('');
+    try { setReport(await api.costForecast(goalId)); }
+    catch (e) { setReport(null); setError(e.message); }
+    finally { setLoading(false); }
+  };
+  return <section aria-label="预计完工成本">
+    <h4>预计完工成本</h4>
+    <ActionButton reason={loading ? '正在读取费用估算…' : ''} onClick={load}>{report ? '刷新完工估算' : '查看完工估算'}</ActionButton>
+    {error && <p role="alert">{error}</p>}
+    {report?.enabled && <div aria-live="polite">
+      <p className="acms-sectionnote">快照 <time dateTime={report.asOf}>{new Date(report.asOf).toLocaleString('zh-CN')}</time>
+        {budgetRevision > report.ledger.revision && ' · 账本已更新，可刷新估算'}</p>
+      {report.status === 'closed' ? <p>目标已结束，费用仍可在上方账本查看。</p> : <>
+        <dl className="acms-definition">
+          <dt>{settled ? '完工实际费用' : '完工预估'}</dt>
+          <dd>{report.completionMicros === null ? '未知' : usdFromMicros(report.completionMicros)}</dd>
+          {report.headroomMicros !== null && <>
+            <dt>{headroomLabel}</dt>
+            <dd>{usdFromMicros(report.headroomMicros.replace(/^-/, ''))}</dd>
+          </>}
+          <dt>已报告结算</dt><dd>{report.ledger.reportedAttempts ? usdFromMicros(report.ledger.settledMicros) : '尚无费用回执'}</dd>
+          <dt>执行预留上界</dt><dd>{usdFromMicros(report.ledger.reservedMicros)} · {report.ledger.reservedAttempts} 次待结算</dd>
+          <dt>未开始任务估算小计</dt><dd>{report.unstartedMicros === null ? '未知' : usdFromMicros(report.unstartedMicros)} · 已覆盖 {report.coverage.unstarted} 项</dd>
+          <dt>剩余验收计划预留</dt><dd>{plannedReserve(report.acceptance)}</dd>
+          <dt>剩余返工计划预留</dt><dd>{plannedReserve(report.rework)}</dd>
+          {report.completionMicros === null && <><dt>已覆盖金额小计</dt><dd>{usdFromMicros(report.coveredMicros)}</dd></>}
+        </dl>
+        {report.plan && <p>已批准 {report.coverage.selected} 项 · 已交付 {report.coverage.delivered} 项 · 执行预留已覆盖 {report.coverage.reserved} 项
+          {report.coverage.unknown > 0 && ` · 批准范围内费用未知 ${report.coverage.unknown} 项`}
+          {report.coverage.outsidePlan > 0 && ` · 未纳入估算 ${report.coverage.outsidePlan} 项`}</p>}
+        {report.reasons.length > 0 && <ul>{report.reasons.map(reason => <li key={reason}>{forecastReasons[reason]}</li>)}</ul>}
+        {!settled && <p className="acms-sectionnote">估算使用快照时的执行预留和已批准范围。当前计划之外的重试或变更需要重新核算。</p>}
+      </>}
+    </div>}
+  </section>;
+}
+
 function GoalCostBudget({ goal, tasks, act, busy }) {
   const [additional, setAdditional] = useState('');
   const budget = goal.costBudget;
@@ -291,6 +359,7 @@ function GoalCostBudget({ goal, tasks, act, busy }) {
     {budget.awaitingReceiptAttempts > 0 && <p>{budget.awaitingReceiptAttempts} 次已清理执行的费用仍未知，预留继续保留。</p>}
     {budget.breach && <p role="alert">执行器报告的费用超过预留上界，后续派发已停。请核对费用回执。</p>}
     {holds.map(reason => <p key={reason}>{reason}</p>)}
+    <GoalCostForecast goalId={goal.id} budgetRevision={budget.revision} />
     {!budget.breach && !['cancelled', 'archived', 'deleted'].includes(goal.status) && <form className="acms-actions wrap" onSubmit={async event => {
       event.preventDefault();
       try {

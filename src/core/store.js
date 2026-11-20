@@ -44,6 +44,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS entities_status ON entities(collection,json_extract(body,'$.status'));
       CREATE INDEX IF NOT EXISTS attempts_usage_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS attempts_usage_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='attempts';
+      CREATE INDEX IF NOT EXISTS tasks_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks';
+      CREATE INDEX IF NOT EXISTS cost_attempts_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='goalCostAttempts';
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL, entity_id TEXT, goal_id TEXT, actor TEXT NOT NULL, principal_kind TEXT, on_behalf_of TEXT, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL, at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS leases (resource TEXT PRIMARY KEY, owner TEXT NOT NULL, pid INTEGER NOT NULL, epoch INTEGER NOT NULL, heartbeat INTEGER NOT NULL);
@@ -108,6 +110,27 @@ export class Store {
   }
   require(collection, entityId) { const value = this.get(collection, entityId); assert(value, "NOT_FOUND", collection + "/" + entityId + " not found"); return value; }
   list(collection) { return this.db.prepare("SELECT body,revision FROM entities WHERE collection=? ORDER BY rowid").all(collection).map(r => ({ ...JSON.parse(r.body), revision: r.revision })); }
+  readSnapshot(read) {
+    if (this.inTransaction) return read();
+    this.db.exec("BEGIN");
+    try {
+      const result = read();
+      assert(!result?.then, "ASYNC_TRANSACTION", "No async work is allowed inside a transaction");
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { }
+      throw error;
+    }
+  }
+  tasksForGoal(goalId) {
+    return this.db.prepare("SELECT body FROM entities WHERE collection='tasks' AND json_extract(body,'$.goalId')=?")
+      .all(goalId).map(({ body }) => JSON.parse(body));
+  }
+  *goalCostAttemptRows(goalId) {
+    const rows = this.db.prepare("SELECT body FROM entities WHERE collection='goalCostAttempts' AND json_extract(body,'$.goalId')=?").iterate(goalId);
+    for (const { body } of rows) yield JSON.parse(body);
+  }
   attemptUsagePage(scope, entityId, before, limit) {
     const field = attemptUsageFields[scope];
     return this.db.prepare(`SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?`)
