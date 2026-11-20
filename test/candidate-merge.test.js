@@ -16,7 +16,7 @@ import { inside, run, WorkspaceManager } from '../src/runtime/workspaces.js';
 import { applyBackup, planBackup } from '../scripts/backup.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { buildHost } from '../scripts/host-bundle.mjs';
-import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
+import { fixture, gitProject, hostedWindows, taskWaitDiagnostics, until } from './helpers.js';
 import { fixtureCommandLabel, tracedRun, traceFixtureWorkspace } from './fixture-trace.js';
 import { SYSTEM } from '../src/core/util.js';
 
@@ -979,7 +979,7 @@ test('a pending branch creation survives backup without the reclaimed author wor
   const s = await setup(t);
   const { f, base, routes, preview, confirmArgs } = s;
   await f.start();
-  await s.ready();
+  await s.ready(hostedWindows ? 120000 : undefined);
   const chosen = await success(await preview());
   let cleanupFile;
   s.afterApply((result, filename) => {
