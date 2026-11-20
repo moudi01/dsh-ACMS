@@ -6,9 +6,11 @@ import { Store } from '../../src/core/store.js';
 import { OWNER } from '../../src/core/util.js';
 import { Engine } from '../../src/runtime/engine.js';
 import { WorkspaceManager } from '../../src/runtime/workspaces.js';
+import { cleanupError } from '../../src/runtime/owned-process.js';
+import { readCommandCleanup } from '../../src/runtime/host-command.js';
 
 const [dataDir, goalId, mode] = process.argv.slice(2);
-assert(['denied', 'withdrawn', 'cancelled', 'optional-quote'].includes(mode));
+assert(['denied', 'withdrawn', 'cancelled', 'optional-quote', 'optional-quote-check', 'optional-quote-recover'].includes(mode));
 const store = new Store(path.join(dataDir, 'company.db'));
 const company = new Company(store);
 const adapter = new SimulatedAdapter(defaultSimulation);
@@ -31,8 +33,33 @@ if (mode === 'optional-quote') {
   };
 }
 const engine = new Engine(company, adapter, workspaces, { intervalMs: 20 });
+if (mode === 'optional-quote-check') {
+  company.command(OWNER, 'quote-fixture-resume', 'company.resume', {});
+  const run = workspaces.runDeliveryCheck.bind(workspaces);
+  workspaces.runDeliveryCheck = async (command, args, cwd, options) => {
+    const delayed = path.join(dataDir, 'delayed-quote-receipt.json');
+    const result = await run(command, args, cwd, { ...options, cleanupReceipt: delayed });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal((await readCommandCleanup(delayed))?.exitCode, 0);
+    throw cleanupError('Fixture withholds the verified cleanup receipt');
+  };
+  workspaces.prepare = async (task, attempt) => {
+    assert(attempt.costDeferralRequestId);
+    await engine.runHostCheck(attempt, process.execPath, ['-e', 'process.exit(0)'], task.workspace.path,
+      { checkId: 'fixture-quote-preparation', signal: attempt.signal });
+    assert.fail('The delayed-receipt check should be held');
+  };
+}
+if (mode === 'optional-quote-recover') {
+  const clear = engine.clearHostCheck.bind(engine);
+  engine.clearHostCheck = async (...args) => {
+    await clear(...args);
+    process.exit(75);
+  };
+}
 store.events.on('event', event => {
   if (event.goalId !== goalId) return;
+  if (mode === 'optional-quote-check' && event.type === 'attempt.cleanup.failed') process.exit(73);
   if (mode !== 'denied' && event.type === 'goal.cost_budget.reserved') {
     const args = mode === 'cancelled' ? { id: goalId } : { id: goalId, afterCurrent: true };
     company.command(OWNER, 'withdraw-before-launch', mode === 'cancelled' ? 'goal.cancel' : 'goal.pause', args);

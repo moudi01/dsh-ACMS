@@ -377,11 +377,12 @@ function OptionalCostDecision({ goal, tasks, act, busy }) {
         {waiting.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}
       </select></Field>
       <p>本次延期范围 · {scope.map(id => tasks.find(task => task.id === id)?.title ?? id).join('、')}</p>
-      <p className="acms-sectionnote">上次核对的单次费用上界 {usdFromMicros(seed.costBudgetHold.bound.upperMicros)}。确认会先核对最新报价，再决定是否延期。</p>
+      <p className="acms-sectionnote">上次核对的单次费用上界 {usdFromMicros(seed.costBudgetHold.bound.upperMicros)}。确认会先进行无付费核价，再决定是否延期。</p>
       <Field label="延期理由"><textarea rows={2} value={reason} maxLength={2000} onChange={event => setReason(event.target.value)} /></Field>
       <ActionButton type="submit" reason={unavailable}>确认可选项本轮延期</ActionButton>
+      <p className="acms-sectionnote">重新核价并继续派发时，若符合预算和其他门禁，任务会正常执行并使用授权额度。</p>
       <ActionButton type="button" reason={busy || checking ? '正在核对当前报价，请稍候' : goal.executionControl ? '请先恢复目标。' : ''}
-        onClick={() => act('task.resume', { id: seed.id }, '已请求按当前额度重新核价')}>重新核对报价</ActionButton>
+        onClick={() => act('task.resume', { id: seed.id }, '已请求重新核价并继续派发。通过门禁后会执行并使用授权额度。')}>重新核价并继续派发</ActionButton>
     </form>}
     {completed.map(task => <p key={task.id}>{task.title} · 本轮延期 · {task.costBudgetDeferral.reason}</p>)}
   </section>;

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -898,7 +898,7 @@ test('owner deferral confirmation obtains a current cap without launching and pr
   assert.equal(budget(f.store, target.id).limitMicros, '35');
 });
 
-test('a host crash while preparing a quote expires the decision without a paid claim or a retry', async t => {
+async function prepareOptionalQuoteCrash(t, beforePause = () => {}) {
   const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
   f.command('project.save', { id: f.project.id, planApproval: true });
   const target = goal(f, '0.000035', { plan: true });
@@ -913,13 +913,22 @@ test('a host crash while preparing a quote expires the decision without a paid c
   await waiting(f, validate, task => task.status === 'succeeded');
   await until(() => budget(f.store, target.id).reservedAttempts === 0, undefined, () => budget(f.store, target.id));
   f.command('company.pause', { afterCurrent: true });
+  beforePause(f);
   const args = optionalDecision(target, plan, state(f.store, bonus));
   const request = (await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'queue-before-host-exit')).costBudgetDeferralRequest;
   assert.equal(request.status, 'queued');
   await f.engine.stop();
   const runner = fileURLToPath(new URL('./fixtures/goal-cost-crash.mjs', import.meta.url));
-  const terminated = spawnSync(process.execPath, [runner, f.dataDir, target.id, 'optional-quote'], { encoding: 'utf8', timeout: 20000, windowsHide: true });
-  assert.equal(terminated.status, 73, terminated.error?.message ?? terminated.stderr);
+  const run = (mode, exitCode) => {
+    const terminated = spawnSync(process.execPath, [runner, f.dataDir, target.id, mode], { encoding: 'utf8', timeout: 20000, windowsHide: true });
+    assert.equal(terminated.status, exitCode, terminated.error?.message ?? terminated.stderr);
+  };
+  return { f, target, priced, plan, bonus, validate, args, request, run };
+}
+
+test('a host crash while preparing a quote expires the decision without a paid claim or a retry', async t => {
+  const { f, target, priced, plan, bonus, validate, args, request, run } = await prepareOptionalQuoteCrash(t);
+  run('optional-quote', 73);
   const attempt = f.store.list('attempts').find(row => row.costDeferralRequestId === request.id);
   assert.equal(attempt.status, 'preparing');
   assert.equal(state(f.store, bonus).attempts, 0);
@@ -934,6 +943,48 @@ test('a host crash while preparing a quote expires the decision without a paid c
   assert.equal(f.store.get('goalCostAttempts', attempt.id), null);
   assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'queue-before-host-exit')).costBudgetDeferralRequest.id, request.id);
   assert.equal(f.store.list('attempts').filter(row => row.costDeferralRequestId === request.id).length, 1);
+});
+
+test('a recovered quote cleanup and its request survive another crash at receipt removal', { skip: process.platform !== 'win32' }, async t => {
+  let independent;
+  const { f, target, priced, bonus, request, run } = await prepareOptionalQuoteCrash(t, f => {
+    f.command('policy.update', { patch: { maxConcurrent: 1, controlSlots: 0 } });
+    independent = f.task({ title: 'Work waiting for the one occupied slot' });
+  });
+  run('optional-quote-check', 73);
+  const attempt = f.store.list('attempts').find(row => row.costDeferralRequestId === request.id);
+  assert.equal(attempt.status, 'reconciling');
+  assert.equal(attempt.cleanupPending, true);
+  assert.equal(attempt.cleanupUncertain, true);
+  assert.equal(attempt.hostCheck.checkId, 'fixture-quote-preparation');
+  const receiptPath = path.join(f.dataDir, 'check-receipts', attempt.hostCheck.id + '.json');
+  await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });
+  await f.start();
+  await f.engine.tick();
+  assert.equal(f.store.require('attempts', attempt.id).cleanupPending, true);
+  assert.equal(f.store.require('goals', target.id).costBudgetDeferralRequest.status, 'checking');
+  assert.equal(state(f.store, independent).status, 'ready');
+  await f.engine.stop();
+
+  await rename(path.join(f.dataDir, 'delayed-quote-receipt.json'), receiptPath);
+  run('optional-quote-recover', 75);
+  const closed = f.store.require('attempts', attempt.id);
+  assert.equal(closed.status, 'interrupted');
+  assert.equal(closed.cleanupPending, false);
+  assert.equal(closed.cleanupUncertain, false);
+  assert.equal(closed.hostCheck, null);
+  assert.deepEqual(closed.hostCheckCleanup, { id: attempt.hostCheck.id, checkId: 'fixture-quote-preparation', exitCode: 0, quoteRequestId: request.id });
+  assert.equal(f.store.require('goals', target.id).costBudgetDeferralRequest.status, 'not-applied');
+  await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });
+  await f.start();
+  await waiting(f, independent, task => task.status === 'succeeded');
+  assert(optionalHold(state(f.store, bonus)));
+  assert.equal(state(f.store, bonus).attempts, 0);
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal(f.store.get('goalCostAttempts', attempt.id), null);
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  const events = f.store.page(0, 200).entries.filter(event => event.entityId === attempt.id && event.type === 'attempt.cleanup.confirmed');
+  assert.equal(events.length, 1);
 });
 
 test('an optional task that becomes a required dependency keeps its ordinary admission and owner pause', async t => {

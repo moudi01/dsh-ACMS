@@ -135,11 +135,13 @@ async function verifyOptionalDeferral(browser) {
   const page = await browser.newPage({ viewport: { width: 375, height: 820 } });
   const { adapter, company, engine } = preview;
   const receipt = new Map();
+  const optionalCaps = new Map();
   const route = { provider: 'simulation', llmProvider: 'preview', model: 'fixed-ui-cost', reasoningEffort: null };
   adapter.inspectTaskRoute = () => ({ selection: { status: 'selected', chosen: route } });
   adapter.taskCost = {
     id: 'fixed-ui-cost',
-    quote: ({ task }) => ({ route, quoteId: 'live-fixed', currency: 'USD', upperMicros: task.title === '可选演示' ? '7' : '2' }),
+    quote: ({ task }) => ({ route, quoteId: 'live-fixed', currency: 'USD',
+      upperMicros: task.title === '可选演示' ? optionalCaps.get(task.goalId) ?? '7' : '2' }),
     estimatePlan: ({ tasks }) => ({ quoteId: 'plan-fixed', currency: 'USD',
       tasks: tasks.map(({ key }) => ({ key, micros: '1', route, basis: 'Fixed UI fixture' })),
       acceptance: { micros: '2', basis: 'Fixture checks' }, rework: { micros: '2', basis: 'Fixture rework' } }),
@@ -165,25 +167,46 @@ async function verifyOptionalDeferral(browser) {
   const command = (name, args) => company.command(OWNER, randomUUID(), name, args);
   const project = command('project.save', { name: 'Optional cost fixture', repoRoot: preview.source, mode: 'copy', checks: [] });
   const template = command('workflow.publish', { name: '直接交付', phases: [{ id: 'execute', name: '执行' }] });
-  const goal = command('goal.create', { title: '可选预算调整测试', description: 'Isolated test', acceptance: 'Required file',
+  const pricedGoal = title => command('goal.create', { title, description: 'Isolated test', acceptance: 'Required file',
     projectId: project.id, templateId: template.id, costLimitUsd: '0.000010' });
+  const goal = pricedGoal('可选预算调整测试');
+  const budget = id => company.store.require('goalCostBudgets', id);
+  const waitForOptional = id => expect.poll(() => company.store.tasksForGoal(id).some(task => task.status === 'blocked' &&
+    task.costBudgetHold?.reasonCode === 'shortfall') && budget(id).reservedAttempts === 0).toBe(true);
   try {
     await engine.start();
-    await expect.poll(() => company.store.tasksForGoal(goal.id).some(task => task.status === 'blocked' &&
-      task.costBudgetHold?.reasonCode === 'shortfall') && company.store.require('goalCostBudgets', goal.id).reservedAttempts === 0).toBe(true);
+    await waitForOptional(goal.id);
     await page.goto(preview.url);
     await page.locator('.acms-project-group > summary .acms-level-tag').click();
     await page.getByRole('button', { name: goal.title, exact: true }).click();
     const panel = page.getByRole('region', { name: '可选任务预算调整' });
     await expect(panel).toContainText('本次延期范围 · 可选演示');
     await expect(panel).toContainText('US$0.000007');
+    await expect(panel).toContainText('确认会先进行无付费核价，再决定是否延期。');
     const confirm = panel.getByRole('button', { name: '确认可选项本轮延期' });
     await expect(confirm).toBeDisabled();
     await panel.getByLabel('延期理由').fill('保留必做演示和原验收');
     await confirm.click();
     await expect(panel).toContainText('可选演示 · 本轮延期');
     await expect.poll(() => company.store.require('goals', goal.id).status).toBe('succeeded');
-    expect(company.store.require('goalCostBudgets', goal.id).limitMicros).toBe('10');
+    expect(budget(goal.id).limitMicros).toBe('10');
     expect(adapter.calls.some(call => call.task.title === '可选演示')).toBe(false);
+
+    await page.getByRole('button', { name: '关闭详情' }).click();
+    const resumed = pricedGoal('重新核价并继续派发测试');
+    await waitForOptional(resumed.id);
+    await page.getByRole('button', { name: '刷新', exact: true }).click();
+    await page.getByRole('button', { name: resumed.title, exact: true }).click();
+    await expect(panel).toContainText('任务会正常执行并使用授权额度。');
+    const dispatch = panel.getByRole('button', { name: '重新核价并继续派发', exact: true });
+    await expect(dispatch).toBeEnabled();
+    optionalCaps.set(resumed.id, '3');
+    await dispatch.click();
+    await expect(page.getByRole('status').filter({ hasText: '已请求重新核价并继续派发' })).toBeVisible();
+    await expect.poll(() => company.store.require('goals', resumed.id).status === 'succeeded' &&
+      budget(resumed.id).settledMicros === '3').toBe(true);
+    const resumedOptional = adapter.calls.find(call => call.task.goalId === resumed.id && call.task.title === '可选演示');
+    expect(resumedOptional?.authorization?.upperMicros).toBe('3');
+    expect(budget(resumed.id).limitMicros).toBe('10');
   } finally { await page.close(); await engine.stop(); await preview.close(); }
 }

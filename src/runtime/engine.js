@@ -85,11 +85,11 @@ export class Engine {
       try {
         const check = pending.hostCheck;
         const cleanup = check ? await readCommandCleanup(checkReceipt(this, check.id)) : null;
-        if (check && cleanup) await this.clearHostCheck(pending.id, check.id, cleanup);
+        if (check && cleanup && await this.clearHostCheck(pending.id, check.id, cleanup, { recovering: true })) continue;
         const saved = this.store.require('attempts', pending.id);
         if (saved.hostCheck) {
           fact = { status: 'unknown', reason: `宿主检查 ${saved.hostCheck.checkId} 的进程树清理尚未确认`, actions: ['refresh-receipt', 'inspect-execution'] };
-        } else if (saved.costDeferralRequestId && saved.cleanupUncertain && !(check && cleanup)) {
+        } else if (saved.costDeferralRequestId && saved.cleanupUncertain) {
           fact = { status: 'unknown', reason: '核价前置操作的清理尚未确认', actions: ['refresh-receipt', 'inspect-execution'] };
         } else if (saved.costDeferralRequestId || saved.preparingHost) {
           fact = { status: 'stopped', cleanupConfirmed: true, reason: '宿主依赖准备已清理，模型尚未启动' };
@@ -809,17 +809,24 @@ export class Engine {
       if (!parked) return this.accept(attempt, output, signal);
     }
   }
-  async clearHostCheck(attemptId, commandId, proof) {
-    this.store.transaction(() => {
+  async clearHostCheck(attemptId, commandId, proof, { recovering = false } = {}) {
+    const cleared = this.store.transaction(() => {
       this.fenced();
       const current = this.store.require('attempts', attemptId);
-      if (current.hostCheck?.id !== commandId) return;
-      const hostCheckCleanup = proof && current.deferredReplayAt
-        ? { id: commandId, checkId: current.hostCheck.checkId, replayAt: current.deferredReplayAt, exitCode: proof.exitCode }
-        : null;
+      if (current.hostCheck?.id !== commandId) return null;
+      const closeQuote = !!(proof && recovering && current.costDeferralRequestId);
+      const evidence = proof && (closeQuote || current.deferredReplayAt)
+        ? { id: commandId, checkId: current.hostCheck.checkId, exitCode: proof.exitCode } : null;
+      const hostCheckCleanup = closeQuote ? { ...evidence, quoteRequestId: current.costDeferralRequestId } :
+        evidence ? { ...evidence, replayAt: current.deferredReplayAt } : null;
       this.store.put('attempts', { ...current, hostCheck: null, hostCheckCleanup });
+      // Consume a recovered quote receipt and release its slot together. A
+      // restart can still read the file until this transaction has committed.
+      if (closeQuote) closeOptionalDeferralQuote(this, current, null, '核价在宿主重启前未完成，本轮未延期。');
+      return { closeQuote };
     });
-    await unlink(checkReceipt(this, commandId)).catch(() => {});
+    if (cleared) await unlink(checkReceipt(this, commandId)).catch(() => {});
+    return cleared?.closeQuote === true;
   }
   async runHostCheck(attempt, command, args, cwd, { checkId, signal, guard, ...options }) {
     const commandId = id('command');

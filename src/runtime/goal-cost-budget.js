@@ -48,6 +48,7 @@ export function closeOptionalDeferralQuote(engine, attempt, input = null, failur
   const { store } = engine;
   engine.fenced();
   const saved = store.require('attempts', attempt.id);
+  if (saved.status === 'interrupted' && saved.cleanupPending === false) return;
   // Quote-only attempts never call a model. Existing host commands must still
   // be proved stopped through their own cleanup receipt before closing.
   assert(!saved.hostCheck, 'CLEANUP_PENDING', '需先核对核价前置命令的清理回执。');
@@ -62,6 +63,7 @@ export function closeOptionalDeferralQuote(engine, attempt, input = null, failur
   if (previous.activeAttemptId === saved.id && previous.stopRequested)
     store.event('task.stop.completed', task.id, { status: previous.stopRequested, attemptId: saved.id }, SYSTEM);
   store.event('attempt.cleanup.confirmed', saved.id, { taskId: task.id, noLaunch: true }, SYSTEM);
+  engine.company.releaseTemporaryAgent(saved.agentId);
 }
 
 export function assertTaskCostCurrent(engine, executor, authorization) {
