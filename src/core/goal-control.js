@@ -62,7 +62,9 @@ export function controlGoal(company, args, actor, action) {
   if (previous?.state === 'paused' && !cancelled && (previous.mode === mode || previous.mode === 'immediate')) return goal;
   const control = { id: id('goal_control'), state: cancelled ? 'cancelled' : 'paused', mode,
     requestedAt: now(), requestedBy: { kind: actor.kind, id: actor.id }, reason: args.reason === undefined ? null : text(args.reason, 'reason', 2000) };
-  const saved = store.put('goals', { ...goal, status: cancelled ? 'cancelled' : goal.status, executionControl: control });
+  const candidateMerge = goal.candidateMerge;
+  const saved = store.put('goals', { ...goal, status: cancelled ? 'cancelled' : goal.status, executionControl: control,
+    ...(cancelled && candidateMerge?.status === 'queued' ? { candidateMerge: { ...candidateMerge, status: 'cancelled' } } : {}) });
   if (mode === 'immediate') {
     for (const task of store.list('tasks')) {
       if (task.goalId !== goal.id || TERMINAL.has(task.status)) continue;

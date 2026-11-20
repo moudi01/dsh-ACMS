@@ -5,6 +5,7 @@ import { ACTIVITY_MAX_LIMIT } from '../core/activity.js';
 import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
 import { prepareCandidateArchive, readCandidateArchive } from '../runtime/candidate-archive.js';
+import { checkCandidateMergeConfirmation, previewCandidateMerge } from '../runtime/candidate-merge.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -76,6 +77,7 @@ export function createRoutes(runtime) {
     },
     '/api/acms/command': async request => {
       assert(request.method === 'POST', 'METHOD', 'POST required'); const input = await body(request);
+      if (input.name === 'goal.candidate_merge.confirm') await checkCandidateMergeConfirmation(company, workspaces, input.args ?? {}, request.signal);
       if (input.name === 'project.save') {
         const previous = input.args?.id ? company.store.get('projects', input.args.id) : {};
         await workspaces.validateProject({ ...previous, ...input.args, mode: input.args?.mode ?? previous?.mode ?? 'git' });
@@ -124,6 +126,7 @@ export function createRoutes(runtime) {
       const selection = await body(request);
       return json(await prepareCandidateArchive(company, workspaces.dataDir, selection, request.signal));
     },
+    '/api/acms/composition/merge-preview': async request => json(await previewCandidateMerge(company, workspaces, await body(request), request.signal)),
     '/api/acms/composition/download': async request => {
       const query = new URL(request.url).searchParams;
       const selection = Object.fromEntries(['goalId', 'version', 'deliveryHash', 'archiveSha256'].map(name => [name, query.get(name)]));
@@ -167,10 +170,12 @@ export function createRoutes(runtime) {
       } });
     },
   };
-  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing', '/api/acms/composition/archive'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
+  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing', '/api/acms/composition/archive', '/api/acms/composition/merge-preview'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
     try { return await handler(request); } catch (e) {
       const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : ['NOT_FOUND'].includes(e.code) ? 404
-        : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED'].includes(e.code) ? 409
+        : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED',
+          'CANDIDATE_NOT_READY', 'STALE_CANDIDATE_CONFIRMATION', 'TARGET_CHANGED', 'TARGET_DIRTY', 'TARGET_BASE_CHANGED',
+          'TARGET_BRANCH_NOT_CHECKED_OUT', 'TARGET_INDEX_UNSUPPORTED'].includes(e.code) ? 409
           : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED', 'PROJECT_PATH_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);
     }

@@ -20,6 +20,8 @@ export const api = {
   artifact: id => request(`artifact?id=${encodeURIComponent(id)}`),
   candidateArchive: selection => request('composition/archive', { method: 'POST',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify(selection) }),
+  candidateMergePreview: selection => request('composition/merge-preview', { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(selection) }),
   async downloadCandidateArchive(selection, archive) {
     const params = new URLSearchParams({ ...selection, archiveSha256: archive.archiveSha256 });
     const response = await transport(`api/acms/composition/download?${params}`, { credentials: 'same-origin' });

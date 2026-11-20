@@ -8,6 +8,7 @@ import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { acceptReviewFlow } from './review-flow.js';
 import { completeCoordination, coordinationAuthority, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow, timeBoxCoordinationKey, CAPACITY_LIMIT_CODES } from '../core/coordination.js';
 import { executeIntegration, interruptIntegration, recoverIntegrations, refreshIntegrationReceipts } from './integration.js';
+import { candidateMergeMatches } from '../core/candidate-confirmation.js';
 import { contractVersion, matchesGoalContract } from '../core/goal-contract.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { migrateLegacyForEngine } from '../core/legacy.js';
@@ -274,6 +275,16 @@ export class Engine {
               this.queueIntegration(anchor.id, request.id); integrationQueued = true; free--;
             } else this.store.put('goals', { ...goal,
               compositionRecheck: { ...request, status: 'failed', reason: '已选交付发生变化，请完成当前工作任务后重验。' } });
+          } else {
+            const goal = this.store.list('goals').find(item => item.candidateMerge?.status === 'queued' && !item.executionControl);
+            if (goal) {
+              const request = goal.candidateMerge;
+              const anchor = this.store.get('tasks', request.taskId);
+              if (anchor?.status === 'succeeded' && candidateMergeMatches(this.company, goal, request)) {
+                this.queueIntegration(anchor.id, null, request.id); integrationQueued = true; free--;
+              } else this.store.put('goals', { ...goal, candidateMerge: { ...request, status: 'failed',
+                reason: '候选、模板审查或项目授权已变化，请重新预览和确认。' } });
+            }
           }
         }
       }
@@ -885,10 +896,10 @@ export class Engine {
   }
   scheduleRepair(task, reason, evidence) { return scheduleRepairFlow(this, task, reason, evidence); }
   async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
-  queueIntegration(taskId, compositionRecheckId = null) {
+  queueIntegration(taskId, compositionRecheckId = null, candidateMergeId = null) {
     if (this.queuedIntegrations.has(taskId)) return;
     this.queuedIntegrations.add(taskId);
-    this.integration = this.integration.then(() => executeIntegration(this, taskId, compositionRecheckId))
+    this.integration = this.integration.then(() => executeIntegration(this, taskId, compositionRecheckId, candidateMergeId))
       .catch(error => { this.lastError = error.message; })
       .finally(() => { this.queuedIntegrations.delete(taskId); this.kick(); });
   }
