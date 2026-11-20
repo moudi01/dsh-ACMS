@@ -13,7 +13,7 @@ const requireValue = (ok, code, path, details) => { if (!ok) fail(code, path, de
 
 // Use one portable namespace. Never extract entries, follow links, or normalize
 // an unsafe name into a safe one. NFC/case aliases are rejected, not overwritten.
-function portablePath(name) {
+export function portablePath(name) {
   requireValue(typeof name === 'string' && name.length > 0 && name.length <= 1024 && name.isWellFormed(), 'INVALID_PATH', String(name).slice(0, 1024));
   requireValue(!/[\\:\x00-\x1f\x7f<>"|?*]/u.test(name), 'INVALID_PATH', name);
   requireValue(name.split('/').every(part => part && part !== '.' && part !== '..' && !/[. ]$/.test(part) &&
@@ -60,7 +60,7 @@ function extras(bytes, name) {
   }
 }
 
-function readZip(bytes, limits) {
+function readZip(bytes, limits, { includeCandidate, gitObjectFormat }) {
   requireValue(bytes.length <= limits.archiveBytes, 'ARCHIVE_SIZE_LIMIT', null);
   let end = -1;
   for (let p = bytes.length - 22; p >= Math.max(0, bytes.length - 65557); p--) {
@@ -96,16 +96,16 @@ function readZip(bytes, limits) {
       'EXPANDED_SIZE_LIMIT', name);
     requireValue(!directory || size === 0, 'DIRECTORY_HAS_CONTENT', name);
     extras(bytes.subarray(p + 46 + n, p + 46 + n + x), name);
-    records.push({ name, key, directory, nameBytes, flags, method, crc, compressed, size, offset });
+    records.push({ name, key, directory, nameBytes, flags, method, crc, compressed, size, offset, mode: attributes >>> 16 });
     p += 46 + n + x + comment;
   }
   requireValue(p === end, 'INVALID_ZIP_DIRECTORY', null);
-  const files = new Map(), textDiagnostics = { inspected: 0, skipped: 0, warnings: [], warningsOmitted: 0 };
+  const files = new Map(), candidateEntries = [], textDiagnostics = { inspected: 0, skipped: 0, warnings: [], warningsOmitted: 0 };
   let localEnd = 0, textBudget = 8 * MAX_TEXT_BYTES;
   // Contiguous local records rule out hidden entries, overlapping entries and
   // self-extracting prefixes that other ZIP readers could interpret differently.
   for (const record of records.sort((a, b) => a.offset - b.offset)) {
-    const { name, nameBytes, offset, flags, method, compressed, size, crc, directory } = record;
+    const { name, nameBytes, offset, flags, method, compressed, size, crc, directory, mode } = record;
     requireValue(offset === localEnd && offset + 30 <= central && bytes.readUInt32LE(offset) === 0x04034b50, 'INVALID_LOCAL_ENTRY', name);
     const n = bytes.readUInt16LE(offset + 26), x = bytes.readUInt16LE(offset + 28), start = offset + 30 + n + x;
     requireValue(start + compressed <= central, 'INVALID_LOCAL_ENTRY', name);
@@ -135,7 +135,13 @@ function readZip(bytes, limits) {
     }
     requireValue(content.length === size, 'ZIP_SIZE_MISMATCH', name, { expected: size, actual: content.length });
     requireValue(crc32(content) === crc, 'ZIP_CRC_MISMATCH', name);
-    if (!directory) files.set(name, { bytes: size, sha256: byteSha256(content), ...(name === MANIFEST_PATH ? { content } : {}) });
+    const hash = directory ? null : byteSha256(content);
+    if (!directory) files.set(name, { bytes: size, sha256: hash, ...(name === MANIFEST_PATH ? { content } : {}) });
+    if (includeCandidate && name !== MANIFEST_PATH) {
+      const oid = !directory && gitObjectFormat
+        ? createHash(gitObjectFormat).update(`blob ${size}\0`).update(content).digest('hex') : hash;
+      candidateEntries.push({ name, directory, mode, bytes: size, oid });
+    }
     if (!directory && isProseFile(name)) {
       if (size > MAX_TEXT_BYTES || size > textBudget) textDiagnostics.skipped++;
       else {
@@ -149,15 +155,15 @@ function readZip(bytes, limits) {
     }
   }
   requireValue(localEnd === central, 'UNINDEXED_ZIP_CONTENT', null);
-  return { files, paths, total, textDiagnostics };
+  return { files, paths, total, textDiagnostics, candidateEntries };
 }
 
 // The report is evidence for these exact archive bytes, never an approval of
 // their content. Caller supplies provenance; the archive cannot assert approval.
-export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
+export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS, { includeCandidate = false, gitObjectFormat } = {}) {
   const report = { format: ARCHIVE_FORMAT, passed: false, archiveSha256: byteSha256(bytes), errors: [] };
   try {
-    const { files, paths, total, textDiagnostics } = readZip(bytes, limits);
+    const { files, paths, total, textDiagnostics, candidateEntries } = readZip(bytes, limits, { includeCandidate, gitObjectFormat });
     report.textDiagnostics = textDiagnostics;
     const manifestFile = files.get(MANIFEST_PATH);
     requireValue(manifestFile, 'MISSING_MANIFEST', MANIFEST_PATH);
@@ -194,6 +200,10 @@ export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
     report.manifest = { format: ARCHIVE_FORMAT, hashAlgorithm: 'sha256-bytes', files: normalized };
     report.totals = { files: files.size, expandedBytes: total };
     report.passed = report.errors.length === 0;
+    if (includeCandidate && report.passed) {
+      report.candidate = manifest.candidate;
+      report.candidateEntries = candidateEntries;
+    }
   } catch (error) { report.errors.push(error.diagnostic ?? { code: 'INVALID_ARCHIVE', path: null }); }
   return report;
 }

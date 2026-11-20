@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import { mkdir, readFile, writeFile, unlink, readdir, rename, rmdir } from 'node:fs/promises';
 import path from 'node:path';
-import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
+import { fixture, gitProject, hostedWindows, taskWaitDiagnostics, until } from './helpers.js';
 import { checkoutComposition, composeGitVersions, selectedGitVersions } from '../src/runtime/git-composition.js';
 import { storeGitBundle } from '../src/runtime/git-delivery.js';
 import { orderedCompositionTasks } from '../src/core/composite-delivery.js';
@@ -463,7 +463,7 @@ async function structuralDecomposition(t, { baseline, update, artifact, inspect 
   return { f, goal, task: f.task({ title: 'Parent', goalId: goal.id }), directory: () => directory };
 }
 
-async function completedStructuralCheckout({ f, goal, task }) {
+async function completedStructuralCheckout({ f, goal, task }, timeout = 45000) {
   await f.start();
   await until(() => {
     const failed = f.store.list('attempts').find(item => item.goalId === goal.id && item.status === 'failed');
@@ -473,7 +473,7 @@ async function completedStructuralCheckout({ f, goal, task }) {
     const recheck = goalState(f, goal).compositionRecheck;
     if (recheck?.status === 'failed') assert.fail(recheck.reason);
     return goalState(f, goal).status === 'succeeded';
-  }, 45000, taskWaitDiagnostics(f, task.id));
+  }, timeout, taskWaitDiagnostics(f, task.id));
   const checkout = path.join(f.root, 'structural-candidate');
   await checkoutComposition(goalState(f, goal).composition, checkout, f.root, f.dataDir, run);
   return checkout;
@@ -515,7 +515,8 @@ test('child delivery supports both directions of file and directory replacement'
     };
     const inspect = async directory => assert.equal(await readFile(path.join(directory, artifact), 'utf8'), 'new input bytes');
     const scenario = await structuralDecomposition(t, { baseline, update, artifact, inspect });
-    const checkout = await completedStructuralCheckout(scenario);
+    // A shared Windows runner can take longer to prepare both decomposed worktrees.
+    const checkout = await completedStructuralCheckout(scenario, hostedWindows ? 90000 : undefined);
     await inspect(checkout);
     const files = (await git(checkout, 'ls-tree', '-r', '--name-only', '-z', 'HEAD')).split('\0');
     assert(files.includes(artifact));

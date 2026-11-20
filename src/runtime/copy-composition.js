@@ -68,6 +68,7 @@ function encodeTree(entries) {
   assert(body.length <= manifestLimit, 'COMPOSITE_CONTENT', '目录候选文件清单超过可核对范围。');
   return { body, reference: { format: treeFormat, sha256: sha256(body) } };
 }
+export const copyTreeHash = entries => encodeTree(entries).reference.sha256;
 
 async function scan(root, signal) {
   const entries = new Map();
@@ -95,7 +96,7 @@ async function scan(root, signal) {
 }
 
 export async function copyContentHash(root, signal) {
-  return encodeTree(await scan(await fs.realpath(root), signal)).reference.sha256;
+  return copyTreeHash(await scan(await fs.realpath(root), signal));
 }
 
 export async function copyCheckInputs(root, signal) {

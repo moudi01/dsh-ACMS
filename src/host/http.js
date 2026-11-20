@@ -4,6 +4,7 @@ import { assert, digest, OWNER } from '../core/util.js';
 import { ACTIVITY_MAX_LIMIT } from '../core/activity.js';
 import { executionCapacity } from '../core/execution-capacity.js';
 import { browseDirectories } from './directories.js';
+import { prepareCandidateArchive, readCandidateArchive } from '../runtime/candidate-archive.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -117,6 +118,23 @@ export function createRoutes(runtime) {
       };
       return json(company.store.activityPage({ before, after, limit, projectId: scope('projectId'), goalId: scope('goalId'), taskId: scope('taskId') }));
     },
+    // DSH owner routes, like command and artifact access. The token-scoped
+    // external agent API does not register these handlers.
+    '/api/acms/composition/archive': async request => {
+      const selection = await body(request);
+      return json(await prepareCandidateArchive(company, workspaces.dataDir, selection, request.signal));
+    },
+    '/api/acms/composition/download': async request => {
+      const query = new URL(request.url).searchParams;
+      const selection = Object.fromEntries(['goalId', 'version', 'deliveryHash', 'archiveSha256'].map(name => [name, query.get(name)]));
+      const { record, bytes } = await readCandidateArchive(company, workspaces.dataDir, selection, request.signal);
+      return new Response(bytes, { status: 200, headers: {
+        'content-type': 'application/zip', 'content-length': String(bytes.length),
+        'content-disposition': contentDisposition(record.filename), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
+        'x-acms-candidate-version': record.version, 'x-acms-archive-sha256': record.archiveSha256,
+        'x-acms-manifest-sha256': record.manifestSha256,
+      } });
+    },
     '/api/acms/artifact': async request => {
       const artifactId = new URL(request.url).searchParams.get('id'); const artifact = company.store.require('artifacts', artifactId);
       const bytes = await fs.readFile(artifact.blob);
@@ -149,9 +167,11 @@ export function createRoutes(runtime) {
       } });
     },
   };
-  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
+  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing', '/api/acms/composition/archive'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
     try { return await handler(request); } catch (e) {
-      const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : e.code === 'ARTIFACT_CORRUPT' ? 409 : ['NOT_FOUND'].includes(e.code) ? 404 : ['CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT'].includes(e.code) ? 409 : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED'].includes(e.code) ? 403 : 400;
+      const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : ['NOT_FOUND'].includes(e.code) ? 404
+        : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED'].includes(e.code) ? 409
+          : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED', 'PROJECT_PATH_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);
     }
   } }));

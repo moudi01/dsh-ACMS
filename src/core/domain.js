@@ -11,7 +11,7 @@ import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNT
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
-import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, GIT_COMPOSITION, newCompositionCheck, usesComposition } from './composite-delivery.js';
+import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, newCompositionCheck, usesComposition } from './composite-delivery.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
@@ -728,9 +728,11 @@ export class Company {
     data.goals = data.goals.map(g => {
       const reviews = reviewTasks.filter(review => review.reviewScope === 'goal' && review.goalId === g.id);
       const current = reviews.filter(review => review.deliveryHash === deliveryHashes.get(g.id));
+      const composition = usesComposition(g) ? acceptedGoalComposition(this.store, g) : null;
       return { ...g, contractVersion: contractVersion(g), completedContractVersion: g.completedContractVersion ?? (g.status === 'succeeded' ? contractVersion(g) : null),
         controlSummary: goalControlView(g, data.tasks, data.attempts),
-        ...(usesComposition(g) ? { compositionVerified: !!acceptedGoalComposition(this.store, g) } : {}),
+        ...(usesComposition(g) ? { compositionVerified: !!composition,
+          finalComposition: finalGoalComposition(this, g, composition, deliveryHashes.get(g.id)) } : {}),
         deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
     });
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));

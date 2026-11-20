@@ -12,7 +12,7 @@ import { OWNER } from '../src/core/util.js';
 
 // Hosted Windows runners can be slow to observe the same scheduled state.
 // Explicit test bounds still apply when a test supplies its own timeout.
-const hostedWindows = process.platform === 'win32' && process.env.GITHUB_ACTIONS === 'true' &&
+export const hostedWindows = process.platform === 'win32' && process.env.GITHUB_ACTIONS === 'true' &&
   process.env.RUNNER_ENVIRONMENT === 'github-hosted';
 const stateWaitMs = hostedWindows ? 24000 : 8000;
 
