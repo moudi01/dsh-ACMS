@@ -16,7 +16,8 @@ import { inside, run, WorkspaceManager } from '../src/runtime/workspaces.js';
 import { applyBackup, planBackup } from '../scripts/backup.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { buildHost } from '../scripts/host-bundle.mjs';
-import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
+import { fixture, gitProject, hostedWindows, taskWaitDiagnostics, until } from './helpers.js';
+import { fixtureCommandLabel, tracedRun, traceFixtureWorkspace } from './fixture-trace.js';
 import { SYSTEM } from '../src/core/util.js';
 
 const basisRef = 'refs/heads/delivery';
@@ -32,63 +33,6 @@ async function git(cwd, ...args) {
   const output = await run('git', args, cwd);
   assert.equal(output.code, 0, output.stderr);
   return output.stdout.trim();
-}
-
-
-const tracedGitCommands = new Set(['add', 'bundle', 'checkout', 'checkout-index', 'check-ref-format', 'commit', 'commit-tree',
-  'diff', 'fetch', 'hash-object', 'init', 'ls-files', 'ls-tree', 'merge', 'merge-base', 'read-tree', 'reflog', 'reset',
-  'rev-parse', 'show', 'status', 'symbolic-ref', 'update-index', 'update-ref', 'worktree', 'write-tree']);
-const gitOptionsWithValue = new Set(['-c', '-C', '--git-dir', '--work-tree', '--config-env']);
-
-function fixtureCommandLabel(command, args) {
-  if (!['git', 'git.exe'].includes(path.basename(command).toLowerCase())) return 'project-check';
-  let index = 0;
-  while (args[index]?.startsWith('-')) index += gitOptionsWithValue.has(args[index]) ? 2 : 1;
-  const subcommand = args[index];
-  return tracedGitCommands.has(subcommand) ? 'git:' + subcommand : 'git:other';
-}
-
-function fixtureTrace() {
-  const limit = 12, inFlight = new Set(), recent = [];
-  return {
-    async observe(operation, invoke) {
-      const span = { operation, stage: 'entered' };
-      const started = performance.now();
-      const entry = { span, started };
-      inFlight.add(entry);
-      let outcome = 'returned';
-      try {
-        return await invoke(span);
-      } catch (error) {
-        outcome = 'threw';
-        if (error?.cleanupUncertain === true) span.cleanupUncertain = true;
-        throw error;
-      } finally {
-        inFlight.delete(entry);
-        recent.push({ ...span, outcome, elapsedMs: Math.round(performance.now() - started) });
-        if (recent.length > limit) recent.shift();
-      }
-    },
-    read() {
-      const snapshotTime = performance.now();
-      return { inFlight: [...inFlight].slice(-limit).map(({ span, started }) => ({
-        ...span, elapsedMs: Math.round(snapshotTime - started),
-      })), recent: recent.slice() };
-    },
-  };
-}
-
-async function tracedRun(span, command, args, cwd, options) {
-  span.stage = 'running';
-  const started = performance.now();
-  try {
-    const result = await run(command, args, cwd, options);
-    span.exitCode = result.code;
-    span.timedOut = result.timedOut === true;
-    return result;
-  } finally {
-    span.commandMs = Math.round(performance.now() - started);
-  }
 }
 
 function ownerRoutes(runtime, registered = createRoutes(runtime)) {
@@ -147,16 +91,7 @@ async function setup(t, { review, autoMerge = false, deliveryApproval = false, l
     title: 'Owner acceptance', description: 'Assemble verified Git changes', acceptance: 'Merge the exact accepted source tree',
     ...(autoMerge || deliveryApproval ? {} : { deliveryMode: 'git-composite' }) });
   const task = f.task({ goalId: goal.id });
-  const trace = fixtureTrace();
-  for (const method of ['prepare', 'integrate']) {
-    const invoke = f.workspaces[method].bind(f.workspaces);
-    f.workspaces[method] = (...args) => trace.observe(method, () => invoke(...args));
-  }
-  const validate = f.workspaces.validateProject.bind(f.workspaces);
-  const validationCommand = (command, args, cwd, options) => trace.observe(fixtureCommandLabel(command, args),
-    span => tracedRun(span, command, args, cwd, options));
-  f.workspaces.validateProject = (project, invoke = validationCommand) =>
-    trace.observe('validate-project', () => validate(project, invoke));
+  const trace = traceFixtureWorkspace(f.workspaces);
 
   let beforeApply, afterGuard, afterApply;
   let applyCalls = 0;
@@ -1044,7 +979,7 @@ test('a pending branch creation survives backup without the reclaimed author wor
   const s = await setup(t);
   const { f, base, routes, preview, confirmArgs } = s;
   await f.start();
-  await s.ready();
+  await s.ready(hostedWindows ? 120000 : undefined);
   const chosen = await success(await preview());
   let cleanupFile;
   s.afterApply((result, filename) => {
