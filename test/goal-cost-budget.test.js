@@ -475,6 +475,7 @@ test('completion forecast combines concurrent caps, zero estimates and trusted r
   assert.equal(concurrent.ledger.reservedMicros, '36');
   assert.equal(concurrent.unstartedMicros, '0');
   assert.equal(concurrent.completionMicros, '41');
+  assert.equal(concurrent.completionBasis, 'forecast');
   assert.equal(concurrent.headroomMicros, '-1');
   assert.equal(concurrent.status, 'over-limit');
 
@@ -571,6 +572,7 @@ test('completion forecast discloses stale quotations, unpriced new work and chan
   const stale = await scopedForecast(f, target.id);
   assert.equal(stale.plan.state, 'quote-stale');
   assert.equal(stale.completionMicros, null);
+  assert.equal(stale.completionBasis, null);
   assert.equal(stale.unstartedMicros, null);
   assert.equal(stale.ledger.settledMicros, '3');
   let extra;
@@ -637,6 +639,13 @@ test('completion forecast keeps a late receipt unknown even when both approved p
   assert.equal(waitingForReceipt.ledger.reservedMicros, '7');
   assert.equal(waitingForReceipt.coveredMicros, '7');
   assert.deepEqual(waitingForReceipt.reasons, ['awaiting-cost-receipt']);
+  delete priced.adapter.taskCost.estimatePlan;
+  const noQuote = await scopedForecast(f, target.id);
+  assert.equal(noQuote.plan.state, 'quote-stale');
+  assert.equal(noQuote.completionBasis, null);
+  assert.equal(noQuote.completionMicros, null);
+  assert.equal(noQuote.coveredMicros, '7');
+  assert.deepEqual(noQuote.reasons, ['awaiting-cost-receipt']);
   const authorization = priced.authorizations.find(row => row.taskId === plan.nodes[0].taskId);
   priced.save('cost-', authorization.id, receipt(authorization, '0'));
   f.engine.nextCostReceiptCheck = 0;
@@ -644,9 +653,40 @@ test('completion forecast keeps a late receipt unknown even when both approved p
   await until(() => budget(f.store, target.id).settledAttempts === 2, undefined, () => budget(f.store, target.id));
   const settled = await scopedForecast(f, target.id);
   assert.equal(settled.completionMicros, '0');
+  assert.equal(settled.completionBasis, 'settled');
   assert.equal(settled.headroomMicros, '7');
   assert.equal(settled.ledger.reportedAttempts, 2);
   assert.deepEqual(settled.reasons, []);
+});
+
+test('completion forecast preserves the fully settled total after the approved quote becomes unavailable', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const priced = fixedCostAdapter(f);
+  planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  f.command('company.resume');
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' &&
+    budget(f.store, target.id).settledAttempts === 3, undefined, () => budget(f.store, target.id));
+  const current = await scopedForecast(f, target.id);
+  assert.equal(current.completionMicros, '9');
+  assert.equal(current.headroomMicros, '31');
+  assert.equal(current.plan.state, 'current');
+  delete priced.adapter.taskCost.estimatePlan;
+  const historical = await scopedForecast(f, target.id);
+  assert.deepEqual(historical.plan, { ...current.plan, state: 'quote-stale' });
+  assert.equal(historical.plan.quoteId, plan.costPlan.estimate.quoteId);
+  assert.deepEqual(historical.ledger, current.ledger);
+  assert.equal(historical.coverage.delivered, 2);
+  assert.equal(historical.unstartedMicros, '0');
+  assert.equal(historical.acceptance.state, 'finished');
+  assert.equal(historical.rework.state, 'finished');
+  assert.equal(historical.completionBasis, 'settled');
+  assert.equal(historical.completionMicros, '9');
+  assert.equal(historical.headroomMicros, '31');
+  assert.deepEqual(historical.reasons, []);
 });
 
 test('budget planning commits a host-estimated minimum and defers optional scope without an extra owner approval', async t => {

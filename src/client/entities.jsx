@@ -302,6 +302,9 @@ function GoalCostForecast({ goalId, budgetRevision }) {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const settled = report?.completionBasis === 'settled';
+  const headroomLabel = report?.status === 'over-limit' ?
+    (settled ? '实际超出授权' : '预计超出授权') : (settled ? '结算后预算余裕' : '预计预算余裕');
   const load = async () => {
     setLoading(true); setError('');
     try { setReport(await api.costForecast(goalId)); }
@@ -317,9 +320,10 @@ function GoalCostForecast({ goalId, budgetRevision }) {
         {budgetRevision > report.ledger.revision && ' · 账本已更新，可刷新估算'}</p>
       {report.status === 'closed' ? <p>目标已结束，费用仍可在上方账本查看。</p> : <>
         <dl className="acms-definition">
-          <dt>完工预估</dt><dd>{report.completionMicros === null ? '未知' : usdFromMicros(report.completionMicros)}</dd>
+          <dt>{settled ? '完工实际费用' : '完工预估'}</dt>
+          <dd>{report.completionMicros === null ? '未知' : usdFromMicros(report.completionMicros)}</dd>
           {report.headroomMicros !== null && <>
-            <dt>{report.status === 'over-limit' ? '预计超出授权' : '预计预算余裕'}</dt>
+            <dt>{headroomLabel}</dt>
             <dd>{usdFromMicros(report.headroomMicros.replace(/^-/, ''))}</dd>
           </>}
           <dt>已报告结算</dt><dd>{report.ledger.reportedAttempts ? usdFromMicros(report.ledger.settledMicros) : '尚无费用回执'}</dd>
@@ -333,7 +337,7 @@ function GoalCostForecast({ goalId, budgetRevision }) {
           {report.coverage.unknown > 0 && ` · 批准范围内费用未知 ${report.coverage.unknown} 项`}
           {report.coverage.outsidePlan > 0 && ` · 未纳入估算 ${report.coverage.outsidePlan} 项`}</p>}
         {report.reasons.length > 0 && <ul>{report.reasons.map(reason => <li key={reason}>{forecastReasons[reason]}</li>)}</ul>}
-        <p className="acms-sectionnote">估算使用快照时的执行预留和已批准范围。当前计划之外的重试或变更需要重新核算。</p>
+        {!settled && <p className="acms-sectionnote">估算使用快照时的执行预留和已批准范围。当前计划之外的重试或变更需要重新核算。</p>}
       </>}
     </div>}
   </section>;

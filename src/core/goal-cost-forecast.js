@@ -37,7 +37,7 @@ function forecast(company, goal, budget, executor) {
   const result = { goalId: goal.id, enabled: true, asOf: now(), ledger: { ...ledger, revision: budget.revision },
     plan: null, coverage: { selected: 0, unstarted: 0, reserved: 0, delivered: 0, unknown: 0, outsidePlan: 0 },
     unstartedMicros: null, acceptance: null, rework: null, coveredMicros: booked.toString(),
-    status: 'unknown', completionMicros: null, headroomMicros: null, reasons: [] };
+    status: 'unknown', completionBasis: null, completionMicros: null, headroomMicros: null, reasons: [] };
   if (closed.has(goal.status)) return { ...result, status: 'closed' };
 
   const reasons = new Set();
@@ -58,7 +58,7 @@ function forecast(company, goal, budget, executor) {
   const quoteCurrent = contractCurrent && isCostPlanEstimateCurrent(company, goal, plan, planner, executor);
   result.plan = { id: plan.id, fingerprint: plan.fingerprint, executorId: cost.estimate.executorId, quoteId: cost.estimate.quoteId,
     state: !contractCurrent ? 'contract-changed' : quoteCurrent ? 'current' : 'quote-stale' };
-  if (result.plan.state !== 'current') reasons.add(result.plan.state);
+  if (!contractCurrent) reasons.add('contract-changed');
 
   const allTasks = new Map(store.tasksForGoal(goal.id).map(task => [task.id, task]));
   const byTask = new Map(plan.nodes.map(node => [node.taskId, node]));
@@ -128,11 +128,13 @@ function forecast(company, goal, budget, executor) {
       reasons.add(missing);
     }
   }
-  result.unstartedMicros = quoteCurrent ? unstarted.toString() : null;
-
   const scopeChanged = !taskScope || changedTasks.size > 0;
   const finished = contractCurrent && !scopeChanged && goal.status === 'succeeded' &&
     goal.completedContractVersion === contractVersion(goal) && coverage.delivered === coverage.selected;
+  // A completed scope does not depend on a current quote for future work.
+  if (!finished && result.plan.state === 'quote-stale') reasons.add('quote-stale');
+  if (finished && ledger.reservedAttempts > ledger.awaitingReceiptAttempts) reasons.add('execution-cleanup-pending');
+  result.unstartedMicros = finished || quoteCurrent ? unstarted.toString() : null;
   const phaseScope = quoteCurrent && !scopeChanged;
   // Stage estimates cover several possible activities. Once a stage may
   // have drawn on that estimate there is no per-stage balance to subtract
@@ -150,6 +152,7 @@ function forecast(company, goal, budget, executor) {
   if (!reasons.size) {
     const headroom = BigInt(ledger.limitMicros) - covered;
     result.status = headroom < 0n ? 'over-limit' : 'within-limit';
+    result.completionBasis = finished ? 'settled' : 'forecast';
     result.completionMicros = covered.toString();
     result.headroomMicros = headroom.toString();
   }
