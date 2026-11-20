@@ -11,7 +11,8 @@ export const api = {
   messages: (id, signal, before) => request(`conversation?id=${encodeURIComponent(id)}${before ? `&before=${encodeURIComponent(before)}` : ''}`, { signal }),
   pairing: input => request('pairing', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
   snapshot: signal => request('state', { signal }),
-  attemptUsage: (goalId, before) => request(`usage?${new URLSearchParams({ goalId, ...(before ? { before } : {}) })}`),
+  attemptUsage: (scope, before) => request(`usage?${new URLSearchParams({ ...scope, ...(before ? { before } : {}) })}`),
+  usageSummary: (scope, groupBy, after) => request(`usage/summary?${new URLSearchParams({ ...scope, groupBy, ...(after !== null && after !== undefined ? { after } : {}) })}`),
   events: (after, signal) => request(`events?after=${after}`, { signal }),
   activity: (query = {}, signal) => {
     const params = new URLSearchParams();

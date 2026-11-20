@@ -7,18 +7,163 @@ import { DshAdapter } from '../src/adapters/dsh.js';
 import { PairedRuntimes } from '../src/adapters/paired.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { createRoutes } from '../src/host/http.js';
+import { Store } from '../src/core/store.js';
 import { executionIdentity, ExecutionReceipt, readExecution } from '../src/runtime/execution-receipt.js';
 import { withAttemptUsage } from '../src/runtime/attempt-usage.js';
 import { fixture, taskWaitDiagnostics, until } from './helpers.js';
 
 const runner = fileURLToPath(new URL('./fixtures/recovery-runtime.mjs', import.meta.url));
-async function view(f, params, status = 200) {
-  const route = createRoutes(f).find(route => route.path === '/api/acms/usage');
-  const response = await route.fetch(new Request(`http://127.0.0.1/api/acms/usage?${new URLSearchParams(params)}`));
+async function view(f, params, status = 200, pathname = '/api/acms/usage') {
+  const route = createRoutes(f).find(route => route.path === pathname);
+  const response = await route.fetch(new Request(`http://127.0.0.1${pathname}?${new URLSearchParams(params)}`));
   const body = await response.json();
   assert.equal(response.status, status, JSON.stringify(body));
   return body;
 }
+
+const summary = (f, params, status) => view(f, params, status, '/api/acms/usage/summary');
+
+test('full usage summaries cover retained attempts independently of page, route group, and other goals', async t => {
+  const f = await fixture(t), a = f.task(), b = f.task();
+  const other = f.command('goal.create', { projectId: f.project.id, title: 'Other goal', description: 'Separate scope', acceptance: 'Independent', plan: false });
+  const outside = f.task({ goalId: other.id });
+  const huge = Number.MAX_SAFE_INTEGER;
+  const saved = { taskId: a.id, goalId: f.goal.id, kind: 'work', status: 'completed', provider: 'paired:chosen', llmProvider: 'observed-channel',
+    model: 'chosen-model', reasoningEffort: 'high', startedAt: '2026-11-20T07:59:59+08:00',
+    selection: { binding: { provider: 'requested', model: 'requested-model', reasoningEffort: 'low' }, chosen: { provider: 'paired:chosen' } } };
+  const receipt = n => ({ source: 'codex-app-server', threadId: 'fixture', turnId: 'fixture-turn', finishedAt: '2026-11-20T00:01:00Z',
+    counts: { inputTokens: null, cachedInputTokens: 0, cacheWriteInputTokens: null, outputTokens: null, reasoningOutputTokens: null, totalTokens: n } });
+  f.store.transaction(() => {
+    // Insert a later-sorting route first to exercise bounded group eviction
+    // when the first observed group is absent from the requested page.
+    f.store.put('attempts', { ...saved, id: 'attempt_zero', taskId: b.id, reasoningEffort: 'low',
+      startedAt: '2026-11-20T08:30:00+08:00', meteredUsage: receipt(0) });
+    f.store.put('attempts', { ...saved, id: 'attempt_preflight', taskId: b.id, status: 'failed', preflightOnly: true,
+      startedAt: '2026-11-20T10:00:00Z' });
+    for (let index = 0; index < 33; index++) f.store.put('attempts', {
+      ...saved, id: `attempt_counted_${index}`, meteredUsage: receipt(huge),
+    });
+    f.store.put('attempts', { ...saved, id: 'attempt_reserved', status: 'running', startedAt: '2026-11-20T00:15:00Z',
+      childId: 'attempt_reserved', execution: { runtime: 'codex-app-server' } });
+    f.store.put('attempts', { ...saved, id: 'attempt_legacy', startedAt: '2026-11-20',
+      provider: 'auto', model: 'unverified', progress: { tokenUsage: { totalTokens: 999999 } } });
+    f.store.put('attempts', { ...saved, id: 'attempt_other_goal', goalId: other.id, taskId: outside.id, meteredUsage: receipt(1000) });
+  });
+  const aggregate = await summary(f, { goalId: f.goal.id, limit: 1 });
+  const amount = (33n * BigInt(huge)).toString();
+  assert.deepEqual(aggregate.coverage, { reported: 34, pending: 1, unknown: 1, 'not-executed': 1 });
+  assert.deepEqual(aggregate.summary.totalTokens, { reported: 34, subtotal: amount });
+  assert.deepEqual(aggregate.summary.inputTokens, { reported: 0, subtotal: null });
+  assert.deepEqual(aggregate.summary.cachedInputTokens, { reported: 34, subtotal: '0' });
+  assert.equal(aggregate.groups.length, 1);
+  assert.deepEqual(['provider', 'llmProvider', 'model', 'reasoningEffort'].map(key => aggregate.groups[0][key]),
+    ['paired:chosen', 'observed-channel', 'chosen-model', 'high']);
+  assert.equal(aggregate.groups[0].coverage.reported, 33);
+  assert.equal(aggregate.groups[0].coverage.pending, 0);
+  const zero = await summary(f, { goalId: f.goal.id, limit: 1, after: aggregate.nextAfter });
+  assert.deepEqual(zero.summary, aggregate.summary);
+  assert.deepEqual(zero.coverage, aggregate.coverage);
+  assert.equal(zero.groups[0].reasoningEffort, 'low');
+  assert.deepEqual(zero.groups[0].summary.totalTokens, { reported: 1, subtotal: '0' });
+  const missing = await summary(f, { goalId: f.goal.id, limit: 1, after: zero.nextAfter });
+  assert.equal(missing.groups[0].provider, null);
+  assert.deepEqual(missing.groups[0].coverage, { reported: 0, pending: 1, unknown: 1, 'not-executed': 1 });
+  assert.equal(missing.groups[0].summary.totalTokens.subtotal, null);
+  assert.equal(missing.nextAfter, null);
+  const task = await summary(f, { taskId: b.id });
+  assert.equal(task.scope, 'task');
+  assert.deepEqual(task.summary.totalTokens, { reported: 1, subtotal: '0' });
+  assert.equal(task.coverage['not-executed'], 1);
+  assert.equal((await summary(f, { goalId: other.id })).summary.totalTokens.subtotal, '1000');
+
+  const date = await summary(f, { goalId: f.goal.id, groupBy: 'date', limit: 2 });
+  assert.equal(date.dateBasis, 'started-at-utc');
+  assert.deepEqual(date.groups.map(({ dateUtc }) => dateUtc), ['2026-11-20', '2026-11-19']);
+  assert.deepEqual(date.groups[0].coverage, { reported: 1, pending: 1, unknown: 0, 'not-executed': 1 });
+  assert.equal(date.groups[1].summary.totalTokens.subtotal, amount);
+  const undated = await summary(f, { goalId: f.goal.id, groupBy: 'date', limit: 2, after: date.nextAfter });
+  assert.equal(undated.groups[0].dateUtc, null);
+  assert.equal(undated.groups[0].coverage.unknown, 1);
+
+  const priorView = await view(f, { goalId: f.goal.id });
+  assert.equal(priorView.attempts.length, 30);
+  assert.equal(priorView.coverage.reported, 28);
+  assert(priorView.nextBefore);
+  assert.equal((await summary(f, { goalId: f.goal.id, groupBy: 'unknown' }, 400)).error.code, 'INVALID_INPUT');
+  assert.equal((await summary(f, { taskId: b.id, limit: 101 }, 400)).error.code, 'INVALID_INPUT');
+});
+
+test('usage attempts use the scoped expression indexes on upgraded stores', async t => {
+  const f = await fixture(t), task = f.task();
+  f.store.db.exec('DROP INDEX attempts_usage_by_goal; DROP INDEX attempts_usage_by_task');
+  const reopened = new Store(f.store.filename);
+  reopened.close();
+  const original = f.store.db.prepare.bind(f.store.db);
+  const statements = [];
+  f.store.db.prepare = sql => {
+    if (sql.includes("collection='attempts'") && sql.startsWith('SELECT')) statements.push(sql);
+    return original(sql);
+  };
+  await view(f, { goalId: f.goal.id });
+  await view(f, { taskId: task.id });
+  await summary(f, { goalId: f.goal.id });
+  await summary(f, { taskId: task.id });
+  const cases = [
+    ['goal', [f.goal.id, Number.MAX_SAFE_INTEGER, 31]], ['task', [task.id, Number.MAX_SAFE_INTEGER, 31]],
+    ['goal', [f.goal.id]], ['task', [task.id]],
+  ];
+  assert.equal(statements.length, cases.length);
+  for (const [index, [scope, args]] of cases.entries()) {
+    const plan = original(`EXPLAIN QUERY PLAN ${statements[index]}`).all(...args).map(row => row.detail).join('\n');
+    assert.match(plan, new RegExp(`SEARCH .* USING INDEX attempts_usage_by_${scope}`));
+    assert.doesNotMatch(plan, /TEMP B-TREE/);
+  }
+});
+
+test('the scope summary reflects task purge without carrying removed usage into another task', async t => {
+  const f = await fixture(t), first = f.task({ title: 'Remove me' }), second = f.task({ title: 'Retain me' });
+  f.store.transaction(() => {
+    for (const [task, amount] of [[first, 13], [second, 7]]) f.store.put('attempts', { id: 'attempt_' + task.id,
+      taskId: task.id, goalId: task.goalId, status: 'completed', provider: 'paired:fixture', model: 'fixture',
+      meteredUsage: { source: 'codex-app-server', counts: { totalTokens: amount } },
+    });
+  });
+  assert.equal((await summary(f, { goalId: f.goal.id })).summary.totalTokens.subtotal, '20');
+  const deleted = f.command('task.delete', { id: first.id });
+  f.command('task.purge', { id: first.id, confirmTitle: first.title, expectedRevision: deleted.revision });
+  assert.equal((await summary(f, { goalId: f.goal.id })).summary.totalTokens.subtotal, '7');
+  assert.equal((await summary(f, { taskId: first.id }, 404)).error.code, 'NOT_FOUND');
+  assert.equal((await summary(f, { taskId: second.id })).summary.totalTokens.subtotal, '7');
+});
+
+test('complete usage and its group page share one SQLite read snapshot', async t => {
+  const f = await fixture(t), task = f.task();
+  const attempt = (id, totalTokens) => ({ id, taskId: task.id, goalId: task.goalId, status: 'completed',
+    provider: 'paired:fixture', model: 'fixture', meteredUsage: { counts: { totalTokens } } });
+  const attempts = [attempt('attempt_first', 1), attempt('attempt_second', 2)];
+  f.store.transaction(() => { for (const row of attempts) f.store.put('attempts', row); });
+  const writer = new Store(f.store.filename);
+  const scopedRows = f.store.attemptUsageRows.bind(f.store);
+  let updated = false;
+  f.store.attemptUsageRows = function* (...args) {
+    for (const row of scopedRows(...args)) {
+      yield row;
+      if (!updated) {
+        const unseen = attempts.find(item => item.id !== row.id);
+        writer.put('attempts', attempt(unseen.id, unseen.meteredUsage.counts.totalTokens + 10));
+        updated = true;
+      }
+    }
+  };
+  try {
+    const before = await summary(f, { goalId: task.goalId });
+    assert.equal(before.summary.totalTokens.subtotal, '3');
+    assert.deepEqual(before.groups[0].summary, before.summary);
+    const after = await summary(f, { goalId: task.goalId });
+    assert.equal(after.summary.totalTokens.subtotal, '13');
+    assert.deepEqual(after.groups[0].summary, after.summary);
+  } finally { writer.close(); }
+});
 
 test('owner usage pages distinguish an observed zero, unknown historical data and executions with no terminal', async t => {
   const f = await fixture(t), task = f.task(), other = f.task();

@@ -9,7 +9,7 @@ import { checkCandidateMergeConfirmation, previewCandidateMerge } from '../runti
 import { inspectBareDeliveryTarget } from '../runtime/bare-delivery-target.js';
 import { inside } from '../runtime/workspaces.js';
 import { hasRecordedDeliveryApproval } from '../core/candidate-confirmation.js';
-import { attemptUsageView } from '../core/usage-view.js';
+import { attemptUsageSummary, attemptUsageView } from '../core/usage-view.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -59,6 +59,7 @@ export function createRoutes(runtime) {
     },
     '/api/acms/state': async () => json({ ...company.snapshot(), runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing, lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, capacity: executionCapacity(company.store, adapter, engine.live, company.policy()), providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] }, dataDir: runtime.dataDir } }),
     '/api/acms/usage': async request => json(attemptUsageView(company.store, new URL(request.url).searchParams)),
+    '/api/acms/usage/summary': async request => json(attemptUsageSummary(company.store, new URL(request.url).searchParams)),
     '/api/acms/directories': async request => json(await browseDirectories(new URL(request.url).searchParams.get('path') ?? '', company.policy())),
     '/api/acms/environment': async request => {
       const task = company.store.require('tasks', new URL(request.url).searchParams.get('id'));

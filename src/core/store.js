@@ -7,6 +7,7 @@ import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from
 import { assertWorktreeRestoreReady } from "./restore-safety.js";
 
 export const SCHEMA_VERSION = "2";
+const attemptUsageFields = { task: "$.taskId", goal: "$.goalId" };
 
 /**
  * Events that count as effective business activity for issue #17 ordering.
@@ -41,6 +42,8 @@ export class Store {
         collection TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL,
         body TEXT NOT NULL CHECK(json_valid(body)), PRIMARY KEY(collection,id));
       CREATE INDEX IF NOT EXISTS entities_status ON entities(collection,json_extract(body,'$.status'));
+      CREATE INDEX IF NOT EXISTS attempts_usage_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='attempts';
+      CREATE INDEX IF NOT EXISTS attempts_usage_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='attempts';
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL, entity_id TEXT, goal_id TEXT, actor TEXT NOT NULL, principal_kind TEXT, on_behalf_of TEXT, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL, at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS leases (resource TEXT PRIMARY KEY, owner TEXT NOT NULL, pid INTEGER NOT NULL, epoch INTEGER NOT NULL, heartbeat INTEGER NOT NULL);
@@ -106,10 +109,15 @@ export class Store {
   require(collection, entityId) { const value = this.get(collection, entityId); assert(value, "NOT_FOUND", collection + "/" + entityId + " not found"); return value; }
   list(collection) { return this.db.prepare("SELECT body,revision FROM entities WHERE collection=? ORDER BY rowid").all(collection).map(r => ({ ...JSON.parse(r.body), revision: r.revision })); }
   attemptUsagePage(scope, entityId, before, limit) {
-    const field = scope === 'task' ? '$.taskId' : '$.goalId';
-    return this.db.prepare("SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND rowid < ? AND json_extract(body, ?) = ? ORDER BY rowid DESC LIMIT ?")
-      .all(before, field, entityId, limit + 1)
+    const field = attemptUsageFields[scope];
+    return this.db.prepare(`SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?`)
+      .all(entityId, before, limit + 1)
       .map(({ cursor, body }) => ({ cursor, attempt: JSON.parse(body) }));
+  }
+  *attemptUsageRows(scope, entityId) {
+    const field = attemptUsageFields[scope];
+    const rows = this.db.prepare(`SELECT body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ?`).iterate(entityId);
+    for (const { body } of rows) yield JSON.parse(body);
   }
   put(collection, entity, expectedRevision) {
     const old = this.get(collection, entity.id);
