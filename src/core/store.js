@@ -105,6 +105,12 @@ export class Store {
   }
   require(collection, entityId) { const value = this.get(collection, entityId); assert(value, "NOT_FOUND", collection + "/" + entityId + " not found"); return value; }
   list(collection) { return this.db.prepare("SELECT body,revision FROM entities WHERE collection=? ORDER BY rowid").all(collection).map(r => ({ ...JSON.parse(r.body), revision: r.revision })); }
+  attemptUsagePage(scope, entityId, before, limit) {
+    const field = scope === 'task' ? '$.taskId' : '$.goalId';
+    return this.db.prepare("SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND rowid < ? AND json_extract(body, ?) = ? ORDER BY rowid DESC LIMIT ?")
+      .all(before, field, entityId, limit + 1)
+      .map(({ cursor, body }) => ({ cursor, attempt: JSON.parse(body) }));
+  }
   put(collection, entity, expectedRevision) {
     const old = this.get(collection, entity.id);
     if (expectedRevision !== undefined) assert((old?.revision ?? 0) === expectedRevision, "CONFLICT", "This record changed; refresh and retry", { collection, id: entity.id });

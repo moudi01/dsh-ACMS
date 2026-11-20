@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, 
 import path from 'node:path';
 import { digest } from '../core/util.js';
 import { atomicJson, fileStem } from '../../packages/codex-runtime/lib/store.js';
+import { codexTokenCounts } from '../../packages/codex-runtime/lib/turn-usage.js';
 
 export function executionIdentity(model, input) {
   const identity = {
@@ -36,6 +37,14 @@ export function receiptPaths(dataDir, ref) {
 export const unknownExecution = (reason, code = 'RECOVERY_UNKNOWN') => ({ status: 'unknown', code, reason, actions: ['refresh-receipt', 'inspect-execution'] });
 const read = file => JSON.parse(readFileSync(file, 'utf8'));
 
+export function normalizedReceiptUsage(ref, value) {
+  if (ref?.runtime !== 'codex-app-server' || ['chat', 'probe'].includes(ref.kind) || value?.source !== 'codex-app-server' ||
+    value.runKey !== ref.runKey || ![value.threadId, value.turnId].every(id => typeof id === 'string' && id.length > 0 && id.length <= 256)) return null;
+  const counts = codexTokenCounts(value.counts);
+  if (counts.totalTokens === null) return null;
+  return { source: value.source, runKey: ref.runKey, threadId: value.threadId, turnId: value.turnId, counts };
+}
+
 export class ExecutionReceipt {
   constructor(dataDir, ref) {
     if (!validExecution(ref)) throw new Error('Invalid execution reference');
@@ -60,8 +69,12 @@ export class ExecutionReceipt {
       this.update({ status: 'reconciling', cleanupConfirmed: false, reason: error.message });
       return; // keep lock and resource hold
     }
+    const metadata = response?.meteredUsage ?? error?.meteredUsage;
+    const meteredUsage = metadata && normalizedReceiptUsage(this.ref, { ...metadata, runKey: this.ref.runKey });
+    const reply = response && { ...response };
+    if (reply) delete reply.meteredUsage;
     this.update({ status: response ? 'completed' : 'stopped', cleanupConfirmed: true,
-      finishedAt: new Date().toISOString(), response: response ?? null,
+      finishedAt: new Date().toISOString(), response: reply ?? null, ...(meteredUsage ? { meteredUsage } : {}),
       reason: error?.message ?? '执行已结束，且自有进程树清理已确认' });
     unlinkSync(this.paths.lock); // publish the terminal receipt before unlocking
   }
@@ -114,14 +127,17 @@ export function readExecution(dataDir, attempt) {
       return { ...unknownExecution(value.reason ?? (locked ? '执行锁仍存在；运行状态和进程树退出尚未确认' : '未收到已结束且清理完成的回执'), 'RECOVERY_PENDING'), ...progress };
     }
     if (!Number.isFinite(Date.parse(value.finishedAt))) return unknownExecution('结束回执缺少有效完成时间', 'RECOVERY_CORRUPT');
+    const usage = normalizedReceiptUsage(ref, value.meteredUsage);
+    const evidence = usage ? { meteredUsage: usage } : {};
     if (value.status === 'completed') {
       const output = value.response?.output;
       const complete = ref.kind === 'probe' ? typeof output === 'string' && output.trim().length > 0 : output && typeof output === 'object' && !Array.isArray(output);
       if (value.response?.executed !== true || !complete) return unknownExecution('完成回执没有完整结果，不能据此重新调用模型', 'RECOVERY_CORRUPT');
-      return { status: 'completed', cleanupConfirmed: true, finishedAt: value.finishedAt, result: value.response.output, reason: '身份匹配的完成回执与进程树清理已核实；恢复结果，无需模型调用', actions: [] };
+      return { status: 'completed', cleanupConfirmed: true, finishedAt: value.finishedAt, result: value.response.output, ...evidence,
+        reason: '身份匹配的完成回执与进程树清理已核实；恢复结果，无需模型调用', actions: [] };
     }
     if (value.response != null) return unknownExecution('停止回执含有冲突的完成结果', 'RECOVERY_CORRUPT');
-    return { status: 'stopped', cleanupConfirmed: true, reason: value.reason, actions: ['retry'] };
+    return { status: 'stopped', cleanupConfirmed: true, ...(usage ? { finishedAt: value.finishedAt, ...evidence } : {}), reason: value.reason, actions: ['retry'] };
   } catch (error) {
     return unknownExecution(`无法读取可靠执行状态：${error.code ?? error.name}；${error.message}`, error.code === 'ENOENT' ? 'RECOVERY_MISSING' : 'RECOVERY_CORRUPT');
   }

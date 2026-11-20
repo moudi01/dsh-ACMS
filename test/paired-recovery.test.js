@@ -209,7 +209,8 @@ test('completed receipt cannot be reused to launch the same attempt; orphan lock
 for (const protocol of ['runner', 'codex-app-server']) for (const persistent of [false, true]) test(`${protocol} persistent=${persistent}: separate host recovers completion not yet stored, with no extra invocation`, windows, async t => {
   const f = await fixture(t); let task = f.task(); const workspace = await f.workspaces.prepare(task, {});
   const calls = path.join(f.root, 'fixture-calls.jsonl');
-  const model = { id: 'paired:restart', model: 'protocol-fixture', persistent, command: process.execPath, args: [runtime, protocol, calls, 'complete'], ...(protocol === 'runner' ? {} : { runtime: protocol }) };
+  const model = { id: 'paired:restart', model: 'protocol-fixture', persistent, command: process.execPath,
+    args: [runtime, protocol, calls, protocol === 'runner' ? 'complete' : 'usage'], ...(protocol === 'runner' ? {} : { runtime: protocol }) };
   const input = { mode: 'task', cwd: workspace.path, prompt: 'Protocol fixture only', attemptId: 'restart-attempt', contextKey: 'isolated-context', generation: task.generation, kind: task.kind };
   const ref = executionIdentity(model, input), a = { ...attempt(ref), taskId: task.id, goalId: task.goalId, agentId: task.agentId, role: 'worker', grants: [], status: 'running', startedAt: new Date().toISOString(), workspace };
   const plan = path.join(f.root, 'host-plan.json'); await writeFile(plan, JSON.stringify({ model, dataDir: f.dataDir, input, attempt: a }));
@@ -222,7 +223,10 @@ for (const protocol of ['runner', 'codex-app-server']) for (const persistent of 
     const next = await hostProcess(t, nextPlan, 'run'); assert.equal(next.exitCode, 0, next.stderr);
     count = await readFile(calls, 'utf8'); assert.equal(count.trim().split('\n').length, 2);
   }
-  const recovered = await hostProcess(t, plan, 'read'); assert.equal(recovered.exitCode, 0, recovered.stderr); assert.equal(JSON.parse(recovered.stdout).status, 'completed');
+  const recovered = await hostProcess(t, plan, 'read'); assert.equal(recovered.exitCode, 0, recovered.stderr);
+  const fact = JSON.parse(recovered.stdout);
+  assert.equal(fact.status, 'completed');
+  assert.equal(fact.meteredUsage?.counts.totalTokens, protocol === 'runner' ? undefined : 25);
   assert.equal(await readFile(calls, 'utf8'), count);
   f.store.transaction(() => { task = f.store.put('tasks', { ...task, status: 'running', activeAttemptId: a.id, workspace }); f.store.put('attempts', a); });
   const adapter = new DshAdapter({ subagents: { providers: new Map() } }, f.company, f.dataDir);
@@ -230,7 +234,13 @@ for (const protocol of ['runner', 'codex-app-server']) for (const persistent of 
   await f.start(); await until(() => f.store.require('tasks', task.id).status === 'succeeded');
   assert.deepEqual(f.adapter.calls.map(c => c.task.kind), []);
   assert.equal(await readFile(calls, 'utf8'), count);
-  assert.equal(f.store.require('attempts', a.id).recovery.status, 'completed');
+  const saved = f.store.require('attempts', a.id);
+  assert.equal(saved.recovery.status, 'completed');
+  assert.equal(saved.meteredUsage?.counts.totalTokens, protocol === 'runner' ? undefined : 25);
+  await f.engine.stop();
+  await f.engine.start();
+  assert.deepEqual(f.store.require('attempts', a.id).meteredUsage, saved.meteredUsage);
+  assert.equal(await readFile(calls, 'utf8'), count);
 });
 
 for (const protocol of ['runner', 'codex-app-server']) test(`${protocol}: host crash remains uncertain across restart even when the process has exited`, windows, async t => {

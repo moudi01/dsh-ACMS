@@ -1,5 +1,5 @@
 // Explicit protocol fixture. No model is called and its text is not model evidence.
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import readline from 'node:readline';
 const [protocol, calls, behavior] = process.argv.slice(2);
 const timer = setTimeout(() => process.exit(98), 8000);
@@ -25,8 +25,17 @@ if (protocol === 'runner') {
       notice('turn/started', { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'inProgress' } });
       notice('item/agentMessage/delta', { threadId: 'fixture-thread', turnId: 'fixture-turn', itemId: 'fixture-message', delta: 'Protocol fixture progress' });
       if (behavior !== 'hold') {
-        notice('item/completed', { threadId: 'fixture-thread', turnId: 'fixture-turn', item: { id: 'fixture-message', type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(output()) } });
-        notice('turn/completed', { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: 'completed' } });
+        if (behavior.startsWith('usage')) {
+          const tokens = n => ({ inputTokens: n * 4, cachedInputTokens: n * 2, outputTokens: n, reasoningOutputTokens: n, totalTokens: n * 5 });
+          for (const [total, last] of [[2, 2], [2, 2], [5, 3]]) notice('thread/tokenUsage/updated', {
+            threadId: 'fixture-thread', turnId: 'fixture-turn', tokenUsage: { total: tokens(total), last: tokens(last) },
+          });
+        }
+        const failed = behavior === 'usage-first-failure' && readFileSync(calls, 'utf8').trim().split('\n').length === 1;
+        if (!failed) notice('item/completed', { threadId: 'fixture-thread', turnId: 'fixture-turn', item: { id: 'fixture-message', type: 'agentMessage', phase: 'final_answer', text: JSON.stringify(output()) } });
+        notice('turn/completed', { threadId: 'fixture-thread', turn: { id: 'fixture-turn', status: failed ? 'failed' : 'completed',
+          ...(failed ? { error: { message: 'Fixture error', codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 503 } } } } : {}),
+        } });
       }
     }
     if (r.method === 'turn/interrupt') reply({});

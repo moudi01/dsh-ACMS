@@ -197,6 +197,7 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
     } catch (error) { store?.quarantine(error.message); throw cleanupError(error.message, error); }
     const run = { modelId: model.id, attemptId: input.attemptId, messages: new Map() }; this.running.set(runId, run);
     let dispatchError;
+    let meteredUsage;
     const beforeDispatch = () => {
       try { input.beforeDispatch?.(); }
       catch (error) { dispatchError = error; throw error; }
@@ -218,10 +219,15 @@ ${JSON.stringify({ protocol: PROTOCOL, inviteId: id, token, name: '你的 agent 
       });
       const result = await run.handle.result;
       if (dispatchError) throw dispatchError;
+      meteredUsage = result.meteredUsage;
       assert(result.stopReason === 'completed', 'PAIRED_RUN_FAILED', result.diagnostic || 'Codex 执行未完成');
-      return { executed: true, reasoningEffort: model.reasoningEffort, output: parseResult(result.structured ?? result.output?.filter(b => b.type === 'text').map(b => b.text).join('\n')) };
+      return { executed: true, reasoningEffort: model.reasoningEffort, meteredUsage,
+        output: parseResult(result.structured ?? result.output?.filter(b => b.type === 'text').map(b => b.text).join('\n')) };
     } catch (error) {
-      if (!error.cleanupUncertain) throw dispatchError ?? error;
+      if (!error.cleanupUncertain) {
+        if (meteredUsage && !dispatchError) error.meteredUsage = meteredUsage;
+        throw dispatchError ?? error;
+      }
       run.cleanupUncertain = true; run.cleanupError = error.message; store.quarantine(error.message);
       throw error;
     }

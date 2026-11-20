@@ -87,6 +87,26 @@ test('transport product failure is returned as error with original HTTP classifi
   assert.equal(f.summary().failure.category, 'transport');
 });
 
+test('counting uses the acknowledged turn, deduplicates increments, and ignores notifications after its terminal', async t => {
+  const f = fixture(t);
+  const counts = { inputTokens: 12, cachedInputTokens: 6, cacheWriteInputTokens: null, outputTokens: 3, reasoningOutputTokens: 3, totalTokens: 15 };
+  let previous;
+  for (const mode of ['usage', 'usage', 'usage-no-baseline']) {
+    const run = await f.runtime(mode).start(f.request());
+    const result = await run.result;
+    await run.dispose();
+    assert.equal(result.stopReason, 'completed');
+    if (previous) {
+      assert.equal(result.threadId, previous.threadId);
+      assert.notEqual(result.turnId, previous.turnId);
+    }
+    if (mode === 'usage-no-baseline') assert.equal(result.meteredUsage, null);
+    else assert.deepEqual(result.meteredUsage, { source: 'codex-app-server', threadId: result.threadId, turnId: result.turnId, counts },
+      previous ? 'resumed turn' : 'new thread');
+    previous = result;
+  }
+});
+
 test('app-server exit keeps the thread ID and a new dispatch resumes it', async t => {
   const f = fixture(t);
   const run = await f.runtime('process-exit').start(f.request());

@@ -786,6 +786,7 @@ export class Company {
     data.trash = data.tasks.filter(t => t.status === 'deleted' && t.deletion?.batchId === t.id).map(t => ({ ...t, purgeReason: taskPurgeReason(t, data.tasks, data.attempts) }));
     data.tasks = data.tasks.filter(t => !deleted.has(t.id));
     for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) data[c] = data[c].filter(item => !deleted.has(item.taskId));
+    data.attempts = data.attempts.map(({ meteredUsage, ...attempt }) => attempt);
     // Presentation-only activity projection for issue #17. Parents inherit the
     // newest effective descendant activity; unknown history falls back to the
     // record's own creation time instead of inventing a new timestamp.
