@@ -5,7 +5,8 @@ import { coordinationAuthority, releaseCoordinatedSource, releaseTimeBox } from 
 import { assertGoalOpen } from './goal-control.js';
 import { restartForChange } from './entity-management.js';
 import { normalizeRequirements } from './model-selection.js';
-import { approvalPlanId, PLAN_APPROVAL_REQUIRED, isApprovalPlanner } from './plan-approval.js';
+import { approvalPlanId, PLAN_APPROVAL_REQUIRED, isApprovalPlanner, isCostPlanner } from './plan-approval.js';
+import { assessCostPlan, costPlanHasUnscopedWork, costPlanIntent, recheckCostPlan } from './plan-cost-budget.js';
 
 function orderNodes(nodes) {
   assert(Array.isArray(nodes) && nodes.length > 0 && nodes.length <= 30, "INVALID_PLAN", "Plan must contain 1-30 tasks");
@@ -94,10 +95,25 @@ function acceptedPlanEvent(store, task, plan, actor, summary) {
 
 function proposalFingerprint(plan) {
   const { taskId, generation, goalContractVersion, goalAcceptance, managerId, rationale, rationaleSource, scope, summary, proposalTasks } = plan;
-  return digest({ taskId, generation, goalContractVersion, goalAcceptance, managerId, rationale, rationaleSource, scope, summary, proposalTasks });
+  return digest({ taskId, generation, goalContractVersion, goalAcceptance, managerId, rationale, rationaleSource, scope, summary, proposalTasks,
+    ...(plan.costPlan ? { costPlan: plan.costPlan } : {}) });
 }
 
-function proposePlan(engine, task, attempt, ordered, facts, manager) {
+function releaseProposal(company, goal, task, plan, manager, decision = null, executor) {
+  const { store } = company;
+  const cost = isCostPlanner(goal, task) ? recheckCostPlan(company, goal, plan, decision ? { task, executor } : null) : null;
+  // This marker and every assignment are written inside the same transaction.
+  store.put('goals', { ...goal, planApproval: { ...goal.planApproval, approvedPlanId: plan.id } });
+  const { records } = materializePlan(company, task, orderNodes(cost?.tasks ?? plan.proposalTasks), manager, plan.rationale);
+  const fields = { approvalStatus: 'approved', nodes: records, acceptedAt: decision?.at ?? now(),
+    ...(decision ? { ownerDecision: decision } : {}),
+    ...(cost ? { costRelease: { kind: decision ? 'owner' : 'automatic', balance: cost.balance } } : {}) };
+  store.put('tasks', { ...task, status: 'succeeded', blocker: null });
+  acceptedPlanEvent(store, task, { ...plan, ...fields }, manager, plan.summary);
+  return fields;
+}
+
+function proposePlan(engine, task, attempt, ordered, facts, manager, output) {
   const { store } = engine;
   const current = store.require('tasks', task.id);
   const goal = store.require('goals', task.goalId);
@@ -115,23 +131,38 @@ function proposePlan(engine, task, attempt, ordered, facts, manager) {
   });
   const draft = { ...facts, goalAcceptance: goal.acceptance, scope: facts.scope ?? { minimumOutcome: goal.acceptance, nonGoals: [] },
     rationale: text(facts.rationale, '计划依据或取舍', 4000), nodes: [], proposalTasks, approvalStatus: 'pending', proposedAt: now() };
-  const fingerprint = proposalFingerprint(draft);
+  const intent = isCostPlanner(goal, current) ? costPlanIntent(ordered, output) : null;
   const previous = store.get('plans', draft.id);
   if (previous) {
-    assert(previous.fingerprint === fingerprint, 'PLAN_CONFLICT', '同一规划代次已有不同提案，请从审批中退回重新规划。');
+    const same = proposalFingerprint(draft) === proposalFingerprint({ ...previous, costPlan: null }) &&
+      digest(intent) === digest(previous.costPlan?.intent ?? null);
+    assert(same, 'PLAN_CONFLICT', '同一规划代次已有不同提案，请从审批中退回重新规划。');
     return previous;
   }
+  if (intent) draft.costPlan = assessCostPlan(engine, goal, current, proposalTasks, intent);
+  const fingerprint = proposalFingerprint(draft);
   engine.finishAttempt(attempt, 'completed', draft.summary);
   const saved = store.put('plans', { ...draft, fingerprint });
-  store.put('tasks', { ...current, status: 'blocked', summary: draft.summary,
-    blocker: { kind: 'plan-approval', planId: saved.id, reason: PLAN_APPROVAL_REQUIRED } });
+  const unscopedWork = !!draft.costPlan && costPlanHasUnscopedWork(store, goal.id);
+  const blockerReason = unscopedWork ? '请先移除未纳入此提案的旧任务。' :
+    draft.costPlan?.status !== 'fits' ? draft.costPlan?.reason : null;
+  const waiting = store.put('tasks', { ...current, status: 'blocked', summary: draft.summary,
+    blocker: { kind: 'plan-approval', planId: saved.id, reason: blockerReason ?? PLAN_APPROVAL_REQUIRED } });
   store.event('plan.approval.proposed', task.id, { planId: saved.id, generation: saved.generation,
     goalContractVersion: saved.goalContractVersion, fingerprint, taskCount: proposalTasks.length,
+    ...(draft.costPlan ? { costStatus: draft.costPlan.status, minimumMicros: draft.costPlan.minimumMicros } : {}),
     decision: { kind: 'manager-proposal', by: manager.id, basis: saved.rationale || saved.summary } }, manager, { goalId: task.goalId });
+  if (draft.costPlan?.status === 'fits' && !goal.planApproval.project && !goal.planApproval.template &&
+      !unscopedWork) {
+    const fields = releaseProposal(engine.company, goal, waiting, saved, manager);
+    const released = store.put('plans', { ...saved, ...fields });
+    engine.updateGoal(goal.id);
+    return released;
+  }
   return saved;
 }
 
-export function decidePlanApproval(company, args, actor) {
+export function decidePlanApproval(company, args, actor, executor) {
   assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可以决定计划审批。');
   const { store } = company;
   const action = args.action;
@@ -169,13 +200,7 @@ export function decidePlanApproval(company, args, actor) {
   let fields;
   if (action === 'approve') {
     const manager = managerForPlan(company, task, attempt);
-    // The transaction also covers all child insertions. A capacity or authority
-    // failure rolls back the approval marker and every new assignment.
-    store.put('goals', { ...goal, planApproval: { ...goal.planApproval, approvedPlanId: plan.id } });
-    const { records } = materializePlan(company, task, orderNodes(plan.proposalTasks), manager, plan.rationale);
-    fields = { approvalStatus: 'approved', nodes: records, acceptedAt: decision.at, ownerDecision: decision };
-    store.put('tasks', { ...task, status: 'succeeded', blocker: null });
-    acceptedPlanEvent(store, task, { ...plan, ...fields }, manager, plan.summary);
+    fields = releaseProposal(company, goal, task, plan, manager, decision, executor);
   } else if (action === 'revise') {
     const revised = restartForChange(company, task, { direct: true });
     store.put('tasks', { ...revised, status: 'ready', activeAttemptId: null, blocker: null, feedback: reason, summary: '' });
@@ -224,7 +249,7 @@ export function acceptPlanFlow(engine, task, attempt, output) {
     const facts = { id: planId, goalId: task.goalId, taskId: task.id, generation: task.generation, goalContractVersion: taskContractVersion(task),
       attemptId: attempt.id, managerId: manager.id, coordinationOf: coordination ? task.coordinationOf : null, rationale, rationaleSource, scope, rework };
     if (gated) return proposePlan(engine, task, attempt, ordered, { ...facts,
-      summary: typeof output.summary === 'string' ? output.summary.slice(0, 4000) : '' }, actor);
+      summary: typeof output.summary === 'string' ? output.summary.slice(0, 4000) : '' }, actor, output);
     const previous = store.get("plans", planId);
     if (previous) {
       assert(previous.fingerprint === fingerprint, "PLAN_CONFLICT", "同一计划任务代次已接受不同计划，未覆盖既有映射");

@@ -4,7 +4,7 @@ const maximumMicros = BigInt(Number.MAX_SAFE_INTEGER);
 export const goalCostCurrency = 'USD';
 const microsPattern = /^(0|[1-9]\d{0,15})$/;
 const shortId = value => typeof value === 'string' && !!value.trim() && value.length <= 200;
-const validMicros = value => typeof value === 'string' && microsPattern.test(value) && BigInt(value) <= maximumMicros;
+export const validGoalCostMicros = value => typeof value === 'string' && microsPattern.test(value) && BigInt(value) <= maximumMicros;
 
 export function parseGoalCostUsd(value) {
   const match = typeof value === 'string' && /^(\d{1,10})(?:\.(\d{1,6}))?$/.exec(value.trim());
@@ -56,7 +56,7 @@ export function reserveGoalCost(store, attempt, bound, route) {
   if (!budget) return {};
   if (budget.breach) return denied(budget, 'COST_CONTRACT_BREACH', '已报告费用超过执行器承诺的上界，请核对执行器回执。');
   if (!bound || !route || !shortId(bound.executorId) || !shortId(bound.quoteId) ||
-      bound.currency !== goalCostCurrency || !validMicros(bound.upperMicros) || digest(bound.route ?? null) !== digest(route)) {
+      bound.currency !== goalCostCurrency || !validGoalCostMicros(bound.upperMicros) || digest(bound.route ?? null) !== digest(route)) {
     return denied(budget, 'COST_BOUND_UNKNOWN', '当前选定的执行路由没有可信的美元费用上界。请核对该路由的执行器支持后重试。');
   }
   const auth = { attemptId: attempt.id, taskId: attempt.taskId, goalId: attempt.goalId,
@@ -94,7 +94,7 @@ export function settleGoalCost(store, attemptId, fact, source = 'executor') {
   const row = store.get('goalCostAttempts', attemptId);
   if (row?.status !== 'awaiting-receipt' || fact?.final !== true || !shortId(fact.receiptId) ||
       fact.attemptId !== row.id || fact.authorizationId !== row.authorizationId || fact.currency !== row.currency ||
-      !validMicros(fact.amountMicros)) return false;
+      !validGoalCostMicros(fact.amountMicros)) return false;
   const budget = store.require('goalCostBudgets', row.goalId);
   const upper = BigInt(row.upperMicros), amount = BigInt(fact.amountMicros);
   const breach = budget.breach ?? (amount > upper ? { attemptId, upperMicros: row.upperMicros, amountMicros: fact.amountMicros } : null);

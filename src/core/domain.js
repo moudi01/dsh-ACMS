@@ -9,6 +9,7 @@ import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, crea
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
 import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS, pendingGoalTimeBox } from './runtime-budget.js';
 import { createGoalCostBudget, extendGoalCostBudget, goalCostBudgetView } from './goal-cost-budget.js';
+import { installPendingCostPlans } from './plan-cost-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
@@ -29,6 +30,7 @@ export class Company {
       store.event('company.created', 'company', {}, OWNER);
     });
     this.ensureTemplates();
+    installPendingCostPlans(this.store);
   }
   ensureTemplates() {
     if (!this.store.get('templates', BASE_TEMPLATE.id)) this.store.put('templates', { ...BASE_TEMPLATE });
@@ -85,7 +87,7 @@ export class Company {
         'agent.restore': () => restoreEntity(this, 'agent', args, actor),
         'goal.create': () => this.createGoal(args, actor),
         'goal.composition.recheck': () => this.recheckGoalComposition(args, actor),
-        'plan.approval.decide': () => decidePlanApproval(this, args, actor),
+        'plan.approval.decide': () => decidePlanApproval(this, args, actor, options.planCostSource),
         'goal.candidate_merge.confirm': () => decideCandidateMerge(this, args, actor, 'confirm'),
         'goal.candidate_merge.approve': () => decideCandidateMerge(this, args, actor, 'approve'),
         'goal.candidate_merge.reject': () => decideCandidateMerge(this, args, actor, 'reject'),
@@ -286,6 +288,7 @@ export class Company {
       '完整候选由所有者在匹配的目录副本或关闭自动合并的 Git 项目上启用。');
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const approvalRequired = project.planApproval === true || template.planApproval === true;
+    const costPlanning = args.costLimitUsd !== undefined;
     const deliveryApproval = project.deliveryApproval === true || template.deliveryApproval === true;
     if (deliveryApproval) assert(compositionMode(project) === GIT_COMPOSITION && project.checks.length > 0 &&
       (!args.deliveryMode || args.deliveryMode === GIT_COMPOSITION), 'DELIVERY_APPROVAL_PROJECT',
@@ -302,8 +305,9 @@ export class Company {
       assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色');
       const task = this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description,
         kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM);
-      if (approvalRequired) goal = this.store.put('goals', { ...goal, planApproval: { taskId: task.id,
-        project: project.planApproval === true, template: template.planApproval === true } });
+      if (approvalRequired || costPlanning) goal = this.store.put('goals', { ...goal, planApproval: { taskId: task.id,
+        project: project.planApproval === true, template: template.planApproval === true,
+        ...(costPlanning ? { costPlanning: true } : {}) } });
     }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }
@@ -312,7 +316,7 @@ export class Company {
     assertGoalOpen(goal);
     assert(!goal.legacyBatch, 'LEGACY_GOAL', '该目标已按旧阶段制数据归档，请恢复或新建目标后再派工');
     const kind = args.kind ?? 'work';
-    if (actor.kind !== 'owner') assertPlanAllowsWork(goal, kind);
+    if (actor.kind !== 'owner' || goal.planApproval?.costPlanning) assertPlanAllowsWork(goal, kind);
     // A review may still be requested after delivery; it is evidence, not a
     // reopened work item, so it does not resurrect a closed goal.
     const reviewRecovery = kind === 'coordination' && args.coordinationOf && this.store.get('tasks', args.coordinationOf);

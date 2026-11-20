@@ -4,6 +4,7 @@ export const PLAN_APPROVAL_REQUIRED = '此目标的根计划等待所有者批�
 export const approvalPlanId = task => `${task.id}:g${task.generation}`;
 export const isApprovalPlanner = (goal, task) => task?.kind === 'plan' && goal?.planApproval?.taskId === task.id;
 export const awaitsPlanApproval = goal => !!goal?.planApproval && !goal.planApproval.approvedPlanId;
+export const isCostPlanner = (goal, task) => isApprovalPlanner(goal, task) && goal.planApproval.costPlanning === true;
 export const planBlocksWork = (goal, kind) => awaitsPlanApproval(goal) && ['work', 'repair'].includes(kind);
 
 export function planBlocksDispatch(goal, task) {
