@@ -63,7 +63,7 @@ async function references(databaseFile, root, files) {
   for (const { collection, id, body } of entities) {
     if (collection !== 'integrations' || !pendingIntegration.has(body.phase)) continue;
     const receipts = [body.commandId, body.inspectionCommandId].filter(Boolean);
-    if (body.taskId && !body.compositionRecheckId) dependencies.set(body.taskId, [...(dependencies.get(body.taskId) ?? []), ...receipts]);
+    if (body.taskId && !body.compositionRecheckId && !body.candidateMergeId) dependencies.set(body.taskId, [...(dependencies.get(body.taskId) ?? []), ...receipts]);
     if (body.candidate) dependencies.set(id, receipts);
   }
   const refs = [];

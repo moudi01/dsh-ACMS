@@ -1,5 +1,5 @@
 import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest, packageName } from './util.js';
-import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, integrationPending, taskDeletionReason, taskPurgeReason } from './task-actions.js';
 import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
 import { canCoordinate, findManager } from './coordination.js';
 import { executionOccupancy } from './execution-capacity.js';
@@ -12,6 +12,7 @@ import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } 
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
 import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, newCompositionCheck, usesComposition } from './composite-delivery.js';
+import { decideCandidateMerge } from './candidate-confirmation.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
@@ -75,6 +76,10 @@ export class Company {
         'agent.restore': () => restoreEntity(this, 'agent', args, actor),
         'goal.create': () => this.createGoal(args, actor),
         'goal.composition.recheck': () => this.recheckGoalComposition(args, actor),
+        'goal.candidate_merge.confirm': () => decideCandidateMerge(this, args, actor, 'confirm'),
+        'goal.candidate_merge.reject': () => decideCandidateMerge(this, args, actor, 'reject'),
+        'goal.candidate_merge.withdraw': () => decideCandidateMerge(this, args, actor, 'withdraw'),
+        'goal.candidate_merge.reconcile': () => decideCandidateMerge(this, args, actor, 'reconcile'),
         'goal.createWithProject': () => this.createGoal({ ...args.goal, projectId: this.saveProject(args.project, actor).id }, actor),
         'goal.propose': () => this.store.put('proposals', { id: id('proposal'), title: text(args.title, 'title'), description: args.description ?? '', status: 'proposed' }),
         'task.create': () => this.createTask(args, actor),
@@ -522,6 +527,8 @@ export class Company {
     const tasks = this.store.list('tasks'); const reason = taskPurgeReason(task, tasks, this.store.list('attempts'));
     assert(!reason, 'PURGE_BLOCKED', reason);
     const ids = new Set(tasks.filter(t => t.deletion?.batchId === task.id).map(t => t.id));
+    assert(!this.store.list('integrations').some(row => row.candidateMergeId && ids.has(row.taskId) && integrationPending(row)),
+      'PURGE_BLOCKED', '候选合入仍在执行或待核对，请等待集成资源释放。');
     this.store.remove('tasks', task.id, args.expectedRevision);
     for (const id of ids) if (id !== task.id) this.store.remove('tasks', id);
     for (const collection of ['attempts', 'integrations', 'artifacts', 'verifications', 'interactions', 'actionBatches', 'plans', 'deferredResults']) for (const item of this.store.list(collection)) if (ids.has(item.taskId)) this.store.remove(collection, item.id);

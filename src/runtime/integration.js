@@ -8,6 +8,8 @@ import { integrationPending } from '../core/task-actions.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
 import { goalStopped } from '../core/goal-control.js';
+import { candidateMergeMatches } from '../core/candidate-confirmation.js';
+import { applyConfirmedCandidate, assertCandidateBranchCreation, candidateGitEnvironment } from './candidate-merge.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -62,9 +64,40 @@ function settleCompositionRecheck(engine, record, { result, error, reason, obser
   engine.store.put('goals', { ...goal, compositionRecheck: { ...request, status: retry ? 'queued' : 'failed', reason: retry ? null : failure, integrationId: null } });
 }
 
+function settleCandidateMerge(engine, record, { result, error, reason, observed, commandCleanupConfirmed, retryCheckpoint }) {
+  const goal = engine.store.require('goals', record.goalId);
+  const request = goal.candidateMerge;
+  const current = request?.id === record.candidateMergeId && request.integrationId === record.id;
+  const saveRequest = fields => {
+    if (current) engine.store.put('goals', { ...goal, candidateMerge: { ...request, recoveryRequested: false, ...fields } });
+  };
+  if (reason) {
+    save(engine, record, { phase: 'reconciling', reason, commandCleanupConfirmed, observed: observed ?? null }, 'integration.reconciling');
+    saveRequest({ status: 'reconciling', reason });
+    return;
+  }
+  if (result) {
+    save(engine, record, { phase: 'completed', result, reason: null, finishedAt: now() }, 'integration.completed');
+    saveRequest({ status: 'applied', reason: null, result });
+    engine.store.event('goal.candidate_merge.applied', goal.id, { previewId: record.candidateMergeId, version: record.candidateVersion,
+      confirmedBy: record.confirmedBy, targetRef: record.targetRef, basisRef: record.basisRef, basisHead: record.basisHead, actualHead: result.actualHead,
+      integratedCommit: result.integratedCommit }, SYSTEM, { goalId: goal.id });
+    return;
+  }
+  const cancelled = request?.stopRequested || ['cancelled', 'archived', 'deleted'].includes(goal.status);
+  const resume = current && !cancelled && (retryCheckpoint || engine.closing || goal.executionControl?.state === 'paused' || engine.company.policy().paused);
+  const reasonText = error?.message ?? '合入已停止，请重新预览目标分支。';
+  const stopped = cancelled || resume;
+  save(engine, record, { phase: stopped ? 'stopped' : 'failed', reason: stopped ? null : reasonText, observed: observed ?? null, finishedAt: now() },
+    stopped ? 'integration.stopped' : 'integration.failed');
+  saveRequest({ status: cancelled ? 'cancelled' : resume ? 'queued' : 'failed', reason: stopped ? null : reasonText, integrationId: null });
+}
+
 function settle(engine, record, { result, error, reason, observed, commandCleanupConfirmed = false, retryCheckpoint = false }) {
   return engine.store.transaction(() => {
     engine.fenced();
+    if (record.candidateMergeId) return settleCandidateMerge(engine, record,
+      { result, error, reason, observed, commandCleanupConfirmed, retryCheckpoint });
     if (record.compositionRecheckId) return settleCompositionRecheck(engine, record,
       { result, error, reason, observed, commandCleanupConfirmed, retryCheckpoint });
     const task = engine.store.require('tasks', record.taskId);
@@ -131,6 +164,7 @@ async function inspect(engine, record) {
     try {
       return await engine.workspaces.runIntegrationCommand(command, args, cwd, {
         timeout: 5000, cleanupReceipt, beforeStart: () => engine.fenced(),
+        ...(record.candidateMergeId ? { env: candidateGitEnvironment() } : {}),
       });
     } catch (error) {
       cleanupUnknown = !!error.cleanupUncertain;
@@ -151,24 +185,25 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
     }
     await clearCommand(engine, record, 'inspectionCommandId', file);
   }
-  if (cleanup?.notStarted) {
-    return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
-  }
   // A pending integration owns one slot. Verify the preceding command's
   // cleanup before starting a read-only command in that slot.
   if (record.commandId && !cleanup) {
     return settle(engine, record, { reason: error?.message ?? '缺少集成命令的进程树清理回执', observed: record.observed });
   }
   let observed;
-  if (record.applyStartedAt) {
+  if (record.applyStartedAt && !cleanup?.notStarted) {
     try { observed = await inspect(engine, record); }
     catch (failure) {
       return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
         observed: record.observed, commandCleanupConfirmed: !!cleanup });
     }
   }
+  if (cleanup?.notStarted) {
+    return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
+  }
   if (observed?.status === 'merged') return settle(engine, record, { result: observed });
-  if (record.applyStartedAt && (observed?.status !== 'unchanged' || cleanup?.exitCode === 0)) {
+  const compareFailed = !!record.candidateMergeId && typeof cleanup?.exitCode === 'number' && cleanup.exitCode > 0 && observed?.status === 'target-changed';
+  if (record.applyStartedAt && ((observed?.status !== 'unchanged' && !compareFailed) || cleanup?.exitCode === 0)) {
     return settle(engine, record, { reason: '无法确认最终 Git 命令是否合入候选提交', observed, commandCleanupConfirmed: !!cleanup });
   }
   settle(engine, record, { error: error ?? new Error('最终 Git 命令未合入候选提交'), observed, retryCheckpoint: recovering && !record.applyStartedAt });
@@ -192,6 +227,10 @@ export async function refreshIntegrationReceipts(engine) {
       if (await readCommandCleanup(receipt(engine, record.inspectionCommandId))) await reconcile(engine, record, { recovering: true });
       continue;
     }
+    if (record.candidateMergeId && engine.store.get('goals', record.goalId)?.candidateMerge?.recoveryRequested) {
+      await reconcile(engine, record, { recovering: true });
+      continue;
+    }
     if (record.commandCleanupConfirmed || !record.commandId) continue;
     const cleanup = await readCommandCleanup(receipt(engine, record.commandId));
     if (cleanup) await reconcile(engine, record, { recovering: true, cleanup });
@@ -204,8 +243,11 @@ export function interruptIntegration(engine) {
   const task = engine.store.get('tasks', entry.taskId);
   const policy = engine.company.policy();
   const goal = task && engine.store.get('goals', task.goalId);
-  const taskCurrent = entry.compositionRecheckId ? task?.status === 'succeeded' && goal?.compositionRecheck?.id === entry.compositionRecheckId
-    : task?.status === 'integrating';
+  const request = goal?.candidateMerge;
+  const taskCurrent = entry.candidateMergeId ? task?.status === 'succeeded' && request?.id === entry.candidateMergeId &&
+    !request.stopRequested && candidateMergeMatches(engine.company, goal, request, true)
+    : entry.compositionRecheckId ? task?.status === 'succeeded' && goal?.compositionRecheck?.id === entry.compositionRecheckId
+      : task?.status === 'integrating';
   if (engine.closing || !owns(engine) || task?.stopRequested || !taskCurrent ||
     (goalStopped(goal) && goal.executionControl?.mode !== 'after-current') ||
     (policy.paused && policy.pauseMode !== 'after-current')) {
@@ -213,16 +255,23 @@ export function interruptIntegration(engine) {
   }
 }
 
-export async function executeIntegration(engine, taskId, compositionRecheckId = null) {
+export async function executeIntegration(engine, taskId, compositionRecheckId = null, candidateMergeId = null) {
   if (engine.closing || !owns(engine) || engine.company.policy().paused ||
     engine.store.list('integrations').some(integrationPending)) return;
   const task = engine.store.require('tasks', taskId);
   const goal = engine.store.require('goals', task.goalId);
-  const eligible = (currentTask, currentGoal) => compositionRecheckId
-    ? currentTask.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId && currentGoal.compositionRecheck.status === 'queued'
-    : currentTask.status === 'integrating' && !ignoresBlocker(currentTask) && matchesGoalContract(currentGoal, currentTask);
+  const eligible = (currentTask, currentGoal) => {
+    if (candidateMergeId) {
+      const request = currentGoal.candidateMerge;
+      return currentTask.status === 'succeeded' && request?.id === candidateMergeId && request.status === 'queued' &&
+        candidateMergeMatches(engine.company, currentGoal, request);
+    }
+    return compositionRecheckId
+      ? currentTask.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId && currentGoal.compositionRecheck.status === 'queued'
+      : currentTask.status === 'integrating' && !ignoresBlocker(currentTask) && matchesGoalContract(currentGoal, currentTask);
+  };
   if (!eligible(task, goal) || goalStopped(goal) || goal.contractChange?.status === 'pending') return;
-  if (goalRuntimeSpent(goal, engine.store.list('attempts')) >= goalRuntimeLimit(goal, engine.company.policy())) {
+  if (!candidateMergeId && goalRuntimeSpent(goal, engine.store.list('attempts')) >= goalRuntimeLimit(goal, engine.company.policy())) {
     if (compositionRecheckId) engine.store.put('goals', { ...goal,
       compositionRecheck: { ...goal.compositionRecheck, status: 'failed', reason: '目标累计执行时间额度已用完，请追加额度后重验。' } });
     else engine.block(task, 'budget', '目标累计执行时间额度已用完', '请追加目标执行时间额度后继续。');
@@ -235,26 +284,34 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
     const policy = engine.company.policy();
     if (current.revision !== task.revision || policy.paused || goalStopped(currentGoal) || !eligible(current, currentGoal) ||
       executionOccupancy(engine.store, engine.adapter, engine.live).used >= policy.maxConcurrent) return null;
+    const request = currentGoal.candidateMerge;
     const saved = engine.store.put('integrations', {
       id: id('integration'), taskId, goalId: task.goalId, projectId: task.projectId, generation: task.generation,
       artifactHash: task.artifactHash, artifactIds: task.artifactIds, goalContractVersion: contractVersion(goal),
       contract: contract(engine, task.projectId), phase: 'preparing', ...(compositionRecheckId ? { compositionRecheckId } : {}),
+      ...(candidateMergeId ? { candidateMergeId, candidateVersion: request.selection.version, confirmedBy: request.confirmedBy,
+        targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead } : {}),
     });
-    if (compositionRecheckId) engine.store.put('goals', { ...currentGoal,
+    if (candidateMergeId) engine.store.put('goals', { ...currentGoal,
+      candidateMerge: { ...request, status: 'preparing', integrationId: saved.id } });
+    else if (compositionRecheckId) engine.store.put('goals', { ...currentGoal,
       compositionRecheck: { ...currentGoal.compositionRecheck, status: 'checking', integrationId: saved.id } });
     else engine.store.put('tasks', { ...task, activeIntegrationId: saved.id });
     engine.store.event('integration.started', taskId, { integrationId: saved.id, generation: task.generation, artifactHash: task.artifactHash }, SYSTEM);
     return saved;
   });
   if (!record) return;
-  const entry = { id: record.id, taskId, controller: new AbortController(), applying: false, compositionRecheckId };
+  const entry = { id: record.id, taskId, controller: new AbortController(), applying: false, compositionRecheckId, candidateMergeId };
   engine.activeIntegration = entry;
   const { signal } = entry.controller;
   const isCurrent = () => {
     const current = engine.store.require('tasks', taskId);
     const policy = engine.company.policy();
     const currentGoal = engine.store.require('goals', task.goalId);
-    const taskCurrent = compositionRecheckId ? current.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId &&
+    const request = currentGoal.candidateMerge;
+    const ownerCurrent = candidateMergeId && request?.id === candidateMergeId && request.integrationId === record.id &&
+      !request.stopRequested && current.status === 'succeeded' && candidateMergeMatches(engine.company, currentGoal, request, true);
+    const taskCurrent = candidateMergeId ? ownerCurrent : compositionRecheckId ? current.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId &&
       currentGoal.compositionRecheck.integrationId === record.id && contractVersion(currentGoal) === record.goalContractVersion && currentGoal.contractChange?.status !== 'pending'
       : current.activeIntegrationId === record.id && current.status === 'integrating' && !ignoresBlocker(current) && matchesGoalContract(currentGoal, current, record);
     return owns(engine) && !engine.closing && !signal.aborted && (!policy.paused || policy.pauseMode === 'after-current') &&
@@ -275,6 +332,10 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       // arriving after admission waits for the actual Git result and cleanup.
       save(engine, record, { commandId, ...(apply ? { phase: 'applying', applyStartedAt: now(), checks: apply.checks } : {}) },
         apply ? 'integration.applying' : null);
+      if (apply && candidateMergeId) {
+        const goal = engine.store.require('goals', record.goalId);
+        engine.store.put('goals', { ...goal, candidateMerge: { ...goal.candidateMerge, status: 'applying' } });
+      }
     });
     if (apply) entry.applying = true;
     let cleanupUnknown = false;
@@ -284,7 +345,9 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
         beforeStart: binary => {
           guard();
           if (apply) {
-            engine.workspaces.assertIntegrationTarget(engine.store.require('integrations', record.id), binary);
+            const current = engine.store.require('integrations', record.id);
+            if (candidateMergeId) assertCandidateBranchCreation(current, binary);
+            else engine.workspaces.assertIntegrationTarget(current, binary);
             guard();
           }
         },
@@ -304,12 +367,17 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       signal,
       run: (executable, args, cwd, options) => command(executable, args, cwd, options),
       checkpoint: patch => { guard(); save(engine, record, patch, patch.phase === 'checking' ? 'integration.checking' : null); },
-      apply: async (checks, cwd, candidate) => {
-        const result = await command('git', ['merge', '--ff-only', candidate], cwd, { timeout: 15000 }, { checks });
+      apply: async (checks, cwd, candidate, ownerOptions) => {
+        const args = ownerOptions ? ['-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--stdin', '-m', ownerOptions.message]
+          : ['merge', '--ff-only', candidate];
+        const input = ownerOptions ? ['start', 'option no-deref', `verify ${ownerOptions.basisRef} ${ownerOptions.basisHead}`,
+          'option no-deref', `create ${ownerOptions.targetRef} ${candidate}`, 'prepare', 'commit', ''].join('\n') : undefined;
+        const result = await command('git', args, cwd, { timeout: 15000, env: ownerOptions?.env, input }, { checks });
         assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || 'Final Git command did not complete cleanly');
       },
     };
-    const result = compositionRecheckId ? await engine.workspaces.recheckGoalComposition(goal, task, execution)
+    const result = candidateMergeId ? await applyConfirmedCandidate(engine.company, engine.workspaces, goal, goal.candidateMerge, execution)
+      : compositionRecheckId ? await engine.workspaces.recheckGoalComposition(goal, task, execution)
       : await engine.workspaces.integrate(task, isCurrent, execution);
     if (!owns(engine)) return;
     const current = engine.store.require('integrations', record.id);

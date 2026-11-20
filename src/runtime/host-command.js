@@ -30,7 +30,7 @@ async function persistCleanup(file, proof) {
 
 // The Windows supervisor writes its own receipt even if the host disappears.
 // Trusted host commands require the same verified Windows containment as paired runners.
-export async function runContained(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, cleanupReceipt, beforeStart, env } = {}) {
+export async function runContained(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, cleanupReceipt, beforeStart, env, input } = {}) {
   const runMs = Number.isSafeInteger(timeout) && timeout > 0 ? Math.min(timeout, 2147483647) : 120000;
   let child;
   try {
@@ -48,7 +48,8 @@ export async function runContained(command, args, cwd, { signal, timeout = 12000
   let stdout = '', stderr = '', timedOut = false;
   child.stdout.setEncoding('utf8').on('data', data => { stdout = (stdout + data).slice(-maxOutput); });
   child.stderr.setEncoding('utf8').on('data', data => { stderr = (stderr + data).slice(-maxOutput); });
-  child.stdin.end();
+  if (input !== undefined) child.stdin.on('error', () => {});
+  child.stdin.end(input);
   const stopped = Promise.withResolvers();
   const abort = () => {
     child.cleanup().then(proof => stopped.resolve({ exitCode: proof.exitCode, signal: null, cleanup: proof }), stopped.reject);
