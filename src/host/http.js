@@ -201,6 +201,7 @@ export function createRoutes(runtime) {
           'CANDIDATE_NOT_READY', 'STALE_CANDIDATE_CONFIRMATION', 'TARGET_CHANGED', 'TARGET_BASE_CHANGED',
           'PLAN_APPROVAL_REQUIRED', 'STALE_PLAN_APPROVAL', 'PLAN_CLEANUP_PENDING', 'PLAN_CONFLICT',
           'DELIVERY_APPROVAL_REQUIRED', 'DELIVERY_REVISION_REQUIRED', 'DELIVERY_APPROVAL_PROJECT',
+          'COST_BUDGET_DISABLED', 'COST_CONTRACT_BREACH',
           'TARGET_BRANCH_EXISTS', 'TARGET_REF_UNSUPPORTED', 'BARE_TARGET_BUSY', 'BARE_TARGET_CHANGED'].includes(e.code) ? 409
           : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED', 'PROJECT_PATH_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);

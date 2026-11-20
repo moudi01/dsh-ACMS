@@ -56,8 +56,9 @@ export class Conversations {
     const cut = before ? all.findIndex(m => m.id === before) : all.length;
     const end = cut < 0 ? all.length : cut; const messages = all.slice(Math.max(0, end - 80), end);
     const task = chat.taskId && this.store.get('tasks', chat.taskId);
+    const costLimited = task && this.store.get('goalCostBudgets', task.goalId);
     return { conversation: chat, messages, hasMore: end > 80, activeAttemptId: active?.id ?? null,
-      taskStatus: task?.status ?? null, mode: !chat.taskId ? 'chat' : active ? this.adapter.canSteer?.(active) ? 'steer' : 'restart' : 'queued',
+      taskStatus: task?.status ?? null, mode: !chat.taskId ? 'chat' : active ? !costLimited && this.adapter.canSteer?.(active) ? 'steer' : 'restart' : 'queued',
       busy: this.jobs.has(chat.id), paused: this.company.policy().paused || (task ? goalStopped(this.store.get('goals', task.goalId)) : false),
       agentAvailable: this.store.get('agents', chat.agentId)?.status === 'available' };
   }
@@ -71,6 +72,7 @@ export class Conversations {
       if (chat.taskId) {
         const task = this.store.require('tasks', chat.taskId);
         if (active && mode !== 'queue') assertGoalOpen(this.store.get('goals', task.goalId));
+        assert(!active || mode !== 'steer' || !this.store.get('goalCostBudgets', task.goalId), 'CHAT_COST_BUDGET', '金额受限目标的消息可排队，或中断后用新预留续接。');
         assert(task.agentId === chat.agentId && task.status !== 'deleted', 'CHAT_SCOPE', '任务负责人已变化，请重新打开会话');
         assert(!['succeeded', 'cancelled', 'archived', 'failed'].includes(task.status), 'CHAT_TASK_CLOSED', '任务已结束，请切换到独立对话');
         assert((active?.id ?? null) === expectedAttemptId, 'CHAT_STALE', '执行轮次已变化，请刷新后发送');
@@ -99,6 +101,7 @@ export class Conversations {
     try {
       const a = this.store.require('attempts', message.targetAttemptId);
       assertGoalOpen(this.store.get('goals', a.goalId));
+      assert(!this.store.get('goalCostBudgets', a.goalId), 'CHAT_COST_BUDGET', '金额受限目标不支持在原轮次追加调用。');
       assert(a.status === 'running' && this.engine.live.has(a.id), 'CHAT_STALE', '原执行已结束，未向新轮次转发');
       const receipt = await this.adapter.steer(a, `公司所有者的即时消息（${message.id}）：\n${message.text}\n请按新方向继续当前任务；不得扩大权限或跳过独立验收。`, AbortSignal.timeout(15000));
       this.update(message.id, { status: 'delivered', attemptId: a.id, deliveredAt: now(), receipt: String(receipt ?? '') });

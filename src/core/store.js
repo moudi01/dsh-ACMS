@@ -119,6 +119,11 @@ export class Store {
     const rows = this.db.prepare(`SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ? ORDER BY rowid DESC`).iterate(entityId);
     for (const { cursor, body } of rows) yield { cursor, attempt: JSON.parse(body) };
   }
+  awaitingGoalCostReceipts(after, limit) {
+    return this.db.prepare(`SELECT rowid AS cursor, body FROM entities WHERE collection='goalCostAttempts'
+      AND json_extract(body,'$.status')='awaiting-receipt' AND rowid > ? ORDER BY rowid LIMIT ?`)
+      .all(after, limit).map(({ cursor, body }) => ({ cursor, row: JSON.parse(body) }));
+  }
   put(collection, entity, expectedRevision) {
     const old = this.get(collection, entity.id);
     if (expectedRevision !== undefined) assert((old?.revision ?? 0) === expectedRevision, "CONFLICT", "This record changed; refresh and retry", { collection, id: entity.id });
