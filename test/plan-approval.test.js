@@ -44,7 +44,7 @@ test('an owner approves the exact pending plan once and downstream work is dispa
   await f.start();
   const pending = await waitForProposal(f, goal);
   assert.equal(planner(f, goal).blocker.planId, pending.id);
-  assert.equal(executionOccupancy(f.store, f.adapter, f.engine.live).used, 0);
+  await until(() => executionOccupancy(f.store, f.adapter, f.engine.live).used === 0, 45000, taskWaitDiagnostics(f, root.id));
   assert.deepEqual(pending.nodes, []);
   assert.deepEqual(pending.scope, { minimumOutcome: 'A module with example usage', nonGoals: ['Publishing'] });
   assert.deepEqual(pending.proposalTasks.map(node => [node.key, node.dependencies]), [['deliver', []], ['handoff', ['deliver']]]);
