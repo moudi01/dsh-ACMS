@@ -51,13 +51,22 @@ function approvedDelivery(company, goal, request) {
     request.confirmedBy === approval.by.id && request.confirmedAt === approval.at;
 }
 
+function matchesConfirmationArguments(request, args) {
+  return !!request && (request.id ?? request.previewId) === args.previewId && request.targetRef === args.targetRef &&
+    request.basisRef === args.basisRef && request.basisHead === args.basisHead &&
+    (request.targetMode ?? 'new') === (args.targetMode ?? 'new') && (request.targetMode !== 'bare' || request.targetRoot === args.targetRoot) &&
+    request.selection.version === args.version && request.selection.deliveryHash === args.deliveryHash;
+}
+
+export function hasRecordedDeliveryApproval(company, args) {
+  const approval = typeof args.previewId === 'string' && company.store.get('deliveryApprovals', args.previewId);
+  return approval?.action === 'approve' && approval.goalId === args.id;
+}
+
 export function verifyCandidateConfirmation(company, args) {
   const goal = company.store.require('goals', args.id);
   const request = goal.candidateMerge;
-  assert(request && request.id === args.previewId && request.targetRef === args.targetRef &&
-    request.basisRef === args.basisRef && request.basisHead === args.basisHead &&
-    (request.targetMode ?? 'new') === (args.targetMode ?? 'new') && (request.targetMode !== 'bare' || request.targetRoot === args.targetRoot) &&
-    request.selection.version === args.version && request.selection.deliveryHash === args.deliveryHash,
+  assert(matchesConfirmationArguments(request, args),
   'STALE_CANDIDATE_CONFIRMATION', '预览或确认的候选与分支不匹配，请重新预览。');
   if (request.status === 'previewed') assert(candidateMergeMatches(company, goal, request), 'STALE_CANDIDATE_CONFIRMATION',
     '当前候选、审查结论或项目授权已变化，请重新预览。');
@@ -102,7 +111,7 @@ function decideDeliveryApproval(company, goal, args, actor, action) {
   const reason = text(args.reason, '交付审批理由', 1000);
   const previous = typeof args.previewId === 'string' && store.get('deliveryApprovals', args.previewId);
   if (previous) {
-    assert(previous.goalId === goal.id && previous.fingerprint === args.approvalFingerprint,
+    assert(previous.goalId === goal.id && previous.fingerprint === args.approvalFingerprint && matchesConfirmationArguments(previous.subject, args),
       'STALE_CANDIDATE_CONFIRMATION', '当前交付预览与决定不匹配，请刷新。');
     assert(previous.action === action && previous.reason === reason, 'CONFLICT', '该预览已经记录交付决定及其理由。');
     return goal.candidateMerge?.id === args.previewId ? goal.candidateMerge : previous;

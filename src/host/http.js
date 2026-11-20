@@ -8,6 +8,7 @@ import { prepareCandidateArchive, readCandidateArchive } from '../runtime/candid
 import { checkCandidateMergeConfirmation, previewCandidateMerge } from '../runtime/candidate-merge.js';
 import { inspectBareDeliveryTarget } from '../runtime/bare-delivery-target.js';
 import { inside } from '../runtime/workspaces.js';
+import { hasRecordedDeliveryApproval } from '../core/candidate-confirmation.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -80,7 +81,10 @@ export function createRoutes(runtime) {
     '/api/acms/command': async request => {
       assert(request.method === 'POST', 'METHOD', 'POST required'); const input = await body(request);
       let args = input.args ?? {};
-      if (['goal.candidate_merge.confirm', 'goal.candidate_merge.approve'].includes(input.name)) {
+      // An already recorded approval can only replay its result in Company.
+      // A newer preview must not intercept that request before idempotency checks.
+      if (input.name === 'goal.candidate_merge.confirm' ||
+          (input.name === 'goal.candidate_merge.approve' && !hasRecordedDeliveryApproval(company, args))) {
         await checkCandidateMergeConfirmation(company, workspaces, args, request.signal);
       }
       if (input.name === 'project.save') {

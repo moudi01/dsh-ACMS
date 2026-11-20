@@ -179,9 +179,11 @@ test('required delivery approval audits the exact new branch and survives restar
   await failure(await routes.decision('approve', { ...accepted, approvalFingerprint: rejected.approvalFingerprint }), 'STALE_CANDIDATE_CONFIRMATION');
   assert.throws(() => f.command('goal.candidate_merge.approve', accepted, SYSTEM), { code: 'OWNER_REQUIRED' });
   await success(await routes.command('company.pause', {}));
-  await Promise.all([routes.decision('approve', accepted), routes.decision('approve', accepted)].map(async response => {
-    assert.equal((await success(await response)).status, 'queued');
-  }));
+  const approvalRequestId = randomUUID();
+  const [firstReceipt, concurrent] = await Promise.all([routes.decision('approve', accepted, approvalRequestId),
+    routes.decision('approve', accepted)].map(async response => success(await response)));
+  assert.equal(firstReceipt.status, 'queued');
+  assert.deepEqual(concurrent, firstReceipt);
   await absent(f.source, pending.targetRef);
   await f.engine.stop();
   await f.engine.start();
@@ -191,6 +193,15 @@ test('required delivery approval audits the exact new branch and survives restar
   const applied = await s.waitMerge('applied');
   assert.equal(await git(f.source, 'rev-parse', `${applied.targetRef}^{tree}`), pending.selection.tree);
   assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  const laterPreview = await success(await preview());
+  assert.notEqual(laterPreview.id, pending.id);
+  assert.deepEqual(await success(await routes.decision('approve', accepted, approvalRequestId)), firstReceipt);
+  await failure(await routes.decision('approve', { ...accepted, targetRef: laterPreview.targetRef }, approvalRequestId), 'IDEMPOTENCY_CONFLICT');
+  await failure(await routes.decision('approve', { ...accepted, targetRef: laterPreview.targetRef }), 'STALE_CANDIDATE_CONFIRMATION');
+  assert.throws(() => f.command('goal.candidate_merge.approve', accepted, SYSTEM), { code: 'OWNER_REQUIRED' });
+  assert.equal(s.current().candidateMerge.id, laterPreview.id);
+  assert.equal(s.current().candidateMerge.status, 'previewed');
+  await absent(f.source, laterPreview.targetRef);
   assert.equal(s.applyCalls(), 1);
   const [prior, approval] = f.store.list('deliveryApprovals');
   assert.deepEqual([prior.action, prior.reason], ['reject', 'Use a different delivery branch']);
