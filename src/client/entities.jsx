@@ -45,25 +45,38 @@ const mergeLabels = { previewed: '等待所有者确认', queued: '已确认，�
 const bareMergeLabels = { preparing: '正在核对裸仓库和目标分支', applying: '正在更新目标分支', applied: '已更新目标分支', failed: '目标分支更新失败' };
 const mergeChanges = { A: '新增', M: '修改', D: '删除', T: '类型变更' };
 
-function CandidateMerge({ goal, deliveryRepository, act, busy }) {
+const ownerDeliveryDecision = { approve: '批准交付', reject: '拒绝交付', revise: '退回修改' };
+
+function CandidateMerge({ goal, approvals, deliveryRepository, act, busy }) {
   const [branch, setBranch] = useState('');
   const [mode, setMode] = useState(goal.candidateMerge?.targetMode ?? 'new');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [reason, setReason] = useState('');
   const request = goal.candidateMerge;
+  const gated = !!goal.deliveryApproval;
   const selectedMode = deliveryRepository ? mode : 'new';
   const bare = selectedMode === 'bare';
   const bareRequest = request?.targetMode === 'bare';
-  const heading = deliveryRepository || bareRequest ? '交付 Git 候选' : '创建 Git 交付分支';
+  const heading = gated ? '人工交付审批' : deliveryRepository || bareRequest ? '交付 Git 候选' : '创建 Git 交付分支';
   const selected = goal.finalComposition;
+  const returned = !!selected && goal.deliveryApproval?.returnedVersions?.includes(selected.version);
   const name = branch.trim();
   const basisRef = name.startsWith('refs/') ? name : `refs/heads/${name}`;
   const active = ['queued', 'preparing', 'applying', 'reconciling'].includes(request?.status);
   const current = request && selected && ['version', 'deliveryHash', 'contractVersion', 'reviewId'].every(key => request.selection[key] === selected[key]);
   const decision = (action, args, notice) => act(`goal.candidate_merge.${action}`, { id: goal.id, previewId: request.id, ...args }, notice);
+  const approvalArgs = () => ({ targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead,
+    version: request.selection.version, deliveryHash: request.selection.deliveryHash,
+    ...(bareRequest ? { targetMode: 'bare', targetRoot: request.targetRoot } : {}),
+    ...(gated ? { approvalFingerprint: request.approvalFingerprint, reason: reason.trim() } : {}) });
+  const decideApproval = async (action, notice) => {
+    try { if (await decision(action, approvalArgs(), notice)) setReason(''); } catch {}
+  };
   const preview = async () => {
     setLoading(true);
     setError('');
+    setReason('');
     try {
       await api.candidateMergePreview({ goalId: goal.id, version: selected.version, deliveryHash: selected.deliveryHash, basisRef, targetMode: selectedMode });
     } catch (error) { setError(error.message); }
@@ -72,9 +85,12 @@ function CandidateMerge({ goal, deliveryRepository, act, busy }) {
   const busyReason = busy || loading ? '正在保存，请稍候。' : '';
   const confirmReason = !current ? '验收版本已变化，请重新预览。' :
     (bareRequest !== bare || (name && basisRef !== request.basisRef)) ? '交付方式或分支已变化，请重新预览。' : '';
+  const approvalReason = busyReason || confirmReason || (!reason.trim() ? '请填写交付审批理由。' : '');
   return <section aria-label={heading} className="acms-review-state">
     <h4>{heading}</h4>
-    {selected && !active && <>
+    {returned && <p role="status">此版本已退回。请编辑需修改的交付任务并重新执行，完成新版本的联合检查和模板要求的审查后再审批。</p>}
+    {gated && !selected && !request && <p>等待完整候选通过联合检查和模板要求的审查。</p>}
+    {selected && !active && !returned && <>
       {deliveryRepository && <Field label="候选交付方式"><select value={mode} onChange={event => setMode(event.target.value)}>
         <option value="new">在源仓库创建新交付分支</option><option value="bare">更新裸交付仓库中的现有分支</option>
       </select></Field>}
@@ -84,7 +100,8 @@ function CandidateMerge({ goal, deliveryRepository, act, busy }) {
     </>}
     {error && <p role="alert">{error}</p>}
     {request && <>
-      <p role="status">{request.result?.proof === 'target-tree' ? '目标分支已包含此候选' : (bareRequest && bareMergeLabels[request.status]) || mergeLabels[request.status]}{active && request.stopRequested && ' · 已请求撤回'}</p>
+      <p role="status">{request.status === 'returned' ? '已退回修改' : gated && request.status === 'previewed' ? '等待所有者批准交付' :
+        request.result?.proof === 'target-tree' ? '目标分支已包含此候选' : (bareRequest && bareMergeLabels[request.status]) || mergeLabels[request.status]}{active && request.stopRequested && ' · 已请求撤回'}</p>
       {request.reason && <p className="acms-sectionnote">{request.reason}</p>}
       <dl className="acms-definition">
         {bareRequest ? <><dt>裸交付仓库</dt><dd><code>{request.targetRoot}</code></dd></> : <><dt>基准分支</dt><dd><code>{request.basisRef}</code></dd></>}
@@ -102,13 +119,17 @@ function CandidateMerge({ goal, deliveryRepository, act, busy }) {
       <details><summary>联合检查证据（{request.checks.length} 项）</summary><dl className="acms-definition">
         {request.checks.map(check => <React.Fragment key={check.id}><dt>{check.id}</dt><dd>退出码 {check.code} · 证据 <code>{check.logHash || check.checkVersion}</code></dd></React.Fragment>)}
       </dl></details>
+      {gated && request.status === 'previewed' && <Field label="交付审批理由"><textarea value={reason} maxLength={1000} rows={3}
+        onChange={event => setReason(event.target.value)} /></Field>}
       <div className="acms-actions">
-        {request.status === 'previewed' && <>
-          <ActionButton reason={busyReason || confirmReason} onClick={() => decision('confirm', {
-            targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead,
-            version: request.selection.version, deliveryHash: request.selection.deliveryHash,
-            ...(bareRequest ? { targetMode: 'bare', targetRoot: request.targetRoot } : {}),
-          }, bareRequest ? '已确认更新目标分支，等待 Git 核对' : '已确认创建交付分支，等待 Git 核对').catch(() => {})}>{bareRequest ? '确认更新目标分支' : '确认创建交付分支'}</ActionButton>
+        {gated && request.status === 'previewed' && <>
+          <ActionButton className="primary" reason={approvalReason} onClick={() => decideApproval('approve', '已批准交付，等待 Git 核对')}>批准交付</ActionButton>
+          <ActionButton className="danger" reason={approvalReason} onClick={() => decideApproval('reject', '已拒绝此交付预览')}>拒绝交付</ActionButton>
+          <ActionButton reason={approvalReason} onClick={() => decideApproval('revise', '已退回该候选，等待交付任务修订')}>退回修改</ActionButton>
+        </>}
+        {!gated && request.status === 'previewed' && <>
+          <ActionButton reason={busyReason || confirmReason} onClick={() => decision('confirm', approvalArgs(),
+            bareRequest ? '已确认更新目标分支，等待 Git 核对' : '已确认创建交付分支，等待 Git 核对').catch(() => {})}>{bareRequest ? '确认更新目标分支' : '确认创建交付分支'}</ActionButton>
           <ActionButton reason={busyReason} onClick={() => decision('reject', {}, '已拒绝该交付分支预览').catch(() => {})}>拒绝预览</ActionButton>
         </>}
         {active && <ActionButton reason={busyReason || (request.stopRequested ? '正在核对撤回结果。' : '')}
@@ -117,10 +138,16 @@ function CandidateMerge({ goal, deliveryRepository, act, busy }) {
           onClick={() => decision('reconcile', {}, '已请求重新核对 Git 结果').catch(() => {})}>重新核对交付结果</ActionButton>}
       </div>
     </>}
+    {gated && approvals.length > 0 && <details open><summary>所有者交付决定（{approvals.length}）</summary>{approvals.map(record => <div key={record.id} className="acms-change-diff">
+      <p><b>{ownerDeliveryDecision[record.action]}</b> · 所有者 · {new Date(record.at).toLocaleString('zh-CN')}</p>
+      <p className="acms-preserve">{record.reason}</p>
+      <p><code>{record.subject.targetRef}</code> · HEAD <code>{record.subject.basisHead}</code></p>
+      <p>候选 <code>{record.subject.selection.version}</code> · 合同 v{record.subject.selection.contractVersion}</p>
+    </div>)}</details>}
   </section>;
 }
 
-function GoalReviewState({ goal, deliveryRepository, taskCount, taskLimit, act, busy }) {
+function GoalReviewState({ goal, approvals, deliveryRepository, taskCount, taskLimit, act, busy }) {
   const review = goal.reviewSummary;
   const pending = goal.contractChange?.status === 'pending';
   const copyCandidate = goal.deliveryMode === 'copy-composite';
@@ -145,7 +172,8 @@ function GoalReviewState({ goal, deliveryRepository, taskCount, taskLimit, act, 
       <dt>固定基线</dt><dd><code>{copyCandidate ? goal.composition.baseHash : goal.composition.baseCommit}</code></dd>
       {!copyCandidate && <><dt>本机交付包</dt><dd><code>{goal.composition.bundle.path}</code></dd></>}</dl></details>}
     {goal.finalComposition && <CandidateDownload key={`${goal.id}/${goal.finalComposition.deliveryHash}/${goal.finalComposition.reviewId}`} goal={goal} />}
-    {goal.deliveryMode === 'git-composite' && (goal.finalComposition || goal.candidateMerge) && <CandidateMerge goal={goal} deliveryRepository={deliveryRepository} act={act} busy={busy} />}
+    {goal.deliveryMode === 'git-composite' && (goal.finalComposition || goal.candidateMerge || goal.deliveryApproval) &&
+      <CandidateMerge goal={goal} approvals={approvals} deliveryRepository={deliveryRepository} act={act} busy={busy} />}
     {waitingForComposition && <p className="acms-sectionnote">{recheck?.reason || candidateLabel + (recheck ? '正在等待重新核验。' : '尚未通过联合检查。请查看任务的集成状态。')}</p>}
     {composite && !pending && !goal.executionControl && goal.status !== 'cancelled' &&
       goal.taskSummary?.done > 0 && goal.taskSummary.done === goal.taskSummary.total && (!recheck || recheck.status === 'failed') &&
@@ -268,7 +296,7 @@ export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, 
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label={`${entityLabels[kind]}详情`}><header><span>{entityLabels[kind]}详情</span><button aria-label="关闭详情" onClick={close}>×</button></header><h2>{entity.title ?? entity.name}</h2>{kind === 'goal' && <p className="acms-sectionnote">优先级：{Number.isInteger(entity.priority) ? entity.priority : 50}（0–100；只影响后续跨目标派发顺序）</p>}{project && <button className="text" onClick={() => navigate('project', project.id)}>所属项目：{project.name}</button>}<CollapsibleText text={entity.description} lines={3} label="说明" />{entity.repoRoot && <p><code>{entity.repoRoot}</code></p>}{entity.acceptance && <section><h3>验收标准</h3><CollapsibleText text={entity.acceptance} lines={3} label="验收标准" /></section>}<div className="acms-actions wrap"><button onClick={() => open(kind === 'goal' ? 'goalEdit' : kind, entity)}>编辑{entityLabels[kind]}</button><ActionButton className="danger" reason={entityDeletionReason(kind, entity, data)} onClick={() => open('deleteEntity', { ...entity, entityKind: kind })}>删除{entityLabels[kind]}</ActionButton></div>
     {kind === 'agent' && chat && <button className="primary" onClick={() => chat(entity.id)}>与智能体对话</button>}
     {kind === 'goal' && entity.planApproval && act && <GoalPlanApproval goal={entity} data={data} act={act} busy={busy} />}
-    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalReviewState goal={entity} deliveryRepository={data.projects.find(project => project.id === entity.projectId)?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
+    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalReviewState goal={entity} approvals={(data.deliveryApprovals ?? []).filter(record => record.goalId === entity.id).reverse()} deliveryRepository={project?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
     {goals.length > 0 && <section><h3>所属目标</h3>{goals.map(g => <button className="acms-entity-link" key={g.id} onClick={() => navigate('goal', g.id)}>{g.title} →</button>)}</section>}
     <section><h3>关联任务（{tasks.length}）</h3>{tasks.slice(0, 8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}{tasks.length > 8 && <details><summary>显示其余 {tasks.length - 8} 项</summary>{tasks.slice(8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}</details>}{!tasks.length && <p>暂无关联任务。</p>}</section><ChangeHistory kind={kind} id={entity.id} data={data} /></aside></div>;
 }

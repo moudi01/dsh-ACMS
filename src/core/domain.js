@@ -12,7 +12,7 @@ import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } 
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
 import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, newCompositionCheck, usesComposition } from './composite-delivery.js';
-import { decideCandidateMerge } from './candidate-confirmation.js';
+import { decideCandidateMerge, requiresDeliveryApproval } from './candidate-confirmation.js';
 import { decidePlanApproval } from './plan-ledger.js';
 import { PLAN_APPROVAL_REQUIRED, assertPlanAllowsWork, awaitsPlanApproval, isApprovalPlanner, supersedePendingPlan } from './plan-approval.js';
 
@@ -85,7 +85,9 @@ export class Company {
         'goal.composition.recheck': () => this.recheckGoalComposition(args, actor),
         'plan.approval.decide': () => decidePlanApproval(this, args, actor),
         'goal.candidate_merge.confirm': () => decideCandidateMerge(this, args, actor, 'confirm'),
+        'goal.candidate_merge.approve': () => decideCandidateMerge(this, args, actor, 'approve'),
         'goal.candidate_merge.reject': () => decideCandidateMerge(this, args, actor, 'reject'),
+        'goal.candidate_merge.revise': () => decideCandidateMerge(this, args, actor, 'revise'),
         'goal.candidate_merge.withdraw': () => decideCandidateMerge(this, args, actor, 'withdraw'),
         'goal.candidate_merge.reconcile': () => decideCandidateMerge(this, args, actor, 'reconcile'),
         'goal.createWithProject': () => this.createGoal({ ...args.goal, projectId: this.saveProject(args.project, actor).id }, actor),
@@ -166,6 +168,10 @@ export class Company {
       this.owner(actor);
       assert(typeof args.planApproval === 'boolean', 'INVALID_INPUT', '计划审批开关必须为布尔值。');
     }
+    if (args.deliveryApproval !== undefined) {
+      this.owner(actor);
+      assert(typeof args.deliveryApproval === 'boolean', 'INVALID_INPUT', '交付审批开关必须为布尔值。');
+    }
     if (args.deliveryRepository !== undefined) this.owner(actor);
     const deliveryRepository = args.deliveryRepository === undefined ? previous?.deliveryRepository : args.deliveryRepository;
     if (deliveryRepository) {
@@ -173,11 +179,19 @@ export class Company {
       text(deliveryRepository.targetRoot, 'deliveryRepository.targetRoot', 4096);
       text(deliveryRepository.targetIdentity, 'deliveryRepository.targetIdentity', 200);
     }
-    const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false,
+    const mode = args.mode ?? previous?.mode ?? 'git';
+    const autoMerge = args.autoMerge ?? previous?.autoMerge ?? false;
+    const deliveryApproval = args.deliveryApproval ?? previous?.deliveryApproval;
+    const existingApproval = previous && this.store.list('goals').some(goal => goal.projectId === previous.id &&
+      requiresDeliveryApproval(goal) && !['deleted', 'cancelled', 'archived'].includes(goal.status));
+    if (deliveryApproval || existingApproval) assert(compositionMode({ mode, autoMerge }) === GIT_COMPOSITION && checks.length > 0,
+      'DELIVERY_APPROVAL_PROJECT', '此项目启用了交付审批，或已有目标使用交付审批。请保留 Git 工作副本、关闭自动合入并配置至少一项项目验收检查。');
+    const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode, checks, preparation, autoMerge,
       ...(args.deliveryRepository === undefined ? {} : { deliveryRepository }), ...(args.planApproval === undefined ? {} : { planApproval: args.planApproval }),
+      ...(args.deliveryApproval === undefined ? {} : { deliveryApproval }),
       ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
-    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge', 'deliveryRepository', 'planApproval'], actor);
+    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge', 'deliveryRepository', 'planApproval', 'deliveryApproval'], actor);
     if (previous && compositionCheckContract(project) !== compositionCheckContract(previous)) {
       for (const goal of this.store.list('goals').filter(item => item.projectId === project.id && item.composition && usesComposition(item))) {
         this.refreshGoal(goal.id);
@@ -269,9 +283,16 @@ export class Company {
       '完整候选由所有者在匹配的目录副本或关闭自动合并的 Git 项目上启用。');
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const approvalRequired = project.planApproval === true || template.planApproval === true;
+    const deliveryApproval = project.deliveryApproval === true || template.deliveryApproval === true;
+    if (deliveryApproval) assert(compositionMode(project) === GIT_COMPOSITION && project.checks.length > 0 &&
+      (!args.deliveryMode || args.deliveryMode === GIT_COMPOSITION), 'DELIVERY_APPROVAL_PROJECT',
+    '交付审批要求使用完整 Git 候选。请选择关闭自动合入且已配置验收检查的 Git 项目，或选择无需交付审批的模板。');
+    const deliveryMode = deliveryApproval ? GIT_COMPOSITION : args.deliveryMode;
     assert(!approvalRequired || args.plan !== false || actor.kind === 'owner', 'OWNER_REQUIRED', '启用计划审批后，只有所有者可创建无需规划的手工目标。');
     const constraints = options.constraints ?? [];
-    let goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(args.deliveryMode ? { deliveryMode: args.deliveryMode } : {}), ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
+    let goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(deliveryMode ? { deliveryMode } : {}),
+      ...(deliveryApproval ? { deliveryApproval: { project: project.deliveryApproval === true, template: template.deliveryApproval === true } } : {}),
+      ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
     if (args.plan !== false) {
       const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId);
       assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色');
@@ -665,6 +686,7 @@ export class Company {
     this.owner(actor);
     const previous = args.id ? this.store.get('templates', args.id) : null;
     assert(args.planApproval === undefined || typeof args.planApproval === 'boolean', 'INVALID_INPUT', '计划审批开关必须为布尔值。');
+    assert(args.deliveryApproval === undefined || typeof args.deliveryApproval === 'boolean', 'INVALID_INPUT', '交付审批开关必须为布尔值。');
     const phases = args.phases ?? previous?.phases;
     assert(Array.isArray(phases) && phases.length >= 1 && phases.length <= 6, 'INVALID_INPUT', 'Template needs 1–6 phases');
     assert(phases.every(p => p && PHASE_IDS.has(p.id)), 'INVALID_INPUT', 'Phase must be plan, execute or final-review');
@@ -672,13 +694,14 @@ export class Company {
     assert(phases.some(p => p.id === 'execute'), 'INVALID_INPUT', 'Template must contain an execute phase');
     const normalized = phases.map(p => ({ id: p.id, name: text(p.name ?? p.id, 'phase.name', 100) }));
     const planApproval = args.planApproval ?? previous?.planApproval;
+    const deliveryApproval = args.deliveryApproval ?? previous?.deliveryApproval;
     const next = { id: previous?.id ?? id('template'), name: text(args.name ?? previous?.name, 'name', 200), phases: clone(normalized),
       version: (previous?.version ?? 0) + 1, finalReview: normalized.some(p => p.id === 'final-review'), published: true,
-      ...(planApproval === undefined ? {} : { planApproval }) };
+      ...(planApproval === undefined ? {} : { planApproval }), ...(deliveryApproval === undefined ? {} : { deliveryApproval }) };
     if (previous) this.store.put('templateHistory', { ...previous, id: `${previous.id}:${previous.version}` });
     const saved = this.store.put('templates', next, args.expectedRevision);
     this.store.event('template.published', saved.id, { version: saved.version, phases: saved.phases, finalReview: saved.finalReview,
-      ...(planApproval === undefined ? {} : { planApproval }), reason: args.reason ?? '' }, actor);
+      ...(planApproval === undefined ? {} : { planApproval }), ...(deliveryApproval === undefined ? {} : { deliveryApproval }), reason: args.reason ?? '' }, actor);
     return saved;
   }
   extendGoalRuntime(args, actor) {
@@ -755,7 +778,7 @@ export class Company {
     return sanitizePreferences(saved);
   }
   snapshot() {
-    const collections = ["projects", "goals", "tasks", "agents", "templates", "templateHistory", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "actionBatches", "agentCredentials"];
+    const collections = ["projects", "goals", "tasks", "agents", "templates", "templateHistory", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "deliveryApprovals", "actionBatches", "agentCredentials"];
     const data = Object.fromEntries(collections.map(c => [c, this.store.list(c)]));
     data.entityTrash = ['project', 'goal', 'agent'].flatMap(kind => data[`${kind}s`].filter(e => e.status === 'deleted' && e.deletion?.rootId === e.id).map(e => ({ ...e, entityKind: kind })));
     for (const c of ['projects', 'goals', 'agents']) data[c] = data[c].filter(e => e.status !== 'deleted');

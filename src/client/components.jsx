@@ -23,7 +23,7 @@ export function CollapsibleText({ text, lines = 3, className = '', label = '全�
     {long && <button type="button" className="text acms-expand-btn" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? `收起${label}` : `展开${label}`}</button>}
   </div>;
 }
-export function DirectoryField({ value = '', onChange, label = '项目目录', hint = '可直接粘贴完整路径，或点击选择目录。' }) {
+export function DirectoryField({ value = '', onChange, label = '项目目录', hint = '可直接粘贴完整路径，或点击选择目录。', required = true }) {
   const [listing, setListing] = useState(null); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const input = useRef();
   const browse = async directory => { setBusy(true); setError(''); try { setListing(await api.directories(directory)); } catch (e) { setError(`无法浏览目录：${e.message}`); } finally { setBusy(false); } };
   const pick = async () => {
@@ -38,7 +38,7 @@ export function DirectoryField({ value = '', onChange, label = '项目目录', h
   };
   const paste = async () => { try { const text = await navigator.clipboard.readText(); if (!text.trim()) throw new Error('剪贴板没有文字路径'); onChange(text.trim().replace(/^"([\s\S]*)"$/, '$1')); setError(''); } catch { setError('无法读取剪贴板。请点击路径输入框后按 Ctrl+V，或使用“选择目录”。'); } };
   return <div className="acms-directory-field">
-    <Field label={label} hint={hint}><input ref={input} required value={value} spellCheck={false} placeholder="例如 D:\\Projects\\my-project" onChange={e => onChange(e.target.value)} onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && ['a', 'c', 'v', 'x', 'z'].includes(e.key.toLowerCase())) e.stopPropagation(); }} onPaste={e => {
+    <Field label={label} hint={hint}><input ref={input} required={required} value={value} spellCheck={false} placeholder="例如 D:\\Projects\\my-project" onChange={e => onChange(e.target.value)} onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && ['a', 'c', 'v', 'x', 'z'].includes(e.key.toLowerCase())) e.stopPropagation(); }} onPaste={e => {
       const text = e.clipboardData.getData('text/plain'); if (!text) return; e.preventDefault(); e.stopPropagation();
       const element = e.currentTarget; const start = element.selectionStart ?? value.length; const end = element.selectionEnd ?? start;
       onChange(value.slice(0, start) + text + value.slice(end)); requestAnimationFrame(() => input.current?.setSelectionRange(start + text.length, start + text.length));
