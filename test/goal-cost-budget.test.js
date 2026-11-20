@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { DshAdapter } from '../src/adapters/dsh.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { Company } from '../src/core/domain.js';
 import { reserveGoalCost } from '../src/core/goal-cost-budget.js';
@@ -26,7 +29,7 @@ function receipt(row, amountMicros, override = {}) {
     receiptId: 'fixture-' + row.id, ...override };
 }
 
-function fixedCostAdapter(f, { quoteFor = () => '7', amountFor = () => '3', beforeResult, throwOnStart = false } = {}) {
+function fixedCostAdapter(f, { quoteFor = () => '7', amountFor = () => '3', beforeResult, onDispose, throwOnStart = false } = {}) {
   const primary = f.adapter;
   const calls = [], authorizations = [];
   const route = { provider: 'simulation', model: 'fixed-cost-fixture', llmProvider: 'test-channel', reasoningEffort: null };
@@ -67,6 +70,7 @@ function fixedCostAdapter(f, { quoteFor = () => '7', amountFor = () => '3', befo
             save('process-', authorization.id, cleanup);
             const amount = amountFor(task);
             if (amount !== null) save('cost-', authorization.id, receipt(authorization, amount));
+            onDispose?.();
             return cleanup;
           },
         };
@@ -303,4 +307,75 @@ test('an authenticated overrun is recorded and aborts overlapping attempts witho
   assert.equal(f.company.snapshot().goals.find(record => record.id === target.id).costBudget.availableMicros, '0');
   assert.equal(f.store.list('tasks').filter(task => task.goalId === target.id).length, 2);
   assert.throws(() => f.command('goal.cost_budget.extend', { id: target.id, additionalCostUsd: '1' }), { code: 'COST_CONTRACT_BREACH' });
+});
+
+
+for (const mode of ['denied', 'withdrawn', 'cancelled']) {
+  test('a host crash after cost launch is ' + mode + ' leaves capacity free on restart', async t => {
+    const f = await fixture(t), target = goal(f, '0.000007');
+    const strict = f.task({ goalId: target.id, title: 'Blocked strict task', priority: 100 });
+    const independent = f.task({ title: 'Independent task', priority: 50 });
+    f.command('policy.update', { patch: { maxConcurrent: 1, controlSlots: 0 } });
+    const runner = fileURLToPath(new URL('./fixtures/goal-cost-crash.mjs', import.meta.url));
+    const terminated = spawnSync(process.execPath, [runner, f.dataDir, target.id, mode], { encoding: 'utf8', timeout: 20000, windowsHide: true });
+    assert.equal(terminated.status, 73, terminated.error?.message ?? terminated.stderr);
+    const attempt = f.store.list('attempts').find(row => row.taskId === strict.id);
+    assert.equal(attempt.preflightOnly, true);
+    assert.equal(attempt.cleanupPending, false);
+    assert.equal(attempt.status, mode === 'denied' ? 'failed' : 'interrupted');
+    assert.equal(state(f.store, independent).status, 'ready');
+    assert.equal(state(f.store, strict).attempts, 0);
+    assert.equal(budget(f.store, target.id).reservedMicros, '0');
+    assert.deepEqual(rows(f.store).map(row => row.source), mode === 'denied' ? [] : ['host-no-dispatch']);
+
+    const dsh = new DshAdapter({ get: () => null, subagents: { providers: new Map() } }, f.company, f.dataDir);
+    let recoveries = 0;
+    f.engine.adapter = { start: input => f.adapter.start(input), reconcile: saved => {
+      recoveries++;
+      return dsh.reconcile(saved);
+    } };
+    await f.start();
+    await waiting(f, independent, task => task.status === 'succeeded');
+    assert.equal(recoveries, 0);
+    assert.deepEqual(f.adapter.calls.map(call => call.task.id), [independent.id]);
+    assert.equal(f.store.list('attempts').find(row => row.id === attempt.id).cleanupPending, false);
+    assert.equal(f.store.page(0, 100).entries.filter(event => event.entityId === attempt.id && event.type === 'attempt.cleanup.confirmed').length, 1);
+    assert.equal(f.store.get('agents', strict.agentId).status, mode === 'cancelled' ? 'retired' : 'available');
+  });
+}
+
+
+test('a stale live host cannot mark paid cleanup after ownership changes at the transaction boundary', async t => {
+  const f = await fixture(t), target = goal(f, '0.000007'), task = f.task({ goalId: target.id });
+  let disposed = false, checked = 0, transferred = false;
+  const priced = fixedCostAdapter(f, { onDispose: () => { disposed = true; } });
+  f.engine.adapter = priced.adapter;
+  const successor = new Store(f.store.filename);
+  const owns = f.store.ownsLease.bind(f.store);
+  f.store.ownsLease = (owner, epoch) => {
+    const result = owns(owner, epoch);
+    if (result && disposed && !f.store.inTransaction && new Error().stack.includes('at Engine.execute')) {
+      if (++checked === 2) {
+        // Simulate ownership changing just after the stale host's outer read.
+        assert.equal(successor.db.prepare("UPDATE leases SET owner='successor', epoch=epoch+1 WHERE resource='scheduler'").run().changes, 1);
+        transferred = true;
+      }
+    }
+    return result;
+  };
+  try {
+    await f.start();
+    await until(() => transferred && !f.engine.live.size, undefined, () => ({
+      transferred, checked, task: taskWaitDiagnostics(f, task.id)(), budget: budget(f.store, target.id), error: f.engine.lastError,
+    }));
+    const row = rows(f.store)[0];
+    assert.equal(row.status, 'reserved');
+    assert.equal(budget(f.store, target.id).awaitingReceiptAttempts, 0);
+    assert.equal(f.store.require('attempts', row.id).cleanupPending, true);
+    assert.equal(budget(f.store, target.id).reservedMicros, '7');
+  } finally {
+    f.store.ownsLease = owns;
+    await f.engine.stop();
+    successor.close();
+  }
 });

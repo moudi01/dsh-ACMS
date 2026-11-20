@@ -718,14 +718,17 @@ export class Engine {
           }
         }
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
+          this.fenced();
           const saved = withAttemptUsage(this.store.require('attempts', attempt.id), usageReceipt);
           if (recoveryFailure) {
             this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, recovery: { status: 'unknown', reason: recoveryFailure.message, actions: ['refresh-receipt', 'inspect-execution'] } });
             return;
           }
           if (authorization && costLaunchInvoked) markGoalCostCleanup(this.store, saved.id);
-          this.store.put('attempts', { ...saved, cleanupPending: false });
-          this.store.event('attempt.cleanup.confirmed', saved.id, { taskId: saved.taskId }, SYSTEM);
+          if (!saved.preflightOnly || saved.cleanupPending !== false) {
+            this.store.put('attempts', { ...saved, cleanupPending: false });
+            this.store.event('attempt.cleanup.confirmed', saved.id, { taskId: saved.taskId }, SYSTEM);
+          }
           const task = this.store.require('tasks', saved.taskId);
           // Stop may arrive after acceptance while dispose is still pending.
           // Once cleanup succeeds there is no active attempt left for recover().

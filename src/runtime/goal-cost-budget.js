@@ -49,10 +49,17 @@ export async function reconcileTaskCost(engine, attempt, authorization) {
   return matchesTaskCostAuthorization(authorization, fact) ? fact : { status: 'unknown', reason: '结束回执未匹配本次金额预留。' };
 }
 
+function finishUnlaunchedTask(engine, attempt, status, reason) {
+  const { store } = engine;
+  const saved = engine.finishAttempt(attempt, status, reason);
+  const finished = store.put('attempts', { ...saved, preflightOnly: true, cleanupPending: false });
+  store.event('attempt.cleanup.confirmed', saved.id, { taskId: saved.taskId, noLaunch: true }, SYSTEM);
+  return finished;
+}
+
 export function holdTaskCost(engine, attempt, task, denied) {
   const { store } = engine;
-  const saved = engine.finishAttempt(attempt, 'failed', denied.reason);
-  store.put('attempts', { ...saved, preflightOnly: true });
+  finishUnlaunchedTask(engine, attempt, 'failed', denied.reason);
   store.put('tasks', { ...task, status: 'blocked',
     attempts: Math.max(0, task.attempts - (attempt.preparingHost ? 0 : 1)), retryAt: null,
     blocker: task.blocker && task.blocker.kind !== 'cost-budget' ? task.blocker : { kind: 'cost-budget', reason: denied.reason },
@@ -64,17 +71,18 @@ export function holdTaskCost(engine, attempt, task, denied) {
 export function interruptUnlaunchedTaskCost(engine, attempt, authorization, error) {
   const { store } = engine;
   engine.fenced();
-  const saved = engine.finishAttempt(attempt, 'interrupted', error.message);
-  store.put('attempts', { ...saved, preflightOnly: true });
+  const saved = finishUnlaunchedTask(engine, attempt, 'interrupted', error.message);
   markGoalCostCleanup(store, saved.id);
   settleGoalCost(store, saved.id, { final: true, receiptId: 'host-no-dispatch', attemptId: saved.id,
     authorizationId: authorization.authorizationId, currency: authorization.currency, amountMicros: '0' }, 'host-no-dispatch');
   const task = store.require('tasks', attempt.taskId);
-  if (task.activeAttemptId !== attempt.id || task.generation !== attempt.taskGeneration ||
-      (!task.stopRequested && !['running', 'reconciling'].includes(task.status))) return;
-  const status = task.stopRequested ?? (engine.closing ? 'paused' : 'ready');
-  store.put('tasks', { ...task, status, attempts: Math.max(0, task.attempts - 1), stopRequested: null,
-    resumeOnStart: engine.closing && !task.stopRequested, retryAt: null });
+  if (task.activeAttemptId === attempt.id && task.generation === attempt.taskGeneration &&
+      (task.stopRequested || ['running', 'reconciling'].includes(task.status))) {
+    const status = task.stopRequested ?? (engine.closing ? 'paused' : 'ready');
+    store.put('tasks', { ...task, status, attempts: Math.max(0, task.attempts - 1), stopRequested: null,
+      resumeOnStart: engine.closing && !task.stopRequested, retryAt: null });
+  }
+  engine.company.releaseTemporaryAgent(attempt.agentId);
   store.event('task.cost_budget.launch_withdrawn', task.id, { attemptId: attempt.id }, SYSTEM, { goalId: task.goalId });
 }
 
