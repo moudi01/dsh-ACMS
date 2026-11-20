@@ -53,10 +53,15 @@ export function promptFor(company, task, attempt, options = {}) {
     ...(agent.role === 'manager' ? { managementResults: company.store.list('actionBatches').filter(b => b.taskId === task.id && b.generation === task.generation).map(b => ({ actionBatchId: b.batchId, results: b.results })), managementTurnsRemaining: 4 - (task.managementGeneration === task.generation ? task.managementTurns ?? 0 : 0) } : {}),
     ...(task.kind === 'review' ? { reviewWorkspacePolicy: 'This is a separate verification copy. You may create temporary test files and run checks here. Review the unchanged delivered source and the host-owned check evidence. Never modify the author workspace or original artifact blobs. A reviewer environment failure is a technical blocker, not evidence of a product defect.' } : {}),
     inputArtifacts: inputs, previousFeedback: task.feedback ?? null, userAnswer: task.lastAnswer ?? null,
-    ...(task.workspace?.compositionInput?.inputs?.length ? { selectedGitInputs: {
+    ...(task.workspace?.mode === 'git' && task.workspace?.compositionInput?.inputs?.length ? { selectedGitInputs: {
       baseCommit: task.workspace.compositionBase, version: task.workspace.compositionInput.version,
       inputs: task.workspace.compositionInput.inputs,
       instructions: 'These exact dependency versions are already present in this isolated workspace. The Git branch starts at the pinned source commit. Work from the materialized files and preserve the selected dependency inputs unless the task requires modifying them.',
+    } } : {}),
+    ...(task.workspace?.mode === 'copy' && task.workspace?.compositionInput?.inputs?.length ? { selectedCopyInputs: {
+      baseHash: task.workspace.compositionBase, version: task.workspace.compositionInput.version,
+      inputs: task.workspace.compositionInput.inputs,
+      instructions: 'These exact dependency files are already present in this isolated directory. Work from the materialized files and preserve the selected inputs unless your task requires changing them.',
     } } : {}),
     ...managerExtras,
     ...(task.workspace?.collaboration ? { collaboration: {

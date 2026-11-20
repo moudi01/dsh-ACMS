@@ -9,7 +9,7 @@ import { resolveHostExecutable } from './host-command.js';
 import { classifyEnvironment, environmentFailure } from './preflight.js';
 
 const excluded = new Set(['.git', '.acms', '.codex', '.aws', '.ssh', '.npmrc', '.netrc', 'node_modules', 'auth.json', 'credentials.json']);
-const included = (name, dependencies = false) => (dependencies && name.toLowerCase() === 'node_modules') ||
+export const includedProjectInput = (name, dependencies = false) => (dependencies && name.toLowerCase() === 'node_modules') ||
   (!excluded.has(name.toLowerCase()) && !name.toLowerCase().startsWith('.env'));
 
 async function fileHash(file, signal) {
@@ -20,7 +20,7 @@ async function fileHash(file, signal) {
 
 export async function copyProject(source, destination, { collaboration = false, dependencies = false } = {}) {
   await cp(source, destination, { recursive: true, force: false, errorOnExist: true, filter: async item => item === source ||
-    ((included(path.basename(item), dependencies) || (collaboration && path.basename(item) === '.acms')) && !(await lstat(item)).isSymbolicLink()) });
+    ((includedProjectInput(path.basename(item), dependencies) || (collaboration && path.basename(item) === '.acms')) && !(await lstat(item)).isSymbolicLink()) });
 }
 
 async function inputFiles(root, signal, dependencies = false) {
@@ -29,7 +29,7 @@ async function inputFiles(root, signal, dependencies = false) {
     const directory = path.join(root, relative);
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       signal?.throwIfAborted();
-      if (!included(entry.name, dependencies)) continue;
+      if (!includedProjectInput(entry.name, dependencies)) continue;
       const name = path.posix.join(relative, entry.name);
       if (entry.isDirectory()) await walk(name, inDependencies || entry.name.toLowerCase() === 'node_modules');
       else if (entry.isFile() && (!dependencies || inDependencies)) files.push([name, await fileHash(path.join(root, name), signal)]);

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { backupWorktreeEvidence, relocatedGitPointer } from './restore-worktrees.mjs';
 import { WORKTREE_RESTORE_HOLD, assertWorktreeRestoreReady, worktreeRestorePending } from '../src/core/restore-safety.js';
+import { includedProjectInput } from '../src/runtime/project-environment.js';
 
 export const FORMAT = 'acms-backup/1';
 const EXCLUDED_DIRS = [
@@ -23,13 +24,30 @@ const SENSITIVE = [
 const PRIVATE_WARNINGS = [
   { name: 'conversations', message: 'conversations/ 包含角色回复与私有内容，备份文件按本机私有数据处理' },
   { name: 'artifacts', message: 'artifacts/ 可能包含项目源码或敏感数据，备份文件按本机私有数据处理' },
-  { name: 'deliveries', message: 'deliveries/ 包含 Git 源码交付包，备份文件按本机私有数据处理' },
+  { name: 'deliveries', message: 'deliveries/ 包含 Git 和目录的源码交付版本，备份文件按本机私有数据处理' },
 ];
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 const isInside = (root, target) => {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 };
+function pathError(root, relative, database = false) {
+  if (typeof relative !== 'string' || !relative) return 'path is missing';
+  if (relative.includes('\\')) return 'must use forward slashes';
+  if (path.isAbsolute(relative) || /^[A-Za-z]:/.test(relative)) return 'must be relative';
+  if (relative.split('/').some(segment => segment === '' || segment === '..')) return 'must not contain empty or parent segments';
+  if (!isInside(root, path.resolve(root, ...relative.split('/')))) return 'escapes backup root';
+  if (database && relative.includes('/')) return 'database file must be a plain basename';
+  return null;
+}
+function workspaceDirectoryError(root, relative) {
+  const problem = pathError(root, relative);
+  if (problem) return problem;
+  const [group, task, ...parts] = relative.split('/');
+  if (group !== 'workspaces' || !/^task_[a-f0-9-]+$/.test(task ?? '') ||
+    parts.some(part => part === '.' || part.includes(':') || !includedProjectInput(part))) return 'must be inside a managed copy workspace';
+  return null;
+}
 async function realTarget(target) {
   const resolved = path.resolve(target);
   try { return await fs.realpath(resolved); }
@@ -58,10 +76,27 @@ async function dirSize(target) {
   return total;
 }
 
-async function walk(root) {
+function managedCopyWorkspaces(source, canonicalSource) {
+  const planned = new Set();
+  const parents = [source, canonicalSource].map(root => path.join(root, 'workspaces'));
+  const database = new DatabaseSync(path.join(source, 'company.db'), { readOnly: true });
+  try {
+    for (const { id, body } of database.prepare("SELECT id, body FROM entities WHERE collection = 'tasks'").iterate()) {
+      const workspace = JSON.parse(body).workspace;
+      if (workspace?.mode === 'copy' && workspace.compositionInput?.format === 'acms-copy-composition/1' &&
+        typeof workspace.path === 'string' && path.basename(workspace.path) === id &&
+        parents.some(parent => path.relative(parent, path.dirname(workspace.path)) === '')) planned.add(`workspaces/${id}`);
+    }
+  } finally { database.close(); }
+  return planned;
+}
+
+async function walk(root, copyWorkspaces = new Set()) {
   const files = [];
+  const directories = [];
   const excluded = [];
-  async function visit(directory) {
+  async function visit(directory, workspace = false, relativeDirectory = '') {
+    const previousCount = files.length + directories.length;
     const entries = await fs.readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
       const absolute = path.join(directory, entry.name);
@@ -69,8 +104,11 @@ async function walk(root) {
       if (entry.isSymbolicLink()) { excluded.push({ path: relative, bytes: 0, reason: '符号链接不跟随，避免越界读取', rebuild: '由所有者确认链接目标后单独处理' }); continue; }
       if (entry.isDirectory()) {
         const rule = EXCLUDED_DIRS.find(item => item.name === entry.name);
-        if (rule) { excluded.push({ path: relative, bytes: await dirSize(absolute), reason: rule.reason, rebuild: rule.rebuild }); continue; }
-        await visit(absolute); continue;
+        if (rule && !(workspace && includedProjectInput(entry.name))) {
+          excluded.push({ path: relative, bytes: await dirSize(absolute), reason: rule.reason, rebuild: rule.rebuild }); continue;
+        }
+        const preserve = workspace && includedProjectInput(entry.name) || copyWorkspaces.has(relative);
+        await visit(absolute, preserve, relative); continue;
       }
       if (entry.isFile()) {
         if (relative === 'backup-manifest.json' || relative === 'REBUILD.md') continue;
@@ -83,9 +121,10 @@ async function walk(root) {
         files.push({ path: relative, bytes: stat.size, file: absolute });
       }
     }
+    if (workspace && files.length + directories.length === previousCount) directories.push(relativeDirectory);
   }
   await visit(root);
-  return { files, excluded };
+  return { files, directories, excluded };
 }
 
 export async function planBackup({ dataDir, out, includePairing = false }) {
@@ -94,7 +133,7 @@ export async function planBackup({ dataDir, out, includePairing = false }) {
   if (!(await exists(path.join(source, 'company.db')))) throw new Error(`ACMS database not found under ${source}`);
   const target = path.resolve(out ?? `${source}-backup-${new Date().toISOString().replace(/[:.]/g, '-')}`);
   if (isInside(await realTarget(source), await realTarget(target))) throw new Error('Backup target must be outside the ACMS data directory');
-  const { files: walkedFiles, excluded } = await walk(source);
+  const { files: walkedFiles, directories, excluded } = await walk(source, managedCopyWorkspaces(source, await fs.realpath(source)));
   const files = includePairing ? walkedFiles : walkedFiles.filter(file => !file.path.startsWith('pairing/'));
   for (const item of SENSITIVE) {
     if (includePairing && item.name === 'pairing') { continue; }
@@ -104,6 +143,7 @@ export async function planBackup({ dataDir, out, includePairing = false }) {
     }
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
+  directories.sort();
   excluded.sort((a, b) => a.path.localeCompare(b.path));
   const databaseBytes = (await fs.lstat(path.join(source, 'company.db'))).size;
   const walBytes = await exists(path.join(source, 'company.db-wal')) ? (await fs.lstat(path.join(source, 'company.db-wal'))).size : 0;
@@ -120,7 +160,7 @@ export async function planBackup({ dataDir, out, includePairing = false }) {
   if (freeBytes !== null && freeBytes < totals.requiredBytes * 1.1) warnings.push(`目标卷可用空间不足：需要约 ${totals.requiredBytes} 字节，当前可用 ${freeBytes} 字节`);
   return { format: FORMAT, mode: 'plan', createdAt: new Date().toISOString(), source, target, includePairing,
     database: { file: 'company.db', sourceBytes: databaseBytes, walBytes, estimatedBytes: estimatedDatabaseBytes },
-    files, excluded, warnings, totals,
+    files, directories, excluded, warnings, totals,
     space: { freeBytes, requiredBytes: totals.requiredBytes, sufficient: freeBytes === null || freeBytes >= totals.requiredBytes * 1.1 } };
 }
 
@@ -142,6 +182,7 @@ export async function applyBackup(plan) {
   if (isInside(await realTarget(source), await realTarget(target))) throw new Error('Backup target must be outside the ACMS data directory');
   if (await exists(target)) { const entries = await fs.readdir(target).catch(() => []); if (entries.length) throw new Error(`Backup target is not empty: ${target}`); }
   await fs.mkdir(target, { recursive: true });
+  const sourceRoot = await fs.realpath(source);
   const database = await snapshotDatabase(path.join(source, 'company.db'), path.join(target, 'company.db'));
   const evidenceFile = path.join(target, database.file);
   const worktreesBefore = new Map((await backupWorktreeEvidence(evidenceFile, source, new Map(plan.files.map(file => [file.path, file]))))
@@ -155,12 +196,22 @@ export async function applyBackup(plan) {
     await fs.writeFile(destination, bytes, { mode: 0o600 });
     files.push({ path: file.path, bytes: bytes.length, sha256: hash });
   }
+  for (const relative of plan.directories ?? []) {
+    const problem = workspaceDirectoryError(sourceRoot, relative);
+    if (problem) throw new Error(`Backup directory ${relative}: ${problem}`);
+    const existing = path.join(sourceRoot, ...relative.split('/'));
+    if (!(await fs.lstat(existing)).isDirectory() || await fs.realpath(existing) !== existing) {
+      throw new Error(`Backup directory cannot be verified: ${relative}`);
+    }
+    await fs.mkdir(path.join(target, ...relative.split('/')), { recursive: true });
+  }
   const gitWorktrees = (await backupWorktreeEvidence(evidenceFile, source, new Map(files.map(file => [file.path, file]))))
     .map(item => item.reason || JSON.stringify(item) === JSON.stringify(worktreesBefore.get(item.relative)) ? item
       : { relative: item.relative, reason: '备份期间 Git 提交或暂存内容发生变化' });
   const manifest = {
-    format: FORMAT, createdAt: plan.createdAt, source, sourceRoot: await fs.realpath(source), includePairing: plan.includePairing === true,
+    format: FORMAT, createdAt: plan.createdAt, source, sourceRoot, includePairing: plan.includePairing === true,
     database, files, excluded: plan.excluded, warnings: plan.warnings, gitWorktrees,
+    ...(plan.directories?.length ? { directories: plan.directories } : {}),
     totals: { files: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), excludedBytes: plan.totals.excludedBytes,
       databaseBytes: database.bytes, requiredBytes: files.reduce((sum, file) => sum + file.bytes, 0) + database.bytes },
     note: 'Raw-byte SHA-256 is used for backup integrity. ACMS artifact.hash uses sha256(base64 text) and is not interchangeable.',
@@ -209,22 +260,27 @@ export async function verifyBackup(backupDir) {
       if (pointer) migratedPointers.set(proof.relative + '/.git', pointer);
     }
   }
-  const pathError = (relative, database = false) => {
-    if (typeof relative !== 'string' || !relative) return 'path is missing';
-    if (relative.includes('\\')) return 'must use forward slashes';
-    if (path.isAbsolute(relative) || /^[A-Za-z]:/.test(relative) || relative.startsWith('\\\\')) return 'must be relative';
-    if (relative.split('/').some(segment => segment === '' || segment === '..')) return 'must not contain empty or parent segments';
-    if (!isInside(root, path.resolve(root, ...relative.split('/')))) return 'escapes backup root';
-    if (database && relative.includes('/')) return 'database file must be a plain basename';
-    return null;
-  };
-  const databaseError = pathError(manifest.database?.file, true);
+  const databaseError = pathError(root, manifest.database?.file, true);
   if (databaseError) errors.push(`database.file: ${databaseError}`);
   for (const file of manifest.files ?? []) {
-    const problem = pathError(file.path);
+    const problem = pathError(root, file.path);
     if (problem) errors.push(`${file.path ?? '<missing>'}: ${problem}`);
   }
+  const directories = manifest.directories ?? [];
+  if (!Array.isArray(directories)) return { ok: false, errors: ['Backup directories must be a list'] };
+  for (const relative of directories) {
+    const problem = workspaceDirectoryError(canonicalRoot, relative);
+    if (problem) errors.push(`Backup directory ${relative}: ${problem}`);
+  }
   if (errors.length) return { ok: false, errors };
+  for (const relative of directories) {
+    const absolute = path.join(canonicalRoot, ...relative.split('/'));
+    try {
+      if (!(await fs.lstat(absolute)).isDirectory() || await fs.realpath(absolute) !== absolute) {
+        errors.push(`Backup directory cannot be verified: ${relative}`);
+      }
+    } catch { errors.push(`Backup directory is missing: ${relative}`); }
+  }
   const check = async (relative, expected) => {
     const absolute = path.join(root, ...relative.split('/'));
     let stat;

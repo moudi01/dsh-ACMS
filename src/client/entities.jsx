@@ -15,7 +15,10 @@ const reviewLabels = { ready: '待执行', running: '进行中', preparing: '准
 function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
   const review = goal.reviewSummary;
   const pending = goal.contractChange?.status === 'pending';
-  const waitingForComposition = goal.deliveryMode === 'git-composite' && !goal.compositionVerified;
+  const copyCandidate = goal.deliveryMode === 'copy-composite';
+  const composite = copyCandidate || goal.deliveryMode === 'git-composite';
+  const candidateLabel = copyCandidate ? '完整目录候选' : '完整 Git 候选';
+  const waitingForComposition = composite && !goal.compositionVerified;
   const recheck = goal.compositionRecheck;
   const active = review && ['ready', 'running', 'preparing', 'blocked', 'paused', 'integrating', 'reconciling', 'stopping'].includes(review.status);
   let capacity = '';
@@ -26,12 +29,15 @@ function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
       capacity = '最终审查等待独立审查员。请在「组织管理」分配可用审查员，或在「公司设置 → 编辑边界」调高「临时人员上限」。';
     }
   }
-  const reason = busy ? '正在保存，请稍候' : goal.status === 'cancelled' ? '目标已取消。' : goal.executionControl ? '请先恢复目标。' : pending ? '请先确认当前目标合同。' : waitingForComposition ? '完整 Git 候选尚未通过联合检查。' : active ? '已有进行中的最终审查，请等待结论。' : capacity || (!(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '');
+  const reason = busy ? '正在保存，请稍候' : goal.status === 'cancelled' ? '目标已取消。' : goal.executionControl ? '请先恢复目标。' : pending ? '请先确认当前目标合同。' : waitingForComposition ? candidateLabel + '尚未通过联合检查。' : active ? '已有进行中的最终审查，请等待结论。' : capacity || (!(goal.taskSummary?.done > 0) ? '目标还没有已交付成果，不能发起最终审查。' : '');
   return <section className="acms-review-state" aria-label="最终审查状态"><h3>最终审查</h3>
     <p>当前合同 v{goal.contractVersion ?? 1}{goal.completedContractVersion && <> · 最近完成 v{goal.completedContractVersion}</>}</p>
-    {goal.compositionVerified && <details><summary>完整 Git 候选已通过联合检查</summary><dl className="acms-definition"><dt>候选提交</dt><dd><code>{goal.composition.bundle.commit}</code></dd><dt>固定基线</dt><dd><code>{goal.composition.baseCommit}</code></dd><dt>本机交付包</dt><dd><code>{goal.composition.bundle.path}</code></dd></dl></details>}
-    {waitingForComposition && <p className="acms-sectionnote">{recheck?.reason || (recheck ? '完整 Git 候选正在等待重新核验。' : '完整 Git 候选尚未通过联合检查。请查看任务的集成状态。')}</p>}
-    {goal.deliveryMode === 'git-composite' && !pending && !goal.executionControl && goal.status !== 'cancelled' &&
+    {goal.compositionVerified && <details><summary>{candidateLabel}已通过联合检查</summary><dl className="acms-definition">
+      <dt>{copyCandidate ? '候选内容指纹' : '候选提交'}</dt><dd><code>{copyCandidate ? goal.composition.contentHash : goal.composition.bundle.commit}</code></dd>
+      <dt>固定基线</dt><dd><code>{copyCandidate ? goal.composition.baseHash : goal.composition.baseCommit}</code></dd>
+      {!copyCandidate && <><dt>本机交付包</dt><dd><code>{goal.composition.bundle.path}</code></dd></>}</dl></details>}
+    {waitingForComposition && <p className="acms-sectionnote">{recheck?.reason || candidateLabel + (recheck ? '正在等待重新核验。' : '尚未通过联合检查。请查看任务的集成状态。')}</p>}
+    {composite && !pending && !goal.executionControl && goal.status !== 'cancelled' &&
       goal.taskSummary?.done > 0 && goal.taskSummary.done === goal.taskSummary.total && (!recheck || recheck.status === 'failed') &&
       <ActionButton reason={busy ? '正在保存，请稍候' : ''} onClick={() => act('goal.composition.recheck', { id: goal.id }, '已排队重新联合检查')}>重新联合检查</ActionButton>}
     {pending && <p className="acms-sectionnote">新要求待确认，普通任务暂不派发。{goal.contractChange.coordinationTaskId ? '等待负责人确认新合同。' : taskCount >= taskLimit ? goalContractCapacityMessage(taskCount, taskLimit) : '等待调度器安排合同确认。'}历史结论适用于当时的合同版本。</p>}

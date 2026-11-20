@@ -57,7 +57,7 @@ function settleCompositionRecheck(engine, record, { result, error, reason, obser
     return;
   }
   const retry = currentContract && (retryCheckpoint || engine.closing || goalStopped(goal) || engine.company.policy().paused);
-  const failure = currentContract ? error?.message ?? '无法重新核对完整 Git 候选。' : '目标合同已变化，请核对当前输入后重新检查。';
+  const failure = currentContract ? error?.message ?? '无法重新核对完整候选。' : '目标合同已变化，请核对当前输入后重新检查。';
   save(engine, record, { phase: retry ? 'stopped' : 'failed', reason: retry ? null : failure, finishedAt: now() }, retry ? 'integration.stopped' : 'integration.failed');
   engine.store.put('goals', { ...goal, compositionRecheck: { ...request, status: retry ? 'queued' : 'failed', reason: retry ? null : failure, integrationId: null } });
 }
@@ -301,6 +301,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
   try {
     const execution = {
       id: record.id,
+      signal,
       run: (executable, args, cwd, options) => command(executable, args, cwd, options),
       checkpoint: patch => { guard(); save(engine, record, patch, patch.phase === 'checking' ? 'integration.checking' : null); },
       apply: async (checks, cwd, candidate) => {
