@@ -9,7 +9,8 @@ import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
 import { goalStopped } from '../core/goal-control.js';
 import { candidateMergeMatches } from '../core/candidate-confirmation.js';
-import { applyConfirmedCandidate, assertCandidateBranchCreation, candidateGitEnvironment } from './candidate-merge.js';
+import { applyConfirmedCandidate, assertCandidateBranchWrite, candidateGitEnvironment } from './candidate-merge.js';
+import { acquireBareDeliveryFence, assertBareTargetIdentity, bareFenceRef, releaseBareDeliveryFence } from './bare-delivery-target.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -81,6 +82,7 @@ function settleCandidateMerge(engine, record, { result, error, reason, observed,
     saveRequest({ status: 'applied', reason: null, result });
     engine.store.event('goal.candidate_merge.applied', goal.id, { previewId: record.candidateMergeId, version: record.candidateVersion,
       confirmedBy: record.confirmedBy, targetRef: record.targetRef, basisRef: record.basisRef, basisHead: record.basisHead, actualHead: result.actualHead,
+      ...(record.targetMode === 'bare' ? { targetMode: 'bare', targetRoot: record.targetRoot } : {}),
       integratedCommit: result.integratedCommit }, SYSTEM, { goalId: goal.id });
     return;
   }
@@ -155,6 +157,7 @@ async function clearCommand(engine, record, field, file) {
 }
 
 async function inspect(engine, record) {
+  if (record.bareFence) assertBareTargetIdentity(record.targetRoot, record.targetIdentity);
   return engine.workspaces.inspectIntegration(record, async (command, args, cwd) => {
     const inspectionCommandId = id('command');
     const cleanupReceipt = receipt(engine, inspectionCommandId);
@@ -191,12 +194,15 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
     return settle(engine, record, { reason: error?.message ?? '缺少集成命令的进程树清理回执', observed: record.observed });
   }
   let observed;
-  if (record.applyStartedAt && !cleanup?.notStarted) {
-    try { observed = await inspect(engine, record); }
-    catch (failure) {
-      return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
-        observed: record.observed, commandCleanupConfirmed: !!cleanup });
-    }
+  try {
+    if (record.applyStartedAt && !cleanup?.notStarted) observed = await inspect(engine, record);
+    if (record.bareFence) engine.store.transaction(() => {
+      engine.fenced();
+      releaseBareDeliveryFence(record);
+    });
+  } catch (failure) {
+    return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
+      observed: observed ?? record.observed, commandCleanupConfirmed: !!cleanup });
   }
   if (cleanup?.notStarted) {
     return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
@@ -346,7 +352,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
           guard();
           if (apply) {
             const current = engine.store.require('integrations', record.id);
-            if (candidateMergeId) assertCandidateBranchCreation(current, binary);
+            if (candidateMergeId) assertCandidateBranchWrite(current, binary);
             else engine.workspaces.assertIntegrationTarget(current, binary);
             guard();
           }
@@ -367,11 +373,19 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       signal,
       run: (executable, args, cwd, options) => command(executable, args, cwd, options),
       checkpoint: patch => { guard(); save(engine, record, patch, patch.phase === 'checking' ? 'integration.checking' : null); },
+      acquireBareFence: () => engine.store.transaction(() => {
+        guard();
+        acquireBareDeliveryFence(engine.store.require('integrations', record.id));
+      }),
       apply: async (checks, cwd, candidate, ownerOptions) => {
-        const args = ownerOptions ? ['-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--stdin', '-m', ownerOptions.message]
+        const bare = ownerOptions?.targetMode === 'bare';
+        const args = ownerOptions ? [...(bare ? ['--git-dir=.', '-c', 'core.bare=true', '-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost'] : []),
+          '-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--stdin', ...(bare ? ['--create-reflog'] : []), '-m', ownerOptions.message]
           : ['merge', '--ff-only', candidate];
-        const input = ownerOptions ? ['start', 'option no-deref', `verify ${ownerOptions.basisRef} ${ownerOptions.basisHead}`,
-          'option no-deref', `create ${ownerOptions.targetRef} ${candidate}`, 'prepare', 'commit', ''].join('\n') : undefined;
+        const input = ownerOptions ? ['start', 'option no-deref',
+          bare ? `verify ${bareFenceRef(record.id)} ${candidate}` : `verify ${ownerOptions.basisRef} ${ownerOptions.basisHead}`,
+          'option no-deref', bare ? `update ${ownerOptions.targetRef} ${candidate} ${ownerOptions.basisHead}` : `create ${ownerOptions.targetRef} ${candidate}`,
+          'prepare', 'commit', ''].join('\n') : undefined;
         const result = await command('git', args, cwd, { timeout: 15000, env: ownerOptions?.env, input }, { checks });
         assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || 'Final Git command did not complete cleanly');
       },
@@ -387,7 +401,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
   } catch (error) {
     if (!owns(engine)) return;
     const current = engine.store.require('integrations', record.id);
-    if (current.applyStartedAt) await reconcile(engine, current, { error });
+    if (current.applyStartedAt || current.bareFence) await reconcile(engine, current, { error });
     else settle(engine, current, error.cleanupUncertain ? { reason: error.message } : { error });
   } finally { engine.activeIntegration = null; }
 }

@@ -14,13 +14,14 @@ export function candidateMergeSelection(company, goal, allowDraining = false) {
     checkEvidence: digest(candidate.checks.map(check => [check.id, check.checkVersion, check.inputHash, check.environment, check.code, check.log?.hash ?? null])) };
 }
 
-export function candidateMergePolicy(company, project) {
+export function candidateMergePolicy(company, project, targetMode) {
   return digest({ project: project?.id, root: project?.repoRoot, mode: project?.mode, autoMerge: project?.autoMerge,
-    status: project?.status ?? null, allowedRoots: company.policy().allowedProjectRoots });
+    status: project?.status ?? null, allowedRoots: company.policy().allowedProjectRoots,
+    ...(targetMode === 'bare' ? { deliveryRepository: project?.deliveryRepository ?? null } : {}) });
 }
 
 export function candidateMergeMatches(company, goal, request, allowDraining = false) {
-  return !!request && request.policy === candidateMergePolicy(company, company.store.get('projects', goal.projectId)) &&
+  return !!request && request.policy === candidateMergePolicy(company, company.store.get('projects', goal.projectId), request.targetMode) &&
     digest(candidateMergeSelection(company, goal, allowDraining)) === digest(request.selection);
 }
 
@@ -29,6 +30,7 @@ export function verifyCandidateConfirmation(company, args) {
   const request = goal.candidateMerge;
   assert(request && request.id === args.previewId && request.targetRef === args.targetRef &&
     request.basisRef === args.basisRef && request.basisHead === args.basisHead &&
+    (request.targetMode ?? 'new') === (args.targetMode ?? 'new') && (request.targetMode !== 'bare' || request.targetRoot === args.targetRoot) &&
     request.selection.version === args.version && request.selection.deliveryHash === args.deliveryHash,
   'STALE_CANDIDATE_CONFIRMATION', '预览或确认的候选与分支不匹配，请重新预览。');
   if (request.status === 'previewed') assert(candidateMergeMatches(company, goal, request), 'STALE_CANDIDATE_CONFIRMATION',
@@ -67,6 +69,7 @@ function recordDecision(company, goal, request, actor, decision) {
   company.store.put('goals', { ...goal, candidateMerge: request });
   company.store.event('goal.candidate_merge.' + decision, goal.id, {
     previewId: request.id, version: request.selection.version, targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead,
+    ...(request.targetMode === 'bare' ? { targetMode: 'bare', targetRoot: request.targetRoot } : {}),
   }, actor, { goalId: goal.id });
   return request;
 }

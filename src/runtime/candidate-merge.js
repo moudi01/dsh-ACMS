@@ -6,11 +6,21 @@ import { candidateMergeActive, candidateMergeMatches, candidateMergePolicy, cand
 import { checkoutComposition } from './git-composition.js';
 import { removeTemporary } from './git-delivery.js';
 import { run } from './workspaces.js';
+import { assertBareDeliveryFence, assertBareMetadataPaths, assertBareRepositoryPolicy, bareFenceRef, bareHooksArgs, barePolicyArgs,
+  inspectBareDeliveryTarget } from './bare-delivery-target.js';
 
 const maximumDiff = 4 * 1024 * 1024;
 const gitList = ['worktree', 'list', '--porcelain', '-z'];
 const samePath = (a, b) => path.relative(a, b) === '';
 const verifiedRef = ref => ['show-ref', '--verify', '--hash', '--', ref];
+const bareTransactionHook = `#!/bin/sh
+cat >/dev/null
+test "$1" = prepared || exit 0
+git symbolic-ref --quiet "$ACMS_BARE_TARGET_REF" >/dev/null 2>&1
+test "$?" = 1 && exit 0
+echo "The confirmed target is no longer a direct branch." >&2
+exit 1
+`;
 const basisRef = value => {
   const ref = text(value, 'basisRef', 1024);
   assert(ref.startsWith('refs/heads/'), 'INVALID_INPUT', '请输入完整本地分支名，例如 refs/heads/main。');
@@ -48,24 +58,30 @@ function assertNewTarget(list, ref, status) {
     '预览分支已存在或已被工作副本占用，请重新预览以分配新的交付分支。');
 }
 
-async function inspectBasis(workspaces, project, goal, selection, ref, invoke) {
-  const root = await workspaces.validateProject(project, invoke);
-  const repository = await fs.realpath(await git(invoke, ['rev-parse', '--show-toplevel'], root));
-  assert(samePath(repository, root) && samePath(goal.compositionBase.source, root),
+async function inspectBasis(workspaces, project, goal, selection, ref, invoke, targetMode) {
+  const source = await workspaces.validateProject(project, invoke);
+  const repository = await fs.realpath(await git(invoke, ['rev-parse', '--show-toplevel'], source));
+  assert(samePath(repository, source) && samePath(goal.compositionBase.source, source),
     'PROJECT_PATH_DENIED', '目标必须是该候选批准的项目 Git 根目录。');
+  const target = targetMode === 'bare'
+    ? await inspectBareDeliveryTarget(workspaces, project.deliveryRepository?.targetRoot, invoke) : { targetRoot: source };
+  if (targetMode === 'bare') assert(target.targetIdentity === project.deliveryRepository?.targetIdentity,
+    'BARE_TARGET_CHANGED', '裸交付仓库目录已变化。请恢复原仓库，或在项目设置中重新授权。');
+  const root = target.targetRoot;
   await git(invoke, ['check-ref-format', ref], root);
+  if (targetMode === 'bare') assertBareMetadataPaths(root, ref);
   const head = await git(invoke, verifiedRef(ref), root);
   const symref = await git(invoke, ['for-each-ref', '--format=%(refname) %(symref)', '--', ref], root);
   assert(symref.split(/\r?\n/).find(line => line.split(' ')[0] === ref)?.trim() === ref,
     'TARGET_REF_UNSUPPORTED', '请选择存在的直接本地分支。');
   const tree = await git(invoke, ['rev-parse', '--verify', head + '^{tree}'], root);
-  const base = await git(invoke, ['rev-parse', '--verify', selection.baseCommit + '^{tree}'], root);
+  const base = await git(invoke, ['rev-parse', '--verify', selection.baseCommit + '^{tree}'], source);
   assert(tree === base || tree === selection.tree, 'TARGET_BASE_CHANGED',
     '所选基准分支的文件树已不同于候选基线。请基于该分支生成并联合核验新候选。');
-  return { targetRoot: root, basisRef: ref, basisHead: head, basisTree: tree };
+  return { ...target, basisRef: ref, basisHead: head, basisTree: tree, ...(targetMode === 'bare' ? { targetMode } : {}) };
 }
 
-export function assertCandidateBranchCreation(record, executable) {
+export function assertCandidateBranchWrite(record, executable) {
   const { targetRoot, targetRef, basisRef, basisHead, basisTree, targetCandidateTree, integratedCommit } = record;
   const invoke = (args, optional = false) => {
     const result = spawnSync(executable, ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args], {
@@ -77,7 +93,14 @@ export function assertCandidateBranchCreation(record, executable) {
   };
   const check = args => invoke(args).stdout.trim();
   assert(samePath(realpathSync(targetRoot), targetRoot), 'TARGET_CHANGED', '项目目录已经变化。');
-  assertNewTarget(worktrees(invoke(gitList).stdout), targetRef, invoke(['rev-parse', '--verify', '--quiet', targetRef], true).status);
+  if (record.targetMode === 'bare') {
+    assertBareDeliveryFence(record);
+    assertBareMetadataPaths(targetRoot, targetRef);
+    assertBareRepositoryPolicy(check(bareHooksArgs), invoke(barePolicyArgs, true).status);
+    assert(check(['rev-parse', '--is-bare-repository']) === 'true' && targetRef === basisRef,
+      'BARE_TARGET_CHANGED', '无法核对裸交付仓库与目标分支。');
+    assert(check(['rev-parse', '--verify', bareFenceRef(record.id)]) === integratedCommit, 'BARE_TARGET_CHANGED', '无法核对 Git 引用事务的仓库凭据。');
+  } else assertNewTarget(worktrees(invoke(gitList).stdout), targetRef, invoke(['rev-parse', '--verify', '--quiet', targetRef], true).status);
   assert(check(verifiedRef(basisRef)) === basisHead && check(['rev-parse', '--verify', basisHead + '^{tree}']) === basisTree &&
     check(['rev-parse', '--verify', integratedCommit + '^{tree}']) === targetCandidateTree &&
     check(['rev-list', '--parents', '-n', '1', integratedCommit]) === `${integratedCommit} ${basisHead}`,
@@ -92,7 +115,7 @@ async function verifyNewBranch(basis, ref, invoke) {
 
 function matchesTarget(current, expected) {
   return current.basisRef === expected.basisRef && current.basisHead === expected.basisHead && current.basisTree === expected.basisTree &&
-    path.relative(current.targetRoot, expected.targetRoot) === '';
+    current.targetIdentity === expected.targetIdentity && path.relative(current.targetRoot, expected.targetRoot) === '';
 }
 
 async function scratch(workspaces, prefix) {
@@ -125,6 +148,8 @@ async function changes(goal, target, checkout, invoke) {
 
 export async function previewCandidateMerge(company, workspaces, input, signal) {
   const ref = basisRef(input.basisRef);
+  const targetMode = input.targetMode ?? 'new';
+  assert(['new', 'bare'].includes(targetMode), 'INVALID_INPUT', '请选择支持的候选交付方式。');
   const goal = company.store.require('goals', input.goalId);
   const project = company.store.require('projects', goal.projectId);
   const selection = candidateMergeSelection(company, goal);
@@ -133,30 +158,30 @@ export async function previewCandidateMerge(company, workspaces, input, signal) 
     'STALE_CANDIDATE_CONFIRMATION', '已验收候选发生变化，请刷新目标。');
   assert(!candidateMergeActive(goal.candidateMerge), 'CONFLICT', '已有确认请求正在执行或待核对。');
   const invoke = gitInvoker(run, signal);
-  const policy = candidateMergePolicy(company, project);
-  const target = await inspectBasis(workspaces, project, goal, selection, ref, invoke);
+  const policy = candidateMergePolicy(company, project, targetMode);
+  const target = await inspectBasis(workspaces, project, goal, selection, ref, invoke, targetMode);
   const previewId = id('candidate_preview');
-  const targetRef = 'refs/heads/acms-deliveries/' + previewId.slice('candidate_preview_'.length);
+  const targetRef = targetMode === 'bare' ? ref : 'refs/heads/acms-deliveries/' + previewId.slice('candidate_preview_'.length);
   const taskId = goal.composition.inputs[0]?.taskId;
   assert(taskId, 'CANDIDATE_NOT_READY', '候选缺少已选任务。');
   const { parent, directory } = await scratch(workspaces, 'owner-preview-');
   try {
     const checkout = await loadTrees(goal, workspaces.dataDir, target, directory, invoke, signal);
     const summary = await changes(goal, target, checkout, invoke);
-    assert(matchesTarget(await inspectBasis(workspaces, project, goal, selection, ref, invoke), target),
+    assert(matchesTarget(await inspectBasis(workspaces, project, goal, selection, ref, invoke, targetMode), target),
       'TARGET_CHANGED', '基准分支在预览期间变化，请重新预览。');
-    await verifyNewBranch(target, targetRef, invoke);
+    if (targetMode === 'new') await verifyNewBranch(target, targetRef, invoke);
     signal?.throwIfAborted();
     return company.store.transaction(() => {
       const current = company.store.require('goals', goal.id);
-      assert(candidateMergeMatches(company, current, { selection, policy }) && !candidateMergeActive(current.candidateMerge),
+      assert(candidateMergeMatches(company, current, { selection, policy, targetMode }) && !candidateMergeActive(current.candidateMerge),
         'STALE_CANDIDATE_CONFIRMATION', '候选、项目授权或确认状态在预览期间变化，请重新预览。');
       const checks = goal.composition.checks.map(({ id, checkVersion, inputHash, environment, code, log }) =>
         ({ id, checkVersion, inputHash, environment, code, logHash: log?.hash ?? null }));
       const request = { id: previewId, status: 'previewed', previewedAt: now(), selection, policy, taskId, ...target, targetRef, summary, checks };
       company.store.put('goals', { ...current, candidateMerge: request });
       company.store.event('goal.candidate_merge.previewed', goal.id, { previewId: request.id, selection, targetRef,
-        basisRef: ref, basisHead: target.basisHead }, OWNER, { goalId: goal.id });
+        basisRef: ref, basisHead: target.basisHead, ...(targetMode === 'bare' ? { targetMode, targetRoot: target.targetRoot } : {}) }, OWNER, { goalId: goal.id });
       return request;
     });
   } finally { await removeTemporary(directory, parent); }
@@ -167,9 +192,9 @@ export async function checkCandidateMergeConfirmation(company, workspaces, args,
   if (request.status !== 'previewed') return;
   const project = company.store.require('projects', goal.projectId);
   const invoke = gitInvoker(run, signal);
-  const target = await inspectBasis(workspaces, project, goal, request.selection, request.basisRef, invoke);
+  const target = await inspectBasis(workspaces, project, goal, request.selection, request.basisRef, invoke, request.targetMode);
   assert(matchesTarget(target, request), 'TARGET_CHANGED', '基准 HEAD 已变化，请重新预览和确认。');
-  await verifyNewBranch(target, request.targetRef, invoke);
+  if (request.targetMode !== 'bare') await verifyNewBranch(target, request.targetRef, invoke);
 }
 
 export async function applyConfirmedCandidate(company, workspaces, goal, request, execution) {
@@ -177,9 +202,9 @@ export async function applyConfirmedCandidate(company, workspaces, goal, request
   const { selection } = request;
   const invoke = gitInvoker(execution.run, execution.signal, { GIT_AUTHOR_DATE: request.confirmedAt, GIT_COMMITTER_DATE: request.confirmedAt });
   const verifyTarget = async () => {
-    const target = await inspectBasis(workspaces, project, goal, selection, request.basisRef, invoke);
+    const target = await inspectBasis(workspaces, project, goal, selection, request.basisRef, invoke, request.targetMode);
     assert(matchesTarget(target, request), 'TARGET_CHANGED', '基准 HEAD 已变化，请重新预览和确认。');
-    await verifyNewBranch(target, request.targetRef, invoke);
+    if (request.targetMode !== 'bare') await verifyNewBranch(target, request.targetRef, invoke);
     return target;
   };
   const target = await verifyTarget();
@@ -187,6 +212,11 @@ export async function applyConfirmedCandidate(company, workspaces, goal, request
   let retain = false;
   try {
     const checkout = await loadTrees(goal, workspaces.dataDir, target, directory, invoke, execution.signal);
+    if (request.targetMode === 'bare' && target.basisTree === selection.tree) {
+      await verifyTarget();
+      execution.checkpoint({ ...target, targetRef: request.targetRef });
+      return { status: 'merged', proof: 'target-tree', targetRef: request.targetRef, integratedCommit: target.basisHead, actualHead: target.basisHead };
+    }
     const commit = await git(invoke, ['-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost', '-c', 'commit.gpgSign=false',
       'commit-tree', selection.tree, '-p', target.basisHead, '-m', `ACMS owner confirmation ${request.id}`], checkout);
     const ref = 'refs/heads/acms-confirmed';
@@ -197,10 +227,13 @@ export async function applyConfirmedCandidate(company, workspaces, goal, request
     await git(invoke, ['fetch', '--no-tags', '--no-auto-maintenance', '--no-write-fetch-head', '--', checkout, ref], target.targetRoot);
     const hooks = path.join(directory, 'hooks');
     await fs.mkdir(hooks);
+    if (request.targetMode === 'bare') await fs.writeFile(path.join(hooks, 'reference-transaction'), bareTransactionHook, { mode: 0o700 });
     execution.checkpoint({ ...target, targetRef: request.targetRef, integratedCommit: commit, commit: goal.composition.bundle.commit,
-      targetCandidateTree: selection.tree, phase: 'checking' });
+      targetCandidateTree: selection.tree, phase: 'checking', ...(request.targetMode === 'bare' ? { bareFence: true } : {}) });
+    if (request.targetMode === 'bare') execution.acquireBareFence();
     await execution.apply(goal.composition.checks, target.targetRoot, commit, { hooks, targetRef: request.targetRef, basisRef: target.basisRef, basisHead: target.basisHead,
-      message: `ACMS owner confirmation ${request.id}`, env: candidateGitEnvironment() });
+      message: `ACMS owner confirmation ${request.id}`, env: { ...candidateGitEnvironment(),
+        ...(request.targetMode === 'bare' ? { ACMS_BARE_TARGET_REF: request.targetRef } : {}) }, targetMode: request.targetMode });
   } catch (error) { retain = !!error.cleanupUncertain; throw error; }
   finally { if (!retain) await removeTemporary(directory, parent); }
 }

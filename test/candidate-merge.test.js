@@ -9,6 +9,7 @@ import { createRoutes } from '../src/host/http.js';
 import { createAgentApi } from '../src/host/agent-api.js';
 import { Engine } from '../src/runtime/engine.js';
 import { cleanupError } from '../src/runtime/owned-process.js';
+import { acquireBareDeliveryFence, bareFenceRef, releaseBareDeliveryFence } from '../src/runtime/bare-delivery-target.js';
 import { inside, run, WorkspaceManager } from '../src/runtime/workspaces.js';
 import { applyBackup, planBackup } from '../scripts/backup.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
@@ -36,6 +37,7 @@ function ownerRoutes(runtime) {
   }));
   return {
     preview: input => post('composition/merge-preview', input),
+    saveProject: args => post('command', { name: 'project.save', args, requestId: randomUUID() }),
     decision: (action, args, requestId = randomUUID()) => post('command', { name: `goal.candidate_merge.${action}`, args, requestId }),
   };
 }
@@ -106,10 +108,11 @@ async function setup(t, { review, autoMerge = false } = {}) {
   };
   const ready = () => until(() => { checkWork(); return snapshot().finalComposition; }, 75000, diagnostics);
   const routes = ownerRoutes(f);
-  const preview = (selectedBasis = basisRef) => routes.preview({ goalId: goal.id, version: current().composition?.version,
-    deliveryHash: f.company.deliveryHash(goal.id), basisRef: selectedBasis });
+  const preview = (selectedBasis = basisRef, targetMode) => routes.preview({ goalId: goal.id, version: current().composition?.version,
+    deliveryHash: f.company.deliveryHash(goal.id), basisRef: selectedBasis, targetMode });
   const confirmArgs = request => ({ id: goal.id, previewId: request.id, version: request.selection.version,
-    deliveryHash: request.selection.deliveryHash, basisHead: request.basisHead, basisRef: request.basisRef, targetRef: request.targetRef });
+    deliveryHash: request.selection.deliveryHash, basisHead: request.basisHead, basisRef: request.basisRef, targetRef: request.targetRef,
+    ...(request.targetMode === 'bare' ? { targetMode: 'bare', targetRoot: request.targetRoot } : {}) });
   const waitMerge = status => until(() => {
     const request = current().candidateMerge;
     if (request?.status === status) return request;
@@ -118,6 +121,237 @@ async function setup(t, { review, autoMerge = false } = {}) {
   return { f, goal, task, base, current, snapshot, diagnostics, checkWork, routes, preview, confirmArgs, ready, waitMerge,
     applyCalls: () => applyCalls, beforeApply: hook => { beforeApply = hook; }, afterGuard: hook => { afterGuard = hook; }, afterApply: hook => { afterApply = hook; } };
 }
+
+async function createBare(f, name = 'receiver.git') {
+  const target = path.join(f.root, name);
+  await git(f.root, 'init', '--bare', '-b', 'main', target);
+  await git(f.source, 'push', '--', target, 'HEAD:refs/heads/main', 'HEAD:refs/heads/delivery');
+  return fs.realpath(target);
+}
+
+async function setupBare(t, options) {
+  const s = await setup(t, options);
+  const target = await createBare(s.f);
+  const approved = await success(await s.routes.saveProject({ id: s.f.project.id, deliveryRepoRoot: target }));
+  assert.equal(approved.deliveryRepository.targetRoot, target);
+  assert(approved.deliveryRepository.targetIdentity);
+  return { ...s, target, approved, previewBare: () => s.preview(basisRef, 'bare') };
+}
+
+async function absentFences(target) {
+  assert(!(await fs.readdir(target)).some(name => /ACMS_FENCE|^(?:worktrees|index\.lock)$/.test(name)));
+}
+
+test('owner approves and advances only the selected branch in an isolated bare delivery repository', async t => {
+  const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+  const s = await setupBare(t, { review });
+  const { f, base, routes, target, previewBare, confirmArgs } = s;
+  const originalRefs = await git(target, 'show-ref');
+  try {
+    await f.start();
+    let reviewing = false;
+    review.entered.promise.then(() => { reviewing = true; });
+    await until(() => { s.checkWork(); return reviewing; }, 75000, s.diagnostics);
+    await failure(await previewBare(), 'CANDIDATE_NOT_READY');
+    assert.equal(await git(target, 'show-ref'), originalRefs);
+  } finally { review.release.resolve(); }
+  const accepted = await s.ready();
+  const sourceHook = path.join(f.source, '.git', 'hooks', 'reference-transaction');
+  const hookContents = '#!/bin/sh\nexit 1\n';
+  await fs.writeFile(sourceHook, hookContents, { mode: 0o700 });
+  const originalIndex = await fs.readFile(path.join(f.source, '.git', 'index'));
+  const originalFiles = await fs.readFile(path.join(f.source, 'README.md'));
+  const rejected = await success(await previewBare());
+  assert.equal(rejected.basisHead, base);
+  assert.equal(rejected.targetRoot, target);
+  assert.equal(rejected.targetRef, basisRef);
+  assert.equal(rejected.selection.reviewId, accepted.reviewId);
+  assert.equal(rejected.summary.total, 3);
+  await success(await routes.decision('reject', { id: s.goal.id, previewId: rejected.id }));
+  assert.equal(await git(target, 'show-ref'), originalRefs);
+  await absentFences(target);
+
+  const chosen = await success(await previewBare());
+  await failure(await routes.decision('confirm', { ...confirmArgs(chosen), targetRoot: f.source }), 'STALE_CANDIDATE_CONFIRMATION');
+  s.afterGuard(async () => {
+    const current = f.store.list('integrations').find(row => row.candidateMergeId === chosen.id);
+    assert.equal(current.bareFence, true);
+    const proof = bareFenceRef(current.id);
+    assert.equal(await git(target, 'rev-parse', proof), current.integratedCommit);
+    assert.doesNotMatch(await git(f.source, 'ls-remote', target), new RegExp(proof));
+    await git(target, 'pack-refs', '--all');
+    assert.equal(await git(target, 'rev-parse', proof), current.integratedCommit);
+    const linked = await run('git', ['worktree', 'add', '--no-checkout', path.join(f.root, 'linked'), 'delivery'], target);
+    assert.notEqual(linked.code, 0);
+    assert.match(linked.stderr, /worktrees/);
+    const alternate = path.join(f.root, 'manual-index');
+    await fs.mkdir(alternate);
+    const check = await run('git', ['--git-dir=' + target, '--work-tree=' + alternate, 'checkout', 'delivery'], alternate);
+    assert.notEqual(check.code, 0);
+    assert.match(check.stderr, /index\.lock/);
+    assert.deepEqual(await fs.readdir(alternate), []);
+  });
+  const args = confirmArgs(chosen);
+  await success(await routes.decision('confirm', args));
+  const applied = await s.waitMerge('applied');
+  const head = await git(target, 'rev-parse', basisRef);
+  assert.equal(head, applied.result.integratedCommit);
+  assert.equal(await git(target, 'rev-parse', basisRef + '^{tree}'), chosen.selection.tree);
+  assert.equal(await git(target, 'rev-list', '--parents', '-n', '1', head), `${head} ${base}`);
+  assert.equal(await git(target, 'rev-parse', 'refs/heads/main'), base);
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  assert.equal(await git(f.source, 'rev-parse', basisRef), base);
+  assert.deepEqual(await fs.readFile(path.join(f.source, '.git', 'index')), originalIndex);
+  assert.deepEqual(await fs.readFile(path.join(f.source, 'README.md')), originalFiles);
+  assert.equal(await fs.readFile(sourceHook, 'utf8'), hookContents);
+  await absentFences(target);
+  assert.equal((await success(await routes.decision('confirm', args))).result.integratedCommit, head);
+  const repeated = await success(await previewBare());
+  await success(await routes.decision('confirm', confirmArgs(repeated)));
+  assert.equal((await s.waitMerge('applied')).result.proof, 'target-tree');
+  assert.equal(await git(target, 'rev-parse', basisRef), head);
+  assert.equal(s.applyCalls(), 1);
+});
+
+test('owner cannot update a bare target after a concurrent ref write, stale approval or existing worktree', async t => {
+  const s = await setupBare(t);
+  const { f, base, routes, target, previewBare, confirmArgs } = s;
+  await f.start();
+  await s.ready();
+  const linked = path.join(f.root, 'before-confirm');
+  await git(target, 'worktree', 'add', '--no-checkout', linked, 'delivery');
+  await failure(await previewBare(), 'BARE_TARGET_BUSY');
+  assert(inside(await fs.realpath(f.root), await fs.realpath(linked)));
+  await git(target, 'worktree', 'remove', '--force', linked);
+  const chosen = await success(await previewBare());
+  const different = await git(target, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost',
+    'commit-tree', chosen.basisTree, '-p', base, '-m', 'Concurrent ref update');
+  s.afterGuard(() => git(target, 'update-ref', basisRef, different, base));
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  assert.match((await s.waitMerge('failed')).reason, /cannot lock ref|expected/);
+  assert.equal(await git(target, 'rev-parse', basisRef), different);
+  assert.equal(await git(target, 'rev-parse', 'refs/heads/main'), base);
+  await absentFences(target);
+
+  const next = await success(await previewBare());
+  await git(target, 'update-ref', basisRef, base, different);
+  await failure(await routes.decision('confirm', confirmArgs(next)), 'TARGET_CHANGED');
+  const replaced = await createBare(f, 'other-approved.git');
+  await success(await routes.saveProject({ id: f.project.id, deliveryRepoRoot: replaced }));
+  await failure(await routes.decision('confirm', confirmArgs(next)), 'STALE_CANDIDATE_CONFIRMATION');
+  assert.equal(await git(replaced, 'rev-parse', basisRef), base);
+});
+
+test('the native bare transaction rejects a same-tip replacement repository after its last process guard', async t => {
+  const s = await setupBare(t);
+  const { f, base, routes, target, previewBare, confirmArgs } = s;
+  const replacement = await createBare(f, 'similar.git');
+  const held = path.join(await fs.realpath(f.root), 'held-original.git');
+  assert(inside(await fs.realpath(f.root), target) && inside(await fs.realpath(f.root), replacement));
+  await f.start();
+  await s.ready();
+  const chosen = await success(await previewBare());
+  s.afterGuard(async () => {
+    const current = f.store.list('integrations').find(row => row.candidateMergeId === chosen.id);
+    await git(replacement, 'fetch', '--no-write-fetch-head', '--', target, current.integratedCommit);
+    assert.equal(await git(replacement, 'cat-file', '-t', current.integratedCommit), 'commit');
+    await fs.rename(target, held);
+    await fs.rename(replacement, target);
+  });
+  s.afterApply(async result => {
+    try {
+      assert.notEqual(result.code, 0);
+      assert.match(result.stderr, /ACMS_FENCE/);
+      assert.equal(await git(target, 'rev-parse', basisRef), base);
+    } finally {
+      await fs.rename(target, replacement);
+      await fs.rename(held, target);
+    }
+  });
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  await s.waitMerge('failed');
+  assert.equal(await git(target, 'rev-parse', basisRef), base);
+  assert.equal(await git(replacement, 'rev-parse', basisRef), base);
+  await absentFences(target);
+});
+
+test('the locked bare transaction refuses a target made symbolic at the same OID', async t => {
+  const s = await setupBare(t);
+  const { f, base, routes, target, previewBare, confirmArgs } = s;
+  await f.start();
+  await s.ready();
+  const chosen = await success(await previewBare());
+  s.afterGuard(() => git(target, 'symbolic-ref', basisRef, 'refs/heads/main'));
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  assert.match((await s.waitMerge('failed')).reason, /no longer a direct branch/);
+  assert.equal(await git(target, 'symbolic-ref', basisRef), 'refs/heads/main');
+  assert.equal(await git(target, 'rev-parse', basisRef), base);
+  assert.equal(await git(target, 'rev-parse', 'refs/heads/main'), base);
+  await absentFences(target);
+});
+
+test('a bare repository with an existing branch policy retains its hook and rejects owner preview', async t => {
+  const s = await setupBare(t);
+  const { f, base, routes, target, previewBare } = s;
+  const customHooks = path.join(f.root, 'protected-hooks');
+  await fs.mkdir(customHooks);
+  await git(target, 'config', 'core.hooksPath', customHooks);
+  const hook = path.join(customHooks, 'reference-transaction');
+  const hookBody = '#!/bin/sh\nexit 1\n';
+  await fs.writeFile(hook, hookBody, { mode: 0o700 });
+  await failure(await routes.saveProject({ id: f.project.id, deliveryRepoRoot: target }), 'BARE_TARGET_REQUIRED', 400);
+  await f.start();
+  await s.ready();
+  await failure(await previewBare(), 'BARE_TARGET_REQUIRED', 400);
+  assert.equal(await fs.readFile(hook, 'utf8'), hookBody);
+  assert.equal(await git(target, 'rev-parse', basisRef), base);
+  await absentFences(target);
+});
+
+test('bare Git fences survive uncertain cleanup and release only after restart reconciles the applied ref', async t => {
+  const s = await setupBare(t);
+  const { f, base, target, routes, previewBare, confirmArgs } = s;
+  await f.start();
+  await s.ready();
+  const chosen = await success(await previewBare());
+  let receiptPath;
+  s.afterApply((result, filename) => {
+    assert.equal(result.code, 0, result.stderr);
+    receiptPath = filename;
+    throw cleanupError('bare Git command cleanup receipt delayed');
+  });
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  await s.waitMerge('reconciling');
+  const advanced = await git(target, 'rev-parse', basisRef);
+  assert.notEqual(advanced, base);
+  assert.equal(await fs.readFile(path.join(target, 'index.lock'), 'utf8'), advanced + '\n');
+  await f.engine.stop();
+  await f.engine.start();
+  assert.equal(s.current().candidateMerge.status, 'reconciling');
+  assert.equal(await fs.readFile(path.join(target, 'worktrees'), 'utf8'), advanced + '\n');
+  await receipt(receiptPath, { exitCode: 0 });
+  assert.equal((await s.waitMerge('applied')).result.integratedCommit, advanced);
+  await absentFences(target);
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  assert.equal(s.applyCalls(), 1);
+});
+
+test('bare fence recovery before marker publication preserves foreign Git metadata', async t => {
+  const { f, target, base, approved } = await setupBare(t);
+  const record = { ...approved.deliveryRepository, integratedCommit: base, id: 'integration_' + randomUUID() };
+  const stage = path.join(target, `.${bareFenceRef(record.id)}.pending`);
+  await fs.writeFile(stage, '');
+  const otherIndexLock = path.join(target, 'index.lock');
+  await fs.writeFile(otherIndexLock, 'other Git process\n');
+  releaseBareDeliveryFence(record);
+  await assert.rejects(fs.stat(stage), { code: 'ENOENT' });
+  assert.throws(() => acquireBareDeliveryFence(record), { code: 'BARE_TARGET_BUSY' });
+  releaseBareDeliveryFence(record);
+  assert.deepEqual((await fs.readdir(target)).filter(name => /ACMS_FENCE|worktrees|index\.lock/.test(name)), ['index.lock']);
+  assert.equal(await fs.readFile(otherIndexLock, 'utf8'), 'other Git process\n');
+  assert.equal(await git(target, 'rev-parse', basisRef), base);
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+});
 
 test('owner waits for required review, previews a new branch from the chosen basis and confirms the exact Git tree once', async t => {
   const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
