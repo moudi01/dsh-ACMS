@@ -21,9 +21,10 @@ import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-con
 import { readCommandCleanup } from './host-command.js';
 import { withAttemptUsage } from './attempt-usage.js';
 import { markGoalCostCleanup } from '../core/goal-cost-budget.js';
-import { admitTaskCost, assertTaskCostCurrent, holdTaskCost, interruptUnlaunchedTaskCost, matchesTaskCostAuthorization,
+import { admitTaskCost, assertTaskCostCurrent, closeOptionalDeferralQuote, holdTaskCost, interruptUnlaunchedTaskCost, matchesTaskCostAuthorization,
   reconcileTaskCost, releaseTaskCostWaits, settleAvailableTaskCosts } from './goal-cost-budget.js';
 import { preparationForTask } from '../core/project-preparation.js';
+import { withdrawOptionalDeferral } from '../core/cost-optional.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 const holdsTimeBox = (goal, task, occupiedTaskIds) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
@@ -84,11 +85,13 @@ export class Engine {
       try {
         const check = pending.hostCheck;
         const cleanup = check ? await readCommandCleanup(checkReceipt(this, check.id)) : null;
-        if (check && cleanup) await this.clearHostCheck(pending.id, check.id, cleanup);
+        if (check && cleanup && await this.clearHostCheck(pending.id, check.id, cleanup, { recovering: true })) continue;
         const saved = this.store.require('attempts', pending.id);
         if (saved.hostCheck) {
           fact = { status: 'unknown', reason: `宿主检查 ${saved.hostCheck.checkId} 的进程树清理尚未确认`, actions: ['refresh-receipt', 'inspect-execution'] };
-        } else if (saved.preparingHost) {
+        } else if (saved.costDeferralRequestId && saved.cleanupUncertain) {
+          fact = { status: 'unknown', reason: '核价前置操作的清理尚未确认', actions: ['refresh-receipt', 'inspect-execution'] };
+        } else if (saved.costDeferralRequestId || saved.preparingHost) {
           fact = { status: 'stopped', cleanupConfirmed: true, reason: '宿主依赖准备已清理，模型尚未启动' };
         } else if (saved.deferredReplayAt) {
           fact = saved.hostCheckCleanup?.replayAt === saved.deferredReplayAt
@@ -122,6 +125,10 @@ export class Engine {
       const currentTask = this.store.require('tasks', previous.taskId);
       const ownsTask = currentTask.activeAttemptId === previous.id && currentTask.generation === previous.taskGeneration;
       const clean = ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed === true;
+      if (previous.costDeferralRequestId && clean) {
+        this.store.transaction(() => closeOptionalDeferralQuote(this, previous, null, '核价在宿主重启前未完成，本轮未延期。'));
+        continue;
+      }
       if (clean) this.store.transaction(() => { this.fenced(); markGoalCostCleanup(this.store, previous.id); });
       if (previous.resultDeferred && ownsTask && clean &&
           (!currentTask.stopRequested || currentTask.stopRequested === 'paused')) {
@@ -237,9 +244,9 @@ export class Engine {
       const spent = new Map(goals.map(g => [g.id, goalRuntimeSpent(g, this.store.list('attempts'))]));
       for (const [attemptId, entry] of this.live) {
         const task = this.store.require('tasks', entry.taskId);
-        if ((spent.get(task.goalId) ?? 0) >= goalRuntimeLimit(this.store.require('goals', task.goalId), this.company.policy()) && !entry.controller.signal.aborted) entry.controller.abort(Object.assign(new Error('Goal runtime budget exhausted'), { code: 'GOAL_RUNTIME_BUDGET' }));
+        if (!entry.quoteOnly && (spent.get(task.goalId) ?? 0) >= goalRuntimeLimit(this.store.require('goals', task.goalId), this.company.policy()) && !entry.controller.signal.aborted) entry.controller.abort(Object.assign(new Error('Goal runtime budget exhausted'), { code: 'GOAL_RUNTIME_BUDGET' }));
         if (task.stopRequested && !entry.controller.signal.aborted) entry.controller.abort(new Error(task.stopRequested));
-        if (this.adapter.progress) {
+        if (this.adapter.progress && !entry.quoteOnly) {
           const attempt = this.store.require('attempts', attemptId); const progress = await this.adapter.progress(attempt);
           if (progress && digest(progress) !== digest(attempt.progress ?? null)) this.store.transaction(() => {
             this.store.put('attempts', { ...this.store.require('attempts', attemptId), progress }); this.store.event('attempt.progress', attemptId, { taskId: task.id }, SYSTEM);
@@ -248,6 +255,7 @@ export class Engine {
       }
       if (this.company.policy().paused) return;
       this.store.transaction(() => {
+        this.fenced();
         releaseGoalPauses(this.company);
         releaseTaskCostWaits(this);
         for (const goal of this.store.list('goals').filter(g => g.contractChange?.status === 'pending' && !g.contractChange.coordinationTaskId)) {
@@ -343,10 +351,11 @@ export class Engine {
           });
           continue;
         }
-        if ((spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
+        const quoteOnly = goal.costBudgetDeferralRequest?.status === 'queued' && goal.costBudgetDeferralRequest.taskId === task.id;
+        if (!quoteOnly && (spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
         // While the time-box decision is open, only control work (coordination,
         // review) may proceed; ordinary work waits for the manager's wrap-up.
-        if (pendingGoalTimeBox(goal) && goalTimeBoxLimit(goal, p) && ['work', 'repair', 'plan'].includes(task.kind)) continue;
+        if (!quoteOnly && pendingGoalTimeBox(goal) && goalTimeBoxLimit(goal, p) && ['work', 'repair', 'plan'].includes(task.kind)) continue;
         if (task.integrationPending) {
           this.store.transaction(() => {
             this.store.put('tasks', { ...task, status: 'integrating' });
@@ -373,11 +382,15 @@ export class Engine {
           this.block(claimed, 'assignment', '当前负责人无法协调此目标', '请重新分配具备协调授权的目标负责人。');
           continue;
         }
-        if (agent.status !== 'available') { this.block(claimed, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。'); continue; }
+        if (agent.status !== 'available') {
+          if (quoteOnly) this.store.transaction(() => { this.fenced(); withdrawOptionalDeferral(this.store, goal.id, task.id); });
+          else this.block(claimed, 'assignment', '执行人员已释放或删除，需要重新分配', '请编辑任务，为其选择可分配的执行人员。');
+          continue;
+        }
         const attempt = this.claim(claimed, agent);
         if (!attempt) continue;
         free--; busyAgents.add(agent.id); if (['work', 'repair'].includes(claimed.kind)) ordinary++;
-        const controller = new AbortController(); const entry = { taskId: task.id, controller, promise: null };
+        const controller = new AbortController(); const entry = { taskId: task.id, controller, promise: null, quoteOnly: !!attempt.costDeferralRequestId };
         this.live.set(attempt.id, entry);
         entry.promise = this.execute(attempt, controller).catch(e => { this.lastError = String(e.message); }).finally(() => { this.live.delete(attempt.id); this.kick(); });
       }
@@ -455,7 +468,7 @@ export class Engine {
   ensureCapacityOwnerEntry(goal, context) {
     const interactions = this.store.list('interactions');
     if (interactions.some(item => item.goalId === goal.id && item.kind === 'capacity' && item.status === 'pending')) return true;
-    const attachable = this.store.list('tasks').filter(task => task.goalId === goal.id && !['succeeded', 'cancelled', 'archived', 'deleted', 'running', 'preparing', 'integrating', 'reconciling', 'stopping'].includes(task.status));
+    const attachable = this.store.list('tasks').filter(task => task.goalId === goal.id && !['succeeded', 'cancelled', 'archived', 'deleted', 'deferred', 'running', 'preparing', 'integrating', 'reconciling', 'stopping'].includes(task.status));
     const target = attachable.find(task => task.status === 'ready') ?? attachable[0];
     if (!target) return false;
     const timeBox = goal.timeBox ?? {};
@@ -523,10 +536,14 @@ export class Engine {
         return this.store.put('attempts', { ...previous, status: 'running', deferredReplayAt: now(), hostCheckCleanup: null });
       }
       const attemptId = id('attempt'); const contextKey = `acms:${task.goalId}:${task.id}:role-${agent.role}:${agent.id}:g${task.generation}`;
+      const optionalRequest = goal.costBudgetDeferralRequest;
+      const quoteOnly = optionalRequest?.status === 'queued' && optionalRequest.taskId === task.id;
       const notificationIds = this.store.list('notifications').filter(n => n.agentId === agent.id && n.status === 'pending').slice(0, 100).map(n => n.id);
       const conversationMessageIds = this.conversations?.messagesFor(task, agent.id).map(m => m.id) ?? [];
-      const attempt = this.store.put('attempts', { id: attemptId, taskId: task.id, goalId: task.goalId, agentId: agent.id, kind: task.kind, provider: agent.provider, model: agent.model, role: agent.role, status: 'preparing', contextKey, startedAt: now(), epoch: this.epoch, taskGeneration: task.generation, goalContractVersion: contractVersion(goal), blockerFeedbackHash: task.blockerEvidence ? task.feedbackHash : null, grants: agent.grants, notificationIds, conversationMessageIds });
-      this.store.put('tasks', { ...current, status: 'running', attempts: current.attempts + 1, activeAttemptId: attemptId });
+      const attempt = this.store.put('attempts', { id: attemptId, taskId: task.id, goalId: task.goalId, agentId: agent.id, kind: task.kind, provider: agent.provider, model: agent.model, role: agent.role, status: 'preparing', contextKey, startedAt: now(), epoch: this.epoch, taskGeneration: task.generation, goalContractVersion: contractVersion(goal), blockerFeedbackHash: task.blockerEvidence ? task.feedbackHash : null, grants: agent.grants, notificationIds, conversationMessageIds,
+        ...(quoteOnly ? { costDeferralRequestId: optionalRequest.id, preflightOnly: true } : {}) });
+      if (quoteOnly) this.store.put('goals', { ...goal, costBudgetDeferralRequest: { ...optionalRequest, status: 'checking' } });
+      this.store.put('tasks', { ...current, status: 'running', attempts: current.attempts + (quoteOnly ? 0 : 1), activeAttemptId: attemptId });
       this.store.event('attempt.claimed', attemptId, { taskId: task.id, kind: task.kind, contextKey }, SYSTEM); return attempt;
     });
   }
@@ -571,7 +588,7 @@ export class Engine {
         assertGoalOpen(this.store.require('goals', task.goalId));
         guardPreparation();
         this.store.transaction(() => {
-          task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
+          if (!attempt.costDeferralRequestId) task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
           attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preparingHost: true });
         });
         try {
@@ -619,7 +636,12 @@ export class Engine {
       };
       const admission = this.store.transaction(() => {
         task = assertCurrent();
-        const cost = admitTaskCost(this, { task, attempt, agent, routeSelection: preflight.selection, prompt });
+        const input = { task, attempt, agent, routeSelection: preflight.selection, prompt };
+        if (attempt.costDeferralRequestId) {
+          closeOptionalDeferralQuote(this, attempt, input);
+          return { quoteOnly: true };
+        }
+        const cost = admitTaskCost(this, input);
         if (cost.denied) {
           holdTaskCost(this, attempt, task, cost.denied);
           return cost;
@@ -632,7 +654,7 @@ export class Engine {
         this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
         return cost;
       });
-      if (admission.denied) return;
+      if (admission.denied || admission.quoteOnly) return;
       authorization = admission.authorization;
       const onAccepted = () => this.conversations?.accepted(attempt);
       const input = { task, attempt, agent, routeSelection: preflight.selection, prompt, signal: controller.signal, assertCurrent, onAccepted };
@@ -666,6 +688,11 @@ export class Engine {
       const raw = await activation.result; deliveredResult = true; controller.signal.throwIfAborted();
       const output = parseResult(raw); this.conversations?.finished(attempt, output); await this.accept(attempt, output, controller.signal);
     } catch (error) {
+      if (attempt.costDeferralRequestId && !error.cleanupUncertain && !this.store.get('attempts', attempt.id)?.hostCheck) {
+        if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() =>
+          closeOptionalDeferralQuote(this, attempt, null, '核价准备未完成，本轮未延期。'));
+        return;
+      }
       if (authorization && !costLaunchInvoked) {
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => interruptUnlaunchedTaskCost(this, attempt, authorization, error));
         return;
@@ -782,17 +809,24 @@ export class Engine {
       if (!parked) return this.accept(attempt, output, signal);
     }
   }
-  async clearHostCheck(attemptId, commandId, proof) {
-    this.store.transaction(() => {
+  async clearHostCheck(attemptId, commandId, proof, { recovering = false } = {}) {
+    const cleared = this.store.transaction(() => {
       this.fenced();
       const current = this.store.require('attempts', attemptId);
-      if (current.hostCheck?.id !== commandId) return;
-      const hostCheckCleanup = proof && current.deferredReplayAt
-        ? { id: commandId, checkId: current.hostCheck.checkId, replayAt: current.deferredReplayAt, exitCode: proof.exitCode }
-        : null;
+      if (current.hostCheck?.id !== commandId) return null;
+      const closeQuote = !!(proof && recovering && current.costDeferralRequestId);
+      const evidence = proof && (closeQuote || current.deferredReplayAt)
+        ? { id: commandId, checkId: current.hostCheck.checkId, exitCode: proof.exitCode } : null;
+      const hostCheckCleanup = closeQuote ? { ...evidence, quoteRequestId: current.costDeferralRequestId } :
+        evidence ? { ...evidence, replayAt: current.deferredReplayAt } : null;
       this.store.put('attempts', { ...current, hostCheck: null, hostCheckCleanup });
+      // Consume a recovered quote receipt and release its slot together. A
+      // restart can still read the file until this transaction has committed.
+      if (closeQuote) closeOptionalDeferralQuote(this, current, null, '核价在宿主重启前未完成，本轮未延期。');
+      return { closeQuote };
     });
-    await unlink(checkReceipt(this, commandId)).catch(() => {});
+    if (cleared) await unlink(checkReceipt(this, commandId)).catch(() => {});
+    return cleared?.closeQuote === true;
   }
   async runHostCheck(attempt, command, args, cwd, { checkId, signal, guard, ...options }) {
     const commandId = id('command');
@@ -960,6 +994,11 @@ export class Engine {
   acceptEnvironment(attempt, task, { failures, report }, executed) {
     this.store.transaction(() => {
       task = this.currentAttemptTask(attempt, true);
+      if (attempt.costDeferralRequestId) {
+        this.store.put('attempts', { ...this.store.require('attempts', attempt.id), environment: report });
+        closeOptionalDeferralQuote(this, attempt, null, '当前环境未通过核价前置检查，本轮未延期。');
+        return;
+      }
       if (task.status === 'reconciling') task = this.store.put('tasks', { ...task, status: 'running' });
       if (!executed && !attempt.preparingHost) task = this.store.put('tasks', { ...task, attempts: Math.max(0, task.attempts - 1) });
       this.store.put('attempts', { ...this.store.require('attempts', attempt.id), environment: report, preflightOnly: !executed });
@@ -1049,7 +1088,7 @@ export class Engine {
       const keepDeferred = !!attempt.deferredReplayAt && (stopped === 'paused' || this.closing);
       // Replay owns no new model process. Keep its payload and command identity
       // until the host check can be reconciled with its own receipt.
-      if (!(attempt.deferredReplayAt && error.cleanupUncertain)) {
+      if (!((attempt.deferredReplayAt || attempt.costDeferralRequestId) && error.cleanupUncertain)) {
         this.finishAttempt(attempt, keepDeferred ? 'completed' : aborted || staleRoute ? 'interrupted' : 'failed', failure ? failure.reason : error.message, keepDeferred);
       }
       if (task.activeAttemptId !== attempt.id || (!stopped && (task.generation !== attempt.taskGeneration || ignoresBlocker(task)))) return;

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +19,7 @@ import { Engine } from '../src/runtime/engine.js';
 import { Conversations } from '../src/runtime/conversations.js';
 import { WorkspaceManager } from '../src/runtime/workspaces.js';
 import { fixture, taskWaitDiagnostics, until } from './helpers.js';
+import { simulateFixtureCleanup } from './fixture-trace.js';
 
 function goal(f, costLimitUsd, options = {}) {
   return f.command('goal.create', { projectId: f.project.id, templateId: f.template.id, title: 'Fixed-cost test goal',
@@ -388,7 +391,7 @@ test('a stale live host cannot mark paid cleanup after ownership changes at the 
 });
 
 
-function budgetedProposal({ requiredDependsOnOptional = false } = {}) {
+function budgetedProposal({ requiredDependsOnOptional = false, allRequired = false } = {}) {
   const node = (key, importance, dependencies = []) => ({ key, title: key, description: 'Prove work for ' + key,
     acceptance: 'A file exists', dependencies, importance, modelBasis: 'Fixed adapter supports the required tools.',
     amountMicros: '0' }); // Untrusted numbers must never become an estimate.
@@ -396,7 +399,7 @@ function budgetedProposal({ requiredDependsOnOptional = false } = {}) {
     minimumOutcome: 'Core file with independent verification', nonGoals: ['Optional enhancements can wait'],
     costPlan: { acceptanceBasis: 'Run configured evidence checks.', reworkBasis: 'Allow one bounded correction.' },
     tasks: [node('core', 'required', requiredDependsOnOptional ? ['bonus'] : []), node('validate', 'required', ['core']),
-      node('bonus', 'optional')] };
+      node('bonus', allRequired ? 'required' : 'optional')] };
 }
 
 function planEstimates(priced, { amounts = { core: '8', validate: '6', bonus: '25' }, acceptance = '5', rework = '4' } = {}) {
@@ -442,7 +445,7 @@ async function approveForecastPlan(f, target) {
 }
 
 test('completion forecast combines concurrent caps, zero estimates and trusted receipts without double counting', async t => {
-  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal({ allRequired: true }) : defaultSimulation(input));
   f.command('project.save', { id: f.project.id, planApproval: true });
   const target = goal(f, '0.000040', { plan: true });
   const parallel = Promise.withResolvers(), finalWork = Promise.withResolvers();
@@ -456,7 +459,7 @@ test('completion forecast combines concurrent caps, zero estimates and trusted r
   f.engine.adapter = priced.adapter;
   const plan = await approveForecastPlan(f, target);
   const initial = await scopedForecast(f, target.id);
-  assert.deepEqual(initial.coverage, { selected: 3, unstarted: 3, reserved: 0, delivered: 0, unknown: 0, outsidePlan: 0 });
+  assert.deepEqual(initial.coverage, { selected: 3, unstarted: 3, reserved: 0, delivered: 0, deferred: 0, unknown: 0, outsidePlan: 0 });
   assert.equal(initial.plan.fingerprint, plan.fingerprint);
   assert.equal(initial.ledger.settledMicros, '2');
   assert.equal(initial.unstartedMicros, '5');
@@ -471,7 +474,7 @@ test('completion forecast combines concurrent caps, zero estimates and trusted r
   f.command('company.resume');
   await until(() => priced.calls.length === 3, undefined, () => ({ calls: priced.calls, ledger: budget(f.store, target.id) }));
   const concurrent = await scopedForecast(f, target.id);
-  assert.deepEqual(concurrent.coverage, { selected: 3, unstarted: 1, reserved: 2, delivered: 0, unknown: 0, outsidePlan: 0 });
+  assert.deepEqual(concurrent.coverage, { selected: 3, unstarted: 1, reserved: 2, delivered: 0, deferred: 0, unknown: 0, outsidePlan: 0 });
   assert.equal(concurrent.ledger.reservedMicros, '36');
   assert.equal(concurrent.unstartedMicros, '0');
   assert.equal(concurrent.completionMicros, '41');
@@ -537,7 +540,7 @@ test('completion forecast keeps prior retry charges and purged task charges with
   assert.equal(progress.ledger.settledMicros, '6');
   assert.equal(progress.ledger.reservedMicros, '7');
   assert.equal(progress.unstartedMicros, '6');
-  assert.deepEqual(progress.coverage, { selected: 2, unstarted: 1, reserved: 0, delivered: 0, unknown: 1, outsidePlan: 0 });
+  assert.deepEqual(progress.coverage, { selected: 2, unstarted: 1, reserved: 0, delivered: 0, deferred: 0, unknown: 1, outsidePlan: 0 });
   assert.equal(progress.rework.remainingMicros, null);
   assert.equal(progress.completionMicros, null);
   assert.ok(progress.reasons.includes('retry-or-progress-unknown'));
@@ -597,7 +600,7 @@ test('completion forecast discloses stale quotations, unpriced new work and chan
   const changed = await scopedForecast(f, target.id);
   assert.equal(changed.completionMicros, null);
   assert.equal(changed.unstartedMicros, '8');
-  assert.deepEqual(changed.coverage, { selected: 2, unstarted: 1, reserved: 0, delivered: 0, unknown: 1, outsidePlan: 1 });
+  assert.deepEqual(changed.coverage, { selected: 2, unstarted: 1, reserved: 0, delivered: 0, deferred: 0, unknown: 1, outsidePlan: 1 });
   assert.ok(changed.reasons.includes('unpriced-work'));
   assert.ok(changed.reasons.includes('work-changed'));
   assert.deepEqual(priced.calls, [plan.taskId]);
@@ -608,6 +611,453 @@ test('completion forecast discloses stale quotations, unpriced new work and chan
   assert.equal(edited.coverage.unknown, 2);
   assert.equal(edited.coverage.unstarted, 0);
   assert.equal(edited.unstartedMicros, '0');
+});
+
+function optionalFixtureProposal(chain = false) {
+  const proposal = budgetedProposal();
+  const bonus = proposal.tasks.find(node => node.key === 'bonus');
+  bonus.priority = 100;
+  if (chain) proposal.tasks.push({ ...bonus, key: 'bonus-next', title: 'bonus-next', dependencies: ['bonus'] });
+  return proposal;
+}
+
+function optionalDecision(target, plan, seed, taskIds = [seed.id]) {
+  return { id: target.id, taskId: seed.id, taskIds, holdAttemptId: seed.costBudgetHold?.attemptId,
+    planFingerprint: plan.fingerprint, reason: 'Keep the funded minimum and its checks' };
+}
+
+const optionalHold = task => task.costBudgetHold?.code === 'COST_OPTIONAL_DEFERRED';
+const planTask = (store, plan, key) => store.require('tasks', plan.nodes.find(node => node.key === key).taskId);
+
+function waitOptionalDecision(store, goalId) {
+  const current = () => store.require('goals', goalId).costBudgetDeferralRequest;
+  return until(() => ['applied', 'not-applied'].includes(current()?.status) ? current() : null, undefined, current);
+}
+
+test('optional dispatch waits for late settlement and resumes from its durable hold after restart', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '20' : task.title === 'core' ? '18' : '7',
+    amountFor: task => task.title === 'core' ? null : '3' });
+  const estimates = { amounts: { core: '8', validate: '6', bonus: '1' } };
+  planEstimates(priced, estimates);
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus');
+  const validate = planTask(f.store, plan, 'validate');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await waiting(f, validate, task => task.status === 'succeeded');
+  await until(() => budget(f.store, target.id).awaitingReceiptAttempts === 1, undefined, () => budget(f.store, target.id));
+  const before = f.store.require('tasks', bonus.id);
+  assert.equal(before.costBudgetHold.bound.upperMicros, '20');
+  assert.equal(before.attempts, 0);
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal(budget(f.store, target.id).reservedMicros, '18');
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', optionalDecision(target, plan, before), 'do-not-defer-late', 409)).code, 'COST_OPTIONAL_PENDING');
+  await f.engine.stop();
+
+  const store = new Store(f.store.filename), company = new Company(store);
+  const recovered = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '20' : '7' });
+  planEstimates(recovered, estimates);
+  const engine = new Engine(company, recovered.adapter, new WorkspaceManager(f.dataDir, company), { intervalMs: 20 });
+  const runtime = { ...f, store, company, engine, adapter: recovered.adapter, workspaces: engine.workspaces };
+  try {
+    await engine.start();
+    await engine.tick();
+    assert(optionalHold(store.require('tasks', bonus.id)));
+    assert.equal(store.require('tasks', bonus.id).workspace.path, before.workspace.path);
+    assert.deepEqual(recovered.calls, []);
+    company.command(OWNER, 'settle-before-releasing-optional', 'company.pause', { afterCurrent: true });
+    const theHeld = rows(store).find(row => row.status === 'awaiting-receipt');
+    recovered.save('cost-', theHeld.id, receipt(theHeld, '3'));
+    engine.nextCostReceiptCheck = 0;
+    engine.nextOptionalCostCheck = 0;
+    engine.kick();
+    await until(() => budget(store, target.id).awaitingReceiptAttempts === 0, undefined, () => budget(store, target.id));
+    assert.equal((await scopedCommand(runtime, 'goal.cost_budget.defer_optional', optionalDecision(target, plan, before),
+      'refuse-after-late-budget-release', 409)).code, 'COST_OPTIONAL_STALE');
+    company.command(OWNER, 'allow-released-optional', 'company.resume');
+    engine.kick();
+    await until(() => store.require('goals', target.id).status === 'succeeded' && budget(store, target.id).settledAttempts === 4,
+      undefined, () => ({ ledger: budget(store, target.id), bonus: state(store, bonus), error: engine.lastError }));
+    assert.deepEqual(recovered.calls, [bonus.id]);
+    assert.equal(budget(store, target.id).limitMicros, '40');
+    assert.equal(budget(store, target.id).settledMicros, '12');
+    assert.equal(store.require('tasks', bonus.id).costBudgetHold, null);
+    assert.equal(store.activityPage({ goalId: target.id }).entries.filter(event => event.type === 'goal.cost_budget.optional_deferred').length, 0);
+  } finally { await engine.stop(); store.close(); }
+});
+
+test('a required task with no currently certified cap keeps optional work waiting instead of spending its estimate', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  let certified = false;
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'core' && !certified ? undefined : '7' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), core = planTask(f.store, plan, 'core');
+  await scopedCommand(f, 'task.pause', { id: bonus.id }, 'wait-for-required-pricing');
+  f.command('company.resume');
+  await waiting(f, core, task => task.costBudgetHold?.code === 'COST_BOUND_UNKNOWN');
+  await scopedCommand(f, 'task.resume', { id: bonus.id }, 'ask-to-recheck-optional');
+  await waiting(f, bonus, task => optionalHold(task) && task.costBudgetHold.reasonCode === 'coverage-unknown');
+  assert.deepEqual(priced.calls, [plan.taskId]);
+  assert.equal(state(f.store, bonus).costBudgetHold.balance.requiredMicros, null);
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', optionalDecision(target, plan, state(f.store, bonus)),
+    'refuse-unknown-required-cost', 409)).code, 'COST_OPTIONAL_STALE');
+  certified = true;
+  await scopedCommand(f, 'task.resume', { id: core.id }, 'verify-required-price');
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' && budget(f.store, target.id).reservedAttempts === 0,
+    undefined, () => ({ ledger: budget(f.store, target.id), goal: f.store.require('goals', target.id), error: f.engine.lastError }));
+  assert(priced.calls.indexOf(core.id) < priced.calls.indexOf(bonus.id));
+  assert.equal(budget(f.store, target.id).limitMicros, '40');
+});
+
+test('owner can defer the unstarted optional chain and deliver the approved required candidate and review', async t => {
+  let reviewed;
+  const f = await fixture(t, async input => {
+    const { task } = input;
+    if (task.kind === 'plan') return optionalFixtureProposal(true);
+    if (task.kind === 'review') {
+      reviewed = task.reviewTargets.map(target => target.id).sort();
+      assert.equal(await readFile(path.join(task.workspace.path, 'core.txt'), 'utf8'), 'core');
+      assert.equal(await readFile(path.join(task.workspace.path, 'validate.txt'), 'utf8'), 'validate');
+      await assert.rejects(readFile(path.join(task.workspace.path, 'bonus.txt')), { code: 'ENOENT' });
+      return defaultSimulation(input);
+    }
+    await writeFile(path.join(task.workspace.path, task.title + '.txt'), task.title);
+    return { outcome: 'completed', summary: 'A fixture output', artifacts: [{ path: task.title + '.txt' }] };
+  });
+  const check = "const fs=require('node:fs'); if(fs.existsSync('validate.txt')&&!fs.existsSync('core.txt'))process.exit(8)";
+  f.command('project.save', { id: f.project.id, planApproval: true, checks: [{ id: 'joint', command: process.execPath, args: ['-e', check] }] });
+  simulateFixtureCleanup(f.workspaces);
+  const target = goal(f, '0.000035', { plan: true, templateId: 'base', deliveryMode: 'copy-composite' });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '20' : '7',
+    amountFor: task => task.kind === 'work' ? '4' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1', 'bonus-next': '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), next = planTask(f.store, plan, 'bonus-next');
+  const work = ['core', 'validate'].map(key => planTask(f.store, plan, key));
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await until(() => work.every(task => state(f.store, task).status === 'succeeded') && budget(f.store, target.id).reservedAttempts === 0,
+    45000, () => ({ ledger: budget(f.store, target.id), work: work.map(task => taskWaitDiagnostics(f, task.id)()), error: f.engine.lastError }));
+  assert.equal(priced.calls.length, 3);
+  assert.equal(f.company.latestGoalReview(target.id), null);
+  const before = f.company.deliveryHash(target.id);
+  const held = state(f.store, bonus);
+  const partial = await scopedCommand(f, 'goal.cost_budget.defer_optional', optionalDecision(target, plan, held), 'refuse-truncated-chain', 409);
+  assert.equal(partial.code, 'COST_OPTIONAL_STALE');
+  const args = optionalDecision(target, plan, held, [bonus.id, next.id]);
+  assert.throws(() => f.command('goal.cost_budget.defer_optional', args, SYSTEM), { code: 'OWNER_REQUIRED' });
+  await scopedCommand(f, 'task.pause', { id: next.id }, 'independent-optional-pause');
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'preserve-paused-optional', 409)).code, 'COST_OPTIONAL_SCOPE');
+  assert.equal(state(f.store, next).status, 'paused');
+  await scopedCommand(f, 'task.resume', { id: next.id }, 'restore-optional-before-decision');
+  const queued = await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'defer-chain');
+  assert.equal(queued.costBudgetDeferralRequest.status, 'queued');
+  assert.equal((await waitOptionalDecision(f.store, target.id)).status, 'applied');
+  assert.equal(state(f.store, bonus).status, 'deferred');
+  assert.equal(state(f.store, bonus).workspace.path, held.workspace.path);
+  assert.equal(state(f.store, next).status, 'deferred');
+  assert.notEqual(f.company.deliveryHash(target.id), before);
+  assert.equal((await scopedCommand(f, 'task.resume', { id: bonus.id }, 'no-reopening', 409)).code, 'COST_OPTIONAL_SCOPE');
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'defer-chain');
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' && budget(f.store, target.id).settledAttempts === 4,
+    45000, () => ({ goal: f.store.require('goals', target.id), reviews: f.store.list('tasks').filter(task => task.kind === 'review'), error: f.engine.lastError }));
+  const completed = f.store.require('goals', target.id);
+  assert.deepEqual(reviewed, work.map(task => task.id).sort());
+  assert.deepEqual(completed.composition.inputs.map(row => row.taskId).sort(), reviewed);
+  assert.equal(f.company.latestGoalReview(target.id).deliveryHash, completed.completedDeliveryHash);
+  assert.equal(completed.acceptance, target.acceptance);
+  assert.equal(completed.contractVersion, target.contractVersion);
+  assert.equal(budget(f.store, target.id).limitMicros, '35');
+  const forecast = await scopedForecast(f, target.id);
+  assert.equal(forecast.coverage.deferred, 2);
+  assert.equal(forecast.completionMicros, '14');
+  const decisions = f.store.activityPage({ goalId: target.id }).entries.filter(event => event.type === 'goal.cost_budget.optional_deferred');
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].data.costBasis.bound.upperMicros, '20');
+  assert.deepEqual(priced.calls.slice(0, 3), [plan.taskId, ...work.map(task => task.id)]);
+  const checked = [...f.store.attemptUsageRows('task', bonus.id)].filter(({ attempt }) => attempt.costDeferralRequestId);
+  assert.equal(checked.length, 1);
+  assert.equal(checked[0].attempt.preflightOnly, true);
+  assert.equal(f.store.get('goalCostAttempts', checked[0].attempt.id), null);
+
+  for (const step of ['delete', 'restore', 'delete', 'purge']) {
+    await scopedCommand(f, 'task.' + step, { id: next.id, ...(step === 'purge' ? { confirmTitle: next.title } : {}) }, randomUUID());
+    const refreshed = await scopedForecast(f, target.id);
+    assert.equal(refreshed.completionMicros, '14');
+    assert.equal(refreshed.coverage.deferred, 2);
+    assert.equal(f.company.deliveryHash(target.id), completed.completedDeliveryHash);
+  }
+  assert.equal(f.store.get('tasks', next.id), null);
+  assert.equal(f.store.activityPage({ goalId: target.id }).entries.filter(event => event.type === 'goal.cost_budget.optional_deferred').length, 1);
+});
+
+test('editing an approved optional task preserves budget protection but invalidates its strict deferral eligibility', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '29' : '7',
+    amountFor: task => task.title === 'bonus' ? '29' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), core = planTask(f.store, plan, 'core');
+  const validate = planTask(f.store, plan, 'validate');
+  await scopedCommand(f, 'task.pause', { id: core.id }, 'hold-core-during-edit');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await scopedCommand(f, 'task.edit', { id: bonus.id, patch: { description: 'Clarify the same optional output' } }, 'clarify-optional-scope');
+  await waiting(f, bonus, current => current.generation === 2 && optionalHold(current));
+  assert.equal(budget(f.store, target.id).settledMicros, '3');
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional',
+    optionalDecision(target, plan, state(f.store, bonus)), 'invalid-edited-scope', 409)).code, 'COST_OPTIONAL_SCOPE');
+  await scopedCommand(f, 'task.resume', { id: core.id }, 'release-funded-minimum');
+  await waiting(f, validate, task => task.status === 'succeeded');
+  assert.deepEqual(priced.calls, [plan.taskId, core.id, validate.id]);
+  assert.equal(budget(f.store, target.id).limitMicros, '40');
+  assert(optionalHold(state(f.store, bonus)));
+});
+
+test('owner deferral confirmation obtains a current cap without launching and preserves newly affordable work', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000035', { plan: true });
+  let cap = '20';
+  const checked = [];
+  const priced = fixedCostAdapter(f, { quoteFor: task => {
+    if (task.title !== 'bonus') return '7';
+    checked.push(cap);
+    return cap;
+  }, amountFor: task => task.kind === 'work' ? '4' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), validate = planTask(f.store, plan, 'validate');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await waiting(f, validate, task => task.status === 'succeeded');
+  await until(() => budget(f.store, target.id).reservedAttempts === 0, undefined, () => budget(f.store, target.id));
+  const args = optionalDecision(target, plan, state(f.store, bonus));
+  const original = f.workspaces.prepare.bind(f.workspaces);
+  f.workspaces.prepare = (task, attempt) => {
+    if (attempt.costDeferralRequestId) throw new Error('Test preparation unavailable');
+    return original(task, attempt);
+  };
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-preparation-unavailable');
+  assert.match((await waitOptionalDecision(f.store, target.id)).result, /核价准备未完成/);
+  assert(!priced.calls.includes(bonus.id));
+
+  const preparing = Promise.withResolvers(), release = Promise.withResolvers();
+  t.after(() => release.resolve());
+  f.workspaces.prepare = async (task, attempt) => {
+    if (attempt.costDeferralRequestId) {
+      preparing.resolve(attempt.id);
+      await release.promise;
+    }
+    return original(task, attempt);
+  };
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-while-owner-pauses');
+  const pausedAttempt = await preparing.promise;
+  await scopedCommand(f, 'goal.pause', { id: target.id, afterCurrent: true }, 'pause-optional-verification');
+  release.resolve();
+  assert.equal((await waitOptionalDecision(f.store, target.id)).status, 'not-applied');
+  await until(() => f.store.require('attempts', pausedAttempt).cleanupPending === false, undefined, taskWaitDiagnostics(f, bonus.id));
+  assert(!priced.calls.includes(bonus.id));
+  f.workspaces.prepare = original;
+  await scopedCommand(f, 'goal.resume', { id: target.id }, 'resume-optional-verification');
+
+  cap = undefined;
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-unknown-cap');
+  assert.match((await waitOptionalDecision(f.store, target.id)).result, /上界无法核实/);
+  assert(!priced.calls.includes(bonus.id));
+  cap = '5';
+  const requested = await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-cheaper-cap');
+  const result = await waitOptionalDecision(f.store, target.id);
+  assert.equal(result.id, requested.costBudgetDeferralRequest.id);
+  assert.equal(result.status, 'not-applied');
+  assert.match(result.result, /足够余量/);
+  assert.deepEqual(checked, ['20', undefined, '5']);
+  assert.equal(state(f.store, bonus).costBudgetHold.bound.upperMicros, '5');
+  assert.equal(state(f.store, bonus).attempts, 0);
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-cheaper-cap')).costBudgetDeferralRequest.id, result.id);
+  await scopedCommand(f, 'task.resume', { id: bonus.id }, 'approve-normal-dispatch-after-verification');
+  await waiting(f, bonus, task => task.status === 'succeeded');
+  assert.equal(priced.calls.filter(id => id === bonus.id).length, 1);
+  assert.equal(priced.authorizations.find(row => row.taskId === bonus.id).upperMicros, '5');
+  assert.equal(budget(f.store, target.id).limitMicros, '35');
+});
+
+async function prepareOptionalQuoteCrash(t, beforePause = () => {}) {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000035', { plan: true });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '20' : '7',
+    amountFor: task => task.kind === 'work' ? '4' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), validate = planTask(f.store, plan, 'validate');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await waiting(f, validate, task => task.status === 'succeeded');
+  await until(() => budget(f.store, target.id).reservedAttempts === 0, undefined, () => budget(f.store, target.id));
+  f.command('company.pause', { afterCurrent: true });
+  beforePause(f);
+  const args = optionalDecision(target, plan, state(f.store, bonus));
+  const request = (await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'queue-before-host-exit')).costBudgetDeferralRequest;
+  assert.equal(request.status, 'queued');
+  await f.engine.stop();
+  const runner = fileURLToPath(new URL('./fixtures/goal-cost-crash.mjs', import.meta.url));
+  const run = (mode, exitCode) => {
+    const terminated = spawnSync(process.execPath, [runner, f.dataDir, target.id, mode], { encoding: 'utf8', timeout: 20000, windowsHide: true });
+    assert.equal(terminated.status, exitCode, terminated.error?.message ?? terminated.stderr);
+  };
+  return { f, target, priced, plan, bonus, validate, args, request, run };
+}
+
+test('a host crash while preparing a quote expires the decision without a paid claim or a retry', async t => {
+  const { f, target, priced, plan, bonus, validate, args, request, run } = await prepareOptionalQuoteCrash(t);
+  run('optional-quote', 73);
+  const attempt = f.store.list('attempts').find(row => row.costDeferralRequestId === request.id);
+  assert.equal(attempt.status, 'preparing');
+  assert.equal(state(f.store, bonus).attempts, 0);
+  await f.start();
+  const result = await waitOptionalDecision(f.store, target.id);
+  assert.equal(result.status, 'not-applied');
+  assert.match(result.result, /宿主重启/);
+  assert.equal(f.store.require('attempts', attempt.id).cleanupPending, false);
+  assert(optionalHold(state(f.store, bonus)));
+  assert.deepEqual(priced.calls, [plan.taskId, planTask(f.store, plan, 'core').id, validate.id]);
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  assert.equal(f.store.get('goalCostAttempts', attempt.id), null);
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'queue-before-host-exit')).costBudgetDeferralRequest.id, request.id);
+  assert.equal(f.store.list('attempts').filter(row => row.costDeferralRequestId === request.id).length, 1);
+});
+
+test('a recovered quote cleanup and its request survive another crash at receipt removal', { skip: process.platform !== 'win32' }, async t => {
+  let independent;
+  const { f, target, priced, bonus, request, run } = await prepareOptionalQuoteCrash(t, f => {
+    f.command('policy.update', { patch: { maxConcurrent: 1, controlSlots: 0 } });
+    independent = f.task({ title: 'Work waiting for the one occupied slot' });
+  });
+  run('optional-quote-check', 73);
+  const attempt = f.store.list('attempts').find(row => row.costDeferralRequestId === request.id);
+  assert.equal(attempt.status, 'reconciling');
+  assert.equal(attempt.cleanupPending, true);
+  assert.equal(attempt.cleanupUncertain, true);
+  assert.equal(attempt.hostCheck.checkId, 'fixture-quote-preparation');
+  const receiptPath = path.join(f.dataDir, 'check-receipts', attempt.hostCheck.id + '.json');
+  await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });
+  await f.start();
+  await f.engine.tick();
+  assert.equal(f.store.require('attempts', attempt.id).cleanupPending, true);
+  assert.equal(f.store.require('goals', target.id).costBudgetDeferralRequest.status, 'checking');
+  assert.equal(state(f.store, independent).status, 'ready');
+  await f.engine.stop();
+
+  await rename(path.join(f.dataDir, 'delayed-quote-receipt.json'), receiptPath);
+  run('optional-quote-recover', 75);
+  const closed = f.store.require('attempts', attempt.id);
+  assert.equal(closed.status, 'interrupted');
+  assert.equal(closed.cleanupPending, false);
+  assert.equal(closed.cleanupUncertain, false);
+  assert.equal(closed.hostCheck, null);
+  assert.deepEqual(closed.hostCheckCleanup, { id: attempt.hostCheck.id, checkId: 'fixture-quote-preparation', exitCode: 0, quoteRequestId: request.id });
+  assert.equal(f.store.require('goals', target.id).costBudgetDeferralRequest.status, 'not-applied');
+  await assert.rejects(readFile(receiptPath), { code: 'ENOENT' });
+  await f.start();
+  await waiting(f, independent, task => task.status === 'succeeded');
+  assert(optionalHold(state(f.store, bonus)));
+  assert.equal(state(f.store, bonus).attempts, 0);
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal(f.store.get('goalCostAttempts', attempt.id), null);
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  const events = f.store.page(0, 200).entries.filter(event => event.entityId === attempt.id && event.type === 'attempt.cleanup.confirmed');
+  assert.equal(events.length, 1);
+});
+
+test('an optional task that becomes a required dependency keeps its ordinary admission and owner pause', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '26' : '7' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), core = planTask(f.store, plan, 'core');
+  await scopedCommand(f, 'task.pause', { id: core.id }, 'pause-core-before-dynamic');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  const old = optionalDecision(target, plan, state(f.store, bonus));
+  await scopedCommand(f, 'task.dependencies', { id: core.id, dependencies: [bonus.id] }, 'make-optional-input-required');
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', old, 'reject-stale-required-input', 409)).code, 'COST_OPTIONAL_STALE');
+  f.engine.nextOptionalCostCheck = 0;
+  f.engine.kick();
+  await waiting(f, bonus, task => task.status === 'succeeded');
+  assert.equal(state(f.store, core).status, 'paused');
+  assert(!priced.calls.includes(core.id));
+  assert.equal(f.store.require('goals', target.id).costBudgetDeferrals, undefined);
+  assert.equal(priced.authorizations.find(auth => auth.taskId === bonus.id).upperMicros, '26');
+  await scopedCommand(f, 'task.resume', { id: core.id }, 'resume-required-work');
+  await until(() => f.store.require('goals', target.id).status === 'succeeded', undefined, taskWaitDiagnostics(f, core.id));
+  assert.equal(budget(f.store, target.id).limitMicros, '40');
+});
+
+test('two prepared optionals do not share headroom and ordinary continue refreshes only the current bound', async t => {
+  const f = await fixture(t, input => {
+    if (input.task.kind !== 'plan') return defaultSimulation(input);
+    const proposal = optionalFixtureProposal();
+    proposal.tasks.push({ ...proposal.tasks.at(-1), key: 'bonus-peer', title: 'bonus-peer' });
+    return proposal;
+  });
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const optionalGates = new Map([['bonus', Promise.withResolvers()], ['bonus-peer', Promise.withResolvers()]]);
+  const liveQuotes = new Map([['bonus', '20'], ['bonus-peer', '20']]);
+  const priced = fixedCostAdapter(f, { quoteFor: task => liveQuotes.get(task.title) ?? '7',
+    amountFor: task => liveQuotes.has(task.title) ? '1' : '3',
+    beforeResult: ({ task }) => optionalGates.get(task.title)?.promise });
+  t.after(() => { for (const gate of optionalGates.values()) gate.resolve(); });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1', 'bonus-peer': '1' }, acceptance: '0', rework: '0' });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const options = ['bonus', 'bonus-peer'].map(key => planTask(f.store, plan, key));
+  f.command('company.resume');
+  const waitingTask = await until(() => options.find(task => optionalHold(state(f.store, task))),
+    undefined, () => options.map(task => taskWaitDiagnostics(f, task.id)()));
+  const paid = options.find(task => task.id !== waitingTask.id);
+  assert(priced.calls.includes(paid.id));
+  assert(!priced.calls.includes(waitingTask.id));
+  const first = state(f.store, waitingTask).costBudgetHold;
+  assert.equal(first.bound.upperMicros, '20');
+  liveQuotes.set(waitingTask.title, '30');
+  await scopedCommand(f, 'task.resume', { id: waitingTask.id }, 'fresh-higher-cap');
+  await waiting(f, waitingTask, task => optionalHold(task) && task.costBudgetHold.attemptId !== first.attemptId);
+  assert.equal(state(f.store, waitingTask).costBudgetHold.bound.upperMicros, '30');
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional',
+    { ...optionalDecision(target, plan, state(f.store, waitingTask)), holdAttemptId: first.attemptId }, 'stale-quote-decision', 409)).code, 'COST_OPTIONAL_STALE');
+  liveQuotes.set(waitingTask.title, '1');
+  await scopedCommand(f, 'task.resume', { id: waitingTask.id }, 'fresh-lower-cap');
+  await until(() => priced.calls.includes(waitingTask.id), undefined, taskWaitDiagnostics(f, waitingTask.id));
+  const current = priced.authorizations.find(row => row.taskId === waitingTask.id);
+  assert.equal(current.upperMicros, '1');
+  assert.equal(budget(f.store, target.id).limitMicros, '40');
+  for (const gate of optionalGates.values()) gate.resolve();
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' && budget(f.store, target.id).reservedAttempts === 0,
+    undefined, () => ({ ledger: budget(f.store, target.id), error: f.engine.lastError }));
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  assert.equal(priced.calls.filter(id => id === waitingTask.id).length, 1);
 });
 
 test('completion forecast keeps a late receipt unknown even when both approved phase reserves are zero', async t => {

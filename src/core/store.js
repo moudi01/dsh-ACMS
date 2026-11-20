@@ -19,6 +19,7 @@ export const EFFECTIVE_ACTIVITY_EVENTS = [
   "goal.contract.changed", "goal.contract.assessed",
   "goal.paused", "goal.resumed", "goal.cancelled",
   "goal.delivery_approval.decided",
+  "goal.cost_budget.optional_deferred",
   "task.created", "task.changed", "task.dependencies", "task.blocked", "task.resumed", "task.retry.scheduled",
   "task.stop.completed", "task.succeeded", "task.restored", "task.deleted", "task.purged",
   "attempt.claimed", "attempt.starting", "attempt.finished", "attempt.failed", "attempt.recovery", "attempt.result.recovered",

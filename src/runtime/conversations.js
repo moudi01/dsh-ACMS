@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { assert, id, now, OWNER, SYSTEM, digest } from '../core/util.js';
+import { assert, id, now, OWNER, SYSTEM, digest, TERMINAL } from '../core/util.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { assertGoalOpen, goalStopped } from '../core/goal-control.js';
 
@@ -74,7 +74,7 @@ export class Conversations {
         if (active && mode !== 'queue') assertGoalOpen(this.store.get('goals', task.goalId));
         assert(!active || mode !== 'steer' || !this.store.get('goalCostBudgets', task.goalId), 'CHAT_COST_BUDGET', '金额受限目标的消息可排队，或中断后用新预留续接。');
         assert(task.agentId === chat.agentId && task.status !== 'deleted', 'CHAT_SCOPE', '任务负责人已变化，请重新打开会话');
-        assert(!['succeeded', 'cancelled', 'archived', 'failed'].includes(task.status), 'CHAT_TASK_CLOSED', '任务已结束，请切换到独立对话');
+        assert(!TERMINAL.has(task.status), 'CHAT_TASK_CLOSED', '任务已结束，请切换到独立对话');
         assert((active?.id ?? null) === expectedAttemptId, 'CHAT_STALE', '执行轮次已变化，请刷新后发送');
         assert(!active || active.status === 'running', 'CHAT_TRANSITION', '执行正在准备或清理，请稍候');
         assert(!active || mode === 'queue' || !task.stopRequested && !this.engine.live.get(active.id)?.controller.signal.aborted, 'CHAT_TRANSITION', '当前执行正在停止；可把消息留到下一轮');

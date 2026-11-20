@@ -28,7 +28,7 @@ export function restoreEntity(company, kind, args, actor) {
   const batch = entity.deletion.batchId;
   for (const c of [collection, ...(kind === 'project' ? ['goals', 'tasks'] : kind === 'goal' ? ['tasks'] : [])]) for (const item of store.list(c).filter(x => x.status === 'deleted' && x.deletion?.batchId === batch)) {
     const previous = item.deletion.previousStatus;
-    const status = c === 'tasks' ? (['succeeded', 'cancelled', 'archived'].includes(previous) ? previous : 'paused') : previous;
+    const status = c === 'tasks' ? (['succeeded', 'cancelled', 'archived', 'deferred'].includes(previous) ? previous : 'paused') : previous;
     if (c === 'tasks') discardDeferredResult(store, item.activeAttemptId);
     store.put(c, { ...item, status, deletion: null, ...(c === 'tasks' ? { stopRequested: null, activeAttemptId: null, goalPauseId: null, resumeOnStart: false } : {}) }, c === collection && item.id === entity.id ? args.expectedRevision : undefined);
   }

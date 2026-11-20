@@ -110,7 +110,7 @@ export function createRoutes(runtime) {
         assert(!Object.hasOwn(args.project ?? {}, 'deliveryRepository'), 'INVALID_INPUT', '请在项目设置中授权裸交付仓库。');
         await workspaces.validateProject({ ...args.project, mode: args.project?.mode ?? 'copy' });
       }
-      const options = input.name === 'plan.approval.decide' ? { planCostSource: engine.adapter?.taskCost } : {};
+      const options = ['plan.approval.decide', 'goal.cost_budget.defer_optional'].includes(input.name) ? { planCostSource: engine.adapter?.taskCost } : {};
       let result = company.command(OWNER, input.requestId, input.name, args, options);
       const projectId = input.name === 'project.save' ? result.id : result?.projectId ?? (result?.goalId ? company.store.get('goals', result.goalId)?.projectId : null);
       if (projectId && company.store.get('projects', projectId)?.status !== 'deleted' && workspaces.publishProject) {
@@ -206,7 +206,7 @@ export function createRoutes(runtime) {
           'PLAN_APPROVAL_REQUIRED', 'STALE_PLAN_APPROVAL', 'PLAN_CLEANUP_PENDING', 'PLAN_CONFLICT',
           'DELIVERY_APPROVAL_REQUIRED', 'DELIVERY_REVISION_REQUIRED', 'DELIVERY_APPROVAL_PROJECT',
           'COST_BUDGET_DISABLED', 'COST_CONTRACT_BREACH', 'COST_PLAN_ESTIMATE_REQUIRED', 'COST_PLAN_ESTIMATE_STALE',
-          'COST_PLAN_LIMIT', 'COST_PLAN_UNSCOPED_WORK',
+          'COST_PLAN_LIMIT', 'COST_PLAN_UNSCOPED_WORK', 'COST_OPTIONAL_STALE', 'COST_OPTIONAL_PENDING', 'COST_OPTIONAL_SCOPE',
           'TARGET_BRANCH_EXISTS', 'TARGET_REF_UNSUPPORTED', 'BARE_TARGET_BUSY', 'BARE_TARGET_CHANGED'].includes(e.code) ? 409
           : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED', 'PROJECT_PATH_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);

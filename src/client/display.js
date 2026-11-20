@@ -7,7 +7,7 @@ import { activityAt } from './graph.js';
  * scheduler order; they only decide what a view shows and in which order.
  */
 
-export const COMPLETED_STATUSES = new Set(['succeeded', 'cancelled', 'archived']);
+export const COMPLETED_STATUSES = new Set(['succeeded', 'cancelled', 'archived', 'deferred']);
 export const isCompleted = item => COMPLETED_STATUSES.has(item?.status);
 
 // Shared by the overview metric and its destination. Waiting/paused/cleanup

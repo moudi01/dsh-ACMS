@@ -13,7 +13,7 @@ export function pendingGoalTimeBox(goal) {
 }
 
 export function accruesGoalRuntime(attempt) {
-  return attempt.status === 'preparing' || attempt.status === 'running';
+  return !attempt.costDeferralRequestId && (attempt.status === 'preparing' || attempt.status === 'running');
 }
 
 export function goalRuntimeSpent(goal, attempts, now = Date.now()) {

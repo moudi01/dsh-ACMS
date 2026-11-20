@@ -7,7 +7,7 @@
  * live in another scope. It never reads or writes task, dependency or scheduler state.
  */
 
-export const terminalStatus = new Set(['succeeded', 'cancelled', 'archived']);
+export const terminalStatus = new Set(['succeeded', 'cancelled', 'archived', 'deferred']);
 const activeStatus = new Set(['running', 'preparing', 'reviewing', 'integrating', 'reconciling']);
 const blockedStatus = new Set(['blocked', 'failed', 'paused', 'stopping']);
 

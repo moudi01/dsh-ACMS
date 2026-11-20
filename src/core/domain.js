@@ -10,6 +10,7 @@ import { deleteEntity, restoreEntity, recordChange, restartForChange } from './e
 import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS, pendingGoalTimeBox } from './runtime-budget.js';
 import { createGoalCostBudget, extendGoalCostBudget, goalCostBudgetView } from './goal-cost-budget.js';
 import { installPendingCostPlans } from './plan-cost-budget.js';
+import { deferOptionalCostScope, withdrawOptionalDeferral } from './cost-optional.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
@@ -78,6 +79,7 @@ export class Company {
         'goal.edit': () => this.editGoal(args, actor),
         'goal.runtime.extend': () => this.extendGoalRuntime(args, actor),
         'goal.cost_budget.extend': () => this.extendGoalCost(args, actor),
+        'goal.cost_budget.defer_optional': () => deferOptionalCostScope(this, args, actor, options.planCostSource),
         'goal.pause': () => controlGoal(this, args, actor, 'pause'),
         'goal.resume': () => controlGoal(this, args, actor, 'resume'),
         'goal.cancel': () => controlGoal(this, args, actor, 'cancel'),
@@ -124,8 +126,11 @@ export class Company {
       };
       assert(methods[name], 'UNKNOWN_COMMAND', `Unknown command ${name}`);
       const result = methods[name]();
+      if (['goal.pause', 'goal.cancel', 'goal.delete'].includes(name) && withdrawOptionalDeferral(this.store, args.id))
+        return this.store.require('goals', args.id);
       if (name.startsWith('task.')) {
         const goalId = result?.goalId ?? args.goalId;
+        if (goalId && ['task.edit', 'task.dependencies', 'task.delete'].includes(name)) withdrawOptionalDeferral(this.store, goalId, args.id);
         if (goalId) this.refreshGoal(goalId, actor);
       }
       return result;
@@ -259,6 +264,7 @@ export class Company {
       if (needsCoordination) goal = this.ensureGoalContractCoordination(goal);
       this.store.event('goal.contract.changed', goal.id, { fromVersion: version, contractVersion: version + 1,
         coordinationTaskId: goal.contractChange?.coordinationTaskId ?? null, fields: changed }, actor);
+      if (withdrawOptionalDeferral(this.store, goal.id)) goal = this.store.require('goals', goal.id);
     }
     recordChange(this, 'goal', previous, goal, substantive ? [...changed, 'contractVersion'] : changed, actor);
     return goal;
@@ -331,8 +337,11 @@ export class Company {
     if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'reviewedTaskGeneration', 'reviewedContractVersion', 'reviewScope', 'reviewTargets', 'deliveryHash', 'requestedBy', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);
     integer(args.priority ?? 50, 'priority', 0, 100);
     const deps = [...new Set(args.dependencies ?? [])];
-    for (const dep of deps) assert(this.store.require('tasks', dep).goalId === goal.id && this.store.require('tasks', dep).status !== 'deleted', 'SCOPE_DENIED', 'Dependencies must belong to the same goal and not be deleted');
-    if (args.parentId) assert(this.store.require('tasks', args.parentId).goalId === goal.id && this.store.require('tasks', args.parentId).status !== 'deleted', 'SCOPE_DENIED', 'Parent must belong to the same goal and not be deleted');
+    for (const dep of [...deps, ...(args.parentId ? [args.parentId] : [])]) {
+      const dependency = this.store.require('tasks', dep);
+      assert(dependency.goalId === goal.id && !['deleted', 'deferred'].includes(dependency.status), 'SCOPE_DENIED',
+        '前置或父任务必须属于同一目标，且仍在本轮范围内。');
+    }
     let agentId = args.agentId;
     if (!agentId && ['work', 'repair'].includes(kind)) agentId = this.temporaryAgent(goal.id).id;
     if (agentId) assert(this.store.require('agents', agentId).status === 'available', 'AGENT_RETIRED', '请为任务选择可分配的执行人员');
@@ -362,7 +371,7 @@ export class Company {
   }
   releaseTemporaryAgent(agentId, actor = SYSTEM) {
     const agent = this.store.get('agents', agentId); if (!agent?.temporary || agent.status !== 'available') return;
-    const held = this.store.list('tasks').some(t => t.agentId === agentId && (t.longLived || !['succeeded', 'cancelled', 'archived'].includes(t.status)));
+    const held = this.store.list('tasks').some(t => t.agentId === agentId && t.status !== 'deferred' && (t.longLived || !['succeeded', 'cancelled', 'archived'].includes(t.status)));
     const active = this.store.list('attempts').some(a => a.agentId === agentId && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending));
     if (held || active) return;
     this.store.put('agents', { ...agent, status: 'retired' }); this.store.event('agent.released', agent.id, { reason: '没有待执行任务或活动执行' }, actor);
@@ -372,7 +381,7 @@ export class Company {
     if (goalStopped(goal) || ['archived', 'deleted'].includes(goal.status) || goal.legacyBatch) return goal;
     const goalTasks = this.store.list('tasks').filter(t => t.goalId === goalId && t.status !== 'deleted');
     const tasks = goalTasks.filter(t => t.kind !== 'review' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
-    const complete = tasks.some(t => t.kind === 'work') && tasks.every(task => taskSettledForGoal(task, goal));
+    const complete = tasks.some(t => t.kind === 'work' && t.status !== 'deferred') && tasks.every(task => taskSettledForGoal(task, goal));
     let status, completionPending = null;
     let compositionRecheck = goal.compositionRecheck;
     if (goal.contractChange?.status === 'pending') status = 'active';
@@ -529,6 +538,7 @@ export class Company {
   }
   editTask(args, actor) {
     const task = this.store.require('tasks', args.id); assert(task.kind !== 'review', 'SYSTEM_TASK', '审查任务使用执行任务的固定验收合同，请编辑对应执行任务');
+    assert(task.status !== 'deferred', 'COST_OPTIONAL_SCOPE', '此可选任务已延期，请为后续范围新建任务。');
     const goal = this.store.require('goals', task.goalId);
     assertGoalOpen(goal);
     if (isApprovalPlanner(goal, task)) assert(!goal.planApproval.approvedPlanId && task.blocker?.kind !== 'plan-approval',
@@ -558,7 +568,8 @@ export class Company {
     assert(Array.isArray(args.dependencies), 'INVALID_INPUT', 'dependencies must be an array');
     const deps = [...new Set(args.dependencies)]; const visit = (dep, seen = new Set()) => {
       assert(dep !== task.id, 'DEPENDENCY_CYCLE', 'Task dependencies contain a cycle'); if (seen.has(dep)) return; seen.add(dep);
-      const other = this.store.require('tasks', dep); assert(other.goalId === task.goalId && other.status !== 'deleted', 'SCOPE_DENIED', 'Dependencies must belong to the same goal and not be deleted');
+      const other = this.store.require('tasks', dep);
+      assert(other.goalId === task.goalId && !['deleted', 'deferred'].includes(other.status), 'SCOPE_DENIED', '前置任务必须属于同一目标，且仍在本轮范围内。');
       for (const next of other.dependencies) visit(next, seen);
     }; deps.forEach(d => visit(d));
     const saved = this.store.put('tasks', { ...task, dependencies: deps }, args.expectedRevision);
@@ -583,6 +594,7 @@ export class Company {
     if (cascade) for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
     this.store.event(`task.${target}.requested`, task.id, args.reason ? { reason: args.reason } : {}, actor);
     if (target === 'cancelled') this.releaseTemporaryAgent(task.agentId, actor);
+    withdrawOptionalDeferral(this.store, task.goalId, task.id);
     return saved;
   }
   deleteTask(args, actor) {
@@ -627,11 +639,16 @@ export class Company {
     assert(this.store.require('goals', task.goalId).status !== 'deleted' && this.store.require('projects', task.projectId).status !== 'deleted', 'RESTORE_BLOCKED', '请先恢复所属项目和目标');
     const group = this.store.list('tasks').filter(t => t.status === 'deleted' && t.deletion?.batchId === task.id);
     const ids = new Set(group.map(t => t.id));
-    for (const item of group) for (const related of [...item.dependencies, ...(item.parentId ? [item.parentId] : [])]) assert(ids.has(related) || this.store.require('tasks', related).status !== 'deleted', 'RESTORE_BLOCKED', '请先恢复此任务的前置任务或父任务');
+    for (const item of group) for (const related of [...item.dependencies, ...(item.parentId ? [item.parentId] : [])]) {
+      if (ids.has(related)) continue;
+      const status = this.store.require('tasks', related).status;
+      assert(status !== 'deleted' && (status !== 'deferred' || item.deletion.previousStatus === 'deferred'),
+        'RESTORE_BLOCKED', '请核对前置或父任务是否仍在当前范围内。');
+    }
     for (const item of group) {
       const old = item.deletion.previousStatus;
       discardDeferredResult(this.store, item.activeAttemptId);
-      this.store.put('tasks', { ...item, status: ['succeeded', 'cancelled', 'archived'].includes(old) ? old : 'paused', deletion: null, stopRequested: null, activeAttemptId: null, goalPauseId: null }, item.id === task.id ? args.expectedRevision : undefined);
+      this.store.put('tasks', { ...item, status: ['succeeded', 'cancelled', 'archived', 'deferred'].includes(old) ? old : 'paused', deletion: null, stopRequested: null, activeAttemptId: null, goalPauseId: null }, item.id === task.id ? args.expectedRevision : undefined);
     }
     this.store.event('task.restored', task.id, { taskIds: group.map(t => t.id) }, actor); return this.store.require('tasks', task.id);
   }
@@ -640,6 +657,7 @@ export class Company {
     const goal = this.store.require('goals', task.goalId);
     assertGoalOpen(goal);
     assertPlanAllowsWork(goal, task.kind);
+    assert(task.status !== 'deferred', 'COST_OPTIONAL_SCOPE', '此可选任务已确认延期，后续范围请新建任务。');
     assert(!task.contractObsolete && matchesGoalContract(goal, task),
       'STALE_RESULT', '任务属于旧目标合同，请在当前合同下安排后续工作');
     assert(actor.kind !== 'agent' || task.status !== 'paused', 'OWNER_REQUIRED', '仅用户可恢复主动暂停的任务');

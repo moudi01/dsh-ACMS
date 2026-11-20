@@ -1,7 +1,9 @@
-import { goalCostRoute, markGoalCostCleanup, reserveGoalCost, settleGoalCost } from '../core/goal-cost-budget.js';
+import { goalCostRoute, markGoalCostCleanup, reserveGoalCost, settleGoalCost, validGoalCostBound } from '../core/goal-cost-budget.js';
+import { assessOptionalDispatch, finishOptionalDeferral, optionalCostEvidence } from '../core/cost-optional.js';
+import { OPTIONAL_COST_WAIT } from '../core/task-actions.js';
 import { goalStopped } from '../core/goal-control.js';
 import { matchesGoalContract } from '../core/goal-contract.js';
-import { assert, SYSTEM } from '../core/util.js';
+import { assert, now, SYSTEM } from '../core/util.js';
 
 // Only a registered host adapter can provide this contract. A quote performs
 // no process launch or billable work. start must enforce the exact route and
@@ -16,18 +18,52 @@ function taskCostExecutor(adapter) {
     typeof executor.reconcile === 'function' ? executor : null;
 }
 
-export function admitTaskCost(engine, input) {
-  const { store, adapter } = engine;
-  if (!store.get('goalCostBudgets', input.attempt.goalId)) return {};
-  const executor = taskCostExecutor(adapter);
+function quoteTaskCost(engine, input) {
+  const executor = taskCostExecutor(engine.adapter);
   const route = goalCostRoute(input.routeSelection);
   let quote;
   if (executor && route) {
     try { quote = executor.quote({ ...input, route }); }
     catch { /* No current authoritative quote means no dispatch. */ }
   }
-  const result = reserveGoalCost(store, input.attempt, quote ? { ...quote, executorId: executor.id } : null, route);
+  const bound = quote ? { executorId: executor.id, quoteId: quote.quoteId, upperMicros: quote.upperMicros, currency: quote.currency, route: quote.route } : null;
+  return { executor, route, bound: validGoalCostBound(bound, route) ? bound : null };
+}
+
+export function admitTaskCost(engine, input) {
+  const { store } = engine;
+  const budget = store.get('goalCostBudgets', input.attempt.goalId);
+  if (!budget) return {};
+  const { executor, route, bound } = quoteTaskCost(engine, input);
+  if (input.task.origin?.kind === 'manager-plan' && bound) {
+    const goal = store.require('goals', input.attempt.goalId);
+    const denied = assessOptionalDispatch(engine.company, goal, budget, input.task, bound, executor);
+    if (denied) return { denied: { ...denied, attemptId: input.attempt.id, quotedAt: now() } };
+  }
+  const result = reserveGoalCost(store, input.attempt, bound, route);
   return { ...result, executor };
+}
+
+export function closeOptionalDeferralQuote(engine, attempt, input = null, failure = null) {
+  const { store } = engine;
+  engine.fenced();
+  const saved = store.require('attempts', attempt.id);
+  if (saved.status === 'interrupted' && saved.cleanupPending === false) return;
+  // Quote-only attempts never call a model. Existing host commands must still
+  // be proved stopped through their own cleanup receipt before closing.
+  assert(!saved.hostCheck, 'CLEANUP_PENDING', '需先核对核价前置命令的清理回执。');
+  const quote = input ? quoteTaskCost(engine, input) : {};
+  const completed = store.put('attempts', { ...saved, status: 'interrupted', preflightOnly: true, cleanupPending: false,
+    cleanupUncertain: false, resultAccepted: false, finishedAt: now(), summary: failure ?? '无付费启动的延期核价' });
+  const previous = store.require('tasks', saved.taskId);
+  const task = previous.activeAttemptId === saved.id ? store.put('tasks', { ...previous,
+    status: previous.stopRequested ?? 'blocked', stopRequested: null, recoveryRequested: false, resumeOnStart: false }) : previous;
+  const goal = store.require('goals', task.goalId);
+  finishOptionalDeferral(engine.company, goal, task, completed, quote.executor, quote.bound, failure);
+  if (previous.activeAttemptId === saved.id && previous.stopRequested)
+    store.event('task.stop.completed', task.id, { status: previous.stopRequested, attemptId: saved.id }, SYSTEM);
+  store.event('attempt.cleanup.confirmed', saved.id, { taskId: task.id, noLaunch: true }, SYSTEM);
+  engine.company.releaseTemporaryAgent(saved.agentId);
 }
 
 export function assertTaskCostCurrent(engine, executor, authorization) {
@@ -64,7 +100,8 @@ export function holdTaskCost(engine, attempt, task, denied) {
     attempts: Math.max(0, task.attempts - (attempt.preparingHost ? 0 : 1)), retryAt: null,
     blocker: task.blocker && task.blocker.kind !== 'cost-budget' ? task.blocker : { kind: 'cost-budget', reason: denied.reason },
     costBudgetHold: denied });
-  store.event('task.cost_budget.blocked', task.id, { code: denied.code }, SYSTEM, { goalId: task.goalId });
+  store.event('task.cost_budget.blocked', task.id, { code: denied.code,
+    ...(denied.code === OPTIONAL_COST_WAIT ? { costBasis: optionalCostEvidence(denied) } : {}) }, SYSTEM, { goalId: task.goalId });
   engine.updateGoal(task.goalId);
 }
 
@@ -90,15 +127,31 @@ export function releaseTaskCostWaits(engine) {
   const { store } = engine;
   const budgets = new Map(store.list('goalCostBudgets').map(row => [row.id, row]));
   if (!budgets.size) return;
+  // Durable optional holds are repriced on a bounded cadence. No duplicate
+  // attempts or audit records are emitted while the hold remains applicable.
+  const refreshOptional = Date.now() >= (engine.nextOptionalCostCheck ?? 0);
+  if (refreshOptional) engine.nextOptionalCostCheck = Date.now() + 1000;
   const pending = new Set(store.list('interactions').filter(item => item.status === 'pending').map(item => item.taskId));
   for (const task of store.list('tasks')) {
     const budget = budgets.get(task.goalId);
+    const hold = task.costBudgetHold;
     if (!budget || budget.breach || task.status !== 'blocked' || task.stopRequested || task.blocker?.kind !== 'cost-budget' ||
-      task.costBudgetHold?.code !== 'COST_LIMIT_REACHED' || task.costBudgetHold.releaseVersion === budget.releaseVersion ||
       task.environmentBlock || task.goalPauseId || task.contractObsolete || pending.has(task.id) ||
       task.dependencies.some(id => store.get('tasks', id)?.status !== 'succeeded')) continue;
     const goal = store.require('goals', task.goalId);
     if (goalStopped(goal) || !matchesGoalContract(goal, task)) continue;
+    if (hold?.code === OPTIONAL_COST_WAIT) {
+      if (!refreshOptional || hold.reasonCode === 'affordable' || goal.contractChange?.status === 'pending') continue;
+      const executor = taskCostExecutor(engine.adapter);
+      const sameBoundSource = executor?.id === hold.bound?.executorId && store.get('agents', task.agentId)?.revision === hold.agentRevision;
+      const next = sameBoundSource && assessOptionalDispatch(engine.company, goal, budget, task, hold.bound, executor);
+      if (next) {
+        if (hold.reasonCode !== next.reasonCode) store.put('tasks', { ...task,
+          costBudgetHold: { ...next, attemptId: hold.attemptId, quotedAt: hold.quotedAt },
+          blocker: { ...task.blocker, reason: next.reason } });
+        continue;
+      }
+    } else if (hold?.code !== 'COST_LIMIT_REACHED' || hold.releaseVersion === budget.releaseVersion) continue;
     store.put('tasks', { ...task, status: 'ready', blocker: null, costBudgetHold: null });
     store.event('task.cost_budget.released', task.id, {}, SYSTEM, { goalId: task.goalId });
   }

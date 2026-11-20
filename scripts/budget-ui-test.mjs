@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { startPreview } from './preview-server.mjs';
 import { OWNER } from '../src/core/util.js';
+import { defaultSimulation } from '../src/adapters/simulated.js';
 
 const server = await startPreview({ seed: false });
 const command = (name, args) => server.company.command(OWNER, randomUUID(), name, args);
@@ -79,8 +80,9 @@ try {
   expect(forecastReads).toBe(1);
   expect(errors).toEqual([]);
   await verifyLiveBudget(browser);
-  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, earlyExtensionMinutes: 30, bothTasksReviewed: true, materialGatePreserved: true, liveUsageWithoutEvents: true, costForecastOnDemand: true, browserErrors: errors }, null, 2));
-  console.log('Budget UI: early extension, explicit budget reply, preserved material gate, live usage, and on-demand completion forecast passed.');
+  await verifyOptionalDeferral(browser);
+  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, earlyExtensionMinutes: 30, bothTasksReviewed: true, materialGatePreserved: true, liveUsageWithoutEvents: true, costForecastOnDemand: true, optionalDeferral: true, browserErrors: errors }, null, 2));
+  console.log('Budget UI: early extension, explicit budget reply, preserved material gate, live usage, completion forecast, and optional deferral passed.');
 } finally { await browser.close(); await server.close(); }
 
 async function verifyLiveBudget(browser) {
@@ -126,4 +128,85 @@ async function verifyLiveBudget(browser) {
     expect(store.cursor()).toBe(cursor);
     expect(snapshots).toBe(1);
   } finally { await livePage.close(); await preview.close(); }
+}
+
+async function verifyOptionalDeferral(browser) {
+  const preview = await startPreview({ seed: false, startEngine: false });
+  const page = await browser.newPage({ viewport: { width: 375, height: 820 } });
+  const { adapter, company, engine } = preview;
+  const receipt = new Map();
+  const optionalCaps = new Map();
+  const route = { provider: 'simulation', llmProvider: 'preview', model: 'fixed-ui-cost', reasoningEffort: null };
+  adapter.inspectTaskRoute = () => ({ selection: { status: 'selected', chosen: route } });
+  adapter.taskCost = {
+    id: 'fixed-ui-cost',
+    quote: ({ task }) => ({ route, quoteId: 'live-fixed', currency: 'USD',
+      upperMicros: task.title === '可选演示' ? optionalCaps.get(task.goalId) ?? '7' : '2' }),
+    estimatePlan: ({ tasks }) => ({ quoteId: 'plan-fixed', currency: 'USD',
+      tasks: tasks.map(({ key }) => ({ key, micros: '1', route, basis: 'Fixed UI fixture' })),
+      acceptance: { micros: '2', basis: 'Fixture checks' }, rework: { micros: '2', basis: 'Fixture rework' } }),
+    readReceipt: ({ id }) => receipt.get(id),
+    reconcile: () => null,
+    async start(input) {
+      input.assertCurrent();
+      const activation = await adapter.start(input);
+      return { ...activation, async dispose() {
+        await activation.dispose();
+        const { id, authorizationId, currency } = input.authorization;
+        receipt.set(id, { attemptId: id, authorizationId, currency, final: true, amountMicros: '1', receiptId: 'ui-' + id });
+        return { authorizationId, cleanupConfirmed: true };
+      } };
+    },
+  };
+  adapter.handler = input => input.task.kind !== 'plan' ? defaultSimulation(input) : {
+    outcome: 'planned', summary: 'Two fixed-price tasks', rationale: 'Keep the required scope affordable.',
+    costPlan: { acceptanceBasis: 'Prepare checks', reworkBasis: 'Allow corrections' },
+    tasks: [{ key: 'core', title: '必做演示', importance: 'required', modelBasis: 'Fixed test model' },
+      { key: 'optional', title: '可选演示', importance: 'optional', modelBasis: 'Fixed test model' }],
+  };
+  const command = (name, args) => company.command(OWNER, randomUUID(), name, args);
+  const project = command('project.save', { name: 'Optional cost fixture', repoRoot: preview.source, mode: 'copy', checks: [] });
+  const template = command('workflow.publish', { name: '直接交付', phases: [{ id: 'execute', name: '执行' }] });
+  const pricedGoal = title => command('goal.create', { title, description: 'Isolated test', acceptance: 'Required file',
+    projectId: project.id, templateId: template.id, costLimitUsd: '0.000010' });
+  const goal = pricedGoal('可选预算调整测试');
+  const budget = id => company.store.require('goalCostBudgets', id);
+  const waitForOptional = id => expect.poll(() => company.store.tasksForGoal(id).some(task => task.status === 'blocked' &&
+    task.costBudgetHold?.reasonCode === 'shortfall') && budget(id).reservedAttempts === 0).toBe(true);
+  try {
+    await engine.start();
+    await waitForOptional(goal.id);
+    await page.goto(preview.url);
+    await page.locator('.acms-project-group > summary .acms-level-tag').click();
+    await page.getByRole('button', { name: goal.title, exact: true }).click();
+    const panel = page.getByRole('region', { name: '可选任务预算调整' });
+    await expect(panel).toContainText('本次延期范围 · 可选演示');
+    await expect(panel).toContainText('US$0.000007');
+    await expect(panel).toContainText('确认会先进行无付费核价，再决定是否延期。');
+    const confirm = panel.getByRole('button', { name: '确认可选项本轮延期' });
+    await expect(confirm).toBeDisabled();
+    await panel.getByLabel('延期理由').fill('保留必做演示和原验收');
+    await confirm.click();
+    await expect(panel).toContainText('可选演示 · 本轮延期');
+    await expect.poll(() => company.store.require('goals', goal.id).status).toBe('succeeded');
+    expect(budget(goal.id).limitMicros).toBe('10');
+    expect(adapter.calls.some(call => call.task.title === '可选演示')).toBe(false);
+
+    await page.getByRole('button', { name: '关闭详情' }).click();
+    const resumed = pricedGoal('重新核价并继续派发测试');
+    await waitForOptional(resumed.id);
+    await page.getByRole('button', { name: '刷新', exact: true }).click();
+    await page.getByRole('button', { name: resumed.title, exact: true }).click();
+    await expect(panel).toContainText('任务会正常执行并使用授权额度。');
+    const dispatch = panel.getByRole('button', { name: '重新核价并继续派发', exact: true });
+    await expect(dispatch).toBeEnabled();
+    optionalCaps.set(resumed.id, '3');
+    await dispatch.click();
+    await expect(page.getByRole('status').filter({ hasText: '已请求重新核价并继续派发' })).toBeVisible();
+    await expect.poll(() => company.store.require('goals', resumed.id).status === 'succeeded' &&
+      budget(resumed.id).settledMicros === '3').toBe(true);
+    const resumedOptional = adapter.calls.find(call => call.task.goalId === resumed.id && call.task.title === '可选演示');
+    expect(resumedOptional?.authorization?.upperMicros).toBe('3');
+    expect(budget(resumed.id).limitMicros).toBe('10');
+  } finally { await page.close(); await engine.stop(); await preview.close(); }
 }

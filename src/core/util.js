@@ -40,4 +40,4 @@ export function parseResult(value) {
 }
 export const OWNER = Object.freeze({ kind: 'owner', id: 'owner' });
 export const SYSTEM = Object.freeze({ kind: 'system', id: 'scheduler' });
-export const TERMINAL = new Set(['succeeded', 'cancelled', 'failed', 'archived', 'deleted']);
+export const TERMINAL = new Set(['succeeded', 'cancelled', 'failed', 'archived', 'deleted', 'deferred']);
