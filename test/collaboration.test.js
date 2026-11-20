@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile, symlink, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fixture, until } from './helpers.js';
+import { fixture, hostedWindows, taskWaitDiagnostics, until } from './helpers.js';
 import { createRoutes } from '../src/host/http.js';
 import { run } from '../src/runtime/workspaces.js';
 import { promptFor } from '../src/runtime/prompt.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { verifyCollaboration } from '../src/runtime/collaboration.js';
+import { readCommandCleanup } from '../src/runtime/host-command.js';
 
 test('adding a project through the UI route creates .acms and preserves owner notes on later saves', async t => {
   const f = await fixture(t); const source = path.join(f.root, 'new-project'); await mkdir(source);
@@ -56,7 +57,28 @@ test('review uses the author context revision; uncommitted .acms does not block 
   });
   for(const args of [['init'],['add','README.md'],['-c','user.name=Test','-c','user.email=test@localhost','commit','-m','baseline']]) { const r=await run('git',args,f.source); assert.equal(r.code,0,r.stderr); }
   f.command('project.save',{...f.project,mode:'git',autoMerge:true,expectedRevision:f.project.revision});
-  const task=f.task(); await f.start(); await until(()=>f.store.require('tasks',task.id).status==='succeeded',15000);
+  const task = f.task();
+  const taskState = taskWaitDiagnostics(f, task.id);
+  const diagnostics = async () => {
+    const current = f.store.require('tasks', task.id);
+    const latest = f.store.list('integrations').findLast(item => item.taskId === task.id);
+    const receipts = await Promise.all(['commandId', 'inspectionCommandId'].filter(key => latest?.[key]).map(async key => {
+      const commandId = latest[key];
+      const proof = await readCommandCleanup(path.join(f.dataDir, 'integration-receipts', `${commandId}.json`));
+      return { kind: key, commandId, cleanupConfirmed: !!proof, exitCode: proof?.exitCode, notStarted: proof?.notStarted };
+    }));
+    return { ...taskState(), feedback: current.feedback, engineError: f.engine.lastError,
+      integration: latest && { phase: latest.phase, reason: latest.reason, applyStartedAt: latest.applyStartedAt,
+        commandCleanupConfirmed: latest.commandCleanupConfirmed, receipts } };
+  };
+  await f.start();
+  await until(async () => {
+    const status = f.store.require('tasks', task.id).status;
+    if (['failed', 'cancelled', 'archived', 'deleted'].includes(status)) {
+      assert.fail(`Git integration reached ${status}. State ${JSON.stringify(await diagnostics())}`);
+    }
+    return status === 'succeeded';
+  }, hostedWindows ? 45000 : 15000, diagnostics);
   assert.match(await readFile(path.join(f.source,'deliverable.md'),'utf8'),/./);
   const tracked=await run('git',['ls-files','.acms'],f.source); assert.equal(tracked.stdout.trim(),'');
 });
