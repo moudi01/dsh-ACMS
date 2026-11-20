@@ -107,7 +107,8 @@ export function createRoutes(runtime) {
         assert(!Object.hasOwn(args.project ?? {}, 'deliveryRepository'), 'INVALID_INPUT', '请在项目设置中授权裸交付仓库。');
         await workspaces.validateProject({ ...args.project, mode: args.project?.mode ?? 'copy' });
       }
-      let result = company.command(OWNER, input.requestId, input.name, args);
+      const options = input.name === 'plan.approval.decide' ? { planCostSource: engine.adapter?.taskCost } : {};
+      let result = company.command(OWNER, input.requestId, input.name, args, options);
       const projectId = input.name === 'project.save' ? result.id : result?.projectId ?? (result?.goalId ? company.store.get('goals', result.goalId)?.projectId : null);
       if (projectId && company.store.get('projects', projectId)?.status !== 'deleted' && workspaces.publishProject) {
         try { await workspaces.publishProject(company.store.require('projects', projectId)); }

@@ -371,9 +371,11 @@ function PlanProposal({ goal, task, plan, data, act, busy }) {
     goal.planApproval.costPlanning && plan.approvalStatus === 'pending' && cost?.status !== 'fits' ? '等待预算决定' : planLabels[plan.approvalStatus];
   const canDecide = ['pending', 'rejected'].includes(plan.approvalStatus) && !['cancelled', 'archived', 'deleted', 'succeeded'].includes(goal.status);
   const decide = async (action, message) => {
-    const result = await act('plan.approval.decide', { planId: plan.id, fingerprint: plan.fingerprint,
-      generation: plan.generation, goalContractVersion: plan.goalContractVersion, action, reason: reason.trim() }, message);
-    if (result) setReason('');
+    try {
+      const result = await act('plan.approval.decide', { planId: plan.id, fingerprint: plan.fingerprint,
+        generation: plan.generation, goalContractVersion: plan.goalContractVersion, action, reason: reason.trim() }, message);
+      if (result) setReason('');
+    } catch { /* The owner command displays its error. */ }
   };
   return <>
     <p role="status"><span className="acms-tag">{badge}</span> · 规划第 {plan.generation} 代 · 合同 v{plan.goalContractVersion}</p>

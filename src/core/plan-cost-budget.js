@@ -22,7 +22,8 @@ function costContext(company, goal, tasks) {
   const project = company.store.require('projects', goal.projectId);
   const review = { finalReview: goal.templateSnapshot?.finalReview === true, checks: project.checks ?? [] };
   const assignments = tasks.map(task => task.assignee ? company.store.get('agents', task.assignee) : null);
-  const policy = company.policy();
+  const { allowedProviders, allowedModels } = company.policy();
+  const policy = { allowedProviders, allowedModels };
   const preferences = company.store.get('modelPreferences', 'model');
   const version = digest({ review, assignments: assignments.map(agent => agent && [agent.id, agent.revision]),
     policy: modelPolicyFingerprint(policy), preferences: preferences?.revision ?? null });
@@ -47,6 +48,22 @@ function normalizeQuote(quote, executorId, keys) {
   const acceptance = normalizeEstimate(quote.acceptance), rework = normalizeEstimate(quote.rework);
   if (!acceptance || !rework || tasks.some(row => !row.estimate)) return null;
   return { executorId, quoteId: quote.quoteId, currency: quote.currency, tasks, acceptance, rework };
+}
+
+function readPlanEstimate(executor, goal, task, tasks, intent, context) {
+  // Use the same scope and policy inputs before and after restart. Workflow
+  // status, timestamps and available balance do not describe the priced work.
+  const input = {
+    goal: { id: goal.id, projectId: goal.projectId, contractVersion: goal.contractVersion ?? 1,
+      description: goal.description, acceptance: goal.acceptance },
+    task: { id: task.id, generation: task.generation, kind: task.kind },
+    tasks, intent, ...context,
+  };
+  try {
+    return normalizeQuote(executor?.estimatePlan?.(input), executor?.id, tasks.map(node => node.key));
+  } catch {
+    return null; // Unavailable or invalid host estimate leaves the plan held.
+  }
 }
 
 // Existing priced goals with no implemented plan can enter the gate after an
@@ -87,7 +104,7 @@ export function assessCostPlan(engine, goal, task, proposalTasks, intent) {
   const byKey = new Map(intent.nodes.map(node => [node.key, node]));
   const requiredKeys = intent.nodes.filter(node => node.importance === 'required').map(node => node.key);
   const base = { intent, submitted, contextVersion: context.version, requiredKeys,
-    estimate: null, minimumMicros: null, fullMicros: null, selectedKeys: [], selectedMicros: null };
+    estimate: null, estimateFingerprint: null, minimumMicros: null, fullMicros: null, selectedKeys: [], selectedMicros: null };
   if (!requiredKeys.length || intent.nodes.some(node => !node.importance || !node.modelBasis) || !intent.acceptanceBasis || !intent.reworkBasis) {
     return { ...base, status: 'incomplete', reason: '请退回规划，补充必做和可选分类、选模依据、验收及返工预留依据。' };
   }
@@ -95,13 +112,7 @@ export function assessCostPlan(engine, goal, task, proposalTasks, intent) {
       node.dependencies.some(key => byKey.get(key)?.importance !== 'required'))) {
     return { ...base, status: 'incomplete', reason: '必做任务依赖可选任务。请退回规划并补齐最低交付的前置任务。' };
   }
-  const executor = adapter.taskCost;
-  let quote;
-  // This optional host hook supplies a fixed forecast and never starts a runner.
-  try {
-    quote = executor?.estimatePlan?.({ goal, task, tasks: proposalTasks, intent, ...context });
-  } catch { /* A missing host estimate is a decision state, not a model failure. */ }
-  const estimate = normalizeQuote(quote, executor?.id, proposalTasks.map(node => node.key));
+  const estimate = readPlanEstimate(adapter.taskCost, goal, task, proposalTasks, intent, context);
   if (!estimate) return { ...base, status: 'incomplete', reason: '宿主还没有覆盖本计划的可信估算。请核对执行器报价能力后退回重新规划。' };
   const reserved = BigInt(estimate.acceptance.micros) + BigInt(estimate.rework.micros);
   const taskAmounts = new Map(estimate.tasks.map(row => [row.key, BigInt(row.estimate.micros)]));
@@ -110,21 +121,28 @@ export function assessCostPlan(engine, goal, task, proposalTasks, intent) {
   const available = BigInt(submitted.availableMicros);
   const fitsFull = !submitted.breach && full <= available;
   const fitsMinimum = !submitted.breach && minimum <= available;
-  return { ...base, estimate, minimumMicros: minimum.toString(), fullMicros: full.toString(),
+  return { ...base, estimate, estimateFingerprint: digest(estimate), minimumMicros: minimum.toString(), fullMicros: full.toString(),
     selectedKeys: fitsFull ? proposalTasks.map(node => node.key) : requiredKeys,
     selectedMicros: (fitsFull ? full : minimum).toString(), status: fitsMinimum ? 'fits' : 'shortfall',
     reason: fitsFull ? null : fitsMinimum ? '可选任务已延期，以保留验收和返工额度。' :
       submitted.breach ? '执行器的真实费用超出承诺。请核对费用回执。' : '当前可派发余额不足以覆盖最低交付。可追加金额、退回缩小范围，或结束目标。' };
 }
 
-export function recheckCostPlan(company, goal, plan) {
+export function recheckCostPlan(company, goal, plan, reprice) {
   const cost = plan.costPlan;
   assert(cost?.estimate && cost.selectedKeys.length && cost.selectedMicros !== null,
     'COST_PLAN_ESTIMATE_REQUIRED', '请退回计划，补齐可核对的宿主估算后再派工。');
-  assert(costContext(company, goal, plan.proposalTasks).version === cost.contextVersion,
+  const context = costContext(company, goal, plan.proposalTasks);
+  assert(context.version === cost.contextVersion,
     'COST_PLAN_ESTIMATE_STALE', '验收检查、模型策略或执行分派已变化，请退回计划重新估算。');
   assert(!costPlanHasUnscopedWork(company.store, goal.id), 'COST_PLAN_UNSCOPED_WORK',
     '此目标还有未纳入提案的旧任务，请先移除这些未派发任务。');
+  if (reprice) {
+    const current = reprice.executor?.id === cost.estimate.executorId ?
+      readPlanEstimate(reprice.executor, goal, reprice.task, plan.proposalTasks, cost.intent, context) : null;
+    assert(current && digest(current) === cost.estimateFingerprint,
+      'COST_PLAN_ESTIMATE_STALE', '受信宿主估算已变化或无法核对。请退回此提案重新估算。');
+  }
   const balance = costPlanBalance(company.store.require('goalCostBudgets', goal.id));
   assert(!balance.breach && BigInt(balance.availableMicros) >= BigInt(cost.selectedMicros),
     'COST_PLAN_LIMIT', '当前余额无法覆盖此计划版本。请追加金额、退回调整范围，或结束目标。');

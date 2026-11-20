@@ -99,9 +99,9 @@ function proposalFingerprint(plan) {
     ...(plan.costPlan ? { costPlan: plan.costPlan } : {}) });
 }
 
-function releaseProposal(company, goal, task, plan, manager, decision = null) {
+function releaseProposal(company, goal, task, plan, manager, decision = null, executor) {
   const { store } = company;
-  const cost = isCostPlanner(goal, task) ? recheckCostPlan(company, goal, plan) : null;
+  const cost = isCostPlanner(goal, task) ? recheckCostPlan(company, goal, plan, decision ? { task, executor } : null) : null;
   // This marker and every assignment are written inside the same transaction.
   store.put('goals', { ...goal, planApproval: { ...goal.planApproval, approvedPlanId: plan.id } });
   const { records } = materializePlan(company, task, orderNodes(cost?.tasks ?? plan.proposalTasks), manager, plan.rationale);
@@ -162,7 +162,7 @@ function proposePlan(engine, task, attempt, ordered, facts, manager, output) {
   return saved;
 }
 
-export function decidePlanApproval(company, args, actor) {
+export function decidePlanApproval(company, args, actor, executor) {
   assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可以决定计划审批。');
   const { store } = company;
   const action = args.action;
@@ -200,7 +200,7 @@ export function decidePlanApproval(company, args, actor) {
   let fields;
   if (action === 'approve') {
     const manager = managerForPlan(company, task, attempt);
-    fields = releaseProposal(company, goal, task, plan, manager, decision);
+    fields = releaseProposal(company, goal, task, plan, manager, decision, executor);
   } else if (action === 'revise') {
     const revised = restartForChange(company, task, { direct: true });
     store.put('tasks', { ...revised, status: 'ready', activeAttemptId: null, blocker: null, feedback: reason, summary: '' });

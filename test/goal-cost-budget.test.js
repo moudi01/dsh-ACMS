@@ -467,7 +467,7 @@ test('budget planning commits a host-estimated minimum and defers optional scope
 test('insufficient minimum leaves no implementation until explicit addition and same-version owner approval after restart', async t => {
   const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
   const priced = fixedCostAdapter(f, { amountFor: task => task.kind === 'plan' ? '7' : '3' });
-  planEstimates(priced);
+  const initialEstimates = planEstimates(priced);
   f.engine.adapter = priced.adapter;
   const target = goal(f, '0.000020', { plan: true });
   await f.start();
@@ -487,6 +487,12 @@ test('insufficient minimum leaves no implementation until explicit addition and 
 
   const reopened = new Store(f.store.filename), company = new Company(reopened);
   const recovered = fixedCostAdapter(f);
+  const restartedEstimates = planEstimates(recovered);
+  const underlyingEstimate = recovered.adapter.taskCost.estimatePlan;
+  recovered.adapter.taskCost.estimatePlan = input => {
+    const quoted = underlyingEstimate(input);
+    return { ...quoted, tasks: [...quoted.tasks].reverse() };
+  };
   const engine = new Engine(company, recovered.adapter, new WorkspaceManager(f.dataDir, company), { intervalMs: 20 });
   const runtime = { ...f, store: reopened, company, adapter: recovered.adapter, engine, workspaces: engine.workspaces };
   try {
@@ -499,6 +505,8 @@ test('insufficient minimum leaves no implementation until explicit addition and 
     const approved = await scopedCommand(runtime, 'plan.approval.decide', approve, 'same-plan-approval');
     assert.equal(approved.costRelease.kind, 'owner');
     assert.equal(approved.costRelease.balance.availableMicros, '63');
+    assert.deepEqual(restartedEstimates, [initialEstimates[0]]);
+    assert.deepEqual(initialEstimates[1], initialEstimates[0]);
     assert.deepEqual(approved.nodes.map(node => node.key), ['core', 'validate']);
     assert.deepEqual(await scopedCommand(runtime, 'plan.approval.decide', approve, 'same-plan-approval'), approved);
     assert.deepEqual(await scopedCommand(runtime, 'plan.approval.decide', approve, 'new-id-same-approval'), approved);
@@ -618,4 +626,50 @@ test('only unimplemented open legacy strict roots receive the new planning gate 
     new Company(reopened);
     assert.equal(reopened.require('goals', pending.id).revision, revision);
   } finally { reopened.close(); }
+});
+
+
+test('owner HTTP refuses a changed or missing trusted quote and preserves the original plan until repriced', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  const priced = fixedCostAdapter(f);
+  const oldRates = planEstimates(priced, { amounts: { core: '8', validate: '7', bonus: '25' }, acceptance: '5', rework: '5' });
+  f.engine.adapter = priced.adapter;
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  await f.start();
+  const original = await proposalFor(f, target);
+  assert.equal(original.costPlan.minimumMicros, '25');
+  assert.equal(budget(f.store, target.id).settledMicros, '3');
+  assert.equal(f.company.snapshot().goals.find(item => item.id === target.id).costBudget.availableMicros, '37');
+  assert.equal(oldRates.length, 1);
+
+  const currentRates = { amounts: { core: '28', validate: '26', bonus: '25' }, acceptance: '5', rework: '5' };
+  const estimateCalls = planEstimates(priced, currentRates);
+  const approve = planDecision(original, 'approve', 'Approve the reviewed version');
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', approve, 'changed-rates-approval', 409)).code, 'COST_PLAN_ESTIMATE_STALE');
+  assert.equal(estimateCalls.length, 1);
+  assert.ok(!f.store.list('tasks').some(task => task.goalId === target.id && task.kind === 'work'));
+  assert.deepEqual(f.store.require('plans', original.id), original);
+  assert.deepEqual(priced.calls, [original.taskId]);
+
+  delete priced.adapter.taskCost.estimatePlan;
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', { ...approve, planCostSource: original.costPlan.estimate },
+    'missing-current-estimator', 409)).code, 'COST_PLAN_ESTIMATE_STALE');
+  assert.deepEqual(f.store.require('plans', original.id), original);
+  assert.deepEqual(priced.calls, [original.taskId]);
+
+  planEstimates(priced, currentRates);
+  const returned = await scopedCommand(f, 'plan.approval.decide', planDecision(original, 'revise', 'Verify the higher rates'), 'return-stale-plan');
+  assert.equal(returned.approvalStatus, 'returned');
+  assert.deepEqual(returned.costPlan, original.costPlan);
+  const revised = await until(() => f.store.list('plans').find(plan => plan.goalId === target.id && plan.generation === original.generation + 1 &&
+    !f.store.require('attempts', plan.attemptId).cleanupPending), undefined, taskWaitDiagnostics(f, original.taskId));
+  assert.equal(revised.costPlan.minimumMicros, '64');
+  assert.equal(revised.costPlan.status, 'shortfall');
+  assert.notEqual(revised.costPlan.estimateFingerprint, original.costPlan.estimateFingerprint);
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', approve, 'old-version-after-return', 409)).code, 'STALE_PLAN_APPROVAL');
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', planDecision(revised, 'approve', 'Still insufficient'),
+    'repriced-plan-insufficient', 409)).code, 'COST_PLAN_LIMIT');
+  assert.deepEqual(priced.calls, [original.taskId, original.taskId]);
+  assert(!f.store.list('tasks').some(task => task.goalId === target.id && task.kind === 'work'));
 });

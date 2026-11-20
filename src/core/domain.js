@@ -87,7 +87,7 @@ export class Company {
         'agent.restore': () => restoreEntity(this, 'agent', args, actor),
         'goal.create': () => this.createGoal(args, actor),
         'goal.composition.recheck': () => this.recheckGoalComposition(args, actor),
-        'plan.approval.decide': () => decidePlanApproval(this, args, actor),
+        'plan.approval.decide': () => decidePlanApproval(this, args, actor, options.planCostSource),
         'goal.candidate_merge.confirm': () => decideCandidateMerge(this, args, actor, 'confirm'),
         'goal.candidate_merge.approve': () => decideCandidateMerge(this, args, actor, 'approve'),
         'goal.candidate_merge.reject': () => decideCandidateMerge(this, args, actor, 'reject'),
