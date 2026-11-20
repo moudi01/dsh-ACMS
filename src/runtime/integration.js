@@ -9,7 +9,7 @@ import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
 import { goalStopped } from '../core/goal-control.js';
 import { candidateMergeMatches } from '../core/candidate-confirmation.js';
-import { applyConfirmedCandidate, assertCandidateReservation, candidateGitEnvironment, releaseCandidateReservation } from './candidate-merge.js';
+import { applyConfirmedCandidate, assertCandidateBranchCreation, candidateGitEnvironment } from './candidate-merge.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -80,7 +80,7 @@ function settleCandidateMerge(engine, record, { result, error, reason, observed,
     save(engine, record, { phase: 'completed', result, reason: null, finishedAt: now() }, 'integration.completed');
     saveRequest({ status: 'applied', reason: null, result });
     engine.store.event('goal.candidate_merge.applied', goal.id, { previewId: record.candidateMergeId, version: record.candidateVersion,
-      confirmedBy: record.confirmedBy, targetRef: record.targetRef, targetHead: record.targetHead, actualHead: result.actualHead,
+      confirmedBy: record.confirmedBy, targetRef: record.targetRef, basisRef: record.basisRef, basisHead: record.basisHead, actualHead: result.actualHead,
       integratedCommit: result.integratedCommit }, SYSTEM, { goalId: goal.id });
     return;
   }
@@ -154,8 +154,8 @@ async function clearCommand(engine, record, field, file) {
   await unlink(file).catch(() => {});
 }
 
-async function inspect(engine, record, observe) {
-  const invoke = async (command, args, cwd, options) => {
+async function inspect(engine, record) {
+  return engine.workspaces.inspectIntegration(record, async (command, args, cwd) => {
     const inspectionCommandId = id('command');
     const cleanupReceipt = receipt(engine, inspectionCommandId);
     await mkdir(path.dirname(cleanupReceipt), { recursive: true });
@@ -163,7 +163,7 @@ async function inspect(engine, record, observe) {
     let cleanupUnknown = false;
     try {
       return await engine.workspaces.runIntegrationCommand(command, args, cwd, {
-        timeout: 5000, ...options, cleanupReceipt, beforeStart: () => engine.fenced(),
+        timeout: 5000, cleanupReceipt, beforeStart: () => engine.fenced(),
         ...(record.candidateMergeId ? { env: candidateGitEnvironment() } : {}),
       });
     } catch (error) {
@@ -172,10 +172,7 @@ async function inspect(engine, record, observe) {
     } finally {
       if (!cleanupUnknown && owns(engine)) await clearCommand(engine, record, 'inspectionCommandId', cleanupReceipt);
     }
-  };
-  const observed = observe ? await engine.workspaces.inspectIntegration(record, invoke) : null;
-  if (record.ownerReservation) await releaseCandidateReservation(engine.workspaces, record, invoke);
-  return observed;
+  });
 }
 
 async function reconcile(engine, record, { error, recovering = false, cleanup } = {}) {
@@ -194,8 +191,8 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
     return settle(engine, record, { reason: error?.message ?? '缺少集成命令的进程树清理回执', observed: record.observed });
   }
   let observed;
-  if (record.ownerReservation || (record.applyStartedAt && !cleanup?.notStarted)) {
-    try { observed = await inspect(engine, record, !!record.applyStartedAt && !cleanup?.notStarted); }
+  if (record.applyStartedAt && !cleanup?.notStarted) {
+    try { observed = await inspect(engine, record); }
     catch (failure) {
       return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
         observed: record.observed, commandCleanupConfirmed: !!cleanup });
@@ -205,7 +202,7 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
     return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
   }
   if (observed?.status === 'merged') return settle(engine, record, { result: observed });
-  const compareFailed = !!record.ownerReservation && typeof cleanup?.exitCode === 'number' && cleanup.exitCode > 0 && observed?.status === 'target-changed';
+  const compareFailed = !!record.candidateMergeId && typeof cleanup?.exitCode === 'number' && cleanup.exitCode > 0 && observed?.status === 'target-changed';
   if (record.applyStartedAt && ((observed?.status !== 'unchanged' && !compareFailed) || cleanup?.exitCode === 0)) {
     return settle(engine, record, { reason: '无法确认最终 Git 命令是否合入候选提交', observed, commandCleanupConfirmed: !!cleanup });
   }
@@ -293,7 +290,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       artifactHash: task.artifactHash, artifactIds: task.artifactIds, goalContractVersion: contractVersion(goal),
       contract: contract(engine, task.projectId), phase: 'preparing', ...(compositionRecheckId ? { compositionRecheckId } : {}),
       ...(candidateMergeId ? { candidateMergeId, candidateVersion: request.selection.version, confirmedBy: request.confirmedBy,
-        targetRef: request.targetRef, targetHead: request.targetHead } : {}),
+        targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead } : {}),
     });
     if (candidateMergeId) engine.store.put('goals', { ...currentGoal,
       candidateMerge: { ...request, status: 'preparing', integrationId: saved.id } });
@@ -349,7 +346,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
           guard();
           if (apply) {
             const current = engine.store.require('integrations', record.id);
-            if (candidateMergeId) assertCandidateReservation(current, binary);
+            if (candidateMergeId) assertCandidateBranchCreation(current, binary);
             else engine.workspaces.assertIntegrationTarget(current, binary);
             guard();
           }
@@ -371,9 +368,11 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       run: (executable, args, cwd, options) => command(executable, args, cwd, options),
       checkpoint: patch => { guard(); save(engine, record, patch, patch.phase === 'checking' ? 'integration.checking' : null); },
       apply: async (checks, cwd, candidate, ownerOptions) => {
-        const args = ownerOptions ? ['-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--no-deref', '-m',
-          ownerOptions.message, ownerOptions.targetRef, candidate, ownerOptions.targetHead] : ['merge', '--ff-only', candidate];
-        const result = await command('git', args, cwd, { timeout: 15000, env: ownerOptions?.env }, { checks });
+        const args = ownerOptions ? ['-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--stdin', '-m', ownerOptions.message]
+          : ['merge', '--ff-only', candidate];
+        const input = ownerOptions ? ['start', 'option no-deref', `verify ${ownerOptions.basisRef} ${ownerOptions.basisHead}`,
+          'option no-deref', `create ${ownerOptions.targetRef} ${candidate}`, 'prepare', 'commit', ''].join('\n') : undefined;
+        const result = await command('git', args, cwd, { timeout: 15000, env: ownerOptions?.env, input }, { checks });
         assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || 'Final Git command did not complete cleanly');
       },
     };
@@ -388,7 +387,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
   } catch (error) {
     if (!owns(engine)) return;
     const current = engine.store.require('integrations', record.id);
-    if (current.applyStartedAt || current.ownerReservation) await reconcile(engine, current, { error });
+    if (current.applyStartedAt) await reconcile(engine, current, { error });
     else settle(engine, current, error.cleanupUncertain ? { reason: error.message } : { error });
   } finally { engine.activeIntegration = null; }
 }

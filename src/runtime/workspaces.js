@@ -39,11 +39,13 @@ async function describesReplacedGitLeaf(root, name) {
   return false;
 }
 
-export async function run(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, env } = {}) {
+export async function run(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, env, input } = {}) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(command === 'node' ? process.execPath : command, args, { cwd, env, shell: false, windowsHide: true,
-      detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+      detached: process.platform !== 'win32', stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(input);
     let stdout = '', stderr = '', timedOut = false;
     let terminating;
     const terminate = () => {
@@ -652,8 +654,8 @@ export class WorkspaceManager {
     const { targetRoot, targetHead, targetRef, integratedCommit, commit, checks, candidate } = record;
     if (record.candidateMergeId) assert(path.relative(await fs.realpath(targetRoot), targetRoot) === '',
       'TARGET_CHANGED', '无法核对已确认的项目目录，请恢复原目录后重新核对。');
-    const observed = await invoke('git', record.ownerReservation ? ['rev-parse', '--verify', '--quiet', targetRef] : ['rev-parse', '--verify', targetRef], targetRoot);
-    if (record.ownerReservation && observed.code === 1 && !observed.timedOut) return { status: 'target-changed', actualHead: null, targetRef };
+    const observed = await invoke('git', record.candidateMergeId ? ['rev-parse', '--verify', '--quiet', targetRef] : ['rev-parse', '--verify', targetRef], targetRoot);
+    if (record.candidateMergeId && observed.code === 1 && !observed.timedOut) return { status: 'unchanged', actualHead: null, targetRef };
     assert(observed.code === 0 && !observed.timedOut, 'GIT_ERROR', observed.stderr || 'Unable to verify the integration target');
     const actualHead = observed.stdout.trim();
     const ancestry = await invoke('git', ['merge-base', '--is-ancestor', integratedCommit, actualHead], targetRoot);
@@ -662,7 +664,7 @@ export class WorkspaceManager {
     if (ancestry.code === 0 || reflog.split(/\r?\n/).includes(integratedCommit)) {
       return { status: 'merged', proof: ancestry.code === 0 ? 'target-history' : 'target-reflog', actualHead, targetRef, commit, integratedCommit, checks, candidate };
     }
-    if (record.ownerReservation) return { status: actualHead === targetHead ? 'unchanged' : 'target-changed', actualHead, targetRef };
+    if (record.candidateMergeId) return { status: 'target-changed', actualHead, targetRef };
     const actual = await this.integrationTarget(targetRoot, invoke);
     return { status: actual.targetRef === targetRef && actual.targetHead === targetHead && !actual.targetStatus ? 'unchanged' : 'unknown', actualHead, targetRef };
   }

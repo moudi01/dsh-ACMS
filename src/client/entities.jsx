@@ -40,8 +40,8 @@ function CandidateDownload({ goal }) {
   </div>;
 }
 
-const mergeLabels = { previewed: '等待所有者确认', queued: '已确认，等待执行', preparing: '正在核对合入条件',
-  applying: '正在更新目标分支', reconciling: '等待核对 Git 结果', applied: '已合入', rejected: '已拒绝', cancelled: '已撤回', failed: '合入失败' };
+const mergeLabels = { previewed: '等待所有者确认', queued: '已确认，等待执行', preparing: '正在核对分支创建条件',
+  applying: '正在创建交付分支', reconciling: '等待核对 Git 结果', applied: '已创建交付分支', rejected: '已拒绝', cancelled: '已撤回', failed: '创建交付分支失败' };
 const mergeChanges = { A: '新增', M: '修改', D: '删除', T: '类型变更' };
 
 function CandidateMerge({ goal, act, busy }) {
@@ -51,7 +51,7 @@ function CandidateMerge({ goal, act, busy }) {
   const request = goal.candidateMerge;
   const selected = goal.finalComposition;
   const name = branch.trim();
-  const targetRef = name.startsWith('refs/') ? name : `refs/heads/${name}`;
+  const basisRef = name.startsWith('refs/') ? name : `refs/heads/${name}`;
   const active = ['queued', 'preparing', 'applying', 'reconciling'].includes(request?.status);
   const current = request && selected && ['version', 'deliveryHash', 'contractVersion', 'reviewId'].every(key => request.selection[key] === selected[key]);
   const decision = (action, args, notice) => act(`goal.candidate_merge.${action}`, { id: goal.id, previewId: request.id, ...args }, notice);
@@ -59,29 +59,30 @@ function CandidateMerge({ goal, act, busy }) {
     setLoading(true);
     setError('');
     try {
-      await api.candidateMergePreview({ goalId: goal.id, version: selected.version, deliveryHash: selected.deliveryHash, targetRef });
+      await api.candidateMergePreview({ goalId: goal.id, version: selected.version, deliveryHash: selected.deliveryHash, basisRef });
     } catch (error) { setError(error.message); }
     finally { setLoading(false); }
   };
   const busyReason = busy || loading ? '正在保存，请稍候。' : '';
-  const confirmReason = !current ? '验收版本已变化，请重新预览。' : name && targetRef !== request.targetRef ? '所选分支已变化，请重新预览。' : '';
-  return <section aria-label="确认合入 Git 候选" className="acms-review-state">
-    <h4>合入 Git 候选</h4>
+  const confirmReason = !current ? '验收版本已变化，请重新预览。' : name && basisRef !== request.basisRef ? '基准分支已变化，请重新预览。' : '';
+  return <section aria-label="创建 Git 交付分支" className="acms-review-state">
+    <h4>创建 Git 交付分支</h4>
     {selected && !active && <>
-      <Field label="目标 Git 分支" hint="输入未被任何工作副本检出的本地分支。确认后只更新这个分支，保留现有工作副本。"><input value={branch} onChange={event => setBranch(event.target.value)} placeholder="例如 refs/heads/release" /></Field>
-      <ActionButton reason={busyReason || (!name ? '请填写目标分支。' : '')} onClick={preview}>预览合入</ActionButton>
+      <Field label="基准 Git 分支" hint="输入现有的本地分支。确认后，ACMS 会基于它当前的 HEAD 创建新的交付分支。"><input value={branch} onChange={event => setBranch(event.target.value)} placeholder="例如 refs/heads/main" /></Field>
+      <ActionButton reason={busyReason || (!name ? '请填写基准分支。' : '')} onClick={preview}>预览交付分支</ActionButton>
     </>}
     {error && <p role="alert">{error}</p>}
     {request && <>
       <p role="status">{mergeLabels[request.status]}{active && request.stopRequested && ' · 已请求撤回'}</p>
       {request.reason && <p className="acms-sectionnote">{request.reason}</p>}
       <dl className="acms-definition">
-        <dt>目标分支</dt><dd><code>{request.targetRef}</code></dd>
-        <dt>预览 HEAD</dt><dd><code>{request.targetHead}</code></dd>
+        <dt>基准分支</dt><dd><code>{request.basisRef}</code></dd>
+        <dt>基准 HEAD</dt><dd><code>{request.basisHead}</code></dd>
+        <dt>新交付分支</dt><dd><code>{request.targetRef}</code></dd>
         <dt>候选版本</dt><dd><code>{request.selection.version}</code></dd>
         <dt>交付合同</dt><dd>v{request.selection.contractVersion}</dd>
         <dt>最终审查</dt><dd>{request.selection.reviewId ? <>已通过 · <code>{request.selection.reviewId}</code></> : '模板无需最终审查'}</dd>
-        {request.result && <><dt>合入提交</dt><dd><code>{request.result.integratedCommit}</code></dd></>}
+        {request.result && <><dt>交付提交</dt><dd><code>{request.result.integratedCommit}</code></dd></>}
       </dl>
       <details><summary>提交变更（{request.summary.total} 项）</summary>
         {request.summary.items.length > 0 && <ul>{request.summary.items.map(item => <li key={`${item.change}/${item.path}`}>{mergeChanges[item.change] ?? item.change} <code>{item.path}</code></li>)}</ul>}
@@ -93,14 +94,15 @@ function CandidateMerge({ goal, act, busy }) {
       <div className="acms-actions">
         {request.status === 'previewed' && <>
           <ActionButton reason={busyReason || confirmReason} onClick={() => decision('confirm', {
-            targetRef: request.targetRef, targetHead: request.targetHead, version: request.selection.version, deliveryHash: request.selection.deliveryHash,
-          }, '已确认合入，等待 Git 核对').catch(() => {})}>确认合入 {request.targetRef}</ActionButton>
-          <ActionButton reason={busyReason} onClick={() => decision('reject', {}, '已拒绝该合入预览').catch(() => {})}>拒绝合入</ActionButton>
+            targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead,
+            version: request.selection.version, deliveryHash: request.selection.deliveryHash,
+          }, '已确认创建交付分支，等待 Git 核对').catch(() => {})}>确认创建交付分支</ActionButton>
+          <ActionButton reason={busyReason} onClick={() => decision('reject', {}, '已拒绝该交付分支预览').catch(() => {})}>拒绝预览</ActionButton>
         </>}
         {active && <ActionButton reason={busyReason || (request.stopRequested ? '正在核对撤回结果。' : '')}
           onClick={() => decision('withdraw', {}, '已请求撤回确认').catch(() => {})}>撤回确认</ActionButton>}
         {request.status === 'reconciling' && <ActionButton reason={busyReason}
-          onClick={() => decision('reconcile', {}, '已请求重新核对 Git 结果').catch(() => {})}>重新核对合入结果</ActionButton>}
+          onClick={() => decision('reconcile', {}, '已请求重新核对 Git 结果').catch(() => {})}>重新核对创建结果</ActionButton>}
       </div>
     </>}
   </section>;

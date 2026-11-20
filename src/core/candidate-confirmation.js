@@ -27,7 +27,8 @@ export function candidateMergeMatches(company, goal, request, allowDraining = fa
 export function verifyCandidateConfirmation(company, args) {
   const goal = company.store.require('goals', args.id);
   const request = goal.candidateMerge;
-  assert(request && request.id === args.previewId && request.targetRef === args.targetRef && request.targetHead === args.targetHead &&
+  assert(request && request.id === args.previewId && request.targetRef === args.targetRef &&
+    request.basisRef === args.basisRef && request.basisHead === args.basisHead &&
     request.selection.version === args.version && request.selection.deliveryHash === args.deliveryHash,
   'STALE_CANDIDATE_CONFIRMATION', '预览或确认的候选与分支不匹配，请重新预览。');
   if (request.status === 'previewed') assert(candidateMergeMatches(company, goal, request), 'STALE_CANDIDATE_CONFIRMATION',
@@ -65,7 +66,7 @@ export function decideCandidateMerge(company, args, actor, decision) {
 function recordDecision(company, goal, request, actor, decision) {
   company.store.put('goals', { ...goal, candidateMerge: request });
   company.store.event('goal.candidate_merge.' + decision, goal.id, {
-    previewId: request.id, version: request.selection.version, targetRef: request.targetRef, targetHead: request.targetHead,
+    previewId: request.id, version: request.selection.version, targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead,
   }, actor, { goalId: goal.id });
   return request;
 }
