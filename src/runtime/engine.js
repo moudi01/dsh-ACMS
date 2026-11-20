@@ -19,6 +19,7 @@ import { classifyEnvironment, environmentFailure } from './preflight.js';
 import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './environment-gate.js';
 import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-control.js';
 import { readCommandCleanup } from './host-command.js';
+import { withAttemptUsage } from './attempt-usage.js';
 import { preparationForTask } from '../core/project-preparation.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
@@ -89,12 +90,20 @@ export class Engine {
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
       this.fenced();
       // A stop or edit may have discarded the parked result during receipt I/O.
-      const previous = this.store.require('attempts', pending.id);
+      let previous = this.store.require('attempts', pending.id);
       if ((previous.resultDeferred || previous.provider?.startsWith('paired:')) && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
         fact = { status: 'unknown', reason: '执行回执未确认进程树清理', actions: ['refresh-receipt', 'inspect-execution'] };
       }
       if (previous.cleanupUncertain && fact.cleanupConfirmed !== true) {
         fact.status = 'unknown'; fact.reason = previous.cleanupError || 'Prior process tree cleanup is still unconfirmed'; delete fact.result;
+      }
+      // Account for the execution whether or not its business result can still
+      // be applied. Keep the usage once on the attempt, not in recovery events.
+      if (fact.meteredUsage) {
+        const accounted = withAttemptUsage(previous, fact);
+        if (accounted !== previous) previous = this.store.transaction(() => this.store.put('attempts', accounted));
+        const { meteredUsage, ...recovery } = fact;
+        fact = recovery;
       }
       const currentTask = this.store.require('tasks', previous.taskId);
       const ownsTask = currentTask.activeAttemptId === previous.id && currentTask.generation === previous.taskGeneration;
@@ -642,8 +651,15 @@ export class Engine {
       try {
         await activation?.dispose?.();
         if (cleanupFailure) throw cleanupFailure;
+        let usageReceipt;
+        if (this.store.ownsLease(this.owner, this.epoch)) {
+          const current = this.store.require('attempts', attempt.id);
+          if (!current.meteredUsage && current.execution?.runtime === 'codex-app-server') {
+            try { usageReceipt = await this.adapter.reconcile?.(current); } catch { /* Unavailable receipt leaves usage unknown. */ }
+          }
+        }
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
-          const saved = this.store.require('attempts', attempt.id);
+          const saved = withAttemptUsage(this.store.require('attempts', attempt.id), usageReceipt);
           if (recoveryFailure) {
             this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, recovery: { status: 'unknown', reason: recoveryFailure.message, actions: ['refresh-receipt', 'inspect-execution'] } });
             return;

@@ -187,6 +187,49 @@ function GoalReviewState({ goal, approvals, deliveryRepository, taskCount, taskL
     {goal.reviewHistory?.length > 0 && <details className="acms-review-history"><summary>历史审查（{goal.reviewHistory.length}）</summary>{goal.reviewHistory.map(item => <div className="acms-review-history-row" key={item.id}><span className="acms-tag">{reviewLabels[item.status] ?? item.status}</span>{item.status === 'succeeded' ? (item.passed ? ' 通过' : ' 未通过') : ''}{item.status === 'cancelled' ? ` 取消：${item.cancelReason || '未填写原因'}` : ''}<small>合同 v{item.goalContractVersion ?? 1} · {item.createdAt ? new Date(item.createdAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}</small></div>)}</details>}
   </section>;
 }
+const usageLabels = { inputTokens: '输入', cachedInputTokens: '缓存命中输入', cacheWriteInputTokens: '写入缓存的输入',
+  outputTokens: '输出', reasoningOutputTokens: '推理输出', totalTokens: '供应商报告合计' };
+const usageState = { reported: '已报告', pending: '等待终态或核对', unknown: '未知', 'not-executed': '前置检查未通过' };
+
+function GoalAttemptUsage({ goalId, tasks }) {
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const load = async before => {
+    setLoading(true); setError('');
+    try { setReport(await api.attemptUsage(goalId, before)); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+  return <section className="acms-review-state" aria-label="模型执行用量">
+    <h3>模型执行用量</h3>
+    <p className="acms-sectionnote">此处仅统计 ACMS 任务执行报告的 token。服务账单和订阅额度有独立口径。</p>
+    <div className="acms-actions wrap">
+      <ActionButton reason={loading ? '正在读取…' : ''} onClick={() => load()}>{report ? '查看最新用量' : '查看执行用量'}</ActionButton>
+      {report?.nextBefore && <ActionButton reason={loading ? '正在读取…' : ''} onClick={() => load(report.nextBefore)}>查看更早记录</ActionButton>}
+    </div>
+    {error && <p role="alert">{error}</p>}
+    {report && (report.attempts.length ? <>
+      <p role="status">本页覆盖 · {Object.entries(report.coverage).map(([state, count]) => `${usageState[state]} ${count}`).join(' · ')}</p>
+      <h4>本页 token 小计</h4>
+      <dl className="acms-definition">
+        {Object.entries(report.summary).map(([field, row]) => <React.Fragment key={field}><dt>{usageLabels[field]}</dt>
+          <dd>{row.subtotal ?? '未知'}{row.subtotal !== null && ` · 本页 ${row.reported} 次报告`}</dd></React.Fragment>)}
+      </dl>
+      <p className="acms-sectionnote">缓存和推理按供应商字段单列，合计沿用供应商报告值。</p>
+      {report.attempts.map(item => <details key={item.id} className="acms-run"><summary>
+        {tasks.find(task => task.id === item.taskId)?.title ?? item.taskId} · {usageState[item.state]} · {item.model ?? '模型未知'}
+      </summary>
+        <p>{item.startedAt ? new Date(item.startedAt).toLocaleString('zh-CN') : '时间未知'} · {item.kind ?? '类型未知'} · <code>{item.id}</code></p>
+        <p>{item.provider ?? '路由未知'}{item.llmProvider && ` / ${item.llmProvider}`} · 思考深度 {item.reasoningEffort ?? '未知'}</p>
+        {item.usage && <><p>来源 {item.usage.source}</p><dl className="acms-definition">
+          {Object.entries(item.usage.counts).map(([field, count]) => <React.Fragment key={field}><dt>{usageLabels[field]}</dt><dd>{count ?? '未知'}</dd></React.Fragment>)}
+        </dl></>}
+      </details>)}
+    </> : <p>暂无执行记录。</p>)}
+  </section>;
+}
+
 function GoalRuntimeBudget({ goal, data, open, busy, runtimeNow }) {
   return <section className="acms-review-state" aria-label="目标执行额度">
     <h3>目标执行额度</h3>
@@ -296,7 +339,7 @@ export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, 
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label={`${entityLabels[kind]}详情`}><header><span>{entityLabels[kind]}详情</span><button aria-label="关闭详情" onClick={close}>×</button></header><h2>{entity.title ?? entity.name}</h2>{kind === 'goal' && <p className="acms-sectionnote">优先级：{Number.isInteger(entity.priority) ? entity.priority : 50}（0–100；只影响后续跨目标派发顺序）</p>}{project && <button className="text" onClick={() => navigate('project', project.id)}>所属项目：{project.name}</button>}<CollapsibleText text={entity.description} lines={3} label="说明" />{entity.repoRoot && <p><code>{entity.repoRoot}</code></p>}{entity.acceptance && <section><h3>验收标准</h3><CollapsibleText text={entity.acceptance} lines={3} label="验收标准" /></section>}<div className="acms-actions wrap"><button onClick={() => open(kind === 'goal' ? 'goalEdit' : kind, entity)}>编辑{entityLabels[kind]}</button><ActionButton className="danger" reason={entityDeletionReason(kind, entity, data)} onClick={() => open('deleteEntity', { ...entity, entityKind: kind })}>删除{entityLabels[kind]}</ActionButton></div>
     {kind === 'agent' && chat && <button className="primary" onClick={() => chat(entity.id)}>与智能体对话</button>}
     {kind === 'goal' && entity.planApproval && act && <GoalPlanApproval goal={entity} data={data} act={act} busy={busy} />}
-    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalReviewState goal={entity} approvals={(data.deliveryApprovals ?? []).filter(record => record.goalId === entity.id).reverse()} deliveryRepository={project?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
+    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalAttemptUsage key={entity.id} goalId={entity.id} tasks={tasks} /><GoalReviewState goal={entity} approvals={(data.deliveryApprovals ?? []).filter(record => record.goalId === entity.id).reverse()} deliveryRepository={project?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
     {goals.length > 0 && <section><h3>所属目标</h3>{goals.map(g => <button className="acms-entity-link" key={g.id} onClick={() => navigate('goal', g.id)}>{g.title} →</button>)}</section>}
     <section><h3>关联任务（{tasks.length}）</h3>{tasks.slice(0, 8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}{tasks.length > 8 && <details><summary>显示其余 {tasks.length - 8} 项</summary>{tasks.slice(8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}</details>}{!tasks.length && <p>暂无关联任务。</p>}</section><ChangeHistory kind={kind} id={entity.id} data={data} /></aside></div>;
 }

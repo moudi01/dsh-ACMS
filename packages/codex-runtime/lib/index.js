@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { brandString } from "@deepseek-ai/dsh-brand";
 import { JsonRpcLineTransport } from "@deepseek-ai/dsh-sdk-protocol";
+import { CodexTurnUsage } from "./turn-usage.js";
 //#region lib/types/wire.js
 /**
 * Codex app-server protocol adapter, verified against 0.166.0. The shared JSON-RPC
@@ -146,6 +147,7 @@ var CodexAppServerWire = class {
 	pendingTurnId;
 	turnCompleted;
 	earlyTurnNotifications = [];
+	earlyUsageCount = 0;
 	earlyThreadNotifications = [];
 	lastFinalAnswer;
 	lastPartialAnswer;
@@ -157,6 +159,7 @@ var CodexAppServerWire = class {
 	pendingDiagnostic;
 	inputEnded = false;
 	terminalObserved = false;
+	usage = new CodexTurnUsage();
 	closed = false;
 	constructor(input, output, permissionMode, model, store, options = {}) {
 		this.options = options;
@@ -237,6 +240,7 @@ var CodexAppServerWire = class {
     if (thread.ephemeral === true) throw new Error("codex-runtime: server returned an ephemeral thread");
     if (previous && id !== previous) throw new Error("codex-runtime: resume returned a different thread id");
     this.threadId = id;
+    this.usage.open(id, Boolean(previous));
     for (const notification of this.earlyThreadNotifications.splice(0)) {
       const notificationThread = notification.params?.threadId ?? notification.params?.thread?.id;
       if (notificationThread !== id) continue;
@@ -260,6 +264,7 @@ var CodexAppServerWire = class {
 		const threadId = this.threadId;
 		try {
 			this.options.beforeTurn?.();
+			this.usage.begin();
 			const turn = object(object(await this.guarded(this.transport.request("turn/start", {
 				threadId,
 				...(this.options.reasoningEffort ? { effort: this.options.reasoningEffort } : {}),
@@ -406,6 +411,7 @@ var CodexAppServerWire = class {
 	commitTurnId(id) {
 		if (this.pendingTurnId !== void 0 && this.pendingTurnId !== id) throw new Error("subagent-codex: turn/start response did not match the active turn");
 		this.turnId = id;
+		this.usage.accept(id);
 		const pendingDiagnostic = this.pendingDiagnostic;
 		this.pendingDiagnostic = void 0;
 		if (pendingDiagnostic !== void 0) this.recordDiagnostic(pendingDiagnostic.request, pendingDiagnostic.decision, pendingDiagnostic.reason, pendingDiagnostic.order);
@@ -506,6 +512,16 @@ var CodexAppServerWire = class {
 		}
 	}
 	handleNotification(method, params, order) {
+		if (method === "thread/tokenUsage/updated") {
+			if (this.turnCompleted !== void 0 && this.turnId === void 0) {
+				if (params?.threadId !== this.threadId || typeof params.turnId !== "string") return;
+				if (this.earlyUsageCount++ < 64) this.earlyTurnNotifications.push({ method, params });
+				else this.usage.invalidate();
+				return;
+			}
+			this.usage.track(params);
+			return;
+		}
 		if (method === "turn/started") {
 			if (string(params.threadId, "turn/started thread id") !== this.threadId) return;
 			const turn = object(params.turn, "turn/started turn");
@@ -561,6 +577,7 @@ var CodexAppServerWire = class {
 			"interrupted",
 			"failed"
 		].includes(String(turn.status))) throw new Error(`subagent-codex: app-server returned invalid terminal turn status ${String(turn.status)}`);
+		this.usage.finish();
 		turnCompleted.resolve({
 			params,
 			order: order ?? this.nextObservationOrder()
@@ -853,7 +870,7 @@ async function startCodexRun(request, spec) {
     spec.outcome = timedOut ? "timeout" : value.stopReason;
     spec.failure ??= wire.collectFailure();
     spec.store.update({ terminalResult: value });
-    return { ...value, ...ids, diagnostic: [value.diagnostic, timedOut ? "Codex turn timeout exceeded" : undefined, identity].filter(Boolean).join("\n") };
+    return { ...value, ...ids, meteredUsage: wire.usage.result(), diagnostic: [value.diagnostic, timedOut ? "Codex turn timeout exceeded" : undefined, identity].filter(Boolean).join("\n") };
   }).finally(() => clearTimeout(timeout));
   const handle = subprocessRunHandle({
 		id: brandString(randomUUID()),
