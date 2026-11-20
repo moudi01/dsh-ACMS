@@ -1,6 +1,7 @@
 import { promises as fs, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { assert, digest, id, now, OWNER, text } from '../core/util.js';
 import { candidateMergeActive, candidateMergeMatches, candidateMergePolicy, candidateMergeSelection, verifyCandidateConfirmation } from '../core/candidate-confirmation.js';
 import { checkoutComposition } from './git-composition.js';
@@ -16,11 +17,9 @@ const verifiedRef = ref => ['show-ref', '--verify', '--hash', '--', ref];
 const bareTransactionHook = `#!/bin/sh
 cat >/dev/null
 test "$1" = prepared || exit 0
-git symbolic-ref --quiet "$ACMS_BARE_TARGET_REF" >/dev/null 2>&1
-test "$?" = 1 && exit 0
-echo "The confirmed target is no longer a direct branch." >&2
-exit 1
+exec "$ACMS_BARE_NODE" "$ACMS_BARE_HOOK"
 `;
+const bareHook = fileURLToPath(new URL('./bare-transaction-hook.js', import.meta.url)).replaceAll('\\', '/');
 const basisRef = value => {
   const ref = text(value, 'basisRef', 1024);
   assert(ref.startsWith('refs/heads/'), 'INVALID_INPUT', '请输入完整本地分支名，例如 refs/heads/main。');
@@ -233,7 +232,9 @@ export async function applyConfirmedCandidate(company, workspaces, goal, request
     if (request.targetMode === 'bare') execution.acquireBareFence();
     await execution.apply(goal.composition.checks, target.targetRoot, commit, { hooks, targetRef: request.targetRef, basisRef: target.basisRef, basisHead: target.basisHead,
       message: `ACMS owner confirmation ${request.id}`, env: { ...candidateGitEnvironment(),
-        ...(request.targetMode === 'bare' ? { ACMS_BARE_TARGET_REF: request.targetRef } : {}) }, targetMode: request.targetMode });
+        ...(request.targetMode === 'bare' ? { ACMS_BARE_NODE: process.execPath.replaceAll('\\', '/'), ACMS_BARE_HOOK: bareHook,
+          ACMS_BARE_WRITE: JSON.stringify({ ...target, id: execution.id, targetRef: request.targetRef, integratedCommit: commit }) } : {}) },
+      targetMode: request.targetMode });
   } catch (error) { retain = !!error.cleanupUncertain; throw error; }
   finally { if (!retain) await removeTemporary(directory, parent); }
 }

@@ -308,6 +308,42 @@ test('a bare repository with an existing branch policy retains its hook and reje
   await absentFences(target);
 });
 
+test('a bare repository policy installed after the final process guard rejects the locked write', async t => {
+  const s = await setupBare(t);
+  const { f, base, routes, target, previewBare, confirmArgs } = s;
+  const customHooks = path.join(f.root, 'late-branch-policy');
+  await fs.mkdir(customHooks);
+  const hook = path.join(customHooks, 'reference-transaction');
+  const content = '#!/bin/sh\ncase "$1" in prepared) exit 1;; esac\n';
+  await fs.writeFile(hook, content, { mode: 0o700 });
+  await f.start();
+  await s.ready();
+  const chosen = await success(await previewBare());
+  const other = await git(target, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost',
+    'commit-tree', chosen.basisTree, '-p', base, '-m', 'Test native policy');
+  s.afterGuard(async () => {
+    await git(target, 'config', 'core.hooksPath', customHooks);
+    const attempt = await run('git', ['update-ref', basisRef, other, base], target);
+    assert.notEqual(attempt.code, 0);
+    assert.match(attempt.stderr, /ref updates aborted|hook/);
+  });
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  assert.match((await s.waitMerge('failed')).reason, /配置了引用或推送策略/);
+  assert.equal(await git(target, 'rev-parse', basisRef), base);
+  assert.equal(await git(target, 'config', '--get', 'core.hooksPath'), customHooks);
+  assert.equal(await fs.readFile(hook, 'utf8'), content);
+  await absentFences(target);
+
+  await git(target, 'config', '--unset', 'core.hooksPath');
+  const next = await success(await previewBare());
+  s.afterGuard(() => git(target, 'config', 'receive.hideRefs', basisRef));
+  await success(await routes.decision('confirm', confirmArgs(next)));
+  assert.match((await s.waitMerge('failed')).reason, /配置了引用或推送策略/);
+  assert.equal(await git(target, 'rev-parse', basisRef), base);
+  assert.equal(await git(target, 'config', '--get', 'receive.hideRefs'), basisRef);
+  await absentFences(target);
+});
+
 test('bare Git fences survive uncertain cleanup and release only after restart reconciles the applied ref', async t => {
   const s = await setupBare(t);
   const { f, base, target, routes, previewBare, confirmArgs } = s;
