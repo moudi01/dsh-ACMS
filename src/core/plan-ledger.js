@@ -150,10 +150,14 @@ export function decidePlanApproval(company, args, actor) {
   const task = store.require('tasks', plan.taskId);
   const attempt = store.require('attempts', plan.attemptId);
   assertGoalOpen(goal);
+  // Entity restore clears live attempt pointers. The retained blocker and the
+  // completed, cleaned attempt still identify exactly this proposal generation.
   assert(!['deleted', 'archived', 'succeeded'].includes(goal.status) && goal.contractChange?.status !== 'pending' &&
     store.require('projects', goal.projectId).status !== 'deleted' && isApprovalPlanner(goal, task) && !goal.planApproval.approvedPlanId &&
-    task.generation === plan.generation && task.activeAttemptId === attempt.id && task.blocker?.planId === plan.id &&
-    attempt.taskId === task.id && attempt.taskGeneration === task.generation && attempt.agentId === plan.managerId && matchesGoalContract(goal, task, attempt),
+    task.generation === plan.generation && (!task.activeAttemptId || task.activeAttemptId === attempt.id) &&
+    task.blocker?.kind === 'plan-approval' && task.blocker.planId === plan.id &&
+    attempt.taskId === task.id && attempt.goalId === goal.id && attempt.taskGeneration === task.generation &&
+    attempt.agentId === plan.managerId && matchesGoalContract(goal, task, attempt),
   'STALE_PLAN_APPROVAL', '当前目标、规划合同或规划任务已变化，请刷新提案。');
   assert(attempt.status === 'completed' && attempt.resultAccepted && !attempt.cleanupPending && !attempt.cleanupUncertain && !task.stopRequested,
     'PLAN_CLEANUP_PENDING', '请先等待规划执行和进程清理完成。');

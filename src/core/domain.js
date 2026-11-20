@@ -54,7 +54,7 @@ export class Company {
     const goals = [args.goalId, args.id ? this.store.get('tasks', args.id)?.goalId : null].filter(Boolean);
     for (const goalId of goals) assert(goalId === actor.goalId, 'SCOPE_DENIED', 'Agent may only change its assigned goal');
     if (command === 'task.create') assertPlanAllowsWork(this.store.get('goals', args.goalId), args.kind ?? 'work');
-    if (command === 'task.retry' && args.id) {
+    if (['task.retry', 'task.edit', 'task.dependencies'].includes(command) && args.id) {
       const task = this.store.get('tasks', args.id);
       if (task) assertPlanAllowsWork(this.store.get('goals', task.goalId), task.kind);
     }
@@ -194,9 +194,14 @@ export class Company {
     assert(args.expectedRevision === undefined || args.expectedRevision === previous.revision, 'CONFLICT', '记录已变化，请刷新后重试', { collection: 'goals', id: previous.id });
     if (!changed.length) return previous;
     const substantive = changed.some(key => !['title', 'priority'].includes(key));
+    // Before the first approval, the root planner handles the new contract.
+    // There is no previously dispatched implementation to reassess.
+    const needsCoordination = substantive && !awaitsPlanApproval(previous);
     if (substantive) {
       assertGoalOpen(previous);
       assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
+    }
+    if (needsCoordination) {
       const used = goalTaskCount(this.store.list('tasks'), previous.id);
       const limit = this.policy().maxTasksPerGoal;
       assert(used < limit, 'TASK_LIMIT', `合同变更未保存。${goalContractCapacityMessage(used, limit)}`, { used, limit });
@@ -205,11 +210,11 @@ export class Company {
     let goal = this.store.put('goals', {
       ...previous, ...patch,
       ...(substantive ? {
-        status: 'active', contractVersion: version + 1,
+        status: needsCoordination ? 'active' : 'planning', contractVersion: version + 1,
         completedContractVersion: previous.completedContractVersion ?? (previous.status === 'succeeded' ? version : null),
         completedDeliveryHash: previous.completedDeliveryHash ?? (previous.status === 'succeeded' ? goalDeliveryHash(previous, deliveredWork(this.store, previous)) : null),
-        contractChange: { fromVersion: version, status: 'pending', coordinationTaskId: null,
-          previous: { description: previous.description, acceptance: previous.acceptance } },
+        contractChange: needsCoordination ? { fromVersion: version, status: 'pending', coordinationTaskId: null,
+          previous: { description: previous.description, acceptance: previous.acceptance } } : null,
       } : {}),
     }, args.expectedRevision);
     if (substantive) {
@@ -233,15 +238,15 @@ export class Company {
             (current.usesGoalAcceptance ?? current.acceptance === previous.acceptance) ? { acceptance: goal.acceptance } : {}),
         });
       }
-      goal = this.ensureGoalContractCoordination(goal);
+      if (needsCoordination) goal = this.ensureGoalContractCoordination(goal);
       this.store.event('goal.contract.changed', goal.id, { fromVersion: version, contractVersion: version + 1,
-        coordinationTaskId: goal.contractChange.coordinationTaskId, fields: changed }, actor);
+        coordinationTaskId: goal.contractChange?.coordinationTaskId ?? null, fields: changed }, actor);
     }
     recordChange(this, 'goal', previous, goal, substantive ? [...changed, 'contractVersion'] : changed, actor);
     return goal;
   }
   ensureGoalContractCoordination(goal) {
-    if (goalStopped(goal) || goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived'].includes(goal.status)) return goal;
+    if (goalStopped(goal) || awaitsPlanApproval(goal) || goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived'].includes(goal.status)) return goal;
     if (goalTaskCount(this.store.list('tasks'), goal.id) >= this.policy().maxTasksPerGoal) return goal;
     const manager = findManager(this, goal.id);
     const task = this.createTask({
@@ -282,7 +287,7 @@ export class Company {
     assertGoalOpen(goal);
     assert(!goal.legacyBatch, 'LEGACY_GOAL', '该目标已按旧阶段制数据归档，请恢复或新建目标后再派工');
     const kind = args.kind ?? 'work';
-    if (actor.kind === 'agent' && !options.trustedOrigin) assertPlanAllowsWork(goal, kind);
+    if (actor.kind !== 'owner') assertPlanAllowsWork(goal, kind);
     // A review may still be requested after delivery; it is evidence, not a
     // reopened work item, so it does not resurrect a closed goal.
     const reviewRecovery = kind === 'coordination' && args.coordinationOf && this.store.get('tasks', args.coordinationOf);

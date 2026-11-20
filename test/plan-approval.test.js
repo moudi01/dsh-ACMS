@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { stableActor } from '../src/core/agent-identity.js';
 import { executionOccupancy } from '../src/core/execution-capacity.js';
 import { OWNER, SYSTEM } from '../src/core/util.js';
+import { createRoutes } from '../src/host/http.js';
 import { fixture, until, taskWaitDiagnostics } from './helpers.js';
 
 const allowProjectApproval = (f, planApproval = true) => f.command('project.save', { id: f.project.id, planApproval });
@@ -18,6 +20,18 @@ const planArgs = (plan, action, reason = 'Checked exact scope and dependencies')
 const propose = async input => input.task.kind === 'plan' ? { ...await defaultSimulation(input),
   minimumOutcome: 'A module with example usage', nonGoals: ['Publishing'], rationale: 'Build in two steps to verify dependencies',
 } : defaultSimulation(input);
+
+async function ownerCommand(f, name, args) {
+  const endpoint = '/api/acms/command';
+  const route = createRoutes(f).find(item => item.path === endpoint);
+  const response = await route.fetch(new Request(`http://127.0.0.1${endpoint}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: randomUUID(), name, args }),
+  }));
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.ok, true);
+  return body.value;
+}
 
 function waitForProposal(f, goal, generation = 1) {
   const diagnostics = taskWaitDiagnostics(f, goal.planApproval.taskId);
@@ -154,11 +168,11 @@ test('capacity and interrupted cleanup leave approval and the entire assignment 
   assert.equal(f.command('plan.approval.decide', planArgs(pending, 'approve')).nodes.length, 2);
 });
 
-test('updating a pending goal contract requires a new plan, and cancellation invalidates it', async t => {
-  const f = await fixture(t, async input => input.task.origin?.kind === 'goal-contract'
-    ? { outcome: 'coordinated', summary: 'Update planning scope', contractAssessment: {
-      reason: 'Plan again to reflect the new acceptance contract', reuse: [], followUps: [],
-    } } : propose(input));
+test('updating a pending goal contract requires a new plan without separate implementation coordination', async t => {
+  const coordinationWork = 'Implementation outside the new plan';
+  const f = await fixture(t, async input => input.task.origin?.kind === 'goal-contract' ? {
+    outcome: 'planned', summary: 'Separate follow-up', tasks: [{ key: 'extra', title: coordinationWork }],
+  } : propose(input));
   allowProjectApproval(f);
   const goal = newGoal(f);
   await f.start();
@@ -168,9 +182,15 @@ test('updating a pending goal contract requires a new plan, and cancellation inv
   assert.equal(f.command('task.resume', { id: first.taskId }).status, 'blocked');
   assert.throws(() => f.command('task.cancel', { id: first.taskId }), { code: 'PLAN_APPROVAL_REQUIRED' });
   allowProjectApproval(f, false);
-  f.command('goal.edit', { id: goal.id, patch: { acceptance: 'Add a consumer example to the updated contract' } });
+  f.command('policy.update', { patch: { maxTasksPerGoal: 1 } });
+  const amended = await ownerCommand(f, 'goal.edit', { id: goal.id, patch: { acceptance: 'Add a consumer example to the updated contract' } });
+  assert.equal(amended.contractChange, null);
   assert.equal(f.store.require('plans', first.id).approvalStatus, 'superseded');
   assert.throws(() => f.command('plan.approval.decide', planArgs(first, 'approve')), { code: 'STALE_PLAN_APPROVAL' });
+  for (const kind of ['work', 'repair']) {
+    assert.throws(() => f.company.createTask({ goalId: goal.id, kind, title: coordinationWork }, SYSTEM, { trustedOrigin: true }),
+      { code: 'PLAN_APPROVAL_REQUIRED' });
+  }
   f.engine.kick();
   const second = await waitForProposal(f, goal, 2);
   assert.equal(second.goalContractVersion, 2);
@@ -179,10 +199,74 @@ test('updating a pending goal contract requires a new plan, and cancellation inv
   assert.equal(returned.approvalStatus, 'returned');
   f.engine.kick();
   const third = await waitForProposal(f, goal, 3);
-  f.command('goal.cancel', { id: goal.id });
-  assert.equal(f.store.require('plans', third.id).approvalStatus, 'superseded');
-  assert.throws(() => f.command('plan.approval.decide', planArgs(third, 'approve')), { code: 'GOAL_CLOSED' });
-  assert.equal(tasksOf(f, goal).filter(task => task.kind === 'work').length, 0);
+  f.command('policy.update', { patch: { maxTasksPerGoal: 3 } });
+  const approved = await ownerCommand(f, 'plan.approval.decide', planArgs(third, 'approve'));
+  await until(() => f.store.require('goals', goal.id).status === 'succeeded', 45000, taskWaitDiagnostics(f, first.taskId));
+  const plannedIds = approved.nodes.map(node => node.taskId);
+  assert.deepEqual(f.adapter.calls.filter(call => call.task.goalId === goal.id && call.task.kind !== 'plan').map(call => call.task.id), plannedIds);
+  assert.deepEqual(tasksOf(f, goal).filter(task => task.kind === 'work').map(task => task.id), plannedIds);
+  assert.equal(tasksOf(f, goal).some(task => task.title === coordinationWork || task.kind === 'coordination'), false);
+});
+
+for (const kind of ['goal', 'project']) {
+  test(`the owner can still decide a cleaned proposal after ${kind} trash restoration`, async t => {
+    const f = await fixture(t, propose);
+    allowProjectApproval(f);
+    const goal = newGoal(f);
+    await f.start();
+    const pending = await waitForProposal(f, goal);
+    const entityId = kind === 'goal' ? goal.id : f.project.id;
+    const removed = await ownerCommand(f, `${kind}.delete`, { id: entityId });
+    await ownerCommand(f, `${kind}.restore`, { id: entityId, expectedRevision: removed.revision });
+    const restored = planner(f, goal);
+    assert.equal(restored.status, 'paused');
+    assert.equal(restored.activeAttemptId, null);
+    const resumed = await ownerCommand(f, 'task.resume', { id: restored.id });
+    assert.equal(resumed.status, 'blocked');
+    assert.equal(resumed.blocker.planId, pending.id);
+    if (kind === 'project') {
+      const rejected = await ownerCommand(f, 'plan.approval.decide', planArgs(pending, 'reject', 'Need a narrower example'));
+      assert.equal(rejected.approvalStatus, 'rejected');
+      const revised = await ownerCommand(f, 'plan.approval.decide', planArgs(pending, 'revise', 'Provide a smaller example'));
+      assert.equal(revised.revisionRequest.action, 'revise');
+      const next = await waitForProposal(f, goal, 2);
+      await ownerCommand(f, 'goal.cancel', { id: goal.id });
+      assert.equal(f.store.require('plans', next.id).approvalStatus, 'superseded');
+      assert.throws(() => f.command('plan.approval.decide', planArgs(next, 'approve')), { code: 'GOAL_CLOSED' });
+      assert.equal(tasksOf(f, goal).filter(task => task.kind === 'work').length, 0);
+    } else {
+      const approved = await ownerCommand(f, 'plan.approval.decide', planArgs(pending, 'approve'));
+      const repeat = await ownerCommand(f, 'plan.approval.decide', planArgs(pending, 'approve'));
+      assert.deepEqual(repeat.nodes, approved.nodes);
+      await until(() => f.store.require('goals', goal.id).status === 'succeeded', 45000, taskWaitDiagnostics(f, restored.id));
+      assert.equal(f.adapter.calls.filter(call => call.task.id === restored.id).length, 1);
+    }
+  });
+}
+
+test('a contract edit after approval uses the existing delivered-work assessment', async t => {
+  let deliveredIds;
+  const f = await fixture(t, input => input.task.origin?.kind === 'goal-contract' ? {
+    outcome: 'coordinated', summary: 'Reuse verified deliveries',
+    contractAssessment: { reason: 'The verified files already meet the latest requirement', reuse: deliveredIds, followUps: [] },
+  } : propose(input));
+  allowProjectApproval(f);
+  const goal = newGoal(f);
+  await f.start();
+  const plan = await waitForProposal(f, goal);
+  const approved = await ownerCommand(f, 'plan.approval.decide', planArgs(plan, 'approve'));
+  deliveredIds = approved.nodes.map(node => node.taskId);
+  const finished = () => f.store.require('goals', goal.id).status === 'succeeded';
+  await until(finished, 45000, taskWaitDiagnostics(f, plan.taskId));
+  const edited = await ownerCommand(f, 'goal.edit', { id: goal.id, patch: { acceptance: 'Keep the testable usage example' } });
+  assert.equal(edited.contractChange.status, 'pending');
+  assert(edited.contractChange.coordinationTaskId);
+  await until(finished, 45000, taskWaitDiagnostics(f, edited.contractChange.coordinationTaskId));
+  const current = f.store.require('goals', goal.id);
+  assert.equal(current.contractChange.status, 'assessed');
+  assert.equal(current.planApproval.approvedPlanId, plan.id);
+  assert.equal(f.store.require('plans', plan.id).goalAcceptance, goal.acceptance);
+  assert.equal(f.adapter.calls.filter(call => call.task.id === plan.taskId).length, 1);
 });
 
 test('approval rechecks the manager grant and preserves the existing execution budget', async t => {

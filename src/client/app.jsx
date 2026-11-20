@@ -346,7 +346,8 @@ function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }
   const changesContract = type === 'goalEdit' && ['description', 'acceptance'].some(key => form[key]?.trim() !== value[key]);
   const goalTasksUsed = changesContract ? goalTaskCount(data.tasks, value.id) : 0;
   const goalTasksLimit = data.policy.maxTasksPerGoal;
-  const contractCapacityReason = changesContract && goalTasksUsed >= goalTasksLimit
+  const needsContractCoordination = !value.planApproval || !!value.planApproval.approvedPlanId;
+  const contractCapacityReason = changesContract && needsContractCoordination && goalTasksUsed >= goalTasksLimit
     ? `合同变更尚未保存。${goalContractCapacityMessage(goalTasksUsed, goalTasksLimit)}` : '';
   const answerPaused = type === 'answer' && data.tasks.find(t => t.id === value.taskId)?.status === 'paused';
   const extendingGoal = type === 'goalRuntime';
