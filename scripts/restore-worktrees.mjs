@@ -64,7 +64,7 @@ async function references(databaseFile, root, files) {
     if (collection !== 'integrations' || !pendingIntegration.has(body.phase)) continue;
     const receipts = [body.commandId, body.inspectionCommandId].filter(Boolean);
     if (body.taskId && !body.compositionRecheckId) dependencies.set(body.taskId, [...(dependencies.get(body.taskId) ?? []), ...receipts]);
-    if (body.candidate) dependencies.set(id, receipts);
+    if (body.candidate || body.ownerReservation) dependencies.set(id, receipts);
   }
   const refs = [];
   for (const { collection, id, body } of entities) {
@@ -73,13 +73,14 @@ async function references(databaseFile, root, files) {
     const workspace = body.workspace;
     const relative = `${candidate ? 'integration' : 'workspaces'}/${id}`;
     const hasPointer = files.has(relative + '/.git');
-    const referenced = candidate ? pendingIntegration.has(body.phase) && !!body.candidate
+    const reservation = candidate && hasPointer ? body.ownerReservation : null;
+    const referenced = candidate ? pendingIntegration.has(body.phase) && !!(body.candidate || reservation)
       : workspace && (workspace.mode === 'git' || (workspace.branch && hasPointer)) &&
         (hasPointer || !terminal.has(body.status) || dependencies.has(id));
     if (!referenced) continue;
-    const target = candidate ? body.candidate : workspace.path;
+    const target = candidate ? body.candidate ?? reservation?.path : workspace.path;
     const source = candidate ? body.targetRoot : workspace.source ?? projects.get(body.projectId)?.repoRoot;
-    const branch = candidate ? null : 'refs/heads/acms/' + id;
+    const branch = candidate ? (reservation ? body.targetRef : null) : 'refs/heads/acms/' + id;
     const rootAlias = typeof target === 'string' && path.isAbsolute(target) ? path.dirname(path.dirname(target)) : null;
     const registeredRoot = rootAlias && samePath(target, path.join(rootAlias, relative))
       ? await fs.realpath(rootAlias).catch(() => null) : null;
@@ -88,7 +89,8 @@ async function references(databaseFile, root, files) {
       : typeof source !== 'string' || !path.isAbsolute(source) ? '缺少源 Git 仓库的绝对路径'
       : !candidate && workspace.branch !== 'acms/' + id ? '任务分支与 ACMS 登记不匹配'
       : null;
-    refs.push({ relative, source, branch, reason, rootAlias, receipts: dependencies.get(id) ?? [] });
+    refs.push({ relative, source, branch, reason, rootAlias, receipts: dependencies.get(id) ?? [],
+      ...(reservation ? { reservationReason: `acms-owner-${id}` } : {}) });
   }
   return refs;
 }
@@ -115,7 +117,7 @@ async function sourceGitDirectory(source) {
     .catch(() => { throw new Error('源 Git 仓库不可用，请恢复同一仓库后继续'); });
 }
 
-async function inspect(source, common, admin, branch) {
+async function inspect(source, common, admin, branch, reservationReason) {
   const gitDir = await fs.realpath(admin).catch(() => { throw new Error('源仓库的工作副本登记缺失'); });
   const registry = path.join(common, 'worktrees');
   requireMatch(samePath(path.dirname(gitDir), registry) && (await stat(registry))?.isDirectory() && (await stat(admin))?.isDirectory(),
@@ -132,7 +134,10 @@ async function inspect(source, common, admin, branch) {
   const head = await gitText(source, '--git-dir=' + gitDir, 'rev-parse', '--verify', 'HEAD^{commit}');
   requireMatch(oid.test(head), '无法核实已登记提交');
   const index = await stat(path.join(gitDir, 'index'));
-  requireMatch(index?.isFile() && !index.isSymbolicLink(), 'Git 暂存索引缺失或类型不受支持');
+  if (reservationReason) {
+    requireMatch((await textFile(path.join(gitDir, 'locked'))).text === reservationReason, 'ACMS 临时分支的锁登记不匹配');
+  }
+  requireMatch((index?.isFile() && !index.isSymbolicLink()) || (!index && reservationReason), 'Git 暂存索引缺失或类型不受支持');
   const stage = await git(source, '--git-dir=' + gitDir, 'ls-files', '--stage', '-z');
   return { common, gitDir, head, stage, stageHash: hash(stage), backlinkPath, backlink };
 }
@@ -210,7 +215,7 @@ export async function backupWorktreeEvidence(databaseFile, root, files) {
   const evidence = [];
   const canonicalRoot = await fs.realpath(root);
   for (const ref of await references(databaseFile, root, files)) {
-    const { relative, source, branch, rootAlias } = ref;
+    const { relative, source, branch, rootAlias, reservationReason } = ref;
     try {
       requireMatch(!ref.reason, ref.reason);
       const original = await managedWorkspace(canonicalRoot, relative);
@@ -218,11 +223,12 @@ export async function backupWorktreeEvidence(databaseFile, root, files) {
       const pointerHash = hash(pointer.bytes);
       const originalAdmin = pointerDirectory(pointer);
       const common = await sourceGitDirectory(source);
-      const { gitDir, head, stageHash, backlink } = await inspect(source, common, originalAdmin, branch);
+      const { gitDir, head, stageHash, backlink } = await inspect(source, common, originalAdmin, branch, reservationReason);
       requireMatch(samePath(await fs.realpath(backlink.text), path.join(original, '.git')), 'Git 登记未指向当前工作副本');
       const file = files.get(relative + '/.git');
       requireMatch(!file.sha256 || file.sha256 === pointerHash, '备份期间 Git 指针发生变化');
-      evidence.push({ relative, source, branch, rootAlias, common, gitDir, head, pointerHash, stageHash, originalAdmin, originalBacklink: backlink.text });
+      evidence.push({ relative, source, branch, rootAlias, common, gitDir, head, pointerHash, stageHash, originalAdmin, originalBacklink: backlink.text,
+        ...(reservationReason ? { reservationReason } : {}) });
     } catch (error) {
       evidence.push({ relative, reason: error.message });
     }
@@ -237,7 +243,8 @@ export async function pendingWorktreeRefs(databaseFile, root, files) {
 async function restorationPlan(ref, evidence, destination, originalRoot) {
   requireMatch(!ref.reason, ref.reason);
   requireMatch(evidence && !evidence.reason, evidence?.reason ?? '旧备份缺少 Git 暂存证据，请从原环境重新备份');
-  requireMatch(evidence.source === ref.source && evidence.branch === ref.branch, '备份 Git 证据与任务登记不一致');
+  requireMatch(evidence.source === ref.source && evidence.branch === ref.branch && evidence.reservationReason === ref.reservationReason,
+    '备份 Git 证据与任务登记不一致');
   const original = path.join(originalRoot, ref.relative);
   const originalBacklink = evidence.originalBacklink ?? path.join(original, '.git');
   requireMatch(!await stat(original) && !await stat(originalBacklink),
@@ -259,7 +266,7 @@ async function restorationPlan(ref, evidence, destination, originalRoot) {
   const oldExists = await stat(evidence.gitDir);
   const newExists = await stat(newAdmin);
   requireMatch(!!oldExists !== !!newExists, '源 Git 登记缺失或恢复登记位置已被占用');
-  const current = await inspect(ref.source, common, oldExists ? evidence.gitDir : newAdmin, ref.branch);
+  const current = await inspect(ref.source, common, oldExists ? evidence.gitDir : newAdmin, ref.branch, ref.reservationReason);
   for (const key of ['common', 'head', 'stageHash']) {
     requireMatch(current[key] === evidence[key], '源 Git 目录、提交或暂存内容与备份证据不一致');
   }

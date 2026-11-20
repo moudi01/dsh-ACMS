@@ -174,8 +174,8 @@ export function createRoutes(runtime) {
     try { return await handler(request); } catch (e) {
       const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : ['NOT_FOUND'].includes(e.code) ? 404
         : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED',
-          'CANDIDATE_NOT_READY', 'STALE_CANDIDATE_CONFIRMATION', 'TARGET_CHANGED', 'TARGET_DIRTY', 'TARGET_BASE_CHANGED',
-          'TARGET_BRANCH_NOT_CHECKED_OUT', 'TARGET_INDEX_UNSUPPORTED'].includes(e.code) ? 409
+          'CANDIDATE_NOT_READY', 'STALE_CANDIDATE_CONFIRMATION', 'TARGET_CHANGED', 'TARGET_BASE_CHANGED',
+          'TARGET_BRANCH_CHECKED_OUT', 'TARGET_REF_UNSUPPORTED'].includes(e.code) ? 409
           : ['FORBIDDEN', 'OWNER_REQUIRED', 'SCOPE_DENIED', 'PROJECT_PATH_DENIED'].includes(e.code) ? 403 : 400;
       return json({ ok: false, error: { code: e.code ?? 'INVALID_REQUEST', message: e.message, details: e.details ?? {} } }, status);
     }

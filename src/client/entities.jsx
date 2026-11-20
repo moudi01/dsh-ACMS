@@ -68,7 +68,7 @@ function CandidateMerge({ goal, act, busy }) {
   return <section aria-label="确认合入 Git 候选" className="acms-review-state">
     <h4>合入 Git 候选</h4>
     {selected && !active && <>
-      <Field label="目标 Git 分支" hint="输入源项目目录已检出的本地分支。预览与拒绝均保留源项目现状。"><input value={branch} onChange={event => setBranch(event.target.value)} placeholder="例如 refs/heads/main" /></Field>
+      <Field label="目标 Git 分支" hint="输入未被任何工作副本检出的本地分支。确认后只更新这个分支，保留现有工作副本。"><input value={branch} onChange={event => setBranch(event.target.value)} placeholder="例如 refs/heads/release" /></Field>
       <ActionButton reason={busyReason || (!name ? '请填写目标分支。' : '')} onClick={preview}>预览合入</ActionButton>
     </>}
     {error && <p role="alert">{error}</p>}

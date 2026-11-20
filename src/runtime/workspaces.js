@@ -22,17 +22,6 @@ export function inside(root, target) { const rel = path.relative(root, target); 
 const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
 const excludeDependencies = ':(exclude,glob,icase)**/node_modules/**';
 
-export const ownerTargetIndexLimit = 4 * 1024 * 1024;
-export const ownerTargetSparseArgs = ['config', '--type=bool', '--default=false', '--get', 'core.sparseCheckout'];
-export const ownerTargetIndexArgs = ['ls-files', '-v', '-z'];
-
-export function assertOwnerTargetIndex(sparse, entries) {
-  assert(sparse === 'false', 'TARGET_INDEX_UNSUPPORTED', '目标使用稀疏检出，请先在完整工作副本中核对并预览。');
-  assert(entries.length < ownerTargetIndexLimit && (!entries || entries.endsWith('\0')), 'TARGET_INDEX_UNSUPPORTED', '目标索引过大，无法安全核对工作副本。');
-  const hidden = entries.split('\0').find(entry => /^[a-zS] /.test(entry));
-  assert(!hidden, 'TARGET_INDEX_UNSUPPORTED', `Git 索引隐藏了路径 ${hidden?.slice(2) ?? ''} 的状态。请检查该路径并移除 assume-unchanged 或 skip-worktree 标记后重新预览。`);
-}
-
 async function describesReplacedGitLeaf(root, name) {
   const parts = name.split('/');
   if (!parts.every(part => part && !['.', '..'].includes(part) && !/[\\:]/.test(part))) return false;
@@ -496,30 +485,21 @@ export class WorkspaceManager {
     const targetStatus = await git(['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain', '--', '.', ':(exclude).acms'], root, undefined, invoke);
     return { targetRef, targetHead, targetStatus };
   }
-  assertIntegrationTarget(record, executable, env) {
+  assertIntegrationTarget(record, executable) {
     // Run immediately before handing the final command to the supervisor.
     // Optional locks and fsmonitor are disabled for this read-only guard.
     const invoke = args => {
       const result = spawnSync(executable, ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args], {
-        cwd: record.targetRoot, encoding: 'utf8', windowsHide: true, timeout: 2000, env,
-        ...(record.candidateMergeId ? { maxBuffer: ownerTargetIndexLimit } : {}),
+        cwd: record.targetRoot, encoding: 'utf8', windowsHide: true, timeout: 2000,
       });
       assert(!result.error && [0, ...(args[0] === 'symbolic-ref' ? [1] : [])].includes(result.status),
         'GIT_ERROR', result.error?.message || result.stderr || 'Unable to verify the final target');
-      return args.includes('-z') ? result.stdout : result.stdout.trim();
+      return result.stdout.trim();
     };
     const status = invoke(['status', '--porcelain', '--', '.', ':(exclude).acms']);
     const head = invoke(['rev-parse', '--verify', 'HEAD']);
     const ref = invoke(['symbolic-ref', '-q', 'HEAD']) || 'HEAD';
     assert(ref === record.targetRef && head === record.targetHead && !status, 'TARGET_CHANGED', 'Source changed before the final Git command', { actualHead: head });
-    if (record.candidateMergeId) {
-      assertOwnerTargetIndex(invoke(ownerTargetSparseArgs), invoke(ownerTargetIndexArgs));
-      assert(path.relative(realpathSync(record.targetRoot), record.targetRoot) === '' &&
-        invoke(['rev-parse', '--verify', head + '^{tree}']) === record.targetTree &&
-        invoke(['rev-parse', '--verify', record.integratedCommit + '^{tree}']) === record.targetCandidateTree &&
-        invoke(['rev-list', '--parents', '-n', '1', record.integratedCommit]) === `${record.integratedCommit} ${head}`,
-      'TARGET_CHANGED', '最终合入前无法核对已确认的目标及候选树。');
-    }
   }
   async integrate(task, isCurrent, execution) {
     const project = this.company.store.require('projects', task.projectId);
@@ -672,7 +652,8 @@ export class WorkspaceManager {
     const { targetRoot, targetHead, targetRef, integratedCommit, commit, checks, candidate } = record;
     if (record.candidateMergeId) assert(path.relative(await fs.realpath(targetRoot), targetRoot) === '',
       'TARGET_CHANGED', '无法核对已确认的项目目录，请恢复原目录后重新核对。');
-    const observed = await invoke('git', ['rev-parse', '--verify', targetRef], targetRoot);
+    const observed = await invoke('git', record.ownerReservation ? ['rev-parse', '--verify', '--quiet', targetRef] : ['rev-parse', '--verify', targetRef], targetRoot);
+    if (record.ownerReservation && observed.code === 1 && !observed.timedOut) return { status: 'target-changed', actualHead: null, targetRef };
     assert(observed.code === 0 && !observed.timedOut, 'GIT_ERROR', observed.stderr || 'Unable to verify the integration target');
     const actualHead = observed.stdout.trim();
     const ancestry = await invoke('git', ['merge-base', '--is-ancestor', integratedCommit, actualHead], targetRoot);
@@ -681,6 +662,7 @@ export class WorkspaceManager {
     if (ancestry.code === 0 || reflog.split(/\r?\n/).includes(integratedCommit)) {
       return { status: 'merged', proof: ancestry.code === 0 ? 'target-history' : 'target-reflog', actualHead, targetRef, commit, integratedCommit, checks, candidate };
     }
+    if (record.ownerReservation) return { status: actualHead === targetHead ? 'unchanged' : 'target-changed', actualHead, targetRef };
     const actual = await this.integrationTarget(targetRoot, invoke);
     return { status: actual.targetRef === targetRef && actual.targetHead === targetHead && !actual.targetStatus ? 'unchanged' : 'unknown', actualHead, targetRef };
   }

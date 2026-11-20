@@ -9,7 +9,7 @@ import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
 import { goalStopped } from '../core/goal-control.js';
 import { candidateMergeMatches } from '../core/candidate-confirmation.js';
-import { applyConfirmedCandidate, candidateGitEnvironment } from './candidate-merge.js';
+import { applyConfirmedCandidate, assertCandidateReservation, candidateGitEnvironment, releaseCandidateReservation } from './candidate-merge.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -154,8 +154,8 @@ async function clearCommand(engine, record, field, file) {
   await unlink(file).catch(() => {});
 }
 
-async function inspect(engine, record) {
-  return engine.workspaces.inspectIntegration(record, async (command, args, cwd) => {
+async function inspect(engine, record, observe) {
+  const invoke = async (command, args, cwd, options) => {
     const inspectionCommandId = id('command');
     const cleanupReceipt = receipt(engine, inspectionCommandId);
     await mkdir(path.dirname(cleanupReceipt), { recursive: true });
@@ -163,7 +163,7 @@ async function inspect(engine, record) {
     let cleanupUnknown = false;
     try {
       return await engine.workspaces.runIntegrationCommand(command, args, cwd, {
-        timeout: 5000, cleanupReceipt, beforeStart: () => engine.fenced(),
+        timeout: 5000, ...options, cleanupReceipt, beforeStart: () => engine.fenced(),
         ...(record.candidateMergeId ? { env: candidateGitEnvironment() } : {}),
       });
     } catch (error) {
@@ -172,7 +172,10 @@ async function inspect(engine, record) {
     } finally {
       if (!cleanupUnknown && owns(engine)) await clearCommand(engine, record, 'inspectionCommandId', cleanupReceipt);
     }
-  });
+  };
+  const observed = observe ? await engine.workspaces.inspectIntegration(record, invoke) : null;
+  if (record.ownerReservation) await releaseCandidateReservation(engine.workspaces, record, invoke);
+  return observed;
 }
 
 async function reconcile(engine, record, { error, recovering = false, cleanup } = {}) {
@@ -185,24 +188,25 @@ async function reconcile(engine, record, { error, recovering = false, cleanup } 
     }
     await clearCommand(engine, record, 'inspectionCommandId', file);
   }
-  if (cleanup?.notStarted) {
-    return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
-  }
   // A pending integration owns one slot. Verify the preceding command's
   // cleanup before starting a read-only command in that slot.
   if (record.commandId && !cleanup) {
     return settle(engine, record, { reason: error?.message ?? '缺少集成命令的进程树清理回执', observed: record.observed });
   }
   let observed;
-  if (record.applyStartedAt) {
-    try { observed = await inspect(engine, record); }
+  if (record.ownerReservation || (record.applyStartedAt && !cleanup?.notStarted)) {
+    try { observed = await inspect(engine, record, !!record.applyStartedAt && !cleanup?.notStarted); }
     catch (failure) {
       return settle(engine, record, { reason: '无法核对 Git 合入结果：' + failure.message,
         observed: record.observed, commandCleanupConfirmed: !!cleanup });
     }
   }
+  if (cleanup?.notStarted) {
+    return settle(engine, record, { error: error ?? new Error('最终 Git 命令尚未启动'), retryCheckpoint: recovering });
+  }
   if (observed?.status === 'merged') return settle(engine, record, { result: observed });
-  if (record.applyStartedAt && (observed?.status !== 'unchanged' || cleanup?.exitCode === 0)) {
+  const compareFailed = !!record.ownerReservation && typeof cleanup?.exitCode === 'number' && cleanup.exitCode > 0 && observed?.status === 'target-changed';
+  if (record.applyStartedAt && ((observed?.status !== 'unchanged' && !compareFailed) || cleanup?.exitCode === 0)) {
     return settle(engine, record, { reason: '无法确认最终 Git 命令是否合入候选提交', observed, commandCleanupConfirmed: !!cleanup });
   }
   settle(engine, record, { error: error ?? new Error('最终 Git 命令未合入候选提交'), observed, retryCheckpoint: recovering && !record.applyStartedAt });
@@ -344,7 +348,9 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
         beforeStart: binary => {
           guard();
           if (apply) {
-            engine.workspaces.assertIntegrationTarget(engine.store.require('integrations', record.id), binary, options?.env);
+            const current = engine.store.require('integrations', record.id);
+            if (candidateMergeId) assertCandidateReservation(current, binary);
+            else engine.workspaces.assertIntegrationTarget(current, binary);
             guard();
           }
         },
@@ -365,8 +371,8 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       run: (executable, args, cwd, options) => command(executable, args, cwd, options),
       checkpoint: patch => { guard(); save(engine, record, patch, patch.phase === 'checking' ? 'integration.checking' : null); },
       apply: async (checks, cwd, candidate, ownerOptions) => {
-        const args = ownerOptions ? ['-c', 'core.hooksPath=' + ownerOptions.hooks, '-c', 'core.fsmonitor=false',
-          'merge', '--ff-only', '--no-autostash', '--no-overwrite-ignore', candidate] : ['merge', '--ff-only', candidate];
+        const args = ownerOptions ? ['-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--no-deref', '-m',
+          ownerOptions.message, ownerOptions.targetRef, candidate, ownerOptions.targetHead] : ['merge', '--ff-only', candidate];
         const result = await command('git', args, cwd, { timeout: 15000, env: ownerOptions?.env }, { checks });
         assert(result.code === 0 && !result.timedOut, 'GIT_ERROR', result.stderr || 'Final Git command did not complete cleanly');
       },
@@ -382,7 +388,7 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
   } catch (error) {
     if (!owns(engine)) return;
     const current = engine.store.require('integrations', record.id);
-    if (current.applyStartedAt) await reconcile(engine, current, { error });
+    if (current.applyStartedAt || current.ownerReservation) await reconcile(engine, current, { error });
     else settle(engine, current, error.cleanupUncertain ? { reason: error.message } : { error });
   } finally { engine.activeIntegration = null; }
 }

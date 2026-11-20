@@ -3,13 +3,18 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { Company } from '../src/core/domain.js';
+import { Store } from '../src/core/store.js';
 import { createRoutes } from '../src/host/http.js';
 import { createAgentApi } from '../src/host/agent-api.js';
+import { Engine } from '../src/runtime/engine.js';
 import { cleanupError } from '../src/runtime/owned-process.js';
-import { run } from '../src/runtime/workspaces.js';
+import { run, WorkspaceManager } from '../src/runtime/workspaces.js';
+import { applyBackup, planBackup } from '../scripts/backup.mjs';
+import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
 
-const branch = 'refs/heads/main';
+const branch = 'refs/heads/delivery';
 const binary = Buffer.from([0, 8, 255, 128]);
 const receipt = (file, fields) => fs.writeFile(file, JSON.stringify({ confirmed: true, ...fields }));
 const sourceStatus = cwd => git(cwd, 'status', '--porcelain', '--', '.', ':(exclude).acms');
@@ -62,21 +67,23 @@ async function setup(t, { review, autoMerge = false } = {}) {
   const checks = [{ id: 'binary-check', command: process.execPath, args: ['-e', `const fs=require('node:fs');
     if (fs.existsSync('obsolete.txt') || !fs.readFileSync('raw.bin').equals(Buffer.from([0,8,255,128]))) process.exit(4);`] }];
   const base = (await gitProject(f, checks)).trim();
+  await git(f.source, 'branch', 'delivery');
   f.command('project.save', { id: f.project.id, autoMerge });
   const goal = f.command('goal.create', { projectId: f.project.id, templateId: review ? 'base' : f.template.id, plan: false,
     title: 'Owner acceptance', description: 'Assemble verified Git changes', acceptance: 'Merge the exact accepted source tree',
     ...(autoMerge ? {} : { deliveryMode: 'git-composite' }) });
   const task = f.task({ goalId: goal.id });
-  let beforeApply, afterApply;
+  let beforeApply, afterGuard, afterApply;
   let applyCalls = 0;
   f.workspaces.runIntegrationCommand = f.workspaces.runDeliveryCheck = async (command, args, cwd, options) => {
-    const apply = args.includes('merge') && args.includes('--no-autostash');
+    const apply = args.includes('update-ref') && args.includes('--no-deref');
     if (apply) await beforeApply?.();
     try { options.beforeStart?.(command); }
     catch (error) {
       await receipt(options.cleanupReceipt, { exitCode: 1, notStarted: true });
       throw error;
     }
+    if (apply) await afterGuard?.();
     if (apply) applyCalls++;
     const result = await run(command, args, cwd, options);
     if (apply) await afterApply?.(result, options.cleanupReceipt);
@@ -105,7 +112,7 @@ async function setup(t, { review, autoMerge = false } = {}) {
     assert(request?.status !== 'failed' && request?.status !== 'cancelled', JSON.stringify(diagnostics()));
   }, 75000, diagnostics);
   return { f, goal, task, base, current, snapshot, diagnostics, checkWork, routes, preview, confirmArgs, ready, waitMerge,
-    applyCalls: () => applyCalls, beforeApply: hook => { beforeApply = hook; }, afterApply: hook => { afterApply = hook; } };
+    applyCalls: () => applyCalls, beforeApply: hook => { beforeApply = hook; }, afterGuard: hook => { afterGuard = hook; }, afterApply: hook => { afterApply = hook; } };
 }
 
 test('owner waits for required review, previews a named branch, rejects, then confirms the exact Git tree once', async t => {
@@ -125,7 +132,11 @@ test('owner waits for required review, previews a named branch, rejects, then co
   const selected = await s.ready();
   assert(selected.reviewId);
   const originalIndex = await fs.readFile(path.join(f.source, '.git', 'index'));
-  await failure(await preview('refs/heads/other'), 'TARGET_BRANCH_NOT_CHECKED_OUT');
+  await failure(await preview('refs/heads/main'), 'TARGET_BRANCH_CHECKED_OUT');
+  const otherWorktree = path.join(f.root, 'existing-worktree');
+  await git(f.source, 'worktree', 'add', otherWorktree, 'other');
+  await failure(await preview('refs/heads/other'), 'TARGET_BRANCH_CHECKED_OUT');
+  const originalWorktrees = await git(f.source, 'worktree', 'list', '--porcelain');
   const rejected = await success(await preview());
   assert.equal(rejected.targetRef, branch);
   assert.equal(rejected.targetHead, base);
@@ -136,6 +147,7 @@ test('owner waits for required review, previews a named branch, rejects, then co
   assert.equal((await success(await routes.decision('reject', { id: s.goal.id, previewId: rejected.id }))).status, 'rejected');
   await failure(await routes.decision('confirm', confirmArgs(rejected)), 'STALE_CANDIDATE_CONFIRMATION');
   assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  assert.equal(await git(f.source, 'worktree', 'list', '--porcelain'), originalWorktrees);
   assert.deepEqual(await fs.readFile(path.join(f.source, '.git', 'index')), originalIndex);
   assert.equal(await sourceStatus(f.source), originalStatus);
   await assert.rejects(fs.stat(path.join(f.source, '.git', 'FETCH_HEAD')), { code: 'ENOENT' });
@@ -157,13 +169,19 @@ test('owner waits for required review, previews a named branch, rejects, then co
   const confirmationId = randomUUID();
   assert.equal((await success(await routes.decision('confirm', args, confirmationId))).status, 'queued');
   const applied = await s.waitMerge('applied');
-  assert.equal(await git(f.source, 'rev-parse', 'HEAD^{tree}'), chosen.selection.tree);
-  const head = await git(f.source, 'rev-parse', 'HEAD');
+  assert.equal(await git(f.source, 'rev-parse', branch + '^{tree}'), chosen.selection.tree);
+  const head = await git(f.source, 'rev-parse', branch);
   assert.equal(applied.result.integratedCommit, head);
   assert.equal(await git(f.source, 'rev-list', '--parents', '-n', '1', head), `${head} ${base}`);
   assert.equal(await git(f.source, 'rev-parse', 'other'), base);
-  assert.deepEqual(await fs.readFile(path.join(f.source, 'raw.bin')), binary);
-  await assert.rejects(fs.stat(path.join(f.source, 'obsolete.txt')), { code: 'ENOENT' });
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  assert.equal(await git(f.source, 'worktree', 'list', '--porcelain'), originalWorktrees);
+  assert.deepEqual(await fs.readFile(path.join(f.source, '.git', 'index')), originalIndex);
+  await assert.rejects(fs.stat(path.join(f.source, 'raw.bin')), { code: 'ENOENT' });
+  const verification = path.join(f.root, 'verified');
+  await git(f.source, 'worktree', 'add', '--detach', verification, head);
+  assert.deepEqual(await fs.readFile(path.join(verification, 'raw.bin')), binary);
+  await assert.rejects(fs.stat(path.join(verification, 'obsolete.txt')), { code: 'ENOENT' });
   assert.equal(await sourceStatus(f.source), originalStatus);
   await success(await routes.decision('confirm', args, confirmationId));
   assert.equal((await success(await routes.decision('confirm', args))).result.integratedCommit, head);
@@ -179,24 +197,26 @@ test('changed checkout, HEAD, project checks and divergent target tree all inval
   await f.start();
   await s.ready();
   const chosen = await success(await preview());
-  await git(f.source, 'switch', '-c', 'other');
-  await failure(await routes.decision('confirm', confirmArgs(chosen)), 'TARGET_BRANCH_NOT_CHECKED_OUT');
-  await git(f.source, 'switch', 'main');
+  await git(f.source, 'switch', 'delivery');
+  await failure(await routes.decision('confirm', confirmArgs(chosen)), 'TARGET_BRANCH_CHECKED_OUT');
   await git(f.source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', 'commit', '--allow-empty', '-m', 'Advance HEAD only');
+  await git(f.source, 'switch', 'main');
   await failure(await routes.decision('confirm', confirmArgs(chosen)), 'TARGET_CHANGED');
   const newer = await success(await preview());
   assert.notEqual(newer.targetHead, base);
+  await git(f.source, 'switch', 'delivery');
   await fs.writeFile(path.join(f.source, 'local.txt'), 'owner work');
-  await failure(await preview(), 'TARGET_DIRTY');
   await git(f.source, 'add', 'local.txt');
   await git(f.source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', 'commit', '-m', 'Change source tree');
   const changed = await git(f.source, 'rev-parse', 'HEAD');
+  await git(f.source, 'switch', 'main');
   await failure(await preview(), 'TARGET_BASE_CHANGED');
   f.command('project.save', { id: f.project.id, checks: [{ id: 'different', command: process.execPath, args: ['-e', '0'] }] });
   await failure(await routes.decision('confirm', confirmArgs(newer)), 'STALE_CANDIDATE_CONFIRMATION');
-  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), changed);
+  assert.equal(await git(f.source, 'rev-parse', branch), changed);
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
   assert.equal(await sourceStatus(f.source), '');
-  assert.equal(await fs.readFile(path.join(f.source, 'local.txt'), 'utf8'), 'owner work');
+  assert.equal(await git(f.source, 'show', 'delivery:local.txt'), 'owner work');
   assert.equal(s.applyCalls(), 0);
 });
 
@@ -212,26 +232,53 @@ test('withdrawal before the final Git launch leaves the branch unchanged', async
   });
   await success(await routes.decision('confirm', confirmArgs(chosen)));
   await s.waitMerge('cancelled');
-  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  assert.equal(await git(f.source, 'rev-parse', branch), base);
   assert.equal(await sourceStatus(f.source), '');
   assert.equal(s.applyCalls(), 0);
   assert.equal(f.store.list('integrations').find(record => record.candidateMergeId === chosen.id).phase, 'stopped');
+  assert.doesNotMatch(await git(f.source, 'worktree', 'list', '--porcelain'), /acms-owner-/);
 });
 
-test('the final launch guard rejects a moved branch and the owner must reconfirm after a contract revision', async t => {
+test('after the final guard a normal checkout cannot replace the reserved target or redirect the write', async t => {
   const s = await setup(t);
   const { f, base, routes, preview, confirmArgs } = s;
   await f.start();
   await s.ready();
   const chosen = await success(await preview());
-  s.beforeApply(() => git(f.source, 'switch', '-c', 'other'));
+  let userIndex;
+  s.afterGuard(async () => {
+    await git(f.source, 'switch', '-c', 'other');
+    const blocked = await run('git', ['switch', 'delivery'], f.source);
+    assert.notEqual(blocked.code, 0);
+    assert.match(blocked.stderr, /already used by worktree|already checked out/);
+    userIndex = await fs.readFile(path.join(f.source, '.git', 'index'));
+  });
   await success(await routes.decision('confirm', confirmArgs(chosen)));
-  assert.match((await s.waitMerge('failed')).reason, /Source changed/);
+  await s.waitMerge('applied');
   assert.equal(await git(f.source, 'rev-parse', 'main'), base);
   assert.equal(await git(f.source, 'rev-parse', 'other'), base);
-  assert.equal(s.applyCalls(), 0);
+  assert.equal(await git(f.source, 'symbolic-ref', 'HEAD'), 'refs/heads/other');
+  assert.equal(await git(f.source, 'rev-parse', branch + '^{tree}'), chosen.selection.tree);
+  assert.deepEqual(await fs.readFile(path.join(f.source, '.git', 'index')), userIndex);
+  assert.equal(s.applyCalls(), 1);
+  assert.doesNotMatch(await git(f.source, 'worktree', 'list', '--porcelain'), /acms-owner-/);
+});
 
-  await git(f.source, 'switch', 'main');
+test('the named ref update refuses a new target HEAD after its last guard', async t => {
+  const s = await setup(t);
+  const { f, base, routes, preview, confirmArgs } = s;
+  await f.start();
+  await s.ready();
+  const first = await success(await preview());
+  const index = await fs.readFile(path.join(f.source, '.git', 'index'));
+  const newHead = await git(f.source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', 'commit-tree', first.targetTree, '-p', base, '-m', 'Concurrent target update');
+  s.afterGuard(() => git(f.source, 'update-ref', branch, newHead, base));
+  await success(await routes.decision('confirm', confirmArgs(first)));
+  assert.match((await s.waitMerge('failed')).reason, /cannot lock ref|expected/);
+  assert.equal(await git(f.source, 'rev-parse', branch), newHead);
+  assert.equal(await git(f.source, 'rev-parse', 'main'), base);
+  assert.deepEqual(await fs.readFile(path.join(f.source, '.git', 'index')), index);
+  assert.doesNotMatch(await git(f.source, 'worktree', 'list', '--porcelain'), /acms-owner-/);
   const second = await success(await preview());
   await f.engine.stop();
   f.command('goal.edit', { id: s.goal.id, patch: { acceptance: 'The candidate must meet the revised contract' } });
@@ -239,44 +286,33 @@ test('the final launch guard rejects a moved branch and the owner must reconfirm
   assert.equal(await git(f.source, 'rev-parse', 'main'), base);
 });
 
-test('hidden index entries, sparse checkout and ignored local files cannot be overwritten', async t => {
+test('the source checkout keeps hidden, staged and ignored files byte for byte', async t => {
   const s = await setup(t);
   const { f, base, routes, preview, confirmArgs } = s;
   await f.start();
   await s.ready();
-  let chosen = await success(await preview());
   const readme = path.join(f.source, 'README.md');
-  const originalReadme = await fs.readFile(readme);
-  for (const flag of ['assume-unchanged', 'skip-worktree']) {
-    await git(f.source, 'update-index', `--${flag}`, '--', 'README.md');
-    await fs.writeFile(readme, 'invisible local draft');
-    assert.equal(await sourceStatus(f.source), '');
-    const blocked = await failure(await routes.decision('confirm', confirmArgs(chosen)), 'TARGET_INDEX_UNSUPPORTED');
-    assert.match(blocked.message, /README\.md/);
-    assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
-    assert.equal(await fs.readFile(readme, 'utf8'), 'invisible local draft');
-    await fs.writeFile(readme, originalReadme);
-    await git(f.source, 'update-index', `--no-${flag}`, '--', 'README.md');
-  }
   await git(f.source, 'sparse-checkout', 'set', '--no-cone', '/README.md', '/obsolete.txt');
-  await failure(await preview(), 'TARGET_INDEX_UNSUPPORTED');
-  await git(f.source, 'sparse-checkout', 'disable');
-
+  await git(f.source, 'update-index', '--assume-unchanged', '--', 'README.md');
+  await fs.writeFile(readme, 'invisible local draft');
+  const obsolete = path.join(f.source, 'obsolete.txt');
+  await fs.writeFile(obsolete, 'staged local draft');
+  await git(f.source, 'add', '--sparse', '--', 'obsolete.txt');
   const localFile = path.join(f.source, 'raw.bin');
   await fs.appendFile(path.join(f.source, '.git', 'info', 'exclude'), '\n/raw.bin\n');
   const localBytes = Buffer.from([0, 7, 138, 255]);
   await fs.writeFile(localFile, localBytes);
-  assert.equal(await sourceStatus(f.source), '');
-  chosen = await success(await preview());
-  const staged = await git(f.source, 'ls-files', '--stage');
+  const index = await fs.readFile(path.join(f.source, '.git', 'index'));
+  const chosen = await success(await preview());
   await success(await routes.decision('confirm', confirmArgs(chosen)));
-  const failed = await s.waitMerge('failed');
-  assert.match(failed.reason, /raw\.bin/);
+  await s.waitMerge('applied');
   assert.equal(s.applyCalls(), 1);
   assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
-  assert.equal(await git(f.source, 'ls-files', '--stage'), staged);
+  assert.deepEqual(await fs.readFile(path.join(f.source, '.git', 'index')), index);
   assert.deepEqual(await fs.readFile(localFile), localBytes);
-  assert.deepEqual(await fs.readFile(readme), originalReadme);
+  assert.equal(await fs.readFile(readme, 'utf8'), 'invisible local draft');
+  assert.equal(await fs.readFile(obsolete, 'utf8'), 'staged local draft');
+  assert.equal(await git(f.source, 'rev-parse', branch + '^{tree}'), chosen.selection.tree);
 });
 
 test('an applied Git result stays held through restart until cleanup is verified, then settles once', async t => {
@@ -294,11 +330,12 @@ test('an applied Git result stays held through restart until cleanup is verified
   const args = confirmArgs(chosen);
   await success(await routes.decision('confirm', args));
   await s.waitMerge('reconciling');
-  const appliedHead = await git(f.source, 'rev-parse', 'HEAD');
+  const appliedHead = await git(f.source, 'rev-parse', branch);
   assert.notEqual(appliedHead, chosen.targetHead);
   await f.engine.stop();
   await f.engine.start();
   assert.equal(s.current().candidateMerge.status, 'reconciling');
+  assert.match(await git(f.source, 'worktree', 'list', '--porcelain'), /locked acms-owner-/);
   await success(await routes.decision('reconcile', { id: s.goal.id, previewId: chosen.id }));
   await until(() => !s.current().candidateMerge.recoveryRequested, 75000, s.diagnostics);
   assert.equal(s.current().candidateMerge.status, 'reconciling');
@@ -307,8 +344,77 @@ test('an applied Git result stays held through restart until cleanup is verified
   const applied = await s.waitMerge('applied');
   assert.equal(applied.result.integratedCommit, appliedHead);
   assert.equal((await success(await routes.decision('confirm', args))).result.integratedCommit, appliedHead);
-  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), appliedHead);
+  assert.equal(await git(f.source, 'rev-parse', branch), appliedHead);
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), s.base);
+  assert.doesNotMatch(await git(f.source, 'worktree', 'list', '--porcelain'), /acms-owner-/);
   assert.equal(s.applyCalls(), 1);
+});
+
+test('an unstarted ref update releases its reservation and resumes the same confirmation after restart', async t => {
+  const s = await setup(t);
+  const { f, base, routes, preview, confirmArgs } = s;
+  await f.start();
+  await s.ready();
+  const chosen = await success(await preview());
+  s.afterGuard(() => { throw cleanupError('fixture interrupted before ref update'); });
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  await s.waitMerge('reconciling');
+  const first = f.store.list('integrations').find(row => row.candidateMergeId === chosen.id);
+  assert.equal(await git(f.source, 'rev-parse', branch), base);
+  assert.equal(await git(f.source, 'cat-file', '-t', first.integratedCommit), 'commit');
+  assert.match(await git(f.source, 'worktree', 'list', '--porcelain'), /locked acms-owner-/);
+  await f.engine.stop();
+  await receipt(path.join(f.dataDir, 'integration-receipts', first.commandId + '.json'), { exitCode: 1, notStarted: true });
+  s.afterGuard(null);
+  await f.engine.start();
+  const applied = await s.waitMerge('applied');
+  assert.equal(applied.id, chosen.id);
+  assert.equal(applied.result.integratedCommit, first.integratedCommit);
+  assert.equal(s.applyCalls(), 1);
+  assert.equal(f.store.require('integrations', first.id).phase, 'stopped');
+  assert.doesNotMatch(await git(f.source, 'worktree', 'list', '--porcelain'), /acms-owner-/);
+});
+
+test('a backed-up pending reservation is rebound before a restored host inspects and cleans it', async t => {
+  const s = await setup(t);
+  const { f, base, routes, preview, confirmArgs } = s;
+  await f.start();
+  await s.ready();
+  const chosen = await success(await preview());
+  let cleanupFile;
+  s.afterApply((result, filename) => {
+    assert.equal(result.code, 0, result.stderr);
+    cleanupFile = filename;
+    throw cleanupError('fixture retains reservation at backup');
+  });
+  await success(await routes.decision('confirm', confirmArgs(chosen)));
+  await s.waitMerge('reconciling');
+  await f.engine.stop();
+  const pending = f.store.list('integrations').find(row => row.candidateMergeId === chosen.id);
+  await receipt(cleanupFile, { exitCode: 0 });
+  const backup = path.join(f.root, 'backup'), target = path.join(f.root, 'restored');
+  await applyBackup(await planBackup({ dataDir: f.dataDir, out: backup }));
+  const restored = await restoreBackup({ backup, target });
+  assert.equal(restored.startable, false);
+  assert(restored.worktrees.issues.some(item => item.path === `integration/${pending.id}`));
+  const workspace = f.store.require('tasks', s.task.id).workspace.path;
+  await fs.rename(workspace, path.join(f.root, 'parked-task'));
+  await fs.rename(pending.ownerReservation.path, path.join(f.root, 'parked-reservation'));
+  const resumed = await restoreBackup({ target, resumeWorktrees: true });
+  assert.equal(resumed.startable, true, JSON.stringify(resumed.worktrees));
+  const store = new Store(path.join(target, 'company.db'));
+  const company = new Company(store);
+  const engine = new Engine(company, f.adapter, new WorkspaceManager(target, company), { intervalMs: 20 });
+  try {
+    await engine.start();
+    const request = store.require('goals', s.goal.id).candidateMerge;
+    assert.equal(request.status, 'applied', JSON.stringify(request));
+    assert.equal(request.result.integratedCommit, pending.integratedCommit);
+    assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+    assert.equal(await git(f.source, 'rev-parse', branch), pending.integratedCommit);
+    assert.doesNotMatch(await git(f.source, 'worktree', 'list', '--porcelain'), /acms-owner-/);
+    assert.equal(s.applyCalls(), 1);
+  } finally { await engine.stop(); store.close(); }
 });
 
 test('existing automatic merge applies task output before the template final review', async t => {
