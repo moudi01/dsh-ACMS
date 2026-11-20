@@ -13,7 +13,7 @@ const requireValue = (ok, code, path, details) => { if (!ok) fail(code, path, de
 
 // Use one portable namespace. Never extract entries, follow links, or normalize
 // an unsafe name into a safe one. NFC/case aliases are rejected, not overwritten.
-function portablePath(name) {
+export function portablePath(name) {
   requireValue(typeof name === 'string' && name.length > 0 && name.length <= 1024 && name.isWellFormed(), 'INVALID_PATH', String(name).slice(0, 1024));
   requireValue(!/[\\:\x00-\x1f\x7f<>"|?*]/u.test(name), 'INVALID_PATH', name);
   requireValue(name.split('/').every(part => part && part !== '.' && part !== '..' && !/[. ]$/.test(part) &&
@@ -154,7 +154,7 @@ function readZip(bytes, limits) {
 
 // The report is evidence for these exact archive bytes, never an approval of
 // their content. Caller supplies provenance; the archive cannot assert approval.
-export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
+export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS, { includeCandidate = false } = {}) {
   const report = { format: ARCHIVE_FORMAT, passed: false, archiveSha256: byteSha256(bytes), errors: [] };
   try {
     const { files, paths, total, textDiagnostics } = readZip(bytes, limits);
@@ -194,6 +194,7 @@ export function verifyDeliveryArchive(bytes, limits = ARCHIVE_LIMITS) {
     report.manifest = { format: ARCHIVE_FORMAT, hashAlgorithm: 'sha256-bytes', files: normalized };
     report.totals = { files: files.size, expandedBytes: total };
     report.passed = report.errors.length === 0;
+    if (includeCandidate && report.passed) report.candidate = manifest.candidate;
   } catch (error) { report.errors.push(error.diagnostic ?? { code: 'INVALID_ARCHIVE', path: null }); }
   return report;
 }

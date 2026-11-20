@@ -18,6 +18,17 @@ export const api = {
     return request(`activity?${params.toString()}`, { signal });
   },
   artifact: id => request(`artifact?id=${encodeURIComponent(id)}`),
+  candidateArchive: selection => request('composition/archive', { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(selection) }),
+  async downloadCandidateArchive(selection, archive) {
+    const params = new URLSearchParams({ ...selection, archiveSha256: archive.archiveSha256 });
+    const response = await transport(`api/acms/composition/download?${params}`, { credentials: 'same-origin' });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.error?.message ?? `下载失败（HTTP ${response.status}）`);
+    }
+    return response.blob();
+  },
   directories: directory => request(`directories?path=${encodeURIComponent(directory)}`),
   modelDetails: (input, signal) => request('model-details', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input), signal }),
   modelCheck: input => request('model-check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),

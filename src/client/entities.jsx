@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useState } from 'react';
+import { api } from './api.js';
 import { ActionButton, CollapsibleText } from './components.jsx';
 import { entityDeletionReason, entityTasks } from '../core/entity-actions.js';
 import { goalContractCapacityMessage } from '../core/task-actions.js';
@@ -12,6 +13,33 @@ export function ChangeHistory({ kind, id, data }) {
   return <section className="acms-change-history"><h3>变更与通知</h3><p className="acms-sectionnote">变更进入负责人的通知队列，在下一轮执行时随任务说明送达；“已送达”表示已交给执行器，不代表已完成处理。</p>{!changes.length && <p className="acms-muted">暂无编辑记录。</p>}{changes.map(c => <details key={c.id}><summary>{new Date(c.at).toLocaleString('zh-CN', { hour12: false })} · {c.changes.map(d => fields[d.field] ?? d.field).join('、')}</summary>{c.changes.map(d => <div className="acms-change-diff" key={d.field}><b>{fields[d.field] ?? d.field}</b><p>修改前：{display(d.before)}</p><p>修改后：{display(d.after)}</p></div>)}<ul>{(data.notifications ?? []).filter(n => n.changeId === c.id).map(n => <li key={n.id}>{data.agents.find(a => a.id === n.agentId)?.name ?? '历史角色'}：{n.status === 'delivered' ? '已随执行送达' : '等待下一轮执行送达'}</li>)}</ul></details>)}</section>;
 }
 const reviewLabels = { ready: '待执行', running: '进行中', preparing: '准备中', blocked: '已阻塞', paused: '已暂停', succeeded: '已结束', failed: '失败', cancelled: '已取消', integrating: '集成中', reconciling: '待核对', stopping: '停止中' };
+function CandidateDownload({ goal }) {
+  const [status, setStatus] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const download = async () => {
+    const selection = { goalId: goal.id, version: goal.finalComposition.version, deliveryHash: goal.finalComposition.deliveryHash };
+    setLoading(true);
+    setStatus(null);
+    try {
+      const archive = await api.candidateArchive(selection);
+      const file = await api.downloadCandidateArchive(selection, archive);
+      const url = URL.createObjectURL(file);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = archive.filename;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setStatus({ message: `已获取 ${archive.files} 个文件。解压 source/ 到空目录即可得到该版本。` });
+    } catch (error) { setStatus({ error: error.message }); }
+    finally { setLoading(false); }
+  };
+  return <div className="acms-actions">
+    <ActionButton reason={loading ? '正在准备候选归档…' : ''} onClick={download}>{loading ? '正在准备 ZIP…' : '下载候选 ZIP'}</ActionButton>
+    {status?.error && <p role="alert">{status.error}</p>}
+    {status?.message && <p role="status">{status.message}</p>}
+  </div>;
+}
+
 function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
   const review = goal.reviewSummary;
   const pending = goal.contractChange?.status === 'pending';
@@ -36,6 +64,7 @@ function GoalReviewState({ goal, taskCount, taskLimit, act, busy }) {
       <dt>{copyCandidate ? '候选内容指纹' : '候选提交'}</dt><dd><code>{copyCandidate ? goal.composition.contentHash : goal.composition.bundle.commit}</code></dd>
       <dt>固定基线</dt><dd><code>{copyCandidate ? goal.composition.baseHash : goal.composition.baseCommit}</code></dd>
       {!copyCandidate && <><dt>本机交付包</dt><dd><code>{goal.composition.bundle.path}</code></dd></>}</dl></details>}
+    {goal.finalComposition && <CandidateDownload key={`${goal.id}/${goal.finalComposition.deliveryHash}/${goal.finalComposition.reviewId}`} goal={goal} />}
     {waitingForComposition && <p className="acms-sectionnote">{recheck?.reason || candidateLabel + (recheck ? '正在等待重新核验。' : '尚未通过联合检查。请查看任务的集成状态。')}</p>}
     {composite && !pending && !goal.executionControl && goal.status !== 'cancelled' &&
       goal.taskSummary?.done > 0 && goal.taskSummary.done === goal.taskSummary.total && (!recheck || recheck.status === 'failed') &&

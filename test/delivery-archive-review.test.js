@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validateDeliveryArchive } from '../src/runtime/archive-validation.js';
-import { verifyDeliveryArchive } from '../src/runtime/delivery-archive.js';
+import { byteSha256, verifyDeliveryArchive } from '../src/runtime/delivery-archive.js';
 import { ARCHIVE_PROMPT_BYTES, promptFor } from '../src/runtime/prompt.js';
 import { buildHost } from '../scripts/host-bundle.mjs';
 import { fixture } from './helpers.js';
@@ -88,6 +88,15 @@ test('isolated host bundle publishes and runs its matching archive worker', asyn
   const bundled = await import(pathToFileURL(built.filename));
   assert.equal((await bundled.validateDeliveryArchive(deliveryZip([{ name: '中文', data: '字节' }]))).passed, true);
   assert.equal((await bundled.validateDeliveryText(Buffer.from('中文交接'))).status, 'no-warning');
+  const candidate = path.join(directory, 'candidate');
+  const file = Buffer.from([0, 255, 13, 10]);
+  await mkdir(candidate);
+  await writeFile(path.join(candidate, 'binary.dat'), file);
+  const archive = await bundled.buildCandidateArchive({ root: candidate, mode: 'copy', maxBytes: 4096,
+    entries: [['binary.dat', { mode: '100644', oid: byteSha256(file) }]], evidence: { version: 'fixture' } });
+  const proof = await bundled.validateCandidateArchive(archive.bytes);
+  assert.equal(proof.manifestSha256, archive.manifestSha256);
+  assert.equal(proof.candidate.version, 'fixture');
   const controller = new AbortController(), pending = bundled.validateDeliveryArchive(deliveryZip([]), { signal: controller.signal });
   controller.abort(); await assert.rejects(pending, { name: 'AbortError' });
 });

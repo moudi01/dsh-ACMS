@@ -1,4 +1,4 @@
-import { deliveredWork, deliveryGeneration, goalDeliveryHash, taskContractVersion } from './goal-contract.js';
+import { contractVersion, deliveredWork, deliveryGeneration, goalDeliveryHash, taskContractVersion } from './goal-contract.js';
 import { assert, digest, id } from './util.js';
 
 export const GIT_COMPOSITION = 'git-composite';
@@ -42,6 +42,16 @@ export function acceptedGoalComposition(store, goal) {
     if (error.code === 'COMPOSITE_DEPENDENCIES') return null;
     throw error;
   }
+}
+
+export function finalGoalComposition(company, goal, candidate, deliveryHash) {
+  if (!candidate || goal.status !== 'succeeded' || goal.executionControl || goal.legacyBatch ||
+    goal.contractChange?.status === 'pending' || goal.completedContractVersion !== contractVersion(goal) ||
+    goal.completedDeliveryHash !== deliveryHash || company.store.get('projects', goal.projectId)?.status === 'deleted') return null;
+  const template = goal.templateSnapshot ?? company.store.get('templates', goal.templateId ?? 'base');
+  const review = template?.finalReview ? company.latestGoalReview(goal.id) : null;
+  if (template?.finalReview && (review?.status !== 'succeeded' || review.passed !== true || review.deliveryHash !== deliveryHash)) return null;
+  return { version: candidate.version, deliveryHash, contractVersion: contractVersion(goal), reviewId: review?.id ?? null };
 }
 
 export function orderedCompositionTasks(store, goal, roots, { consumer = null, includeHistorical = false } = {}) {
