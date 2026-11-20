@@ -9,15 +9,39 @@ import { checkIdentity, copyProject, inputFingerprint, prepareDependencies, veri
 import { ARCHIVE_FORMAT } from './delivery-archive.js';
 import { validateDeliveryArchive, validateDeliveryText } from './archive-validation.js';
 import { isProseFile } from './text-integrity.js';
-import { checkoutGitBundle, publishGitDelivery, verifiedGitBundle } from './git-delivery.js';
+import { checkoutGitBundle, gitWorktreeFingerprint, publishGitDelivery, removeTemporary, verifiedGitBundle } from './git-delivery.js';
+import { checkoutComposition, composeGitVersions, selectedGitVersions, updateCompositionWorkspace } from './git-composition.js';
+import { acceptedGoalComposition, compositionCheckContract, orderedCompositionTasks, supportsGitComposition, usesGitComposition } from '../core/composite-delivery.js';
+import { deliveredWork, goalDeliveryHash } from '../core/goal-contract.js';
+import { taskSettledForGoal } from '../core/hierarchy.js';
+import { assertGoalOpen } from '../core/goal-control.js';
 
 export function inside(root, target) { const rel = path.relative(root, target); return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)); }
 const dependencyPath = filename => filename.split(/[/\\]/).some(part => part.toLowerCase() === 'node_modules');
 const excludeDependencies = ':(exclude,glob,icase)**/node_modules/**';
-export async function run(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000 } = {}) {
+
+async function describesReplacedGitLeaf(root, name) {
+  const parts = name.split('/');
+  if (!parts.every(part => part && !['.', '..'].includes(part) && !/[\\:]/.test(part))) return false;
+  let filename = root;
+  for (const [index, part] of parts.entries()) {
+    filename = path.join(filename, part);
+    const info = await fs.lstat(filename).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!info || info.isSymbolicLink()) return false;
+    if (index === parts.length - 1) return info.isDirectory();
+    if (!info.isDirectory()) return info.isFile();
+  }
+  return false;
+}
+
+export async function run(command, args, cwd, { signal, timeout = 120000, maxOutput = 100000, env } = {}) {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = spawn(command === 'node' ? process.execPath : command, args, { cwd, shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command === 'node' ? process.execPath : command, args, { cwd, env, shell: false, windowsHide: true,
+      detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', timedOut = false;
     let terminating;
     const terminate = () => {
@@ -81,6 +105,8 @@ export class WorkspaceManager {
       return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration: sourceTask.workspace.collaboration };
     }
     const project = this.company.store.require('projects', task.projectId); const source = await this.validateProject(project);
+    const goal = task.goalId && this.company.store.get('goals', task.goalId);
+    if (usesGitComposition(goal) && ['work', 'repair'].includes(task.kind)) return this.prepareCompositionTask(task, attempt, goal, project, source);
     if (task.workspace) { await fs.access(task.workspace.path); return syncCollaboration(this.company, project, task, task.workspace); }
     const destination = path.join(this.dataDir, 'workspaces', task.id); await fs.mkdir(path.dirname(destination), { recursive: true });
     if (project.mode === 'git') {
@@ -91,7 +117,91 @@ export class WorkspaceManager {
     await copyProject(source, destination);
     return syncCollaboration(this.company, project, task, { path: destination, source, mode: 'copy' });
   }
+  async prepareCompositionTask(task, attempt, goal, project, source) {
+    assert(supportsGitComposition(project), 'COMPOSITE_PROJECT', '完整候选要求关闭 Git 自动合并。');
+    const invoke = (command, args, cwd, options) => run(command, args, cwd, { ...options, signal: attempt.signal });
+    const getGit = (args, cwd) => git(args, cwd, undefined, invoke);
+    assert(path.relative(await fs.realpath(await getGit(['rev-parse', '--show-toplevel'], source)), source) === '',
+      'COMPOSITE_PROJECT', '完整候选要求使用批准的 Git 仓库根目录。');
+    const store = this.company.store;
+    let base = goal.compositionBase;
+    if (!base) {
+      const commit = await getGit(['rev-parse', '--verify', 'HEAD^{commit}'], source);
+      base = store.transaction(() => {
+        const fresh = store.require('goals', goal.id);
+        assertGoalOpen(fresh);
+        if (fresh.compositionBase) return fresh.compositionBase;
+        const compositionBase = { source, commit };
+        store.put('goals', { ...fresh, compositionBase });
+        return compositionBase;
+      });
+    }
+    assert(path.relative(base.source, source) === '', 'COMPOSITE_BASE', '当前 Git 仓库与目标固定基线不一致。');
+    const dependencies = orderedCompositionTasks(store, goal, (task.dependencies ?? []).map(id => store.require('tasks', id)),
+      { consumer: task, includeHistorical: true });
+    const inputs = await selectedGitVersions(dependencies, base.commit, this.dataDir);
+    const compose = items => composeGitVersions({ dataDir: this.dataDir, source, baseCommit: base.commit, inputs: items, invoke, signal: attempt.signal });
+    const input = await compose(inputs);
+    const destination = path.join(this.dataDir, 'workspaces', task.id);
+    const branch = `acms/${task.id}`;
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    const workspaceParent = path.join(await fs.realpath(this.dataDir), 'workspaces');
+    assert(path.relative(await fs.realpath(path.dirname(destination)), workspaceParent) === '' &&
+      (await fs.lstat(path.dirname(destination))).isDirectory(), 'COMPOSITE_WORKSPACE_INCOMPLETE', '工作副本目录经过链接。');
+    if (task.workspace) {
+      assert(task.workspace.compositionBase === base.commit && path.relative(task.workspace.path, destination) === '',
+        'COMPOSITE_BASE', '任务副本与固定 Git 基线不匹配，保留已有文件。');
+      const previous = task.workspace.compositionInput ?? await compose([]);
+      if (previous.version !== input.version) {
+        const actual = await fs.realpath(destination);
+        const expected = path.join(workspaceParent, task.id);
+        assert(path.relative(actual, expected) === '' && await getGit(['symbolic-ref', '--short', 'HEAD'], destination) === branch,
+          'COMPOSITE_WORKSPACE_INCOMPLETE', '任务副本无法核对，保留已有文件。');
+        await updateCompositionWorkspace(previous, input, destination, this.dataDir, invoke, attempt.signal);
+      }
+      return syncCollaboration(this.company, project, task, { ...task.workspace, compositionInput: input });
+    }
+    const existing = await fs.lstat(destination).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (existing) {
+      const directory = path.join(workspaceParent, task.id);
+      const matches = existing.isDirectory() && path.relative(await fs.realpath(destination), directory) === '' &&
+        await getGit(['symbolic-ref', '--short', 'HEAD'], destination) === branch &&
+        await getGit(['rev-parse', '--verify', 'HEAD'], destination) === base.commit;
+      const registrations = matches && await getGit(['worktree', 'list', '--porcelain', '-z'], source);
+      const registered = registrations && registrations.split('\0').some(row => row.startsWith('worktree ') && path.relative(row.slice(9), directory) === '');
+      const accurate = registered && await gitWorktreeFingerprint(destination) === input.contentHash;
+      assert(accurate, 'COMPOSITE_WORKSPACE_INCOMPLETE', '未登记的任务副本需要人工核对，保留已有文件。');
+    } else {
+      const parent = await fs.realpath(path.join(this.dataDir, 'integration'));
+      const temporary = await fs.mkdtemp(path.join(parent, 'composition-input-'));
+      try {
+        const checkout = path.join(temporary, 'checkout');
+        await checkoutComposition(input, checkout, temporary, this.dataDir, invoke, attempt.signal);
+        await getGit(['worktree', 'add', '--no-checkout', '-b', branch, destination, base.commit], source);
+        await getGit(['read-tree', base.commit], destination);
+        for (const name of await fs.readdir(checkout)) {
+          if (name.toLowerCase() === '.git') continue;
+          await fs.cp(path.join(checkout, name), path.join(destination, name), { recursive: true, force: false, errorOnExist: true });
+        }
+        assert(await gitWorktreeFingerprint(destination) === input.contentHash, 'COMPOSITE_CONTENT', '任务副本未能完整接收已选依赖版本。');
+      } finally { await removeTemporary(temporary, parent); }
+    }
+    return syncCollaboration(this.company, project, task, { path: destination, source, branch, baseCommit: base.commit,
+      mode: 'git', compositionBase: base.commit, compositionInput: input });
+  }
   async prepareGoalReview(task) {
+    const goal = this.company.store.require('goals', task.goalId);
+    if (usesGitComposition(goal)) {
+      const candidate = acceptedGoalComposition(this.company.store, goal);
+      assert(candidate && task.deliveryHash === this.company.deliveryHash(goal.id), 'STALE_REVIEW', '最终审查的完整 Git 候选已经变化。');
+      const destination = path.join(this.dataDir, 'reviews', task.id);
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await checkoutComposition(candidate, destination, this.dataDir, this.dataDir, run);
+      return { path: destination, mode: 'review-copy', reviewScope: 'goal', artifactHash: task.deliveryHash, candidateVersion: candidate.version };
+    }
     if (task.workspace?.mode === 'review-copy') { await fs.access(task.workspace.path); return task.workspace; }
     const destination = path.join(this.dataDir, 'reviews', task.id);
     await fs.mkdir(destination, { recursive: true });
@@ -184,6 +294,12 @@ export class WorkspaceManager {
     const store = this.company.store;
     const rows = store.list('verifications');
     const evidence = {};
+    const goal = task.reviewScope === 'goal' && store.require('goals', task.goalId);
+    const composition = goal && acceptedGoalComposition(store, goal);
+    if (composition && this.company.deliveryHash(goal.id) === task.deliveryHash) {
+      evidence.composition = { version: composition.version, contentHash: composition.contentHash, baseCommit: composition.baseCommit,
+        checks: composition.checks.map(({ id, checkVersion, environment, code, inputHash, log }) => ({ id, checkVersion, environment, code, inputHash, log })) };
+    }
     for (const id of targets) {
       const source = store.require('tasks', id);
       const row = rows.findLast(v => v.kind === 'checks' && v.taskId === id && v.artifactHash === source.artifactHash &&
@@ -222,10 +338,37 @@ export class WorkspaceManager {
     const tracked = await git(['diff', '--name-only', '--no-renames', '-z', task.workspace.baseCommit ?? 'HEAD', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
     const untracked = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', excludeDependencies], cwd, { maxOutput }, invoke);
     assert(tracked.length < maxOutput && untracked.length < maxOutput, 'CHANGE_LIMIT', 'Git change names exceed the delivery limit');
-    const names = [...new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)))].sort();
-    assert(names.length <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
     const root = await fs.realpath(cwd);
+    const changed = new Set((tracked + '\0' + untracked).split('\0').filter(n => n && !isCollaborationPath(n) && !dependencyPath(n)));
     const files = [];
+    let baseLeaves;
+    const readBaseLeaves = async () => {
+      if (!baseLeaves) {
+        const tree = await git(['ls-tree', '-r', '--full-tree', '-z', task.workspace.baseCommit ?? 'HEAD'], cwd, { maxOutput }, invoke);
+        assert(tree.length < maxOutput, 'CHANGE_LIMIT', 'Git baseline names exceed the delivery limit');
+        baseLeaves = new Set(tree.split('\0').map(row => /^100(?:644|755) blob [a-f0-9]+\t(.*)$/s.exec(row)?.[1]).filter(Boolean));
+      }
+      return baseLeaves;
+    };
+    if (process.platform === 'win32' && task.workspace.compositionBase) {
+      // The parent retains its index when selected inputs are applied. Git can
+      // hide a case-only rename whose bytes still match that older index name.
+      for (const name of await readBaseLeaves()) {
+        if (isCollaborationPath(name) || dependencyPath(name)) continue;
+        const actual = await fs.realpath(path.join(root, name)).catch(error => {
+          if (['ENOENT', 'ENOTDIR'].includes(error.code)) return null;
+          throw error;
+        });
+        if (!actual) continue;
+        const spelling = path.relative(root, actual).split(path.sep).join('/');
+        if (spelling !== name && spelling.toLowerCase() === name.toLowerCase()) {
+          changed.add(name);
+          changed.add(spelling);
+        }
+      }
+    }
+    assert(changed.size <= 1000, 'CHANGE_LIMIT', 'A single reviewed submission may change at most 1000 files');
+    const names = [...changed].sort();
     for (const name of names) {
       try {
         const filename = await this.safeFile(cwd, name);
@@ -236,8 +379,11 @@ export class WorkspaceManager {
           files.push({ path: name, deleted: true });
         } else files.push({ path: name, hash: digest((await fs.readFile(filename)).toString('base64')) });
       } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-        files.push({ path: name, deleted: true });
+        if (error.code === 'ENOENT') { files.push({ path: name, deleted: true }); continue; }
+        if (['ENOTDIR', 'ARTIFACT_PATH'].includes(error.code) && await describesReplacedGitLeaf(root, name)) {
+          if ((await readBaseLeaves()).has(name)) { files.push({ path: name, deleted: true }); continue; }
+        }
+        throw error;
       }
     }
     return files;
@@ -282,6 +428,8 @@ export class WorkspaceManager {
   }
   async integrate(task, isCurrent, execution) {
     const project = this.company.store.require('projects', task.projectId);
+    const goal = task.goalId && this.company.store.get('goals', task.goalId);
+    if (usesGitComposition(goal)) assert(supportsGitComposition(project), 'COMPOSITE_PROJECT', '完整候选要求关闭 Git 自动合并，原项目没有合入。');
     if (!project.autoMerge) {
       const available = { status: 'available', path: task.workspace.path, branch: task.workspace.branch };
       if (task.workspace.mode !== 'git') return available;
@@ -337,6 +485,73 @@ export class WorkspaceManager {
       throw withEvidence(error, { commit, actualHead: error.details?.actualHead ?? null,
         checks: error.details?.checks?.filter(c => !c.passed).map(c => ({ id: c.id, code: c.code })) ?? [] });
     }
+  }
+  async recheckGoalComposition(goal, task, execution) {
+    const store = this.company.store;
+    const project = store.require('projects', task.projectId);
+    assert(supportsGitComposition(project), 'COMPOSITE_PROJECT', '完整候选要求关闭 Git 自动合并。');
+    const source = await this.validateProject(project, execution.run);
+    const current = store.require('goals', goal.id);
+    const work = store.list('tasks').filter(item => item.goalId === goal.id && item.kind === 'work' &&
+      !item.contractObsolete && !item.legacyBatch && !item.workflowSnapshot && item.status !== 'deleted');
+    assert(work.every(item => taskSettledForGoal(item, current)), 'COMPOSITE_NO_DELIVERY', '请先完成当前工作任务。');
+    const baseCommit = current.compositionBase?.commit;
+    assert(baseCommit && current.compositionBase?.source && path.relative(current.compositionBase.source, source) === '',
+      'COMPOSITE_BASE', '当前 Git 仓库与目标固定基线不一致。');
+    assert(project.checks.length, 'COMPOSITE_CHECK_REQUIRED', '请由所有者添加至少一项用于完整候选的联合检查。');
+    const delivered = deliveredWork(store, current);
+    const ordered = orderedCompositionTasks(store, current, delivered, { includeHistorical: true });
+    const versions = await selectedGitVersions(ordered, baseCommit, this.dataDir);
+    const historical = new Set(current.supersededTaskIds ?? []);
+    const inputs = [];
+    const compose = items => composeGitVersions({ dataDir: this.dataDir, source, baseCommit, inputs: items, invoke: execution.run });
+    for (const version of versions) {
+      if (historical.has(version.taskId)) continue;
+      const inherited = version.baseline?.inputs ?? [];
+      if (inherited.some(row => historical.has(row.taskId))) {
+        // A replacement can retain bytes from its approved historical draft.
+        // Compare it to its current dependencies so the retired task is not a
+        // separate selected output and retained bytes belong to replacement.
+        const active = new Set(inherited.filter(row => !historical.has(row.taskId)).map(row => row.taskId));
+        version.mergeBase = await compose(inputs.filter(item => active.has(item.taskId)));
+      }
+      inputs.push(version);
+    }
+    assert(inputs.length, 'COMPOSITE_NO_DELIVERY', '没有当前目标可组合的工作任务交付。');
+    const candidate = await compose(inputs);
+    const parent = await fs.realpath(path.join(this.dataDir, 'integration'));
+    const temporary = await fs.mkdtemp(path.join(parent, 'composition-check-'));
+    let retain = false;
+    try {
+      const checkout = path.join(temporary, 'checkout');
+      await checkoutComposition(candidate, checkout, temporary, this.dataDir, execution.run);
+      const inputHash = await inputFingerprint(checkout);
+      const evidence = store.list('integrations').filter(item => item.goalId === goal.id && item.composition?.version === candidate.version)
+        .flatMap(item => item.composition.checks ?? []);
+      const checks = [];
+      for (const check of project.checks) {
+        const identity = await checkIdentity(check, checkout, project.preparation).catch(error => {
+          if (!project.preparation || error.code !== 'ENOENT') throw error;
+          return null;
+        });
+        const cached = identity?.reusable && evidence.findLast(row => row.id === check.id && row.reusable && row.passed &&
+          row.cleanupConfirmed === true && row.inputUnchanged === true && row.inputHash === inputHash && row.checkVersion === identity.version);
+        checks.push(cached ? { ...cached, reused: true } : await verifyInCopy({ dataDir: temporary, source: checkout, inputHash, check,
+          preparation: project.preparation, identity, invoke: execution.run }));
+      }
+      const composition = { ...candidate, checkContract: compositionCheckContract(project), ledgerHash: goalDeliveryHash(current, delivered),
+        passed: checks.every(check => check.passed), checks };
+      execution.checkpoint({ phase: 'checking', composition });
+      if (!composition.passed) {
+        const failed = checks.filter(check => !check.passed).map(check => check.id);
+        throw Object.assign(new AcmsError('COMPOSITE_CHECK_FAILED', '完整候选联合检查未通过，请核对检查 ' + failed.join('、') + '。'),
+          { integrationEvidence: { code: 'COMPOSITE_CHECK_FAILED', version: candidate.version, checks: failed } });
+      }
+      return { composition };
+    } catch (error) {
+      retain = !!error.cleanupUncertain;
+      throw error;
+    } finally { if (!retain) await removeTemporary(temporary, parent); }
   }
   runIntegrationCommand(command, args, cwd, options) {
     return runContained(command, args, cwd, options);

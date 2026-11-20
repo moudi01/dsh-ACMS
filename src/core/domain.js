@@ -11,6 +11,7 @@ import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNT
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
+import { acceptedGoalComposition, compositionCheckContract, GIT_COMPOSITION, newCompositionCheck, supportsGitComposition, usesGitComposition } from './composite-delivery.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
@@ -73,6 +74,7 @@ export class Company {
         'agent.delete': () => deleteEntity(this, 'agent', args, actor),
         'agent.restore': () => restoreEntity(this, 'agent', args, actor),
         'goal.create': () => this.createGoal(args, actor),
+        'goal.composition.recheck': () => this.recheckGoalComposition(args, actor),
         'goal.createWithProject': () => this.createGoal({ ...args.goal, projectId: this.saveProject(args.project, actor).id }, actor),
         'goal.propose': () => this.store.put('proposals', { id: id('proposal'), title: text(args.title, 'title'), description: args.description ?? '', status: 'proposed' }),
         'task.create': () => this.createTask(args, actor),
@@ -150,6 +152,11 @@ export class Company {
     const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false, ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
     if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge'], actor);
+    if (previous && compositionCheckContract(project) !== compositionCheckContract(previous)) {
+      for (const goal of this.store.list('goals').filter(item => item.projectId === project.id && item.composition && usesGitComposition(item))) {
+        this.refreshGoal(goal.id);
+      }
+    }
     this.store.event('project.saved', project.id, { created: !previous }, actor); return project;
   }
   editGoal(args, actor) {
@@ -220,10 +227,14 @@ export class Company {
   }
   createGoal(args, actor) { this.owner(actor); return this.createGoalRecord(args, actor); }
   createGoalRecord(args, actor, options = {}) {
-    assert(this.store.require("projects", args.projectId).status !== "deleted", "ENTITY_DELETED", "请先恢复项目");
+    const project = this.store.require('projects', args.projectId);
+    assert(project.status !== 'deleted', 'ENTITY_DELETED', '请先恢复项目');
+    assert(args.deliveryMode === undefined || args.deliveryMode === GIT_COMPOSITION, 'INVALID_INPUT', '未知的目标交付方式。');
+    if (args.deliveryMode) assert(actor.kind === 'owner' && supportsGitComposition(project), 'COMPOSITE_PROJECT',
+      '完整 Git 候选由所有者在关闭自动合并的 Git 项目上启用。');
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
     const constraints = options.constraints ?? [];
-    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
+    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(args.deliveryMode ? { deliveryMode: args.deliveryMode } : {}), ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
     if (args.plan !== false) { const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId); assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色'); this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description, kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM); }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }
@@ -289,9 +300,18 @@ export class Company {
     const tasks = goalTasks.filter(t => t.kind !== 'review' && !t.legacyBatch && !t.workflowSnapshot && !t.contractObsolete);
     const complete = tasks.some(t => t.kind === 'work') && tasks.every(task => taskSettledForGoal(task, goal));
     let status, completionPending = null;
+    let compositionRecheck = goal.compositionRecheck;
     if (goal.contractChange?.status === 'pending') status = 'active';
     else if (!tasks.length) status = 'empty';
     else if (!complete) status = tasks.some(t => t.kind === 'plan' && !TERMINAL.has(t.status)) ? 'planning' : 'active';
+    else if (usesGitComposition(goal) && !acceptedGoalComposition(this.store, goal)) {
+      status = 'active';
+      const newDelivery = goal.completionPending === 'delivery';
+      if ((!compositionRecheck || compositionRecheck.status === 'failed') &&
+          (newDelivery || (!goal.composition && !compositionRecheck))) {
+        compositionRecheck = newCompositionCheck(this.store, goal);
+      }
+    }
     else {
       const template = goal.templateSnapshot ?? this.store.get('templates', goal.templateId ?? 'base');
       if (!template?.finalReview) status = 'succeeded';
@@ -314,9 +334,12 @@ export class Company {
       }
     }
     const pendingChanged = (goal.completionPending ?? null) !== completionPending;
-    if (status === goal.status && !pendingChanged) return goal;
+    const compositionChanged = compositionRecheck !== goal.compositionRecheck;
+    if (status === goal.status && !pendingChanged && !compositionChanged) return goal;
     const completed = status === 'succeeded' ? { completedContractVersion: contractVersion(goal), completedDeliveryHash: this.deliveryHash(goalId) } : {};
-    const saved = this.store.put('goals', { ...goal, status, ...completed, ...(pendingChanged ? { completionPending } : {}) });
+    const saved = this.store.put('goals', { ...goal, status, ...completed, ...(pendingChanged ? { completionPending } : {}),
+      ...(compositionChanged ? { compositionRecheck } : {}) });
+    if (compositionChanged && compositionRecheck) this.store.event('goal.composition.queued', goal.id, { compositionId: compositionRecheck.id }, SYSTEM);
     if (pendingChanged && completionPending) this.store.event('goal.final_review.waiting', goalId, { reason: completionPending }, SYSTEM);
     if (status === goal.status) return saved;
     const delivered = status === 'succeeded' ? deliveredWork(this.store, goal) : [];
@@ -338,9 +361,30 @@ export class Company {
     }, actor);
     return saved;
   }
+  recheckGoalComposition(args, actor) {
+    this.owner(actor);
+    const goal = this.store.require('goals', args.id);
+    assertGoalOpen(goal);
+    assert(usesGitComposition(goal) && supportsGitComposition(this.store.require('projects', goal.projectId)),
+      'COMPOSITE_PROJECT', '该目标没有可重新核对的 Git 候选。');
+    assert(goal.contractChange?.status !== 'pending', 'CONTRACT_PENDING', '请先确认当前目标合同。');
+    if (goal.compositionRecheck && goal.compositionRecheck.status !== 'failed') return goal;
+    const work = this.store.list('tasks').filter(task => task.goalId === goal.id && task.kind === 'work' &&
+      !task.legacyBatch && !task.workflowSnapshot && !task.contractObsolete && task.status !== 'deleted');
+    const compositionRecheck = newCompositionCheck(this.store, goal);
+    assert(compositionRecheck && work.every(task => taskSettledForGoal(task, goal)), 'COMPOSITE_NO_DELIVERY', '请先完成当前工作任务。');
+    for (const review of this.store.list('tasks').filter(task => task.goalId === goal.id && task.reviewScope === 'goal' && !TERMINAL.has(task.status))) {
+      this.controlTask({ id: review.id, reason: '完整 Git 候选正在重新核验' }, 'cancelled', SYSTEM);
+    }
+    this.store.event('goal.composition.queued', goal.id, { compositionId: compositionRecheck.id }, actor);
+    return this.store.put('goals', { ...this.store.require('goals', goal.id), status: 'active', completionPending: null, compositionRecheck });
+  }
   deliveryHash(goalId) {
     const goal = this.store.require('goals', goalId);
-    return goalDeliveryHash(goal, deliveredWork(this.store, goal));
+    const standard = goalDeliveryHash(goal, deliveredWork(this.store, goal));
+    const candidate = acceptedGoalComposition(this.store, goal);
+    return candidate ? digest({ standard, candidate: candidate.version, content: candidate.contentHash, checks: candidate.checkContract,
+      verifiedChecks: candidate.checks.map(check => [check.id, check.checkVersion, check.inputHash]) }) : standard;
   }
   latestGoalReview(goalId) {
     const goal = this.store.require('goals', goalId);
@@ -353,6 +397,8 @@ export class Company {
   }
   createGoalReview(goal, deliveryHash) {
     const targets = deliveredWork(this.store, goal);
+    assert(!usesGitComposition(goal) || acceptedGoalComposition(this.store, goal), 'COMPOSITE_NOT_VERIFIED',
+      '完整 Git 候选通过联合验证后才可申请最终审查。');
     // A reviewer must not have authored any reviewed deliverable.
     const reviewer = this.reviewerFor(goal.id, targets.map(t => t.lastAuthorId));
     const review = this.createTask({
@@ -683,6 +729,7 @@ export class Company {
       const current = reviews.filter(review => review.deliveryHash === deliveryHashes.get(g.id));
       return { ...g, contractVersion: contractVersion(g), completedContractVersion: g.completedContractVersion ?? (g.status === 'succeeded' ? contractVersion(g) : null),
         controlSummary: goalControlView(g, data.tasks, data.attempts),
+        ...(usesGitComposition(g) ? { compositionVerified: !!acceptedGoalComposition(this.store, g) } : {}),
         deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
     });
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));

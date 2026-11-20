@@ -2,6 +2,8 @@ import { reworkDetails } from "../core/rework.js";
 import { contractVersion, deliveryGeneration, matchesTaskReview, taskContractVersion } from "../core/goal-contract.js";
 import { assert, id, SYSTEM } from "../core/util.js";
 import { canCoordinate, createCoordination, feedbackHashOf, findManager, reviewCoordinationKey } from "../core/coordination.js";
+import { acceptedGoalComposition, usesGitComposition } from '../core/composite-delivery.js';
+import { verifiedStoredGitBundle } from './git-delivery.js';
 
 // A review only judges the delivered outcome. It never advances or reopens the
 // reviewed task: approval is evidence, rejection opens a manager-led rework
@@ -47,11 +49,17 @@ async function acceptTaskReview(engine, review, attempt, output, store) {
   });
 }
 
-function acceptGoalReview(engine, review, attempt, output) {
+async function acceptGoalReview(engine, review, attempt, output) {
   const { company, store } = engine;
   const goal = store.require("goals", review.goalId);
   assert(goal.contractChange?.status !== 'pending' && review.deliveryHash === company.deliveryHash(goal.id),
     "STALE_REVIEW", "Goal contract or delivery changed after the final review was requested");
+  if (usesGitComposition(goal)) {
+    const candidate = acceptedGoalComposition(store, goal);
+    assert(candidate && review.workspace?.candidateVersion === candidate.version &&
+      await verifiedStoredGitBundle(candidate.bundle, engine.workspaces.dataDir),
+      'STALE_REVIEW', '完整 Git 候选的持久版本不可用或已变化。');
+  }
   for (const target of review.reviewTargets ?? []) {
     const current = store.require("tasks", target.id);
     assert(current.status === "succeeded" && current.artifactHash === target.artifactHash &&
@@ -63,6 +71,7 @@ function acceptGoalReview(engine, review, attempt, output) {
   }
   store.transaction(() => {
     engine.currentAttemptTask(attempt, true);
+    if (usesGitComposition(goal)) assert(review.deliveryHash === company.deliveryHash(goal.id), 'STALE_REVIEW', '完整 Git 候选已变化。');
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...review, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
     store.put("verifications", { id: id("verification"), taskId: goal.id, goalId: goal.id, attemptId: attempt.id, artifactHash: review.deliveryHash,

@@ -264,6 +264,18 @@ export class Engine {
           return !goalStopped(goal) && matchesGoalContract(goal, t) && goal.contractChange?.status !== 'pending';
         });
         if (waiting) { this.queueIntegration(waiting.id); integrationQueued = true; free--; }
+        else {
+          const goal = this.store.list('goals').find(item => item.compositionRecheck?.status === 'queued' &&
+            !goalStopped(item) && item.contractChange?.status !== 'pending' && !['deleted', 'archived'].includes(item.status));
+          if (goal) {
+            const request = goal.compositionRecheck;
+            const anchor = this.store.get('tasks', request.taskId);
+            if (anchor?.status === 'succeeded') {
+              this.queueIntegration(anchor.id, request.id); integrationQueued = true; free--;
+            } else this.store.put('goals', { ...goal,
+              compositionRecheck: { ...request, status: 'failed', reason: '已选交付发生变化，请完成当前工作任务后重验。' } });
+          }
+        }
       }
       let ordinary = active.filter(a => ['work', 'repair'].includes(a.kind)).length;
       const busyAgents = new Set(active.map(a => a.agentId));
@@ -500,7 +512,7 @@ export class Engine {
         return;
       }
       preparingWorkspace = true;
-      const workspace = await this.workspaces.prepare(task, attempt);
+      const workspace = await this.workspaces.prepare(task, { ...attempt, signal: controller.signal });
       preparingWorkspace = false;
       this.store.transaction(() => {
         this.fenced(); task = this.store.require('tasks', task.id);
@@ -872,10 +884,10 @@ export class Engine {
   }
   scheduleRepair(task, reason, evidence) { return scheduleRepairFlow(this, task, reason, evidence); }
   async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
-  queueIntegration(taskId) {
+  queueIntegration(taskId, compositionRecheckId = null) {
     if (this.queuedIntegrations.has(taskId)) return;
     this.queuedIntegrations.add(taskId);
-    this.integration = this.integration.then(() => executeIntegration(this, taskId))
+    this.integration = this.integration.then(() => executeIntegration(this, taskId, compositionRecheckId))
       .catch(error => { this.lastError = error.message; })
       .finally(() => { this.queuedIntegrations.delete(taskId); this.kick(); });
   }
@@ -1006,6 +1018,12 @@ export class Engine {
         };
         this.block(task, 'model-selection', '没有可用执行候选：' + error.message,
           '请在模型偏好或执行人员绑定中调整候选后恢复任务。选择阻塞代码：' + evidence.code, evidence);
+        return;
+      }
+      if (preparingWorkspace && error.code?.startsWith('COMPOSITE_') && !stopped && !this.closing) {
+        const held = this.store.put('tasks', { ...task, attempts: previousAttempts });
+        this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true });
+        this.block(held, 'dependency', error.message, '请核对固定基线和已选依赖版本，再恢复此任务。', { code: error.code });
         return;
       }
       if (failure && observed && !stopped && !this.closing) {

@@ -10,7 +10,7 @@ const oid = value => typeof value === 'string' && /^[a-f0-9]{40}([a-f0-9]{24})?$
 const attributes = '* -text -eol -ident -filter -working-tree-encoding\n';
 const treeOutputLimit = 8 * 1024 * 1024;
 
-function bundlePath(dataDir, sha256) {
+export function bundlePath(dataDir, sha256) {
   return path.join(dataDir, 'deliveries', sha256 + '.bundle');
 }
 
@@ -27,7 +27,7 @@ function deliveryPath(filename) {
   return name;
 }
 
-async function fileDigest(filename, { algorithm = 'sha256', prefix = '' } = {}) {
+export async function fileDigest(filename, { algorithm = 'sha256', prefix = '' } = {}) {
   const hash = createHash(algorithm).update(prefix);
   for await (const bytes of createReadStream(filename)) hash.update(bytes);
   return hash.digest('hex');
@@ -70,7 +70,7 @@ async function stageMaterializedBaseFiles({ tree, files, workspaceRoot, destinat
   return { modified, deleted };
 }
 
-async function removeTemporary(directory, parent) {
+export async function removeTemporary(directory, parent) {
   if (await fs.realpath(directory).catch(() => null) === directory && path.dirname(directory) === parent) {
     await fs.rm(directory, { recursive: true, force: true, maxRetries: 3 }).catch(() => {});
   }
@@ -100,9 +100,13 @@ export async function gitWorktreeFingerprint(root) {
 
 export async function verifiedGitBundle(task, dataDir) {
   const delivery = task.integration?.delivery;
-  if (!delivery || delivery.format !== FORMAT || !oid(delivery.commit) || !oid(delivery.baseCommit) ||
-    !oid(delivery.workspaceHead) || delivery.generation !== task.generation || delivery.artifactHash !== task.artifactHash ||
-    delivery.baseCommit !== task.workspace?.baseCommit || typeof delivery.sha256 !== 'string' ||
+  if (!delivery || !oid(delivery.baseCommit) || !oid(delivery.workspaceHead) || delivery.generation !== task.generation ||
+    delivery.artifactHash !== task.artifactHash || delivery.baseCommit !== task.workspace?.baseCommit) return null;
+  return verifiedStoredGitBundle(delivery, dataDir);
+}
+
+export async function verifiedStoredGitBundle(delivery, dataDir) {
+  if (!delivery || delivery.format !== FORMAT || !oid(delivery.commit) || typeof delivery.sha256 !== 'string' ||
     !/^[a-f0-9]{64}$/.test(delivery.sha256) || !Number.isSafeInteger(delivery.bytes) || delivery.bytes < 1) return null;
   const expected = bundlePath(dataDir, delivery.sha256);
   if (delivery.path !== expected) return null;
@@ -115,6 +119,22 @@ export async function verifiedGitBundle(task, dataDir) {
   } catch {
     return null;
   }
+}
+
+export async function storeGitBundle(bundle, commit, dataDir) {
+  const sha256 = await fileDigest(bundle);
+  const { size: bytes } = await fs.stat(bundle);
+  const filename = bundlePath(dataDir, sha256);
+  const delivery = { format: FORMAT, path: filename, sha256, bytes, commit };
+  await fs.mkdir(path.dirname(filename), { recursive: true });
+  // Readers may already have the content-addressed file open on Windows.
+  try { await fs.link(bundle, filename); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    assert(await verifiedStoredGitBundle(delivery, dataDir), 'GIT_DELIVERY_EVIDENCE',
+      '同一哈希的持久 Git 交付无法核对，请检查现有交付文件。');
+  }
+  return delivery;
 }
 
 export async function publishGitDelivery({ dataDir, task, artifacts, source, executionId, git, safeFile }) {
@@ -187,19 +207,13 @@ export async function publishGitDelivery({ dataDir, task, artifacts, source, exe
     await build(['update-ref', branch, commit]);
     const bundle = path.join(temporary, 'delivery.bundle');
     await build(['-c', 'pack.threads=1', 'bundle', 'create', bundle, branch]);
-    const sha256 = await fileDigest(bundle);
-    const { size: bytes } = await fs.stat(bundle);
     const reconstruction = path.join(temporary, 'reconstruction');
     await checkoutGitBundle({ path: bundle, commit }, reconstruction, temporary, git);
     const reconstructedHash = await gitWorktreeFingerprint(reconstruction);
     const authorHash = await gitWorktreeFingerprint(workspace.path);
     // Only a match against an independent checkout proves cleanup coverage.
     const worktreeHash = task.gitDeliveryInputHash && authorHash === reconstructedHash ? authorHash : null;
-    const filename = bundlePath(dataDir, sha256);
-    await fs.mkdir(path.dirname(filename), { recursive: true });
-    // A retry only publishes identically hashed bytes at this path.
-    await fs.rename(bundle, filename);
-    return { format: FORMAT, path: filename, sha256, bytes, commit, workspaceHead, worktreeHash, baseCommit: workspace.baseCommit,
+    return { ...await storeGitBundle(bundle, commit, dataDir), workspaceHead, worktreeHash, baseCommit: workspace.baseCommit,
       generation: task.generation, artifactHash: task.artifactHash };
   } catch (error) {
     cleanupPending = !!error.cleanupUncertain;
