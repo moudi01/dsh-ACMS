@@ -34,6 +34,63 @@ async function git(cwd, ...args) {
   return output.stdout.trim();
 }
 
+
+const tracedGitCommands = new Set(['add', 'bundle', 'checkout', 'checkout-index', 'check-ref-format', 'commit', 'commit-tree',
+  'diff', 'fetch', 'hash-object', 'init', 'ls-files', 'ls-tree', 'merge', 'merge-base', 'read-tree', 'reflog', 'reset',
+  'rev-parse', 'show', 'status', 'symbolic-ref', 'update-index', 'update-ref', 'worktree', 'write-tree']);
+const gitOptionsWithValue = new Set(['-c', '-C', '--git-dir', '--work-tree', '--config-env']);
+
+function fixtureCommandLabel(command, args) {
+  if (!['git', 'git.exe'].includes(path.basename(command).toLowerCase())) return 'project-check';
+  let index = 0;
+  while (args[index]?.startsWith('-')) index += gitOptionsWithValue.has(args[index]) ? 2 : 1;
+  const subcommand = args[index];
+  return tracedGitCommands.has(subcommand) ? 'git:' + subcommand : 'git:other';
+}
+
+function fixtureTrace() {
+  const limit = 12, inFlight = new Set(), recent = [];
+  return {
+    async observe(operation, invoke) {
+      const span = { operation, stage: 'entered' };
+      const started = performance.now();
+      const entry = { span, started };
+      inFlight.add(entry);
+      let outcome = 'returned';
+      try {
+        return await invoke(span);
+      } catch (error) {
+        outcome = 'threw';
+        if (error?.cleanupUncertain === true) span.cleanupUncertain = true;
+        throw error;
+      } finally {
+        inFlight.delete(entry);
+        recent.push({ ...span, outcome, elapsedMs: Math.round(performance.now() - started) });
+        if (recent.length > limit) recent.shift();
+      }
+    },
+    read() {
+      const snapshotTime = performance.now();
+      return { inFlight: [...inFlight].slice(-limit).map(({ span, started }) => ({
+        ...span, elapsedMs: Math.round(snapshotTime - started),
+      })), recent: recent.slice() };
+    },
+  };
+}
+
+async function tracedRun(span, command, args, cwd, options) {
+  span.stage = 'running';
+  const started = performance.now();
+  try {
+    const result = await run(command, args, cwd, options);
+    span.exitCode = result.code;
+    span.timedOut = result.timedOut === true;
+    return result;
+  } finally {
+    span.commandMs = Math.round(performance.now() - started);
+  }
+}
+
 function ownerRoutes(runtime, registered = createRoutes(runtime)) {
   const handlers = new Map(registered.map(route => [route.path, route]));
   const post = (route, body) => handlers.get(`/api/acms/${route}`).fetch(new Request(`http://127.0.0.1/api/acms/${route}`, {
@@ -90,34 +147,73 @@ async function setup(t, { review, autoMerge = false, deliveryApproval = false, l
     title: 'Owner acceptance', description: 'Assemble verified Git changes', acceptance: 'Merge the exact accepted source tree',
     ...(autoMerge || deliveryApproval ? {} : { deliveryMode: 'git-composite' }) });
   const task = f.task({ goalId: goal.id });
+  const trace = fixtureTrace();
+  for (const method of ['prepare', 'integrate']) {
+    const invoke = f.workspaces[method].bind(f.workspaces);
+    f.workspaces[method] = (...args) => trace.observe(method, () => invoke(...args));
+  }
+  const validate = f.workspaces.validateProject.bind(f.workspaces);
+  const validationCommand = (command, args, cwd, options) => trace.observe(fixtureCommandLabel(command, args),
+    span => tracedRun(span, command, args, cwd, options));
+  f.workspaces.validateProject = (project, invoke = validationCommand) =>
+    trace.observe('validate-project', () => validate(project, invoke));
+
   let beforeApply, afterGuard, afterApply;
   let applyCalls = 0;
-  f.workspaces.runIntegrationCommand = f.workspaces.runDeliveryCheck = async (command, args, cwd, options) => {
-    const apply = args.includes('update-ref') && args.includes('--stdin');
-    if (apply) await beforeApply?.();
-    try { options.beforeStart?.(command); }
-    catch (error) {
-      await receipt(options.cleanupReceipt, { exitCode: 1, notStarted: true });
-      throw error;
-    }
-    if (apply) await afterGuard?.();
-    if (apply) applyCalls++;
-    const result = await run(command, args, cwd, options);
-    if (apply) await afterApply?.(result, options.cleanupReceipt);
-    if (options.cleanupReceipt) await receipt(options.cleanupReceipt, { exitCode: result.code ?? 1 });
-    return { ...result, cleanupConfirmed: true };
-  };
+  f.workspaces.runIntegrationCommand = f.workspaces.runDeliveryCheck = (command, args, cwd, options) =>
+    trace.observe(fixtureCommandLabel(command, args), async span => {
+      const apply = args.includes('update-ref') && args.includes('--stdin');
+      if (apply) {
+        span.stage = 'before-apply';
+        await beforeApply?.();
+      }
+      span.stage = 'guard';
+      try { options.beforeStart?.(command); }
+      catch (error) {
+        span.stage = 'no-start-receipt';
+        await receipt(options.cleanupReceipt, { exitCode: 1, notStarted: true });
+        span.cleanupConfirmed = true;
+        throw error;
+      }
+      if (apply) {
+        span.stage = 'after-guard';
+        await afterGuard?.();
+        applyCalls++;
+      }
+      const result = await tracedRun(span, command, args, cwd, options);
+      if (apply) {
+        span.stage = 'after-apply';
+        await afterApply?.(result, options.cleanupReceipt);
+      }
+      if (options.cleanupReceipt) {
+        span.stage = 'cleanup-receipt';
+        await receipt(options.cleanupReceipt, { exitCode: result.code ?? 1 });
+        span.cleanupConfirmed = true;
+      }
+      return { ...result, cleanupConfirmed: true };
+    });
   const current = () => f.store.require('goals', goal.id);
   const snapshot = () => f.company.snapshot().goals.find(row => row.id === goal.id);
-  const diagnostics = () => ({ ...taskWaitDiagnostics(f, task.id)(), goalStatus: current().status,
-    review: snapshot().reviewSummary, candidateMerge: current().candidateMerge,
-    integrations: f.store.list('integrations').filter(record => record.goalId === goal.id).map(({ phase, reason, commandId }) => ({ phase, reason, commandId })) });
-  const checkWork = () => {
-    const failed = f.store.list('integrations').find(record => record.goalId === goal.id && !record.candidateMergeId && ['failed', 'blocked'].includes(record.phase));
-    const attempted = f.store.list('attempts').find(record => record.goalId === goal.id && record.status === 'failed');
-    assert(!failed && !attempted, failed?.reason ?? attempted?.summary ?? JSON.stringify(diagnostics()));
+  const diagnostics = () => {
+    const goalState = current(), request = goalState.candidateMerge, reviewState = snapshot().reviewSummary;
+    return { ...taskWaitDiagnostics(f, task.id)(), goalStatus: goalState.status,
+      review: reviewState && { status: reviewState.status, passed: reviewState.passed },
+      candidateMerge: request && { status: request.status, recoveryRequested: !!request.recoveryRequested,
+        stopRequested: !!request.stopRequested },
+      integrations: f.store.list('integrations').filter(record => record.goalId === goal.id).slice(-8).map(record => ({
+        phase: record.phase, commandPending: !!record.commandId, inspectionPending: !!record.inspectionCommandId,
+      })),
+      trace: trace.read() };
   };
-  const ready = () => until(() => { checkWork(); return snapshot().finalComposition; }, 75000, diagnostics);
+  const checkWork = () => {
+    const failed = f.store.list('integrations').some(record => record.goalId === goal.id && !record.candidateMergeId && ['failed', 'blocked'].includes(record.phase));
+    const attempted = f.store.list('attempts').some(record => record.goalId === goal.id && record.status === 'failed');
+    if (failed || attempted) assert.fail(JSON.stringify(diagnostics()));
+  };
+  const ready = (timeout = 75000) => until(() => {
+    checkWork();
+    return current().status === 'succeeded' && snapshot().finalComposition;
+  }, timeout, diagnostics);
   const routes = ownerRoutes(f);
   const preview = (selectedBasis = basisRef, targetMode) => routes.preview({ goalId: goal.id, version: current().composition?.version,
     deliveryHash: f.company.deliveryHash(goal.id), basisRef: selectedBasis, targetMode });
@@ -127,7 +223,7 @@ async function setup(t, { review, autoMerge = false, deliveryApproval = false, l
   const waitMerge = status => until(() => {
     const request = current().candidateMerge;
     if (request?.status === status) return request;
-    assert(request?.status !== 'failed' && request?.status !== 'cancelled', JSON.stringify(diagnostics()));
+    if (request?.status === 'failed' || request?.status === 'cancelled') assert.fail(JSON.stringify(diagnostics()));
   }, 75000, diagnostics);
   return { f, project, goal, task, base, source, current, snapshot, diagnostics, checkWork, routes, preview, confirmArgs, ready, waitMerge,
     revisionFeedback: () => revisionFeedback,
@@ -645,6 +741,24 @@ test('owner waits for required review, previews a new branch from the chosen bas
     await until(() => { s.checkWork(); return reviewRunning; }, 75000, s.diagnostics);
     assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
     await failure(await preview(), 'CANDIDATE_NOT_READY');
+
+    const readSnapshot = f.company.snapshot.bind(f.company);
+    let reads = 0;
+    f.company.snapshot = () => { reads++; return readSnapshot(); };
+    try {
+      // The verified contribution exists while final review is deliberately held.
+      // Probing readiness must stay false and snapshot only once for the timeout.
+      await assert.rejects(s.ready(60), error => {
+        assert.match(error.message, /Condition not reached within test deadline/);
+        const diagnostics = JSON.parse(error.message.split('\nState ').at(-1));
+        assert.equal(diagnostics.review.status, 'running');
+        assert(diagnostics.trace.recent.some(entry => entry.operation.startsWith('git:') &&
+          entry.exitCode === 0 && Number.isSafeInteger(entry.commandMs)));
+        assert(!error.message.includes(JSON.stringify(f.root).slice(1, -1)));
+        return true;
+      });
+      assert.equal(reads, 1);
+    } finally { f.company.snapshot = readSnapshot; }
   } finally { review.release.resolve(); }
   const selected = await s.ready();
   assert(selected.reviewId);
@@ -687,8 +801,15 @@ test('owner waits for required review, previews a new branch from the chosen bas
   } finally { await agent.close(); }
   await failure(await routes.decision('confirm', { ...args, targetRef: 'refs/heads/other' }), 'STALE_CANDIDATE_CONFIRMATION');
   const confirmationId = randomUUID();
+  let applyTrace;
+  s.afterGuard(() => {
+    applyTrace = s.diagnostics().trace.inFlight.find(entry => entry.operation === 'git:update-ref');
+  });
   assert.equal((await success(await routes.decision('confirm', args, confirmationId))).status, 'queued');
   const applied = await s.waitMerge('applied');
+  assert.equal(applyTrace?.stage, 'after-guard');
+  assert.equal(applyTrace.exitCode, undefined);
+  assert(Number.isSafeInteger(applyTrace.elapsedMs));
   assert.equal(await git(f.source, 'rev-parse', chosen.targetRef + '^{tree}'), chosen.selection.tree);
   const head = await git(f.source, 'rev-parse', chosen.targetRef);
   assert.equal(applied.result.integratedCommit, head);
