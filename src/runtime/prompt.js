@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
 import { contractVersion, deliveredWork, deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
+import { isApprovalPlanner } from '../core/plan-approval.js';
 
 export const ARCHIVE_PROMPT_BYTES = 16 * 1024;
 function archivePromptProjection() {
@@ -53,6 +54,7 @@ export function promptFor(company, task, attempt, options = {}) {
     ...(agent.role === 'manager' ? { managementResults: company.store.list('actionBatches').filter(b => b.taskId === task.id && b.generation === task.generation).map(b => ({ actionBatchId: b.batchId, results: b.results })), managementTurnsRemaining: 4 - (task.managementGeneration === task.generation ? task.managementTurns ?? 0 : 0) } : {}),
     ...(task.kind === 'review' ? { reviewWorkspacePolicy: 'This is a separate verification copy. You may create temporary test files and run checks here. Review the unchanged delivered source and the host-owned check evidence. Never modify the author workspace or original artifact blobs. A reviewer environment failure is a technical blocker, not evidence of a product defect.' } : {}),
     inputArtifacts: inputs, previousFeedback: task.feedback ?? null, userAnswer: task.lastAnswer ?? null,
+    ...(isApprovalPlanner(goal, task) ? { planApprovalInstructions: 'Submit a structured plan proposal for the owner. Include the proposed scope, exclusions, rationale or trade-offs, assignments and task dependencies. Implementation and repair cannot start before the owner approves this proposal. Submit the tasks in the plan outcome. Do not try to create or retry them via management actions while preparing the proposal.' } : {}),
     ...(task.workspace?.mode === 'git' && task.workspace?.compositionInput?.inputs?.length ? { selectedGitInputs: {
       baseCommit: task.workspace.compositionBase, version: task.workspace.compositionInput.version,
       inputs: task.workspace.compositionInput.inputs,
@@ -118,7 +120,7 @@ function goalReviewEvidence(company, task, goal, hostEvidence, projectArtifact) 
 function buildManagerExtras(company, goal, task) {
   const store = company.store;
   const tasks = store.list("tasks").filter(t => t.goalId === goal.id && t.status !== "deleted");
-  const plans = store.list("plans").filter(p => p.goalId === goal.id).slice(-5);
+  const plans = store.list("plans").filter(p => p.goalId === goal.id).slice(-5).map(({ proposalTasks, ...plan }) => plan);
   // Scan the whole recent window instead of only its first page: a burst of ordinary
   // execution events must not hide the latest coordination decision from the manager.
   // Pagination is bounded by the 2000-event window and 50 pages.
