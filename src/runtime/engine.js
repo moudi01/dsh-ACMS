@@ -857,7 +857,8 @@ export class Engine {
     this.store.transaction(() => {
       task = this.currentAttemptTask(attempt, true);
       task = this.store.put('tasks', { ...task, deliveryGeneration: attempt.taskGeneration, artifactIds: collected.artifacts.map(a => a.id), artifactHash: collected.hash, changeSet: collected.changeSet,
-        gitDeliveryInputHash: collected.gitDeliveryInputHash, summary: output.summary ?? '', status: 'integrating', integrationPending: true, lastAuthorId: attempt.agentId });
+        gitDeliveryInputHash: collected.gitDeliveryInputHash, ...(collected.copyDeliveryInputHash ? { copyDeliveryInputHash: collected.copyDeliveryInputHash } : {}),
+        summary: output.summary ?? '', status: 'integrating', integrationPending: true, lastAuthorId: attempt.agentId });
       this.finishAttempt(attempt, 'completed', output.summary);
     });
   }

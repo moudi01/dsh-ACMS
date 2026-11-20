@@ -2,8 +2,11 @@ import { deliveredWork, deliveryGeneration, goalDeliveryHash, taskContractVersio
 import { assert, digest, id } from './util.js';
 
 export const GIT_COMPOSITION = 'git-composite';
-export const usesGitComposition = goal => goal?.deliveryMode === GIT_COMPOSITION;
+export const COPY_COMPOSITION = 'copy-composite';
+export const usesComposition = goal => [GIT_COMPOSITION, COPY_COMPOSITION].includes(goal?.deliveryMode);
 export const supportsGitComposition = project => project?.mode === 'git' && !project.autoMerge;
+export const compositionMode = project => supportsGitComposition(project) ? GIT_COMPOSITION
+  : project?.mode === 'copy' && !project.autoMerge ? COPY_COMPOSITION : null;
 
 export function newCompositionCheck(store, goal) {
   const task = deliveredWork(store, goal).sort((a, b) => a.id.localeCompare(b.id))[0];
@@ -18,9 +21,13 @@ export function compositionCheckContract(project) {
 export function acceptedGoalComposition(store, goal) {
   const candidate = goal.composition;
   const project = store.get('projects', goal.projectId);
-  if (!usesGitComposition(goal) || !supportsGitComposition(project) || !candidate?.passed || goal.compositionRecheck ||
-      candidate.baseCommit !== goal.compositionBase?.commit || candidate.checkContract !== compositionCheckContract(project) ||
+  if (!usesComposition(goal) || goal.deliveryMode !== compositionMode(project) || !candidate?.passed || goal.compositionRecheck ||
+      candidate.checkContract !== compositionCheckContract(project) ||
       !candidate.checks?.length || !candidate.checks.every(check => check.passed && check.cleanupConfirmed === true)) return null;
+  const copy = goal.deliveryMode === COPY_COMPOSITION;
+  if (copy ? !candidate.snapshot || candidate.contentHash !== candidate.snapshot.sha256 ||
+      candidate.baseHash !== goal.compositionBase?.snapshot?.sha256
+    : candidate.baseCommit !== goal.compositionBase?.commit) return null;
   try {
     const roots = deliveredWork(store, goal);
     if (candidate.ledgerHash !== goalDeliveryHash(goal, roots)) return null;
@@ -28,7 +35,8 @@ export function acceptedGoalComposition(store, goal) {
     return candidate.inputs?.length === current.length && current.every((task, index) => {
       const input = candidate.inputs[index];
       return task.id === input.taskId && task.generation === input.generation && task.artifactHash === input.artifactHash &&
-        task.integration?.delivery?.sha256 === input.bundleSha256 && (task.workspace?.compositionInput?.version ?? null) === input.baseline;
+        task.integration?.delivery?.sha256 === (copy ? input.snapshotSha256 : input.bundleSha256) &&
+        (task.workspace?.compositionInput?.version ?? null) === input.baseline;
     }) ? candidate : null;
   } catch (error) {
     if (error.code === 'COMPOSITE_DEPENDENCIES') return null;

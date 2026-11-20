@@ -27,9 +27,9 @@ function deliveryPath(filename) {
   return name;
 }
 
-export async function fileDigest(filename, { algorithm = 'sha256', prefix = '' } = {}) {
+export async function fileDigest(filename, { algorithm = 'sha256', prefix = '', signal } = {}) {
   const hash = createHash(algorithm).update(prefix);
-  for await (const bytes of createReadStream(filename)) hash.update(bytes);
+  for await (const bytes of createReadStream(filename, { signal })) hash.update(bytes);
   return hash.digest('hex');
 }
 

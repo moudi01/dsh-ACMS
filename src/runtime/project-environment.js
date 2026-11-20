@@ -7,10 +7,7 @@ import path from 'node:path';
 import { assert, digest } from '../core/util.js';
 import { resolveHostExecutable } from './host-command.js';
 import { classifyEnvironment, environmentFailure } from './preflight.js';
-
-const excluded = new Set(['.git', '.acms', '.codex', '.aws', '.ssh', '.npmrc', '.netrc', 'node_modules', 'auth.json', 'credentials.json']);
-const included = (name, dependencies = false) => (dependencies && name.toLowerCase() === 'node_modules') ||
-  (!excluded.has(name.toLowerCase()) && !name.toLowerCase().startsWith('.env'));
+import { includedProjectInput } from './project-inputs.js';
 
 async function fileHash(file, signal) {
   const hash = createHash('sha256');
@@ -20,7 +17,7 @@ async function fileHash(file, signal) {
 
 export async function copyProject(source, destination, { collaboration = false, dependencies = false } = {}) {
   await cp(source, destination, { recursive: true, force: false, errorOnExist: true, filter: async item => item === source ||
-    ((included(path.basename(item), dependencies) || (collaboration && path.basename(item) === '.acms')) && !(await lstat(item)).isSymbolicLink()) });
+    ((includedProjectInput(path.basename(item), dependencies) || (collaboration && path.basename(item) === '.acms')) && !(await lstat(item)).isSymbolicLink()) });
 }
 
 async function inputFiles(root, signal, dependencies = false) {
@@ -29,7 +26,7 @@ async function inputFiles(root, signal, dependencies = false) {
     const directory = path.join(root, relative);
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       signal?.throwIfAborted();
-      if (!included(entry.name, dependencies)) continue;
+      if (!includedProjectInput(entry.name, dependencies)) continue;
       const name = path.posix.join(relative, entry.name);
       if (entry.isDirectory()) await walk(name, inDependencies || entry.name.toLowerCase() === 'node_modules');
       else if (entry.isFile() && (!dependencies || inDependencies)) files.push([name, await fileHash(path.join(root, name), signal)]);
@@ -275,17 +272,22 @@ export async function checkIdentity(check, cwd, preparation, signal) {
     reusable: reusable && preparation?.network !== 'allow' };
 }
 
-export async function verifyInCopy({ dataDir, source, inputHash, check, preparation, identity, signal, invoke }) {
+async function byteInputs(root, signal) {
+  const entries = await inputFiles(root, signal);
+  return { entries, hash: digest(entries) };
+}
+
+export async function verifyInCopy({ dataDir, source, inputHash, check, preparation, identity, signal, invoke, readInputs = byteInputs }) {
   const directory = await mkdtemp(path.join(dataDir, 'check-'));
   const cwd = path.join(directory, 'project');
   let retain = false;
   try {
     // Preserve manually supplied dependencies in a private, content-bound copy.
     await copyProject(source, cwd, { dependencies: !preparation });
-    const inputs = await inputFiles(cwd, signal);
-    assert(digest(inputs) === inputHash, 'CHECK_INPUT_CHANGED', 'Verification copy does not match its input');
+    const inputs = await readInputs(cwd, signal);
+    assert(inputs.hash === inputHash, 'CHECK_INPUT_CHANGED', 'Verification copy does not match its input');
     const prepared = await prepareDependencies(directory, cwd, preparation, invoke, signal);
-    assert(await inputFingerprint(cwd, signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Dependency preparation changed verification input');
+    assert((await readInputs(cwd, signal)).hash === inputHash, 'CHECK_INPUT_CHANGED', 'Dependency preparation changed verification input');
     const actual = await checkIdentity(check, cwd, preparation, signal);
     assert(!identity || actual.version === identity.version, 'CHECK_INPUT_CHANGED', 'Verification command or environment changed');
     const env = await privateEnvironment(directory);
@@ -293,11 +295,11 @@ export async function verifyInCopy({ dataDir, source, inputHash, check, preparat
     // Unresolved paths already prevent reuse. They may be output or signal
     // paths, so their creation does not invalidate the live command result.
     const inputsStable = await boundFilesStable(actual.inputs, cwd, signal);
-    const outputs = await inputFiles(cwd, signal);
-    const outputMap = new Map(outputs);
-    const inputUnchanged = inputs.every(([file, hash]) => outputMap.get(file) === hash);
+    const outputs = await readInputs(cwd, signal);
+    const outputMap = new Map(outputs.entries);
+    const inputUnchanged = inputs.entries.every(([file, hash]) => outputMap.get(file) === hash);
     return { ...result, stdout: redactLog(result.stdout), stderr: redactLog(result.stderr), id: check.id, command: check.command, args: redactArguments(check.args), cwd,
-      inputHash, outputHash: digest(outputs), inputUnchanged, environment: actual.environment, checkVersion: actual.version, preparation: prepared,
+      inputHash, outputHash: outputs.hash, inputUnchanged, environment: actual.environment, checkVersion: actual.version, preparation: prepared,
       reusable: actual.reusable && inputsStable,
       log: logSummary(result), passed: result.cleanupConfirmed === true && result.code === 0 && !result.timedOut && inputUnchanged && inputsStable,
       ...(!inputsStable ? { reason: 'Declared or external check inputs changed during execution' }

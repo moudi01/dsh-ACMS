@@ -7,6 +7,8 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { gitWorktreeFingerprint, verifiedGitBundle } from '../src/runtime/git-delivery.js';
+import { copyContentHash, verifiedCopyDelivery } from '../src/runtime/copy-composition.js';
+import { includedProjectInput } from '../src/runtime/project-inputs.js';
 import { run } from '../src/runtime/workspaces.js';
 
 const CANDIDATE_DIRS = ['workspaces', 'reviews', 'integration', 'diagnostics'];
@@ -62,6 +64,24 @@ async function incompleteGitDelivery(task, root, workspace) {
   return 'Git 工作副本当前内容或索引无法核实为已归档的交付版本';
 }
 
+async function incompleteCopyDelivery(task, root, workspace) {
+  if (task?.workspace?.mode !== 'copy' || !task.workspace.compositionInput) return '';
+  const delivery = await verifiedCopyDelivery(task, root);
+  if (!delivery) return '目录工作副本缺少可验证的持久交付';
+  async function hasUncapturedInput(directory, isRoot) {
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      const name = entry.name.toLowerCase();
+      if (entry.isDirectory() && (name === 'node_modules' || (isRoot && name === '.acms'))) continue;
+      if (!includedProjectInput(entry.name) || (entry.isDirectory() && await hasUncapturedInput(path.join(directory, entry.name), false))) return true;
+    }
+    return false;
+  }
+  try {
+    if (await copyContentHash(workspace) === delivery.sha256 && !await hasUncapturedInput(workspace, true)) return '';
+  } catch { /* A missing, altered or unreadable copy reference cannot authorize cleanup. */ }
+  return '目录工作副本含未归档内容或持久版本无法核对';
+}
+
 export async function prunePlan({ dataDir, days = 30 }) {
   const root = path.resolve(dataDir);
   const databasePath = path.join(root, 'company.db');
@@ -108,7 +128,9 @@ export async function prunePlan({ dataDir, days = 30 }) {
       if (ageDays < days) continue;
       const owner = [...protectedIds.keys()].find(id => entry.name.includes(id));
       if (owner) { protectedEntries.push({ path: relative, reason: `仍被${protectedIds.get(owner)}引用（${owner}），不能清理`, ageDays: Number(ageDays.toFixed(1)) }); continue; }
-      const reason = directory === 'workspaces' ? await incompleteGitDelivery(workspaceTasks.get(absolute), root, absolute) : '';
+      const task = workspaceTasks.get(absolute);
+      const reason = directory === 'workspaces' ? await incompleteGitDelivery(task, root, absolute) ||
+        await incompleteCopyDelivery(task, root, absolute) : '';
       if (reason) { protectedEntries.push({ path: relative, reason, ageDays: Number(ageDays.toFixed(1)) }); continue; }
       candidates.push({ path: relative, bytes: await size(absolute), ageDays: Number(ageDays.toFixed(1)) });
     }
