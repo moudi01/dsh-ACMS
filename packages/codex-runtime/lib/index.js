@@ -514,7 +514,7 @@ var CodexAppServerWire = class {
 	handleNotification(method, params, order) {
 		if (method === "thread/tokenUsage/updated") {
 			if (this.turnCompleted !== void 0 && this.turnId === void 0) {
-				if (params?.threadId !== this.threadId || typeof params.turnId !== "string") return;
+				if (params?.threadId !== this.threadId) return;
 				if (this.earlyUsageCount++ < 64) this.earlyTurnNotifications.push({ method, params });
 				else this.usage.invalidate();
 				return;

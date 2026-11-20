@@ -20,6 +20,10 @@ function terminal(server, status = 'completed', error) {
   server.notify('turn/completed', { threadId: THREAD, turn: { id: TURN, status, ...(error ? { error } : {}) } });
 }
 
+function meter(server, total, last, ids = { threadId: THREAD, turnId: TURN }) {
+  server.notify('thread/tokenUsage/updated', { ...ids, tokenUsage: { total, last } });
+}
+
 async function harness(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-runtime-wire-'));
   const store = new ThreadStore(path.join(dir, 'threads.json'), 'acms-task:wire-test');
@@ -172,6 +176,47 @@ test('turn/start response before notifications reports running and counts only o
   await result;
   assert.equal(h.store.summary.turns, 1);
   assert.equal(h.store.summary.lastStatus, 'completed');
+});
+
+for (const timing of ['before', 'after']) test(`unattributed same-thread usage after a valid update stays unknown ${timing} the turn reply`, async t => {
+  const emit = server => {
+    meter(server, { totalTokens: 10 }, { totalTokens: 10 });
+    meter(server, { totalTokens: 16 }, { totalTokens: 6 }, { threadId: THREAD });
+    answer(server);
+    terminal(server);
+  };
+  const h = await harness(t, { onTurn({ server }) { if (timing === 'before') emit(server); } });
+  const result = h.run();
+  if (timing === 'after') {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.wire.turnId, TURN);
+    emit(h.server);
+  }
+  assert.equal((await result).stopReason, 'completed');
+  assert.equal(h.wire.usage.result(), null);
+});
+
+test('unchanged cumulative usage can replay only matching counts', async t => {
+  const original = { totalTokens: 10, inputTokens: 6, outputTokens: 4, cachedInputTokens: 2, reasoningOutputTokens: 1 };
+  for (const variant of ['exact duplicate', 'conflicting breakdown', 'conflicting total increment']) await t.test(variant, async t => {
+    const h = await harness(t, { onTurn({ server }) {
+      meter(server, original, original);
+      meter(server, original, original);
+      if (variant === 'conflicting breakdown') {
+        const changed = { ...original, inputTokens: 5, outputTokens: 5 };
+        meter(server, changed, changed);
+      } else if (variant === 'conflicting total increment') {
+        meter(server, original, { ...original, totalTokens: 5 });
+      }
+      answer(server);
+      terminal(server);
+    } });
+    assert.equal((await h.run()).stopReason, 'completed');
+    const usage = h.wire.usage.result();
+    if (variant === 'conflicting total increment') assert.equal(usage, null);
+    else assert.deepEqual(usage.counts, { ...original, cacheWriteInputTokens: null,
+      ...(variant === 'conflicting breakdown' ? { inputTokens: null, outputTokens: null } : {}) });
+  });
 });
 
 test('interrupt sends the active IDs and an interrupted terminal turn rejects without losing its thread', async t => {
