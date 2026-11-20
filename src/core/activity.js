@@ -54,7 +54,8 @@ export const ACTIVITY_EVENT_TYPES = Object.freeze([
   'review.queued', 'review.requested', 'review.request.reused', 'review.decided', 'review.rework.requested',
   'review.rework.limit', 'review.rework.blocked', 'review.rework.gate',
   'coordination.created', 'coordination.decided', 'coordination.applied', 'coordination.evidence.refreshed',
-  'blocker.coordinated', 'plan.accepted', 'management.batch.committed', 'management.continued',
+  'blocker.coordinated', 'plan.accepted', 'plan.approval.proposed', 'plan.approval.decided', 'plan.approval.superseded',
+  'management.batch.committed', 'management.continued',
   'attempt.failed', 'attempt.finished', 'attempt.result.recovered',
   'agent.saved', 'agent.released', 'agent.deleted', 'agent.restored',
   'template.published',
@@ -232,7 +233,7 @@ function subjectOf(event, context, { task, goal, project }) {
 
 function categoryOf(type) {
   if (/(\.blocked|\.environment\.blocked|blocker\.coordinated|timebox\.blocked|integration\.failed|\.failed)$/.test(type)) return 'block';
-  if (type.startsWith('review.') || type === 'plan.accepted' || type === 'coordination.decided') return 'review';
+  if (type.startsWith('review.') || type.startsWith('plan.') || type === 'coordination.decided') return 'review';
   if (/(\.succeeded|\.completed|\.finished|\.decided|\.applied)$/.test(type) || type === 'coordination.applied') return 'result';
   if (/(\.resumed|\.recovered|\.restored|result\.recovered|recheck\.requested|evidence\.refreshed)$/.test(type)) return 'recover';
   if (/(\.deleted|\.purged|\.cancelled|\.paused|\.stopped|\.stopping|timebox\.warning|timebox\.blocked)$/.test(type)) return 'control';
@@ -335,6 +336,15 @@ export function describeActivity(event, context = activityContext()) {
     case 'coordination.evidence.refreshed': action = `刷新了任务「${sourceTitle}」的阻塞证据`; break;
     case 'blocker.coordinated': action = `将任务「${reviewTitle}」的阻塞交给负责人协调`; reason = `${BLOCK_KIND[event.data?.blockerKind] ?? '阻塞'}：${shortReason(event.data?.reason) ?? '等待负责人处理'}`; break;
     case 'plan.accepted': action = `负责人提交了执行计划（${list(event.data?.tasks, 20).length} 项任务）`; break;
+    case 'plan.approval.proposed': action = `目标「${goalTitle}」的计划已提交审批（${event.data?.taskCount} 项任务）`; break;
+    case 'plan.approval.decided': {
+      const decision = event.data?.decision;
+      const label = { approve: '批准了', reject: '拒绝了', revise: '退回了' }[decision?.action] ?? '处理了';
+      action = `所有者${label}目标「${goalTitle}」的计划`;
+      reason = shortReason(decision?.reason);
+      break;
+    }
+    case 'plan.approval.superseded': action = `目标「${goalTitle}」的计划提案已失效`; reason = shortReason(event.data?.reason); break;
     case 'management.batch.committed': action = `负责人提交了 ${event.data?.actionCount ?? '?'} 项管理动作`; break;
     case 'management.continued': action = `负责人继续了管理批次（第 ${event.data?.turn ?? '?'} 轮）`; break;
     case 'attempt.failed': action = `任务「${reviewTitle}」执行失败`; reason = shortReason(event.data?.message) ?? shortReason(event.data?.code); break;

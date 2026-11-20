@@ -13,6 +13,8 @@ import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, go
 import { normalizePreparation } from './project-preparation.js';
 import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, newCompositionCheck, usesComposition } from './composite-delivery.js';
 import { decideCandidateMerge } from './candidate-confirmation.js';
+import { decidePlanApproval } from './plan-ledger.js';
+import { PLAN_APPROVAL_REQUIRED, assertPlanAllowsWork, awaitsPlanApproval, isApprovalPlanner, supersedePendingPlan } from './plan-approval.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
@@ -51,6 +53,11 @@ export class Company {
     // A caller-supplied goal must never hide the actual target task's scope.
     const goals = [args.goalId, args.id ? this.store.get('tasks', args.id)?.goalId : null].filter(Boolean);
     for (const goalId of goals) assert(goalId === actor.goalId, 'SCOPE_DENIED', 'Agent may only change its assigned goal');
+    if (command === 'task.create') assertPlanAllowsWork(this.store.get('goals', args.goalId), args.kind ?? 'work');
+    if (['task.retry', 'task.edit', 'task.dependencies'].includes(command) && args.id) {
+      const task = this.store.get('tasks', args.id);
+      if (task) assertPlanAllowsWork(this.store.get('goals', task.goalId), task.kind);
+    }
   }
   command(actor, requestId, name, args = {}, options = {}) {
     assert(actor && ["owner", "agent", "system", "user-agent"].includes(actor.kind), "UNAUTHORIZED", "A trusted caller identity is required");
@@ -76,6 +83,7 @@ export class Company {
         'agent.restore': () => restoreEntity(this, 'agent', args, actor),
         'goal.create': () => this.createGoal(args, actor),
         'goal.composition.recheck': () => this.recheckGoalComposition(args, actor),
+        'plan.approval.decide': () => decidePlanApproval(this, args, actor),
         'goal.candidate_merge.confirm': () => decideCandidateMerge(this, args, actor, 'confirm'),
         'goal.candidate_merge.reject': () => decideCandidateMerge(this, args, actor, 'reject'),
         'goal.candidate_merge.withdraw': () => decideCandidateMerge(this, args, actor, 'withdraw'),
@@ -154,6 +162,10 @@ export class Company {
         c.requiredPackages.every(value => typeof value === 'string' && packageName.test(value))), 'INVALID_INPUT', 'requiredPackages must contain valid Node package names');
     }
     const preparation = args.preparation === undefined ? previous?.preparation ?? null : normalizePreparation(args.preparation);
+    if (args.planApproval !== undefined) {
+      this.owner(actor);
+      assert(typeof args.planApproval === 'boolean', 'INVALID_INPUT', '计划审批开关必须为布尔值。');
+    }
     if (args.deliveryRepository !== undefined) this.owner(actor);
     const deliveryRepository = args.deliveryRepository === undefined ? previous?.deliveryRepository : args.deliveryRepository;
     if (deliveryRepository) {
@@ -162,9 +174,10 @@ export class Company {
       text(deliveryRepository.targetIdentity, 'deliveryRepository.targetIdentity', 200);
     }
     const project = this.store.put("projects", { ...previous, id: previous?.id ?? id("project"), name: text(args.name ?? previous?.name, "name", 200), repoRoot: text(args.repoRoot ?? previous?.repoRoot, "repoRoot", 4096), mode: args.mode ?? previous?.mode ?? "git", checks, preparation, autoMerge: args.autoMerge ?? previous?.autoMerge ?? false,
-      ...(args.deliveryRepository === undefined ? {} : { deliveryRepository }), ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
+      ...(args.deliveryRepository === undefined ? {} : { deliveryRepository }), ...(args.planApproval === undefined ? {} : { planApproval: args.planApproval }),
+      ...(extra.source ? { source: extra.source } : {}) }, args.expectedRevision);
     assert(['git', 'copy'].includes(project.mode), 'INVALID_INPUT', 'Project mode must be git or copy');
-    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge', 'deliveryRepository'], actor);
+    if (previous) recordChange(this, 'project', previous, project, ['name', 'repoRoot', 'mode', 'checks', 'preparation', 'autoMerge', 'deliveryRepository', 'planApproval'], actor);
     if (previous && compositionCheckContract(project) !== compositionCheckContract(previous)) {
       for (const goal of this.store.list('goals').filter(item => item.projectId === project.id && item.composition && usesComposition(item))) {
         this.refreshGoal(goal.id);
@@ -181,9 +194,14 @@ export class Company {
     assert(args.expectedRevision === undefined || args.expectedRevision === previous.revision, 'CONFLICT', '记录已变化，请刷新后重试', { collection: 'goals', id: previous.id });
     if (!changed.length) return previous;
     const substantive = changed.some(key => !['title', 'priority'].includes(key));
+    // Before the first approval, the root planner handles the new contract.
+    // There is no previously dispatched implementation to reassess.
+    const needsCoordination = substantive && !awaitsPlanApproval(previous);
     if (substantive) {
       assertGoalOpen(previous);
       assert(!previous.legacyBatch && !['archived', 'cancelled'].includes(previous.status), 'GOAL_CLOSED', '此目标无法更新合同');
+    }
+    if (needsCoordination) {
       const used = goalTaskCount(this.store.list('tasks'), previous.id);
       const limit = this.policy().maxTasksPerGoal;
       assert(used < limit, 'TASK_LIMIT', `合同变更未保存。${goalContractCapacityMessage(used, limit)}`, { used, limit });
@@ -192,11 +210,11 @@ export class Company {
     let goal = this.store.put('goals', {
       ...previous, ...patch,
       ...(substantive ? {
-        status: 'active', contractVersion: version + 1,
+        status: needsCoordination ? 'active' : 'planning', contractVersion: version + 1,
         completedContractVersion: previous.completedContractVersion ?? (previous.status === 'succeeded' ? version : null),
         completedDeliveryHash: previous.completedDeliveryHash ?? (previous.status === 'succeeded' ? goalDeliveryHash(previous, deliveredWork(this.store, previous)) : null),
-        contractChange: { fromVersion: version, status: 'pending', coordinationTaskId: null,
-          previous: { description: previous.description, acceptance: previous.acceptance } },
+        contractChange: needsCoordination ? { fromVersion: version, status: 'pending', coordinationTaskId: null,
+          previous: { description: previous.description, acceptance: previous.acceptance } } : null,
       } : {}),
     }, args.expectedRevision);
     if (substantive) {
@@ -212,20 +230,23 @@ export class Company {
         }
         const current = this.store.require('tasks', task.id);
         const restarted = restartForChange(this, current);
+        const supersedesPlan = isApprovalPlanner(previous, current) && current.blocker?.kind === 'plan-approval';
+        if (supersedesPlan) supersedePendingPlan(this.store, current, actor, '目标合同发生变化');
         this.store.put('tasks', { ...restarted, goalContractVersion: version + 1,
+          ...(supersedesPlan ? { blocker: null, ...(restarted.status === 'blocked' ? { status: 'ready' } : {}) } : {}),
           ...(current.kind === 'plan' ? { description: goal.description, acceptance: goal.acceptance } :
             (current.usesGoalAcceptance ?? current.acceptance === previous.acceptance) ? { acceptance: goal.acceptance } : {}),
         });
       }
-      goal = this.ensureGoalContractCoordination(goal);
+      if (needsCoordination) goal = this.ensureGoalContractCoordination(goal);
       this.store.event('goal.contract.changed', goal.id, { fromVersion: version, contractVersion: version + 1,
-        coordinationTaskId: goal.contractChange.coordinationTaskId, fields: changed }, actor);
+        coordinationTaskId: goal.contractChange?.coordinationTaskId ?? null, fields: changed }, actor);
     }
     recordChange(this, 'goal', previous, goal, substantive ? [...changed, 'contractVersion'] : changed, actor);
     return goal;
   }
   ensureGoalContractCoordination(goal) {
-    if (goalStopped(goal) || goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived'].includes(goal.status)) return goal;
+    if (goalStopped(goal) || awaitsPlanApproval(goal) || goal.contractChange?.status !== 'pending' || goal.contractChange.coordinationTaskId || ['deleted', 'archived'].includes(goal.status)) return goal;
     if (goalTaskCount(this.store.list('tasks'), goal.id) >= this.policy().maxTasksPerGoal) return goal;
     const manager = findManager(this, goal.id);
     const task = this.createTask({
@@ -247,9 +268,18 @@ export class Company {
     if (args.deliveryMode) assert(actor.kind === 'owner' && args.deliveryMode === compositionMode(project), 'COMPOSITE_PROJECT',
       '完整候选由所有者在匹配的目录副本或关闭自动合并的 Git 项目上启用。');
     const template = this.store.require('templates', args.templateId ?? args.workflowId ?? 'base');
+    const approvalRequired = project.planApproval === true || template.planApproval === true;
+    assert(!approvalRequired || args.plan !== false || actor.kind === 'owner', 'OWNER_REQUIRED', '启用计划审批后，只有所有者可创建无需规划的手工目标。');
     const constraints = options.constraints ?? [];
-    const goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(args.deliveryMode ? { deliveryMode: args.deliveryMode } : {}), ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
-    if (args.plan !== false) { const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId); assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色'); this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description, kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM); }
+    let goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(args.deliveryMode ? { deliveryMode: args.deliveryMode } : {}), ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
+    if (args.plan !== false) {
+      const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId);
+      assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色');
+      const task = this.createTask({ goalId: goal.id, title: `规划：${goal.title}`, description: goal.description,
+        kind: 'plan', agentId: manager.id, acceptance: goal.acceptance, requiresArtifacts: false }, SYSTEM);
+      if (approvalRequired) goal = this.store.put('goals', { ...goal, planApproval: { taskId: task.id,
+        project: project.planApproval === true, template: template.planApproval === true } });
+    }
     this.store.event('goal.created', goal.id, {}, actor); return goal;
   }
   createTask(args, actor = SYSTEM, options = {}) {
@@ -257,6 +287,7 @@ export class Company {
     assertGoalOpen(goal);
     assert(!goal.legacyBatch, 'LEGACY_GOAL', '该目标已按旧阶段制数据归档，请恢复或新建目标后再派工');
     const kind = args.kind ?? 'work';
+    if (actor.kind !== 'owner') assertPlanAllowsWork(goal, kind);
     // A review may still be requested after delivery; it is evidence, not a
     // reopened work item, so it does not resurrect a closed goal.
     const reviewRecovery = kind === 'coordination' && args.coordinationOf && this.store.get('tasks', args.coordinationOf);
@@ -469,7 +500,10 @@ export class Company {
   }
   editTask(args, actor) {
     const task = this.store.require('tasks', args.id); assert(task.kind !== 'review', 'SYSTEM_TASK', '审查任务使用执行任务的固定验收合同，请编辑对应执行任务');
-    assertGoalOpen(this.store.require('goals', task.goalId));
+    const goal = this.store.require('goals', task.goalId);
+    assertGoalOpen(goal);
+    if (isApprovalPlanner(goal, task)) assert(!goal.planApproval.approvedPlanId && task.blocker?.kind !== 'plan-approval',
+      'PLAN_APPROVAL_REQUIRED', '审批记录关联的规划任务不能直接改派或编辑。请在计划审批中退回修改。');
     if (TERMINAL.has(task.status)) this.owner(actor);
     const patch = args.patch ?? {}; const allowed = ['title', 'description', 'acceptance', 'priority', 'agentId', 'longLived', 'requirements'];
     assert(Object.keys(patch).every(k => allowed.includes(k)), 'INVALID_INPUT', 'Task state cannot be set directly');
@@ -491,6 +525,7 @@ export class Company {
   }
   dependencies(args, actor) {
     const task = this.store.require('tasks', args.id); assert(['ready', 'blocked', 'paused'].includes(task.status), 'TASK_ACTIVE', 'Dependencies cannot change during execution');
+    assert(!isApprovalPlanner(this.store.get('goals', task.goalId), task), 'PLAN_APPROVAL_REQUIRED', '根规划的依赖在计划提案中维护。');
     assert(Array.isArray(args.dependencies), 'INVALID_INPUT', 'dependencies must be an array');
     const deps = [...new Set(args.dependencies)]; const visit = (dep, seen = new Set()) => {
       assert(dep !== task.id, 'DEPENDENCY_CYCLE', 'Task dependencies contain a cycle'); if (seen.has(dep)) return; seen.add(dep);
@@ -502,6 +537,10 @@ export class Company {
   }
   controlTask(args, target, actor, { cascade = true, goalPauseId = null } = {}) {
     const task = this.store.require('tasks', args.id); assert(!TERMINAL.has(task.status), 'TASK_CLOSED', 'Task is already closed');
+    const goal = this.store.get('goals', task.goalId);
+    const approvalPlanner = isApprovalPlanner(goal, task);
+    assert(target !== 'cancelled' || !approvalPlanner || goal.status === 'cancelled', 'PLAN_APPROVAL_REQUIRED',
+      '请暂停此规划、在计划审批中退回修改，或取消整个目标。');
     if (task.stopRequested === 'cancelled' && target === 'paused') return task;
     const pending = this.store.list('attempts').filter(a => a.taskId === task.id && (['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending));
     const active = pending.length > 0 || !!task.activeIntegrationId;
@@ -511,6 +550,7 @@ export class Company {
       stopRequested: active ? target : null, recoveryRequested: active, goalPauseId, ...cancellation }, args.expectedRevision);
     if (target === 'cancelled') discardDeferredResult(this.store, task.activeAttemptId);
     if (target === 'cancelled') this.invalidateInteractions(task.id, '任务已取消');
+    if (target === 'cancelled' && approvalPlanner) supersedePendingPlan(this.store, task, actor, '所属目标已取消');
     if (cascade) for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
     this.store.event(`task.${target}.requested`, task.id, args.reason ? { reason: args.reason } : {}, actor);
     if (target === 'cancelled') this.releaseTemporaryAgent(task.agentId, actor);
@@ -518,6 +558,9 @@ export class Company {
   }
   deleteTask(args, actor) {
     this.owner(actor); const task = this.store.require('tasks', args.id);
+    const goal = this.store.require('goals', task.goalId);
+    assert(!isApprovalPlanner(goal, task) || !awaitsPlanApproval(goal) || ['cancelled', 'archived', 'deleted'].includes(goal.status),
+      'PLAN_APPROVAL_REQUIRED', '请先在计划审批中处理提案，或取消整个目标。');
     assert(task.status !== 'deleted', 'TASK_DELETED', '任务已经在回收站中');
     const tasks = this.store.list('tasks'); const reason = taskDeletionReason(task, tasks, this.store.list('attempts'));
     assert(!reason, 'DELETE_BLOCKED', reason);
@@ -565,11 +608,19 @@ export class Company {
   }
   resumeTask(args, actor, retry = false) {
     const task = this.store.require('tasks', args.id);
-    assertGoalOpen(this.store.require('goals', task.goalId));
-    assert(!task.contractObsolete && matchesGoalContract(this.store.require('goals', task.goalId), task),
+    const goal = this.store.require('goals', task.goalId);
+    assertGoalOpen(goal);
+    assertPlanAllowsWork(goal, task.kind);
+    assert(!task.contractObsolete && matchesGoalContract(goal, task),
       'STALE_RESULT', '任务属于旧目标合同，请在当前合同下安排后续工作');
     assert(actor.kind !== 'agent' || task.status !== 'paused', 'OWNER_REQUIRED', '仅用户可恢复主动暂停的任务');
     assert(['paused', 'blocked', ...(retry ? ['failed'] : [])].includes(task.status), 'INVALID_TRANSITION', 'Task cannot resume in its current state');
+    if (isApprovalPlanner(goal, task) && task.blocker?.kind === 'plan-approval') {
+      assert(task.status === 'paused' && !retry, 'PLAN_APPROVAL_REQUIRED', PLAN_APPROVAL_REQUIRED);
+      const saved = this.store.put('tasks', { ...task, status: 'blocked', stopRequested: null, goalPauseId: null }, args.expectedRevision);
+      this.store.event('task.resumed', task.id, {}, actor);
+      return saved;
+    }
     assert(!this.store.list('interactions').some(i => i.taskId === task.id && i.status === 'pending'), 'WAITING_INPUT', 'Answer the pending interaction first');
     if (task.environmentBlock) {
       const saved = this.store.put('tasks', { ...task, status: 'ready', stopRequested: null }, args.expectedRevision);
@@ -613,16 +664,21 @@ export class Company {
     // silently changed by the manager agent.
     this.owner(actor);
     const previous = args.id ? this.store.get('templates', args.id) : null;
+    assert(args.planApproval === undefined || typeof args.planApproval === 'boolean', 'INVALID_INPUT', '计划审批开关必须为布尔值。');
     const phases = args.phases ?? previous?.phases;
     assert(Array.isArray(phases) && phases.length >= 1 && phases.length <= 6, 'INVALID_INPUT', 'Template needs 1–6 phases');
     assert(phases.every(p => p && PHASE_IDS.has(p.id)), 'INVALID_INPUT', 'Phase must be plan, execute or final-review');
     assert(new Set(phases.map(p => p.id)).size === phases.length, 'INVALID_INPUT', 'Phase IDs must be unique');
     assert(phases.some(p => p.id === 'execute'), 'INVALID_INPUT', 'Template must contain an execute phase');
     const normalized = phases.map(p => ({ id: p.id, name: text(p.name ?? p.id, 'phase.name', 100) }));
-    const next = { id: previous?.id ?? id('template'), name: text(args.name ?? previous?.name, 'name', 200), phases: clone(normalized), version: (previous?.version ?? 0) + 1, finalReview: normalized.some(p => p.id === 'final-review'), published: true };
+    const planApproval = args.planApproval ?? previous?.planApproval;
+    const next = { id: previous?.id ?? id('template'), name: text(args.name ?? previous?.name, 'name', 200), phases: clone(normalized),
+      version: (previous?.version ?? 0) + 1, finalReview: normalized.some(p => p.id === 'final-review'), published: true,
+      ...(planApproval === undefined ? {} : { planApproval }) };
     if (previous) this.store.put('templateHistory', { ...previous, id: `${previous.id}:${previous.version}` });
     const saved = this.store.put('templates', next, args.expectedRevision);
-    this.store.event('template.published', saved.id, { version: saved.version, phases: saved.phases, finalReview: saved.finalReview, reason: args.reason ?? '' }, actor);
+    this.store.event('template.published', saved.id, { version: saved.version, phases: saved.phases, finalReview: saved.finalReview,
+      ...(planApproval === undefined ? {} : { planApproval }), reason: args.reason ?? '' }, actor);
     return saved;
   }
   extendGoalRuntime(args, actor) {

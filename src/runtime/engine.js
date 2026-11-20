@@ -5,6 +5,7 @@ import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '.
 import { promptFor } from './prompt.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
+import { assertPlanAllowsWork, planBlocksDispatch, planBlocksWork } from '../core/plan-approval.js';
 import { acceptReviewFlow } from './review-flow.js';
 import { completeCoordination, coordinationAuthority, coordinateBlocker, coordinateExecutionLimit, findManager, canCoordinate, scheduleRepairFlow, timeBoxCoordinationKey, CAPACITY_LIMIT_CODES } from '../core/coordination.js';
 import { executeIntegration, interruptIntegration, recoverIntegrations, refreshIntegrationReceipts } from './integration.js';
@@ -262,7 +263,7 @@ export class Engine {
         const waiting = this.store.list('tasks').find(t => {
           if (t.status !== 'integrating' || ignoresBlocker(t) || active.some(a => a.taskId === t.id)) return false;
           const goal = this.store.require('goals', t.goalId);
-          return !goalStopped(goal) && matchesGoalContract(goal, t) && goal.contractChange?.status !== 'pending';
+          return !goalStopped(goal) && matchesGoalContract(goal, t) && goal.contractChange?.status !== 'pending' && !planBlocksWork(goal, t.kind);
         });
         if (waiting) { this.queueIntegration(waiting.id); integrationQueued = true; free--; }
         else {
@@ -304,7 +305,7 @@ export class Engine {
         if (source && (source.stopRequested || ['paused', 'cancelled', 'deleted', 'archived', 'reconciling'].includes(source.status) ||
           active.some(a => a.taskId === source.id))) continue;
         const goal = this.store.require('goals', task.goalId);
-        if (goalStopped(goal) || !matchesGoalContract(goal, task) || task.contractObsolete ||
+        if (goalStopped(goal) || !matchesGoalContract(goal, task) || task.contractObsolete || planBlocksDispatch(goal, task) ||
           (goal.contractChange?.status === 'pending' && task.kind !== 'coordination')) continue;
         if (task.reviewScope === 'goal' && task.deliveryHash !== this.company.deliveryHash(goal.id)) {
           this.store.transaction(() => {
@@ -479,6 +480,7 @@ export class Engine {
       this.fenced(); const current = this.store.require('tasks', task.id); assert(current.status === 'ready', 'CLAIM_CONFLICT', 'Task is no longer ready');
       const goal = this.store.require('goals', current.goalId);
       assertGoalOpen(goal);
+      if (planBlocksDispatch(goal, current)) return null;
       assert(matchesGoalContract(goal, current) && !current.contractObsolete, 'STALE_RESULT', 'Task belongs to an obsolete goal contract');
       const deferred = current.activeAttemptId && this.store.get('deferredResults', current.activeAttemptId);
       if (deferred && deferred.generation === current.generation) {
@@ -678,6 +680,7 @@ export class Engine {
       !task.contractObsolete && ['running', 'reconciling'].includes(task.status) && matchesGoalContract(goal, task, attempt),
     'STALE_RESULT', 'Result belongs to an obsolete attempt or contract');
     if (applyingResult || goal.status === 'cancelled') assertGoalOpen(goal);
+    assertPlanAllowsWork(goal, task.kind);
     return task;
   }
   async accept(attempt, output, signal) {

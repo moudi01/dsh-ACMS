@@ -190,11 +190,84 @@ function GoalControls({ goal, companyPaused, act, open, busy }) {
     </div>}
   </section>;
 }
+const planLabels = { pending: '等待批准', approved: '已批准', rejected: '已拒绝', returned: '已退回修改', superseded: '已失效' };
+
+function PlanDecisionHistory({ plan }) {
+  return <>{[plan.ownerDecision, plan.revisionRequest].filter(Boolean).map(decision => <div key={decision.action}>
+    <p><b>{decision.action === 'approve' ? '批准派工' : decision.action === 'reject' ? '拒绝' : '退回重新规划'}</b> · {new Date(decision.at).toLocaleString('zh-CN')}</p>
+    <p className="acms-preserve">{decision.reason}</p>
+  </div>)}{plan.supersededReason && <p>{plan.supersededReason}</p>}</>;
+}
+
+function PlanProposal({ goal, task, plan, data, act, busy }) {
+  const [reason, setReason] = useState('');
+  const attempt = data.attempts.find(item => item.id === plan.attemptId);
+  const decisionReason = busy ? '正在保存，请稍候' : goal.executionControl ? '请先恢复目标。' :
+    goal.contractChange?.status === 'pending' ? '请先处理当前目标合同变更。' :
+    attempt?.cleanupPending || attempt?.cleanupUncertain ? '请等待规划执行完成清理或核对。' :
+    task.status !== 'blocked' ? '请先恢复规划任务。' : !reason.trim() ? '请先填写决定理由。' : '';
+  const canDecide = ['pending', 'rejected'].includes(plan.approvalStatus) && !['cancelled', 'archived', 'deleted', 'succeeded'].includes(goal.status);
+  const decide = async (action, message) => {
+    const result = await act('plan.approval.decide', { planId: plan.id, fingerprint: plan.fingerprint,
+      generation: plan.generation, goalContractVersion: plan.goalContractVersion, action, reason: reason.trim() }, message);
+    if (result) setReason('');
+  };
+  return <>
+    <p role="status"><span className="acms-tag">{planLabels[plan.approvalStatus]}</span> · 规划第 {plan.generation} 代 · 合同 v{plan.goalContractVersion}</p>
+    <dl className="acms-definition">
+      <dt>提案版本</dt><dd><code title={plan.fingerprint}>{plan.fingerprint.slice(0, 16)}</code></dd>
+      <dt>负责人</dt><dd>{data.agents.find(agent => agent.id === plan.managerId)?.name ?? plan.managerId}</dd>
+      <dt>交付范围</dt><dd className="acms-preserve">{plan.scope.minimumOutcome}</dd>
+      {!!plan.scope?.nonGoals?.length && <><dt>范围之外</dt><dd>{plan.scope.nonGoals.join('、')}</dd></>}
+      <dt>取舍与依据</dt><dd className="acms-preserve">{plan.rationale || plan.summary}</dd>
+    </dl>
+    <details open={plan.approvalStatus === 'pending'}><summary>拟派发任务（{plan.proposalTasks.length}）</summary>
+      {plan.proposalTasks.map(node => <div key={node.key} className="acms-change-diff">
+        <b>{node.title}</b>
+        {node.description !== node.title && <p className="acms-preserve">{node.description}</p>}
+        <p className="acms-preserve">验收要求 · {node.acceptance ?? plan.goalAcceptance}</p>
+        <p>前置任务 · {node.dependencies.map(key => plan.proposalTasks.find(item => item.key === key)?.title ?? key).join('、') || '无'}</p>
+        {node.assignee && <p>拟执行人员 · {data.agents.find(agent => agent.id === node.assignee)?.name ?? node.assignee}</p>}
+      </div>)}
+    </details>
+    <PlanDecisionHistory plan={plan} />
+    {canDecide && <>
+      <Field label="计划审批理由"><textarea rows={3} value={reason} maxLength={2000} onChange={event => setReason(event.target.value)} /></Field>
+      {plan.approvalStatus === 'pending' && <p className="acms-sectionnote">批准后按此版本和依赖派工。拒绝后等待所有者决定是否重新规划。</p>}
+      <div className="acms-actions wrap">
+        {plan.approvalStatus === 'pending' && <>
+          <ActionButton className="primary" reason={decisionReason} onClick={() => decide('approve', '已批准此计划并派工')}>批准计划并派工</ActionButton>
+          <ActionButton className="danger" reason={decisionReason} onClick={() => decide('reject', '已拒绝此计划')}>拒绝此计划</ActionButton>
+        </>}
+        <ActionButton reason={decisionReason} onClick={() => decide('revise', '已安排负责人重新规划')}>{plan.approvalStatus === 'rejected' ? '重新规划' : '退回修改'}</ActionButton>
+      </div>
+    </>}
+  </>;
+}
+
+function GoalPlanApproval({ goal, data, act, busy }) {
+  const rootTask = data.tasks.find(task => task.id === goal.planApproval.taskId);
+  const plans = (data.plans ?? []).filter(plan => plan.taskId === goal.planApproval.taskId && plan.approvalStatus)
+    .sort((a, b) => b.generation - a.generation);
+  const current = plans.find(plan => plan.id === goal.planApproval.approvedPlanId || plan.generation === rootTask?.generation);
+  const history = plans.filter(plan => plan.id !== current?.id);
+  return <section className="acms-review-state" aria-label="计划审批">
+    <h3>计划审批</h3>
+    {current && rootTask ? <PlanProposal key={current.id} goal={goal} task={rootTask} plan={current} data={data} act={act} busy={busy} /> :
+      <p role="status">{rootTask ? `等待负责人提交计划 · ${reviewLabels[rootTask.status] ?? rootTask.status}` : '当前规划任务不在可查看范围内。'}</p>}
+    {!!history.length && <details><summary>历史提案（{history.length}）</summary>{history.map(plan => <div key={plan.id}>
+      <p>第 {plan.generation} 代 · 合同 v{plan.goalContractVersion} · {planLabels[plan.approvalStatus]} · <code>{plan.fingerprint.slice(0, 16)}</code></p>
+      <PlanDecisionHistory plan={plan} />
+    </div>)}</details>}
+  </section>;
+}
+
 export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, act, busy, runtimeNow }) {
   const tasks = entityTasks(kind, entity, data); const goals = data.goals.filter(g => kind === 'project' && g.projectId === entity.id);
   const project = kind === 'goal' ? data.projects.find(p => p.id === entity.projectId) : null;
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label={`${entityLabels[kind]}详情`}><header><span>{entityLabels[kind]}详情</span><button aria-label="关闭详情" onClick={close}>×</button></header><h2>{entity.title ?? entity.name}</h2>{kind === 'goal' && <p className="acms-sectionnote">优先级：{Number.isInteger(entity.priority) ? entity.priority : 50}（0–100；只影响后续跨目标派发顺序）</p>}{project && <button className="text" onClick={() => navigate('project', project.id)}>所属项目：{project.name}</button>}<CollapsibleText text={entity.description} lines={3} label="说明" />{entity.repoRoot && <p><code>{entity.repoRoot}</code></p>}{entity.acceptance && <section><h3>验收标准</h3><CollapsibleText text={entity.acceptance} lines={3} label="验收标准" /></section>}<div className="acms-actions wrap"><button onClick={() => open(kind === 'goal' ? 'goalEdit' : kind, entity)}>编辑{entityLabels[kind]}</button><ActionButton className="danger" reason={entityDeletionReason(kind, entity, data)} onClick={() => open('deleteEntity', { ...entity, entityKind: kind })}>删除{entityLabels[kind]}</ActionButton></div>
     {kind === 'agent' && chat && <button className="primary" onClick={() => chat(entity.id)}>与智能体对话</button>}
+    {kind === 'goal' && entity.planApproval && act && <GoalPlanApproval goal={entity} data={data} act={act} busy={busy} />}
     {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalReviewState goal={entity} deliveryRepository={data.projects.find(project => project.id === entity.projectId)?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
     {goals.length > 0 && <section><h3>所属目标</h3>{goals.map(g => <button className="acms-entity-link" key={g.id} onClick={() => navigate('goal', g.id)}>{g.title} →</button>)}</section>}
     <section><h3>关联任务（{tasks.length}）</h3>{tasks.slice(0, 8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}{tasks.length > 8 && <details><summary>显示其余 {tasks.length - 8} 项</summary>{tasks.slice(8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}</details>}{!tasks.length && <p>暂无关联任务。</p>}</section><ChangeHistory kind={kind} id={entity.id} data={data} /></aside></div>;

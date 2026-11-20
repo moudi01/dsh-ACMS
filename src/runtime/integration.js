@@ -8,6 +8,7 @@ import { integrationPending } from '../core/task-actions.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
 import { goalStopped } from '../core/goal-control.js';
+import { planBlocksWork } from '../core/plan-approval.js';
 import { candidateMergeMatches } from '../core/candidate-confirmation.js';
 import { applyConfirmedCandidate, assertCandidateBranchWrite, candidateGitEnvironment } from './candidate-merge.js';
 import { acquireBareDeliveryFence, assertBareTargetIdentity, bareFenceRef, releaseBareDeliveryFence } from './bare-delivery-target.js';
@@ -253,7 +254,7 @@ export function interruptIntegration(engine) {
   const taskCurrent = entry.candidateMergeId ? task?.status === 'succeeded' && request?.id === entry.candidateMergeId &&
     !request.stopRequested && candidateMergeMatches(engine.company, goal, request, true)
     : entry.compositionRecheckId ? task?.status === 'succeeded' && goal?.compositionRecheck?.id === entry.compositionRecheckId
-      : task?.status === 'integrating';
+      : task?.status === 'integrating' && !planBlocksWork(goal, task.kind);
   if (engine.closing || !owns(engine) || task?.stopRequested || !taskCurrent ||
     (goalStopped(goal) && goal.executionControl?.mode !== 'after-current') ||
     (policy.paused && policy.pauseMode !== 'after-current')) {
@@ -274,7 +275,8 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
     }
     return compositionRecheckId
       ? currentTask.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId && currentGoal.compositionRecheck.status === 'queued'
-      : currentTask.status === 'integrating' && !ignoresBlocker(currentTask) && matchesGoalContract(currentGoal, currentTask);
+      : currentTask.status === 'integrating' && !ignoresBlocker(currentTask) && matchesGoalContract(currentGoal, currentTask) &&
+        !planBlocksWork(currentGoal, currentTask.kind);
   };
   if (!eligible(task, goal) || goalStopped(goal) || goal.contractChange?.status === 'pending') return;
   if (!candidateMergeId && goalRuntimeSpent(goal, engine.store.list('attempts')) >= goalRuntimeLimit(goal, engine.company.policy())) {
@@ -319,7 +321,8 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       !request.stopRequested && current.status === 'succeeded' && candidateMergeMatches(engine.company, currentGoal, request, true);
     const taskCurrent = candidateMergeId ? ownerCurrent : compositionRecheckId ? current.status === 'succeeded' && currentGoal.compositionRecheck?.id === compositionRecheckId &&
       currentGoal.compositionRecheck.integrationId === record.id && contractVersion(currentGoal) === record.goalContractVersion && currentGoal.contractChange?.status !== 'pending'
-      : current.activeIntegrationId === record.id && current.status === 'integrating' && !ignoresBlocker(current) && matchesGoalContract(currentGoal, current, record);
+      : current.activeIntegrationId === record.id && current.status === 'integrating' && !ignoresBlocker(current) &&
+        matchesGoalContract(currentGoal, current, record) && !planBlocksWork(currentGoal, current.kind);
     return owns(engine) && !engine.closing && !signal.aborted && (!policy.paused || policy.pauseMode === 'after-current') &&
       (!goalStopped(currentGoal) || currentGoal.executionControl?.mode === 'after-current') &&
       taskCurrent && !current.stopRequested && current.generation === record.generation && current.artifactHash === record.artifactHash;
