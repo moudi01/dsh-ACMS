@@ -362,3 +362,69 @@ test('a moved approved directory blocks new copies while an already captured can
   assert.equal(get(f, review).passed, true);
   assert.equal(get(f, review).workspace.candidateVersion, delivered.version);
 });
+
+test('joint checks cannot approve a directory candidate by removing an empty input directory', async t => {
+  const { f, goal, current } = await setup(t, async input => {
+    if (input.task.title === 'A') {
+      await mkdir(file(input, 'feature.disabled'));
+      await writeFile(file(input, 'a.txt'), 'Provided the feature control directory');
+      return result('a.txt');
+    }
+    await writeFile(file(input, 'app.cjs'), "if(require('node:fs').existsSync('feature.disabled'))process.exit(42)");
+    return result('app.cjs');
+  }, "const fs=require('node:fs'); if(fs.existsSync('app.cjs') && fs.existsSync('feature.disabled')){fs.rmdirSync('feature.disabled');require('./app.cjs')}");
+  f.task({ title: 'A', goalId: goal.id });
+  f.task({ title: 'B', goalId: goal.id });
+  await f.start();
+  await until(() => {
+    assert.notEqual(current().status, 'succeeded', 'a check on a mutated candidate must not approve the goal');
+    return current().compositionRecheck?.status === 'failed';
+  }, 45000, () => current().compositionRecheck);
+  const record = f.store.list('integrations').find(row => row.goalId === goal.id && row.phase === 'failed');
+  const [check] = record.composition.checks;
+  assert.equal(check.code, 0);
+  assert.equal(check.inputHash, record.composition.contentHash);
+  assert.equal(check.inputUnchanged, false);
+  assert.equal(check.passed, false);
+  assert.throws(() => f.command('review.request', { goalId: goal.id }), { code: 'COMPOSITE_NOT_VERIFIED' });
+  const checkout = path.join(f.root, 'empty-directory-candidate');
+  await checkoutCopyComposition(record.composition.snapshot, checkout, f.dataDir);
+  assert.deepEqual(await readdir(path.join(checkout, 'feature.disabled')), []);
+  assert.equal((await run(process.execPath, ['app.cjs'], checkout)).code, 42);
+});
+
+for (const corrupt of [false, true]) test(`task review checks the saved copy after the work folder is removed (corrupt=${corrupt})`, async t => {
+  const payload = Buffer.from([0, 33, 128, 255]);
+  const { f, goal, current } = await setup(t, async input => {
+    if (input.task.kind === 'review') {
+      assert.deepEqual(await readFile(file(input, 'material.bin')), payload);
+      return { outcome: 'reviewed', decision: 'approve', summary: 'Independent review from the persisted copy' };
+    }
+    await writeFile(file(input, 'material.bin'), payload);
+    return result('material.bin');
+  });
+  const task = f.task({ goalId: goal.id });
+  await f.start();
+  await waitForComposition(f, goal, current);
+  await f.engine.stop();
+  const original = get(f, task);
+  await rename(original.workspace.path, path.join(f.root, 'held-workspace'));
+  if (corrupt) {
+    const version = original.integration.delivery.sha256;
+    const tree = JSON.parse(await readFile(path.join(f.dataDir, 'deliveries', 'copy', 'trees', version + '.json'), 'utf8'));
+    const row = tree.entries.find(([name]) => name === 'material.bin');
+    await writeFile(path.join(f.dataDir, 'deliveries', 'copy', 'files', row[2]), Buffer.alloc(payload.length));
+  }
+  const review = f.command('review.request', { id: task.id });
+  await f.start();
+  await waitForTask(f, review, corrupt ? 'blocked' : 'succeeded');
+  const reviews = f.adapter.calls.filter(call => call.task.id === review.id);
+  assert.equal(reviews.length, corrupt ? 0 : 1);
+  if (corrupt) {
+    assert.equal(get(f, review).attempts, 0);
+    assert(get(f, review).environmentBlock?.failures.some(failure => failure.subject === '持久目录交付'));
+  } else {
+    assert.equal(get(f, review).passed, true);
+    assert.equal(get(f, review).reviewArtifactHash, original.artifactHash);
+  }
+});

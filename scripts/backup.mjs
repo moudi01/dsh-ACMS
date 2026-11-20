@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { backupWorktreeEvidence, relocatedGitPointer } from './restore-worktrees.mjs';
 import { WORKTREE_RESTORE_HOLD, assertWorktreeRestoreReady, worktreeRestorePending } from '../src/core/restore-safety.js';
-import { includedProjectInput } from '../src/runtime/project-environment.js';
+import { includedProjectInput } from '../src/runtime/project-inputs.js';
 
 export const FORMAT = 'acms-backup/1';
 const EXCLUDED_DIRS = [

@@ -5,13 +5,14 @@ import { runContained } from './host-command.js';
 import { AcmsError, assert, digest } from '../core/util.js';
 import { publishCollaboration, syncCollaboration, verifyCollaboration, isCollaborationPath } from './collaboration.js';
 import { deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
-import { checkIdentity, copyProject, includedProjectInput, inputFingerprint, prepareDependencies, verifyInCopy } from './project-environment.js';
+import { checkIdentity, copyProject, inputFingerprint, prepareDependencies, verifyInCopy } from './project-environment.js';
+import { includedProjectInput } from './project-inputs.js';
 import { ARCHIVE_FORMAT } from './delivery-archive.js';
 import { validateDeliveryArchive, validateDeliveryText } from './archive-validation.js';
 import { isProseFile } from './text-integrity.js';
 import { checkoutGitBundle, gitWorktreeFingerprint, publishGitDelivery, removeTemporary, verifiedGitBundle } from './git-delivery.js';
 import { checkoutComposition, composeGitVersions, selectedGitVersions, updateCompositionWorkspace, updateWorkspaceInput } from './git-composition.js';
-import { captureCopySnapshot, checkoutCopyComposition, composeCopyVersions, copyContentHash, selectedCopyVersions, verifyCopySnapshot } from './copy-composition.js';
+import { captureCopySnapshot, checkoutCopyComposition, composeCopyVersions, copyCheckInputs, copyContentHash, copyDeliveryFor, selectedCopyVersions, verifiedCopyDelivery } from './copy-composition.js';
 import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, orderedCompositionTasks, usesComposition } from '../core/composite-delivery.js';
 import { deliveredWork, goalDeliveryHash } from '../core/goal-contract.js';
 import { taskSettledForGoal } from '../core/hierarchy.js';
@@ -105,8 +106,8 @@ export class WorkspaceManager {
       });
       if (missing) {
         if (sourceTask.copyDeliveryInputHash) {
-          const delivery = sourceTask.integration?.delivery;
-          assert(delivery?.sha256 === sourceTask.copyDeliveryInputHash, 'COMPOSITE_CONTENT', '缺少原任务的持久目录交付。');
+          const delivery = copyDeliveryFor(sourceTask);
+          assert(delivery, 'COMPOSITE_CONTENT', '缺少原任务的当前持久目录交付。');
           await checkoutCopyComposition(delivery, destination, this.dataDir, attempt.signal);
           return { path: destination, mode: 'review-copy', artifactHash: task.reviewArtifactHash };
         }
@@ -297,7 +298,7 @@ export class WorkspaceManager {
     const gitDelivery = task.workspace.mode === 'git' && !project.autoMerge;
     const copyDelivery = task.workspace.mode === 'copy' && !!task.workspace.compositionInput;
     const copyDeliveryInputHash = copyDelivery ? await copyContentHash(source, attempt.signal) : null;
-    const inputHash = task.checkIds.length || gitDelivery ? await inputFingerprint(source, attempt.signal).catch(error => {
+    const inputHash = copyDelivery ? copyDeliveryInputHash : task.checkIds.length || gitDelivery ? await inputFingerprint(source, attempt.signal).catch(error => {
       if (gitDelivery && !task.checkIds.length && error.code === 'CHECK_INPUT_LINK') return null;
       throw error;
     }) : null;
@@ -341,13 +342,15 @@ export class WorkspaceManager {
         item.cleanupConfirmed === true && item.inputHash === inputHash && item.inputUnchanged === true && item.checkVersion === identity.version);
       checkResults.push(cached ? { ...cached, reused: true } : await verifyInCopy({ dataDir: this.dataDir, source,
         inputHash, check, preparation: project.preparation, identity, signal: attempt.signal,
+        readInputs: copyDelivery ? copyCheckInputs : undefined,
         invoke: (command, args, cwd, options) => invoke(command, args, cwd, { ...options, guard }) }));
     }
     const changeSet = await this.captureChanges(task);
     if (inputHash) guard();
-    if (inputHash) assert(await inputFingerprint(source, attempt.signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Delivery inputs changed during verification');
-    if (copyDelivery) assert(await copyContentHash(source, attempt.signal) === copyDeliveryInputHash,
-      'CHECK_INPUT_CHANGED', '验收期间目录交付内容已变化。');
+    if (inputHash) {
+      const fingerprint = copyDelivery ? copyContentHash : inputFingerprint;
+      assert(await fingerprint(source, attempt.signal) === inputHash, 'CHECK_INPUT_CHANGED', 'Delivery inputs changed during verification');
+    }
     const gitDeliveryInputHash = gitDelivery ? inputHash : null;
     return { artifacts, checks: checkResults, changeSet, gitDeliveryInputHash, copyDeliveryInputHash,
       hash: digest({ artifacts: artifacts.map(a => ({ path: a.path, hash: a.hash,
@@ -375,12 +378,13 @@ export class WorkspaceManager {
         v.taskGeneration === deliveryGeneration(source) && v.goalContractVersion === taskContractVersion(source));
       if (!row?.checks?.some(check => check.checkVersion) || !source.workspace) continue;
       const cwd = source.workspace.path;
-      const inputHash = await inputFingerprint(cwd, signal).catch(error => {
+      const fingerprint = source.copyDeliveryInputHash ? copyContentHash : inputFingerprint;
+      const inputHash = await fingerprint(cwd, signal).catch(error => {
         if (error.code === 'ENOENT') return null;
         throw error;
       });
       if (!inputHash) continue;
-      if (task.reviewOf && checkReviewCopy && await inputFingerprint(task.workspace.path, signal) !== inputHash) continue;
+      if (task.reviewOf && checkReviewCopy && await fingerprint(task.workspace.path, signal) !== inputHash) continue;
       const project = store.require('projects', source.projectId);
       const checks = [];
       for (const item of row.checks) {
@@ -460,11 +464,7 @@ export class WorkspaceManager {
   async unchanged(task, artifactIds, invoke = run) {
     try { await fs.access(task.workspace.path); } catch (error) {
       if (error.code !== 'ENOENT') return false;
-      if (task.copyDeliveryInputHash) {
-        const delivery = task.integration?.delivery;
-        if (delivery?.sha256 !== task.copyDeliveryInputHash) return false;
-        return verifyCopySnapshot(delivery, this.dataDir).then(() => true, () => false);
-      }
+      if (task.copyDeliveryInputHash) return !!(await verifiedCopyDelivery(task, this.dataDir));
       return !!(await verifiedGitBundle(task, this.dataDir));
     }
     try { await verifyCollaboration(task.workspace); } catch { return false; }
@@ -613,7 +613,7 @@ export class WorkspaceManager {
       const checkout = path.join(temporary, 'checkout');
       if (copy) await checkoutCopyComposition(candidate.snapshot, checkout, this.dataDir, execution.signal);
       else await checkoutComposition(candidate, checkout, temporary, this.dataDir, execution.run);
-      const inputHash = await inputFingerprint(checkout);
+      const inputHash = copy ? candidate.contentHash : await inputFingerprint(checkout);
       const evidence = store.list('integrations').filter(item => item.goalId === goal.id && item.composition?.version === candidate.version)
         .flatMap(item => item.composition.checks ?? []);
       const checks = [];
@@ -625,7 +625,8 @@ export class WorkspaceManager {
         const cached = identity?.reusable && evidence.findLast(row => row.id === check.id && row.reusable && row.passed &&
           row.cleanupConfirmed === true && row.inputUnchanged === true && row.inputHash === inputHash && row.checkVersion === identity.version);
         checks.push(cached ? { ...cached, reused: true } : await verifyInCopy({ dataDir: temporary, source: checkout, inputHash, check,
-          preparation: project.preparation, identity, invoke: execution.run }));
+          preparation: project.preparation, identity, invoke: execution.run, readInputs: copy ? copyCheckInputs : undefined,
+          signal: copy ? execution.signal : undefined }));
       }
       const composition = { ...candidate, checkContract: compositionCheckContract(project), ledgerHash: goalDeliveryHash(current, delivered),
         passed: checks.every(check => check.passed), checks };

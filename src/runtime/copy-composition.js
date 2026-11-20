@@ -3,7 +3,7 @@ import { constants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { AcmsError, assert, digest } from '../core/util.js';
 import { fileDigest, removeTemporary } from './git-delivery.js';
-import { includedProjectInput } from './project-environment.js';
+import { includedProjectInput } from './project-inputs.js';
 
 const treeFormat = 'acms-copy-tree/1';
 const candidateFormat = 'acms-copy-composition/1';
@@ -98,6 +98,14 @@ export async function copyContentHash(root, signal) {
   return encodeTree(await scan(await fs.realpath(root), signal)).reference.sha256;
 }
 
+export async function copyCheckInputs(root, signal) {
+  const entries = await scan(await fs.realpath(root), signal);
+  return {
+    hash: encodeTree(entries).reference.sha256,
+    entries: [...entries].map(([name, { mode, oid }]) => [name, oid ? `${mode}:${oid}` : mode]),
+  };
+}
+
 async function publishFile(source, filename, verify) {
   try { await fs.link(source, filename); }
   catch (error) {
@@ -184,6 +192,20 @@ export async function verifyCopySnapshot(reference, dataDir, signal) {
   await verifyFiles(await readTree(reference, dataDir), dataDir, signal);
 }
 
+export function copyDeliveryFor(task) {
+  const delivery = task?.integration?.delivery;
+  if (!task?.copyDeliveryInputHash || task.workspace?.mode !== 'copy' || delivery?.format !== treeFormat ||
+    delivery.sha256 !== task.copyDeliveryInputHash || delivery.generation !== task.generation ||
+    delivery.artifactHash !== task.artifactHash || delivery.baseHash !== task.workspace.compositionBase) return null;
+  return delivery;
+}
+
+export async function verifiedCopyDelivery(task, dataDir) {
+  const delivery = copyDeliveryFor(task);
+  if (!delivery) return null;
+  return verifyCopySnapshot(delivery, dataDir).then(() => delivery, () => null);
+}
+
 export async function checkoutCopyComposition(reference, destination, dataDir, signal) {
   const entries = await readTree(reference, dataDir);
   const blobs = await verifyFiles(entries, dataDir, signal);
@@ -222,9 +244,8 @@ const inputIdentity = ({ taskId, generation, artifactHash, snapshot, baseline, m
 export function selectedCopyVersions(tasks, baseHash) {
   const selected = new Map(), versions = [];
   for (const task of tasks) {
-    const snapshot = task.integration?.delivery;
-    assert(snapshot?.format === treeFormat && isHash(snapshot.sha256) && snapshot.baseHash === baseHash &&
-      task.workspace?.compositionBase === baseHash && snapshot.generation === task.generation && snapshot.artifactHash === task.artifactHash,
+    const snapshot = copyDeliveryFor(task);
+    assert(snapshot && snapshot.baseHash === baseHash,
     'COMPOSITE_INPUT_MISSING', `任务 ${task.id} 缺少当前固定基线的持久目录交付。`, { taskId: task.id });
     const baseline = task.workspace.compositionInput;
     assert(baseline?.baseHash === baseHash && Array.isArray(baseline.inputs) &&

@@ -7,8 +7,8 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { gitWorktreeFingerprint, verifiedGitBundle } from '../src/runtime/git-delivery.js';
-import { copyContentHash, verifyCopySnapshot } from '../src/runtime/copy-composition.js';
-import { includedProjectInput } from '../src/runtime/project-environment.js';
+import { copyContentHash, verifiedCopyDelivery } from '../src/runtime/copy-composition.js';
+import { includedProjectInput } from '../src/runtime/project-inputs.js';
 import { run } from '../src/runtime/workspaces.js';
 
 const CANDIDATE_DIRS = ['workspaces', 'reviews', 'integration', 'diagnostics'];
@@ -66,9 +66,8 @@ async function incompleteGitDelivery(task, root, workspace) {
 
 async function incompleteCopyDelivery(task, root, workspace) {
   if (task?.workspace?.mode !== 'copy' || !task.workspace.compositionInput) return '';
-  const delivery = task.integration?.delivery;
-  if (!task.copyDeliveryInputHash || delivery?.sha256 !== task.copyDeliveryInputHash || delivery.baseHash !== task.workspace.compositionBase ||
-    delivery.generation !== task.generation || delivery.artifactHash !== task.artifactHash) return '目录工作副本缺少可验证的持久交付';
+  const delivery = await verifiedCopyDelivery(task, root);
+  if (!delivery) return '目录工作副本缺少可验证的持久交付';
   async function hasUncapturedInput(directory, isRoot) {
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
       const name = entry.name.toLowerCase();
@@ -78,7 +77,6 @@ async function incompleteCopyDelivery(task, root, workspace) {
     return false;
   }
   try {
-    await verifyCopySnapshot(delivery, root);
     if (await copyContentHash(workspace) === delivery.sha256 && !await hasUncapturedInput(workspace, true)) return '';
   } catch { /* A missing, altered or unreadable copy reference cannot authorize cleanup. */ }
   return '目录工作副本含未归档内容或持久版本无法核对';
