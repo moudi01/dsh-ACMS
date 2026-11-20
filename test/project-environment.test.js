@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { runContained } from '../src/runtime/host-command.js';
 import { prepareDependencies } from '../src/runtime/project-environment.js';
-import { fixture, gitProject, until, taskWaitDiagnostics } from './helpers.js';
+import { fixture, gitProject, hostedWindows, until, taskWaitDiagnostics } from './helpers.js';
 import { cleanupError } from '../src/runtime/owned-process.js';
 import { environmentFailure } from '../src/runtime/preflight.js';
 
@@ -15,7 +15,7 @@ const npmCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 
 const tree = fileURLToPath(new URL('./fixtures/owned-tree.mjs', import.meta.url));
 const writeJson = (file, object) => writeFile(file, JSON.stringify(object));
 
-async function offlinePackage(f) {
+async function offlinePackage(f, timeoutMs = 12000) {
   const packageDir = path.join(f.root, 'package');
   const cache = path.join(f.root, 'seed-cache');
   await mkdir(packageDir);
@@ -33,7 +33,7 @@ async function offlinePackage(f) {
   await writeJson(path.join(f.source, 'package-lock.json'), { name: 'fixture-project', version: '1.0.0', lockfileVersion: 3,
     packages: { '': { name: 'fixture-project', version: '1.0.0', dependencies },
       'node_modules/acms-fixture-dependency': { version: '1.0.0', resolved: 'https://registry.npmjs.org/acms-fixture-dependency/-/acms-fixture-dependency-1.0.0.tgz', integrity: packed.integrity } } });
-  return { command: process.execPath, args: [npmCli], cacheSeed: cache, timeoutMs: 12000 };
+  return { command: process.execPath, args: [npmCli], cacheSeed: cache, timeoutMs };
 }
 
 test('offline lockfile preparation works in a Git worktree, in the check copy and in an independent reviewer copy', { ...windows, timeout: 150000 }, async t => {
@@ -53,7 +53,7 @@ test('offline lockfile preparation works in a Git worktree, in the check copy an
     }
     return defaultSimulation(input);
   });
-  const preparation = await offlinePackage(f);
+  const preparation = await offlinePackage(f, hostedWindows ? 30000 : undefined);
   await gitProject(f);
   f.command('project.save', { id: f.project.id, autoMerge: false, preparation,
     checks: [{ id: 'node-check', command: 'node', args: ['-e', "process.exit(require('acms-fixture-dependency') === 42 ? 0 : 1)"],
@@ -65,7 +65,7 @@ test('offline lockfile preparation works in a Git worktree, in the check copy an
     assert(!current.environmentBlock, JSON.stringify(current.environmentBlock));
     return current.status === 'succeeded';
   // Includes worktree creation, offline npm preparation, host checks and Git
-  // delivery. Keep the individual preparation timeout unchanged.
+  // delivery. The command's own timeout is set by this fixture.
   }, 60000, taskWaitDiagnostics(f, task.id));
   const delivered = f.store.require('tasks', task.id);
   assert(!delivered.changeSet.some(file => file.path.includes('node_modules')));
