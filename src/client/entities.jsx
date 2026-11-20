@@ -348,24 +348,28 @@ function GoalCostForecast({ goalId, budgetRevision }) {
 function OptionalCostDecision({ goal, tasks, act, busy }) {
   const [chosen, setChosen] = useState('');
   const [reason, setReason] = useState('');
+  const review = goal.costBudgetDeferralRequest;
+  const checking = ['queued', 'checking'].includes(review?.status);
   const waiting = tasks.filter(task => task.status === 'blocked' && task.blocker?.kind === 'cost-budget' &&
     task.costBudgetHold?.code === OPTIONAL_COST_WAIT);
   const seed = waiting.find(task => task.id === chosen) ?? waiting[0];
   const scope = seed ? optionalDependentScope(tasks, seed.id) : [];
   const completed = tasks.filter(task => task.status === 'deferred' && task.costBudgetDeferral);
-  if (!waiting.length && !completed.length) return null;
-  const unavailable = busy ? '正在保存，请稍候' : goal.executionControl ? '请先恢复目标。' :
+  if (!waiting.length && !completed.length && !review) return null;
+  const unavailable = busy || checking ? '正在核对当前报价，请稍候' : goal.executionControl ? '请先恢复目标。' :
     goal.costBudget.reservedAttempts ? '仍有费用待结算，先保留可恢复的等待。' :
     seed?.costBudgetHold.reasonCode !== 'shortfall' ? '费用覆盖尚未核实。' : !reason.trim() ? '请填写延期理由。' : '';
   return <section aria-label="可选任务预算调整">
     <h4>可选任务预算调整</h4>
+    {checking && <p role="status">正在核对当前报价与可延期范围。</p>}
+    {review?.status === 'not-applied' && <p role="status">{review.result}</p>}
     {!!waiting.length && <p>{waiting.length} 项可选任务等待费用核对或余量。余额释放后会重新核对。</p>}
     {seed && <form onSubmit={async event => {
       event.preventDefault();
       try {
         const saved = await act('goal.cost_budget.defer_optional', { id: goal.id, taskId: seed.id, taskIds: scope,
           holdAttemptId: seed.costBudgetHold.attemptId, planFingerprint: seed.costBudgetHold.planFingerprint,
-          reason: reason.trim() }, '已确认本轮延期');
+          reason: reason.trim() }, '已请求按当前报价核对延期');
         if (saved) setReason('');
       } catch { /* The owner command displays its error. */ }
     }}>
@@ -373,10 +377,10 @@ function OptionalCostDecision({ goal, tasks, act, busy }) {
         {waiting.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}
       </select></Field>
       <p>本次延期范围 · {scope.map(id => tasks.find(task => task.id === id)?.title ?? id).join('、')}</p>
-      <p className="acms-sectionnote">上次核对的单次费用上界 {usdFromMicros(seed.costBudgetHold.bound.upperMicros)}。确认后继续完成剩余范围和原验收。</p>
+      <p className="acms-sectionnote">上次核对的单次费用上界 {usdFromMicros(seed.costBudgetHold.bound.upperMicros)}。确认会先核对最新报价，再决定是否延期。</p>
       <Field label="延期理由"><textarea rows={2} value={reason} maxLength={2000} onChange={event => setReason(event.target.value)} /></Field>
       <ActionButton type="submit" reason={unavailable}>确认可选项本轮延期</ActionButton>
-      <ActionButton type="button" reason={busy ? '正在保存，请稍候' : goal.executionControl ? '请先恢复目标。' : ''}
+      <ActionButton type="button" reason={busy || checking ? '正在核对当前报价，请稍候' : goal.executionControl ? '请先恢复目标。' : ''}
         onClick={() => act('task.resume', { id: seed.id }, '已请求按当前额度重新核价')}>重新核对报价</ActionButton>
     </form>}
     {completed.map(task => <p key={task.id}>{task.title} · 本轮延期 · {task.costBudgetDeferral.reason}</p>)}

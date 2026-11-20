@@ -16,18 +16,17 @@ export function assessOptionalDispatch(company, goal, budget, task, bound, execu
   if (task.kind !== 'work' || task.origin?.kind !== 'manager-plan' || budget.breach) return null;
   const { store } = company;
   const plan = approvedCostPlan(store, goal);
-  const planner = plan && currentCostPlanTask(store, goal, plan);
   const node = plan?.nodes.find(node => node.taskId === task.id);
   const plannedOptional = plan?.costPlan.intent.nodes.some(item => item.key === node?.key && item.importance === 'optional');
-  if (!planner || !node || !plannedOptional || !matchesCostPlanWork(task, node, goal, plan)) return null;
+  // Retain optional identity through ordinary edits. Exact plan matching is
+  // required for scope removal, while this dispatch already has a fresh cap.
+  if (!node || !plannedOptional) return null;
+  const planner = currentCostPlanTask(store, goal, plan);
 
   const tasks = store.tasksForGoal(goal.id), byId = new Map(tasks.map(item => [item.id, item]));
   const planNodes = new Map(plan.nodes.map(node => [node.taskId, node]));
   const optionalKeys = new Set(plan.costPlan.intent.nodes.filter(node => node.importance === 'optional').map(node => node.key));
-  const isOptional = item => {
-    const planned = planNodes.get(item.id);
-    return planned && optionalKeys.has(planned.key) && matchesCostPlanWork(item, planned, goal, plan);
-  };
+  const isOptional = item => optionalKeys.has(planNodes.get(item.id)?.key);
   const critical = new Set();
   const protect = id => {
     if (critical.has(id)) return;
@@ -52,7 +51,7 @@ export function assessOptionalDispatch(company, goal, budget, task, bound, execu
 
   const { availableMicros } = goalCostBudgetView(budget);
   const acceptanceMicros = plan.costPlan.estimate.acceptance.micros, reworkMicros = plan.costPlan.estimate.rework.micros;
-  const price = isCostPlanEstimateCurrent(company, goal, plan, planner, executor);
+  const price = !!planner && isCostPlanEstimateCurrent(company, goal, plan, planner, executor);
   const estimates = new Map(plan.costPlan.estimate.tasks.map(entry => [entry.key, entry.estimate.micros]));
   let required = 0n;
   let known = price;
@@ -99,8 +98,21 @@ function isUndispatched(store, task) {
   return [...store.attemptUsageRows('task', task.id)].every(({ attempt }) => attempt.preflightOnly && !attempt.cleanupPending);
 }
 
-export function deferOptionalCostScope(company, args, actor, executor) {
-  assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可确认本轮延期。');
+export const optionalDeferralPending = request => ['queued', 'checking'].includes(request?.status);
+
+export function withdrawOptionalDeferral(store, goalId, taskId = null) {
+  const goal = store.get('goals', goalId);
+  const request = goal?.costBudgetDeferralRequest;
+  if (!optionalDeferralPending(request) || (taskId && !request.taskIds.includes(taskId))) return false;
+  const seed = store.get('tasks', request.taskId);
+  if (request.status === 'queued' && seed?.status === 'ready' && seed.costBudgetHold?.attemptId === request.holdAttemptId)
+    store.put('tasks', { ...seed, status: 'blocked' });
+  store.put('goals', { ...goal, costBudgetDeferralRequest: { ...request, status: 'not-applied',
+    result: '范围、暂停或停止状态已变化，本轮未延期。', finishedAt: now() } });
+  return true;
+}
+
+function confirmableScope(company, args, executor) {
   const { store } = company;
   const goal = store.require('goals', args.id);
   assertGoalOpen(goal);
@@ -116,8 +128,6 @@ export function deferOptionalCostScope(company, args, actor, executor) {
     !['succeeded', 'archived', 'deleted'].includes(goal.status),
   'COST_OPTIONAL_STALE', '当前可选派工或费用来源已变化，请刷新后确认。');
   assert(budget.reservedAttempts === 0, 'COST_OPTIONAL_PENDING', '仍有费用待结算，先保留可恢复的等待。');
-  const current = assessOptionalDispatch(company, goal, budget, task, hold.bound, executor);
-  assert(current?.reasonCode === 'shortfall', 'COST_OPTIONAL_STALE', '当前余量不足尚未确认，请重新核对该可选任务。');
   const tasks = store.tasksForGoal(goal.id);
   const scope = optionalDependentScope(tasks, task.id);
   assert(Array.isArray(args.taskIds) && args.taskIds.length === scope.length && digest([...args.taskIds].sort()) === digest(scope),
@@ -132,17 +142,62 @@ export function deferOptionalCostScope(company, args, actor, executor) {
       isUndispatched(store, item) && !started.has(item.id) && !pending.has(item.id),
     'COST_OPTIONAL_SCOPE', '延期范围包含已执行、独立阻塞或其他必需任务。请核对依赖及交付范围。');
   }
-  const reason = text(args.reason, '延期理由', 2000);
-  const decision = { decisionId: id('cost-deferral'), planId: plan.id, planFingerprint: plan.fingerprint,
-    goalContractVersion: plan.goalContractVersion, by: actor.id, at: now(), reason };
+  return { goal, plan, budget, task, hold, scope, selected };
+}
+
+export function deferOptionalCostScope(company, args, actor, executor) {
+  assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可确认本轮延期。');
+  const { store } = company;
+  const { goal, budget, task, hold, scope } = confirmableScope(company, args, executor);
+  assert(!optionalDeferralPending(goal.costBudgetDeferralRequest), 'COST_OPTIONAL_PENDING', '此目标已有延期核价，请等待结果。');
+  const current = assessOptionalDispatch(company, goal, budget, task, hold.bound, executor);
+  assert(current?.reasonCode === 'shortfall', 'COST_OPTIONAL_STALE', '当前余量不足尚未确认，请重新核对该可选任务。');
+  const request = { id: id('cost-deferral'), status: 'queued', taskId: task.id, taskIds: scope, holdAttemptId: hold.attemptId,
+    generation: task.generation, planFingerprint: args.planFingerprint, by: actor.id, requestedAt: now(),
+    reason: text(args.reason, '延期理由', 2000) };
+  store.put('tasks', { ...task, status: 'ready' });
+  return store.put('goals', { ...goal, costBudgetDeferralRequest: request });
+}
+
+export function finishOptionalDeferral(company, goal, task, attempt, executor, bound, failure) {
+  const { store } = company;
+  const request = goal.costBudgetDeferralRequest;
+  if (!optionalDeferralPending(request) || request.id !== attempt.costDeferralRequestId) return;
+  const actor = { kind: 'owner', id: request.by };
+  let resolution;
+  try {
+    assert(!failure, 'COST_OPTIONAL_STALE', failure);
+    assert(!company.policy().paused && task.activeAttemptId === attempt.id && task.generation === request.generation,
+      'COST_OPTIONAL_STALE', '确认时任务或调度状态已变化，请核对后重试。');
+    assert(validGoalCostBound(bound, bound?.route), 'COST_OPTIONAL_STALE', '当前实际执行上界无法核实，本轮未延期。');
+    resolution = confirmableScope(company, { ...request, id: goal.id }, executor);
+  } catch (error) {
+    if (!['COST_OPTIONAL_STALE', 'COST_OPTIONAL_PENDING', 'COST_OPTIONAL_SCOPE', 'GOAL_CLOSED', 'GOAL_PAUSED'].includes(error.code)) throw error;
+    store.put('goals', { ...goal, costBudgetDeferralRequest: { ...request, status: 'not-applied', result: error.message, finishedAt: now() } });
+    return;
+  }
+  const { plan, budget, scope, selected } = resolution;
+  const current = assessOptionalDispatch(company, goal, budget, task, bound, executor);
+  if (current?.reasonCode !== 'shortfall') {
+    const reason = current ? current.reason : '当前报价已有足够余量。可继续正常派发，本轮未延期。';
+    store.put('goals', { ...goal, costBudgetDeferralRequest: { ...request, status: 'not-applied', result: reason, finishedAt: now() } });
+    const latest = current ?? { ...task.costBudgetHold, bound, reason, reasonCode: 'affordable' };
+    store.put('tasks', { ...task, costBudgetHold: { ...latest, attemptId: attempt.id, quotedAt: now() },
+      blocker: { kind: 'cost-budget', reason } });
+    return;
+  }
+  const decision = { decisionId: request.id, planId: plan.id, planFingerprint: plan.fingerprint,
+    goalContractVersion: plan.goalContractVersion, by: request.by, at: now(), reason: request.reason };
   for (const item of selected) {
     store.put('tasks', { ...item, status: 'deferred', blocker: null, costBudgetHold: null,
       costBudgetDeferral: { ...decision, taskGeneration: item.generation } });
     company.releaseTemporaryAgent(item.agentId, actor);
   }
-  store.put('goals', { ...goal, costBudgetDeferrals: [...(goal.costBudgetDeferrals ?? []),
-    ...scope.map(taskId => ({ taskId, decisionId: decision.decisionId }))] });
+  store.put('goals', { ...goal, costBudgetDeferralRequest: { ...request, status: 'applied', finishedAt: decision.at },
+    costBudgetDeferrals: [...(goal.costBudgetDeferrals ?? []), ...selected.map(item => ({
+      taskId: item.id, taskGeneration: item.generation, decisionId: decision.decisionId, planId: plan.id,
+      planFingerprint: plan.fingerprint, goalContractVersion: plan.goalContractVersion }))] });
   store.event('goal.cost_budget.optional_deferred', goal.id, { ...decision, taskIds: scope,
-    costBasis: optionalCostEvidence({ ...current, attemptId: hold.attemptId, quotedAt: hold.quotedAt }) }, actor);
+    costBasis: optionalCostEvidence({ ...current, attemptId: attempt.id, quotedAt: decision.at }) }, actor);
   return company.refreshGoal(goal.id, actor);
 }

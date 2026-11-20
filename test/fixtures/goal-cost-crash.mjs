@@ -8,7 +8,7 @@ import { Engine } from '../../src/runtime/engine.js';
 import { WorkspaceManager } from '../../src/runtime/workspaces.js';
 
 const [dataDir, goalId, mode] = process.argv.slice(2);
-assert(['denied', 'withdrawn', 'cancelled'].includes(mode));
+assert(['denied', 'withdrawn', 'cancelled', 'optional-quote'].includes(mode));
 const store = new Store(path.join(dataDir, 'company.db'));
 const company = new Company(store);
 const adapter = new SimulatedAdapter(defaultSimulation);
@@ -22,7 +22,15 @@ if (mode !== 'denied') adapter.taskCost = {
   reconcile: () => null,
   readReceipt: () => null,
 };
-const engine = new Engine(company, adapter, new WorkspaceManager(dataDir, company), { intervalMs: 20 });
+const workspaces = new WorkspaceManager(dataDir, company);
+if (mode === 'optional-quote') {
+  company.command(OWNER, 'quote-fixture-resume', 'company.resume', {});
+  workspaces.prepare = (_task, attempt) => {
+    assert(attempt.costDeferralRequestId);
+    process.exit(73);
+  };
+}
+const engine = new Engine(company, adapter, workspaces, { intervalMs: 20 });
 store.events.on('event', event => {
   if (event.goalId !== goalId) return;
   if (mode !== 'denied' && event.type === 'goal.cost_budget.reserved') {

@@ -1,5 +1,5 @@
 import { goalCostRoute, markGoalCostCleanup, reserveGoalCost, settleGoalCost, validGoalCostBound } from '../core/goal-cost-budget.js';
-import { assessOptionalDispatch, optionalCostEvidence } from '../core/cost-optional.js';
+import { assessOptionalDispatch, finishOptionalDeferral, optionalCostEvidence } from '../core/cost-optional.js';
 import { OPTIONAL_COST_WAIT } from '../core/task-actions.js';
 import { goalStopped } from '../core/goal-control.js';
 import { matchesGoalContract } from '../core/goal-contract.js';
@@ -18,25 +18,50 @@ function taskCostExecutor(adapter) {
     typeof executor.reconcile === 'function' ? executor : null;
 }
 
-export function admitTaskCost(engine, input) {
-  const { store, adapter } = engine;
-  const budget = store.get('goalCostBudgets', input.attempt.goalId);
-  if (!budget) return {};
-  const executor = taskCostExecutor(adapter);
+function quoteTaskCost(engine, input) {
+  const executor = taskCostExecutor(engine.adapter);
   const route = goalCostRoute(input.routeSelection);
   let quote;
   if (executor && route) {
     try { quote = executor.quote({ ...input, route }); }
     catch { /* No current authoritative quote means no dispatch. */ }
   }
-  const bound = quote ? { ...quote, executorId: executor.id } : null;
-  if (input.task.origin?.kind === 'manager-plan' && validGoalCostBound(bound, route)) {
+  const bound = quote ? { executorId: executor.id, quoteId: quote.quoteId, upperMicros: quote.upperMicros, currency: quote.currency, route: quote.route } : null;
+  return { executor, route, bound: validGoalCostBound(bound, route) ? bound : null };
+}
+
+export function admitTaskCost(engine, input) {
+  const { store } = engine;
+  const budget = store.get('goalCostBudgets', input.attempt.goalId);
+  if (!budget) return {};
+  const { executor, route, bound } = quoteTaskCost(engine, input);
+  if (input.task.origin?.kind === 'manager-plan' && bound) {
     const goal = store.require('goals', input.attempt.goalId);
     const denied = assessOptionalDispatch(engine.company, goal, budget, input.task, bound, executor);
     if (denied) return { denied: { ...denied, attemptId: input.attempt.id, quotedAt: now() } };
   }
   const result = reserveGoalCost(store, input.attempt, bound, route);
   return { ...result, executor };
+}
+
+export function closeOptionalDeferralQuote(engine, attempt, input = null, failure = null) {
+  const { store } = engine;
+  engine.fenced();
+  const saved = store.require('attempts', attempt.id);
+  // Quote-only attempts never call a model. Existing host commands must still
+  // be proved stopped through their own cleanup receipt before closing.
+  assert(!saved.hostCheck, 'CLEANUP_PENDING', '需先核对核价前置命令的清理回执。');
+  const quote = input ? quoteTaskCost(engine, input) : {};
+  const completed = store.put('attempts', { ...saved, status: 'interrupted', preflightOnly: true, cleanupPending: false,
+    cleanupUncertain: false, resultAccepted: false, finishedAt: now(), summary: failure ?? '无付费启动的延期核价' });
+  const previous = store.require('tasks', saved.taskId);
+  const task = previous.activeAttemptId === saved.id ? store.put('tasks', { ...previous,
+    status: previous.stopRequested ?? 'blocked', stopRequested: null, recoveryRequested: false, resumeOnStart: false }) : previous;
+  const goal = store.require('goals', task.goalId);
+  finishOptionalDeferral(engine.company, goal, task, completed, quote.executor, quote.bound, failure);
+  if (previous.activeAttemptId === saved.id && previous.stopRequested)
+    store.event('task.stop.completed', task.id, { status: previous.stopRequested, attemptId: saved.id }, SYSTEM);
+  store.event('attempt.cleanup.confirmed', saved.id, { taskId: task.id, noLaunch: true }, SYSTEM);
 }
 
 export function assertTaskCostCurrent(engine, executor, authorization) {
@@ -114,7 +139,7 @@ export function releaseTaskCostWaits(engine) {
     const goal = store.require('goals', task.goalId);
     if (goalStopped(goal) || !matchesGoalContract(goal, task)) continue;
     if (hold?.code === OPTIONAL_COST_WAIT) {
-      if (!refreshOptional || goal.contractChange?.status === 'pending') continue;
+      if (!refreshOptional || hold.reasonCode === 'affordable' || goal.contractChange?.status === 'pending') continue;
       const executor = taskCostExecutor(engine.adapter);
       const sameBoundSource = executor?.id === hold.bound?.executorId && store.get('agents', task.agentId)?.revision === hold.agentRevision;
       const next = sameBoundSource && assessOptionalDispatch(engine.company, goal, budget, task, hold.bound, executor);

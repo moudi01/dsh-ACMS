@@ -80,16 +80,21 @@ function forecast(company, goal, budget, executor) {
 
   let unstarted = 0n;
   const changedTasks = new Set();
+  const deferrals = new Map((goal.costBudgetDeferrals ?? []).map(record => [record.taskId, record]));
   for (const node of plan.nodes) {
     const task = allTasks.get(node.taskId), history = allocations.get(node.taskId), claim = history?.active;
+    const deferral = deferrals.get(node.taskId);
+    const approvedDeferral = deferral?.planId === plan.id && deferral.planFingerprint === plan.fingerprint &&
+      deferral.goalContractVersion === plan.goalContractVersion && deferral.taskGeneration === 1 &&
+      (!task || (task.generation === deferral.taskGeneration &&
+        (task.status === 'deleted' || (task.status === 'deferred' && taskSettledForGoal(task, goal)))));
     let missing;
-    if (!matchesCostPlanWork(task, node, goal, plan) || closed.has(task.status) || node.dependencies.some(id => changedTasks.has(id)) ||
+    if (approvedDeferral && selected.has(node.key) && !history?.count && !unverifiedTasks.has(node.taskId)) {
+      coverage.deferred++;
+    } else if (!matchesCostPlanWork(task, node, goal, plan) || closed.has(task.status) || node.dependencies.some(id => changedTasks.has(id)) ||
         !selected.has(node.key) || !estimates.has(node.key)) {
       missing = 'work-changed';
       changedTasks.add(node.taskId);
-    } else if (task.status === 'deferred' && taskSettledForGoal(task, goal) &&
-        task.costBudgetDeferral.planFingerprint === plan.fingerprint && !history?.count && !unverifiedTasks.has(task.id)) {
-      coverage.deferred++;
     } else if (unverifiedTasks.has(task.id) || (task.status === 'succeeded' && !history?.count)) missing = 'unverified-cost';
     else if (task.status === 'succeeded') coverage.delivered++;
     else if (history?.count === 1 && claim?.id === task.activeAttemptId && inProgress.has(task.status) &&

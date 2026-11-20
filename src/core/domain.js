@@ -10,7 +10,7 @@ import { deleteEntity, restoreEntity, recordChange, restartForChange } from './e
 import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS, pendingGoalTimeBox } from './runtime-budget.js';
 import { createGoalCostBudget, extendGoalCostBudget, goalCostBudgetView } from './goal-cost-budget.js';
 import { installPendingCostPlans } from './plan-cost-budget.js';
-import { deferOptionalCostScope } from './cost-optional.js';
+import { deferOptionalCostScope, withdrawOptionalDeferral } from './cost-optional.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
@@ -126,8 +126,11 @@ export class Company {
       };
       assert(methods[name], 'UNKNOWN_COMMAND', `Unknown command ${name}`);
       const result = methods[name]();
+      if (['goal.pause', 'goal.cancel', 'goal.delete'].includes(name) && withdrawOptionalDeferral(this.store, args.id))
+        return this.store.require('goals', args.id);
       if (name.startsWith('task.')) {
         const goalId = result?.goalId ?? args.goalId;
+        if (goalId && ['task.edit', 'task.dependencies', 'task.delete'].includes(name)) withdrawOptionalDeferral(this.store, goalId, args.id);
         if (goalId) this.refreshGoal(goalId, actor);
       }
       return result;
@@ -261,6 +264,7 @@ export class Company {
       if (needsCoordination) goal = this.ensureGoalContractCoordination(goal);
       this.store.event('goal.contract.changed', goal.id, { fromVersion: version, contractVersion: version + 1,
         coordinationTaskId: goal.contractChange?.coordinationTaskId ?? null, fields: changed }, actor);
+      if (withdrawOptionalDeferral(this.store, goal.id)) goal = this.store.require('goals', goal.id);
     }
     recordChange(this, 'goal', previous, goal, substantive ? [...changed, 'contractVersion'] : changed, actor);
     return goal;
@@ -590,6 +594,7 @@ export class Company {
     if (cascade) for (const child of this.store.list('tasks')) if (child.reviewOf === task.id && !TERMINAL.has(child.status)) this.controlTask({ id: child.id }, target, actor);
     this.store.event(`task.${target}.requested`, task.id, args.reason ? { reason: args.reason } : {}, actor);
     if (target === 'cancelled') this.releaseTemporaryAgent(task.agentId, actor);
+    withdrawOptionalDeferral(this.store, task.goalId, task.id);
     return saved;
   }
   deleteTask(args, actor) {

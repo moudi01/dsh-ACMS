@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -628,6 +629,11 @@ function optionalDecision(target, plan, seed, taskIds = [seed.id]) {
 const optionalHold = task => task.costBudgetHold?.code === 'COST_OPTIONAL_DEFERRED';
 const planTask = (store, plan, key) => store.require('tasks', plan.nodes.find(node => node.key === key).taskId);
 
+function waitOptionalDecision(store, goalId) {
+  const current = () => store.require('goals', goalId).costBudgetDeferralRequest;
+  return until(() => ['applied', 'not-applied'].includes(current()?.status) ? current() : null, undefined, current);
+}
+
 test('optional dispatch waits for late settlement and resumes from its durable hold after restart', async t => {
   const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
   f.command('project.save', { id: f.project.id, planApproval: true });
@@ -753,7 +759,9 @@ test('owner can defer the unstarted optional chain and deliver the approved requ
   assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'preserve-paused-optional', 409)).code, 'COST_OPTIONAL_SCOPE');
   assert.equal(state(f.store, next).status, 'paused');
   await scopedCommand(f, 'task.resume', { id: next.id }, 'restore-optional-before-decision');
-  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'defer-chain');
+  const queued = await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'defer-chain');
+  assert.equal(queued.costBudgetDeferralRequest.status, 'queued');
+  assert.equal((await waitOptionalDecision(f.store, target.id)).status, 'applied');
   assert.equal(state(f.store, bonus).status, 'deferred');
   assert.equal(state(f.store, bonus).workspace.path, held.workspace.path);
   assert.equal(state(f.store, next).status, 'deferred');
@@ -776,6 +784,156 @@ test('owner can defer the unstarted optional chain and deliver the approved requ
   assert.equal(decisions.length, 1);
   assert.equal(decisions[0].data.costBasis.bound.upperMicros, '20');
   assert.deepEqual(priced.calls.slice(0, 3), [plan.taskId, ...work.map(task => task.id)]);
+  const checked = [...f.store.attemptUsageRows('task', bonus.id)].filter(({ attempt }) => attempt.costDeferralRequestId);
+  assert.equal(checked.length, 1);
+  assert.equal(checked[0].attempt.preflightOnly, true);
+  assert.equal(f.store.get('goalCostAttempts', checked[0].attempt.id), null);
+
+  for (const step of ['delete', 'restore', 'delete', 'purge']) {
+    await scopedCommand(f, 'task.' + step, { id: next.id, ...(step === 'purge' ? { confirmTitle: next.title } : {}) }, randomUUID());
+    const refreshed = await scopedForecast(f, target.id);
+    assert.equal(refreshed.completionMicros, '14');
+    assert.equal(refreshed.coverage.deferred, 2);
+    assert.equal(f.company.deliveryHash(target.id), completed.completedDeliveryHash);
+  }
+  assert.equal(f.store.get('tasks', next.id), null);
+  assert.equal(f.store.activityPage({ goalId: target.id }).entries.filter(event => event.type === 'goal.cost_budget.optional_deferred').length, 1);
+});
+
+test('editing an approved optional task preserves budget protection but invalidates its strict deferral eligibility', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '29' : '7',
+    amountFor: task => task.title === 'bonus' ? '29' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), core = planTask(f.store, plan, 'core');
+  const validate = planTask(f.store, plan, 'validate');
+  await scopedCommand(f, 'task.pause', { id: core.id }, 'hold-core-during-edit');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await scopedCommand(f, 'task.edit', { id: bonus.id, patch: { description: 'Clarify the same optional output' } }, 'clarify-optional-scope');
+  await waiting(f, bonus, current => current.generation === 2 && optionalHold(current));
+  assert.equal(budget(f.store, target.id).settledMicros, '3');
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional',
+    optionalDecision(target, plan, state(f.store, bonus)), 'invalid-edited-scope', 409)).code, 'COST_OPTIONAL_SCOPE');
+  await scopedCommand(f, 'task.resume', { id: core.id }, 'release-funded-minimum');
+  await waiting(f, validate, task => task.status === 'succeeded');
+  assert.deepEqual(priced.calls, [plan.taskId, core.id, validate.id]);
+  assert.equal(budget(f.store, target.id).limitMicros, '40');
+  assert(optionalHold(state(f.store, bonus)));
+});
+
+test('owner deferral confirmation obtains a current cap without launching and preserves newly affordable work', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000035', { plan: true });
+  let cap = '20';
+  const checked = [];
+  const priced = fixedCostAdapter(f, { quoteFor: task => {
+    if (task.title !== 'bonus') return '7';
+    checked.push(cap);
+    return cap;
+  }, amountFor: task => task.kind === 'work' ? '4' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), validate = planTask(f.store, plan, 'validate');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await waiting(f, validate, task => task.status === 'succeeded');
+  await until(() => budget(f.store, target.id).reservedAttempts === 0, undefined, () => budget(f.store, target.id));
+  const args = optionalDecision(target, plan, state(f.store, bonus));
+  const original = f.workspaces.prepare.bind(f.workspaces);
+  f.workspaces.prepare = (task, attempt) => {
+    if (attempt.costDeferralRequestId) throw new Error('Test preparation unavailable');
+    return original(task, attempt);
+  };
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-preparation-unavailable');
+  assert.match((await waitOptionalDecision(f.store, target.id)).result, /核价准备未完成/);
+  assert(!priced.calls.includes(bonus.id));
+
+  const preparing = Promise.withResolvers(), release = Promise.withResolvers();
+  t.after(() => release.resolve());
+  f.workspaces.prepare = async (task, attempt) => {
+    if (attempt.costDeferralRequestId) {
+      preparing.resolve(attempt.id);
+      await release.promise;
+    }
+    return original(task, attempt);
+  };
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-while-owner-pauses');
+  const pausedAttempt = await preparing.promise;
+  await scopedCommand(f, 'goal.pause', { id: target.id, afterCurrent: true }, 'pause-optional-verification');
+  release.resolve();
+  assert.equal((await waitOptionalDecision(f.store, target.id)).status, 'not-applied');
+  await until(() => f.store.require('attempts', pausedAttempt).cleanupPending === false, undefined, taskWaitDiagnostics(f, bonus.id));
+  assert(!priced.calls.includes(bonus.id));
+  f.workspaces.prepare = original;
+  await scopedCommand(f, 'goal.resume', { id: target.id }, 'resume-optional-verification');
+
+  cap = undefined;
+  await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-unknown-cap');
+  assert.match((await waitOptionalDecision(f.store, target.id)).result, /上界无法核实/);
+  assert(!priced.calls.includes(bonus.id));
+  cap = '5';
+  const requested = await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-cheaper-cap');
+  const result = await waitOptionalDecision(f.store, target.id);
+  assert.equal(result.id, requested.costBudgetDeferralRequest.id);
+  assert.equal(result.status, 'not-applied');
+  assert.match(result.result, /足够余量/);
+  assert.deepEqual(checked, ['20', undefined, '5']);
+  assert.equal(state(f.store, bonus).costBudgetHold.bound.upperMicros, '5');
+  assert.equal(state(f.store, bonus).attempts, 0);
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  assert(!priced.calls.includes(bonus.id));
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'check-cheaper-cap')).costBudgetDeferralRequest.id, result.id);
+  await scopedCommand(f, 'task.resume', { id: bonus.id }, 'approve-normal-dispatch-after-verification');
+  await waiting(f, bonus, task => task.status === 'succeeded');
+  assert.equal(priced.calls.filter(id => id === bonus.id).length, 1);
+  assert.equal(priced.authorizations.find(row => row.taskId === bonus.id).upperMicros, '5');
+  assert.equal(budget(f.store, target.id).limitMicros, '35');
+});
+
+test('a host crash while preparing a quote expires the decision without a paid claim or a retry', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? optionalFixtureProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000035', { plan: true });
+  const priced = fixedCostAdapter(f, { quoteFor: task => task.title === 'bonus' ? '20' : '7',
+    amountFor: task => task.kind === 'work' ? '4' : '3' });
+  planEstimates(priced, { amounts: { core: '8', validate: '6', bonus: '1' } });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const bonus = planTask(f.store, plan, 'bonus'), validate = planTask(f.store, plan, 'validate');
+  f.command('company.resume');
+  await waiting(f, bonus, optionalHold);
+  await waiting(f, validate, task => task.status === 'succeeded');
+  await until(() => budget(f.store, target.id).reservedAttempts === 0, undefined, () => budget(f.store, target.id));
+  f.command('company.pause', { afterCurrent: true });
+  const args = optionalDecision(target, plan, state(f.store, bonus));
+  const request = (await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'queue-before-host-exit')).costBudgetDeferralRequest;
+  assert.equal(request.status, 'queued');
+  await f.engine.stop();
+  const runner = fileURLToPath(new URL('./fixtures/goal-cost-crash.mjs', import.meta.url));
+  const terminated = spawnSync(process.execPath, [runner, f.dataDir, target.id, 'optional-quote'], { encoding: 'utf8', timeout: 20000, windowsHide: true });
+  assert.equal(terminated.status, 73, terminated.error?.message ?? terminated.stderr);
+  const attempt = f.store.list('attempts').find(row => row.costDeferralRequestId === request.id);
+  assert.equal(attempt.status, 'preparing');
+  assert.equal(state(f.store, bonus).attempts, 0);
+  await f.start();
+  const result = await waitOptionalDecision(f.store, target.id);
+  assert.equal(result.status, 'not-applied');
+  assert.match(result.result, /宿主重启/);
+  assert.equal(f.store.require('attempts', attempt.id).cleanupPending, false);
+  assert(optionalHold(state(f.store, bonus)));
+  assert.deepEqual(priced.calls, [plan.taskId, planTask(f.store, plan, 'core').id, validate.id]);
+  assert.equal(budget(f.store, target.id).settledMicros, '11');
+  assert.equal(f.store.get('goalCostAttempts', attempt.id), null);
+  assert.equal((await scopedCommand(f, 'goal.cost_budget.defer_optional', args, 'queue-before-host-exit')).costBudgetDeferralRequest.id, request.id);
+  assert.equal(f.store.list('attempts').filter(row => row.costDeferralRequestId === request.id).length, 1);
 });
 
 test('an optional task that becomes a required dependency keeps its ordinary admission and owner pause', async t => {
