@@ -8,50 +8,50 @@ import { prunePlan } from '../scripts/prune-data.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { checkoutCopyComposition, copyContentHash } from '../src/runtime/copy-composition.js';
 import { run } from '../src/runtime/workspaces.js';
+import { compositionWaitDiagnostics, simulateFixtureCleanup, traceFixtureWorkspace } from './fixture-trace.js';
 import { fixture, taskWaitDiagnostics, until } from './helpers.js';
 
 const result = name => ({ outcome: 'completed', artifacts: [{ path: name }] });
 const file = (input, name) => path.join(input.task.workspace.path, name);
 const get = (f, task) => f.store.require('tasks', task.id);
 
-async function setup(t, handler, check = 'process.exitCode=0', finalReview = false) {
+async function setup(t, handler, check = 'process.exitCode=0', { finalReview = false, traceWait = false } = {}) {
   const f = await fixture(t, handler);
   f.command('project.save', { id: f.project.id, checks: [{ id: 'joint', command: process.execPath, args: ['-e', check] }] });
   const goal = f.command('goal.create', { title: 'Directory candidate', description: 'Combine a runnable source', acceptance: 'Pass the joint check',
     projectId: f.project.id, templateId: finalReview ? 'base' : f.template.id, plan: false, deliveryMode: 'copy-composite' });
-  f.workspaces.runIntegrationCommand = f.workspaces.runDeliveryCheck = async (command, args, cwd, options) => {
-    options.beforeStart?.(command);
-    const answer = await run(command, args, cwd, options);
-    if (options.cleanupReceipt) await writeFile(options.cleanupReceipt, JSON.stringify({ confirmed: true, exitCode: answer.code ?? 1 }));
-    return { ...answer, cleanupConfirmed: true };
-  };
-  return { f, goal, current: () => f.store.require('goals', goal.id) };
+  const trace = traceWait ? traceFixtureWorkspace(f.workspaces, { composition: true }) : null;
+  simulateFixtureCleanup(f.workspaces, trace);
+  return { f, goal, current: () => f.store.require('goals', goal.id),
+    diagnostics: trace && compositionWaitDiagnostics(f, goal.id, trace) };
 }
 
-const waitForTask = (f, task, status) => until(() => {
+const waitForTask = (f, task, status, diagnostics) => until(() => {
   const current = get(f, task);
   if (current.status === status) return true;
   if (['blocked', 'failed', 'cancelled'].includes(current.status)) {
+    if (diagnostics) assert.fail(JSON.stringify(diagnostics()));
     const attempt = f.store.list('attempts').findLast(row => row.taskId === task.id);
     assert.fail(`${current.title}: ${attempt?.summary ?? current.feedback ?? current.blocker?.reason ?? current.status}`);
   }
   return false;
-}, 45000, taskWaitDiagnostics(f, task.id));
+}, 45000, diagnostics ?? taskWaitDiagnostics(f, task.id));
 
-async function waitForComposition(f, goal, current) {
+async function waitForComposition(f, goal, current, diagnostics) {
   await until(() => {
     const attempt = f.store.list('attempts').find(row => row.goalId === goal.id && row.status === 'failed');
-    if (attempt) assert.fail(attempt.summary);
-    if (current().compositionRecheck?.status === 'failed') assert.fail(current().compositionRecheck.reason);
-    return current().status === 'succeeded';
-  }, 45000, () => ({ goal: current().status, recheck: current().compositionRecheck,
-    tasks: f.store.list('tasks').filter(row => row.goalId === goal.id).map(({ title, status, feedback }) => ({ title, status, feedback })) }));
+    if (attempt) assert.fail(diagnostics ? JSON.stringify(diagnostics()) : attempt.summary);
+    const state = current();
+    if (state.compositionRecheck?.status === 'failed') assert.fail(diagnostics ? JSON.stringify(diagnostics()) : state.compositionRecheck.reason);
+    return state.status === 'succeeded';
+  }, 45000, diagnostics ?? (() => ({ goal: current().status, recheck: current().compositionRecheck,
+    tasks: f.store.list('tasks').filter(row => row.goalId === goal.id).map(({ title, status, feedback }) => ({ title, status, feedback })) })));
 }
 
 test('directory dependencies, joint checks and final review use the same fixed contents after restart and backup', async t => {
   const binary = Buffer.from([0, 255, 128, 42]);
   let reviewerHash;
-  const { f, goal, current } = await setup(t, async input => {
+  const { f, goal, current, diagnostics } = await setup(t, async input => {
     if (input.task.kind === 'review') {
       reviewerHash = await copyContentHash(input.task.workspace.path);
       assert.equal(await readFile(file(input, 'app.cjs'), 'utf8'), "require('./new.cjs');\n");
@@ -74,15 +74,36 @@ test('directory dependencies, joint checks and final review use the same fixed c
     for (const absent of ['obsolete.txt', 'later.txt', '.env']) await assert.rejects(readFile(file(input, absent)), { code: 'ENOENT' });
     await writeFile(file(input, 'app.cjs'), "require('./new.cjs');\n");
     return result('app.cjs');
-  }, "const fs=require('node:fs'); if(fs.existsSync('app.cjs') && (require('./new.cjs')!==42 || fs.readFileSync('asset.bin')[1]!==255 || fs.existsSync('obsolete.txt') || !fs.statSync('expected-empty').isDirectory()))process.exit(7)", true);
+  }, "const fs=require('node:fs'); if(fs.existsSync('app.cjs') && (require('./new.cjs')!==42 || fs.readFileSync('asset.bin')[1]!==255 || fs.existsSync('obsolete.txt') || !fs.statSync('expected-empty').isDirectory()))process.exit(7)", { finalReview: true, traceWait: true });
   await writeFile(path.join(f.source, 'stable.txt'), 'fixed source');
   await writeFile(path.join(f.source, 'obsolete.txt'), 'original source');
   await writeFile(path.join(f.source, '.env'), 'private fixture');
   const a = f.task({ title: 'A', goalId: goal.id });
   const b = f.task({ title: 'B', goalId: goal.id, dependencies: [a.id] });
   f.command('task.pause', { id: b.id });
-  await f.start();
-  await waitForTask(f, a, 'succeeded');
+  const prepareCopy = f.workspaces.prepareCopyCompositionTask.bind(f.workspaces);
+  let observedPreparation = false;
+  f.workspaces.prepareCopyCompositionTask = (task, ...args) => {
+    if (task.id === a.id) {
+      const observed = diagnostics();
+      assert(observed.trace.inFlight.some(span => span.operation === 'prepare' && span.subject === a.id &&
+        Number.isSafeInteger(span.elapsedMs)));
+      assert(observed.attempts.some(attempt => attempt.taskId === a.id && attempt.status === 'preparing'));
+      assert.equal(f.adapter.calls.length, 0);
+      observedPreparation = true;
+    }
+    return prepareCopy(task, ...args);
+  };
+  try {
+    await f.start();
+    await waitForTask(f, a, 'succeeded', diagnostics);
+    assert(observedPreparation);
+  } finally {
+    f.workspaces.prepareCopyCompositionTask = prepareCopy;
+  }
+  const afterPreparation = diagnostics().trace.recent;
+  assert(afterPreparation.some(span => span.operation === 'prepare-copy-composition' && span.subject === a.id && span.outcome === 'returned'));
+  assert(afterPreparation.some(span => span.operation === 'project-check' && span.exitCode === 0 && span.cleanupConfirmed));
   const aDelivery = get(f, a).integration.delivery;
   const baseline = current().compositionBase.snapshot.sha256;
   await f.engine.stop();
@@ -92,7 +113,7 @@ test('directory dependencies, joint checks and final review use the same fixed c
   assert.equal(get(f, b).workspace, undefined);
   await f.start();
   f.command('task.resume', { id: b.id });
-  await waitForComposition(f, goal, current);
+  await waitForComposition(f, goal, current, diagnostics);
   const candidate = current().composition;
   assert.equal(get(f, b).workspace.path, unattached.path);
   assert.equal(candidate.baseHash, baseline);
@@ -136,7 +157,7 @@ test('directory dependencies, joint checks and final review use the same fixed c
 
 test('a directory parent consumes the child structural changes without losing its draft', async t => {
   let earlier;
-  const { f, goal, current } = await setup(t, async input => {
+  const { f, goal, current, diagnostics } = await setup(t, async input => {
     if (input.task.title === 'Child') {
       await unlink(file(input, 'module'));
       await mkdir(file(input, 'module'));
@@ -154,11 +175,11 @@ test('a directory parent consumes the child structural changes without losing it
     assert.equal(await readFile(file(input, 'module/file.cjs'), 'utf8'), 'child content');
     assert.deepEqual(await readdir(file(input, 'module/empty')), []);
     return result('draft.txt');
-  });
+  }, undefined, { traceWait: true });
   await writeFile(path.join(f.source, 'module'), 'base file');
   f.task({ title: 'Parent', goalId: goal.id });
   await f.start();
-  await waitForComposition(f, goal, current);
+  await waitForComposition(f, goal, current, diagnostics);
   const checkout = path.join(f.root, 'parent-candidate');
   await checkoutCopyComposition(current().composition.snapshot, checkout, f.dataDir);
   assert.equal(await readFile(path.join(checkout, 'draft.txt'), 'utf8'), 'parent draft');

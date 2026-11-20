@@ -9,6 +9,7 @@ import { storeGitBundle } from '../src/runtime/git-delivery.js';
 import { orderedCompositionTasks } from '../src/core/composite-delivery.js';
 import { executionOccupancy } from '../src/core/execution-capacity.js';
 import { run } from '../src/runtime/workspaces.js';
+import { compositionWaitDiagnostics, simulateFixtureCleanup, traceFixtureWorkspace } from './fixture-trace.js';
 
 const fromWorkspace = (input, name) => path.join(input.task.workspace.path, name);
 const taskState = (f, task) => f.store.require('tasks', task.id);
@@ -20,18 +21,7 @@ async function git(cwd, ...args) {
   return result.stdout.trim();
 }
 
-function simulateCleanup(f) {
-  const invoke = async (command, args, cwd, options) => {
-    options.beforeStart?.(command);
-    const result = await run(command, args, cwd, options);
-    if (options.cleanupReceipt) await writeFile(options.cleanupReceipt, JSON.stringify({ confirmed: true, exitCode: result.code ?? 1 }));
-    return { ...result, cleanupConfirmed: true };
-  };
-  f.workspaces.runIntegrationCommand = invoke;
-  f.workspaces.runDeliveryCheck = invoke;
-}
-
-async function setup(t, handler, check, { finalReview = false } = {}) {
+async function setup(t, handler, check, { finalReview = false, traceWait = false } = {}) {
   const f = await fixture(t, handler);
   await writeFile(path.join(f.source, 'obsolete.txt'), 'remove this from the candidate');
   await writeFile(path.join(f.source, 'shared.txt'), 'base');
@@ -40,8 +30,9 @@ async function setup(t, handler, check, { finalReview = false } = {}) {
     checks: [{ id: 'candidate-test', command: process.execPath, args: ['-e', check] }] });
   const goal = f.command('goal.create', { projectId: f.project.id, templateId: finalReview ? 'base' : f.template.id, plan: false,
     title: 'Runnable Git candidate', description: 'Combine selected task versions', acceptance: 'Candidate passes the project check', deliveryMode: 'git-composite' });
-  simulateCleanup(f);
-  return { f, base, goal };
+  const trace = traceWait ? traceFixtureWorkspace(f.workspaces, { composition: true }) : null;
+  simulateFixtureCleanup(f.workspaces, trace);
+  return { f, base, goal, diagnostics: trace && compositionWaitDiagnostics(f, goal.id, trace) };
 }
 
 test('a dependent task and final reviewer receive the same selected candidate after the source advances', async t => {
@@ -157,33 +148,27 @@ test('a dependent task and final reviewer receive the same selected candidate af
 });
 
 test('a combined check failure leaves the goal and its final review waiting', async t => {
-  const { f, goal } = await setup(t, async input => {
+  const { f, goal, diagnostics } = await setup(t, async input => {
     if (input.task.kind !== 'work') return { outcome: 'blocked', kind: 'human', reason: 'Fixture waits for the owner' };
     const filename = input.task.title + '.txt';
     await writeFile(fromWorkspace(input, filename), input.task.title);
     return { outcome: 'completed', artifacts: [{ path: filename }] };
-  }, "const fs=require('node:fs'); if(fs.existsSync('left.txt') && fs.existsSync('right.txt')) process.exit(9)", { finalReview: true });
+  }, "const fs=require('node:fs'); if(fs.existsSync('left.txt') && fs.existsSync('right.txt')) process.exit(9)", { finalReview: true, traceWait: true });
   const left = f.task({ title: 'left', goalId: goal.id });
   const right = f.task({ title: 'right', goalId: goal.id });
   const integrations = () => f.store.list('integrations').filter(record => record.goalId === goal.id);
-  const prepare = f.workspaces.prepare.bind(f.workspaces);
-  const preparationErrors = new Map();
-  f.workspaces.prepare = async (task, attempt) => {
-    try { return await prepare(task, attempt); }
-    catch (error) { preparationErrors.set(task.id, error); throw error; }
-  };
   await f.start();
   const failed = await until(() => {
-    const failedAttempt = f.store.list('attempts').find(attempt => [left.id, right.id].includes(attempt.taskId) && attempt.status === 'failed');
-    if (failedAttempt) assert.fail(`${taskState(f, { id: failedAttempt.taskId }).title}: ${preparationErrors.get(failedAttempt.taskId)?.stack ?? failedAttempt.summary}`);
+    const failedAttempt = f.store.list('attempts').some(attempt => [left.id, right.id].includes(attempt.taskId) && attempt.status === 'failed');
+    if (failedAttempt) assert.fail(JSON.stringify(diagnostics()));
     const failure = integrations().find(record => record.phase === 'failed');
-    if (failure) assert(failure.composition, failure.reason);
+    if (failure && !failure.composition) assert.fail(JSON.stringify(diagnostics()));
     return failure;
-  }, 45000, () => ({
-    goalStatus: goalState(f, goal).status,
-    tasks: [left, right].map(task => ({ ...taskWaitDiagnostics(f, task.id)(), feedback: taskState(f, task).feedback })),
-    integrations: integrations().map(({ taskId, phase, reason }) => ({ taskId, phase, reason })),
-  }));
+  }, 45000, diagnostics);
+  const observed = diagnostics();
+  assert(observed.trace.recent.some(entry => entry.operation === 'project-check' && entry.exitCode === 9 &&
+    entry.cleanupConfirmed && Number.isSafeInteger(entry.commandMs)));
+  assert(observed.integrations.some(record => record.phase === 'failed'));
   assert.equal(failed.composition.passed, false);
   assert.equal(failed.composition.checks[0].code, 9);
   assert.equal(goalState(f, goal).status, 'active');
