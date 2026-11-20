@@ -42,6 +42,8 @@ export function promptFor(company, task, attempt, options = {}) {
     return { path: a.path, hash: a.hash, content: readFileSync(a.blob, 'utf8'), included: true };
   });
   const managerExtras = agent.role === "manager" ? buildManagerExtras(company, goal, task) : {};
+  const deliveryReturn = goal.deliveryApproval?.latestReturnId && ['work', 'repair', 'coordination'].includes(task.kind)
+    ? company.store.get('deliveryApprovals', goal.deliveryApproval.latestReturnId) : null;
   const contract = {
     attemptId: attempt.id, goal: { id: goal.id, title: goal.title, description: goal.description, acceptance: goal.acceptance,
       contractVersion: contractVersion(goal), template: template ? { id: template.id, name: template.name, phases: template.phases } : null },
@@ -54,6 +56,8 @@ export function promptFor(company, task, attempt, options = {}) {
     ...(agent.role === 'manager' ? { managementResults: company.store.list('actionBatches').filter(b => b.taskId === task.id && b.generation === task.generation).map(b => ({ actionBatchId: b.batchId, results: b.results })), managementTurnsRemaining: 4 - (task.managementGeneration === task.generation ? task.managementTurns ?? 0 : 0) } : {}),
     ...(task.kind === 'review' ? { reviewWorkspacePolicy: 'This is a separate verification copy. You may create temporary test files and run checks here. Review the unchanged delivered source and the host-owned check evidence. Never modify the author workspace or original artifact blobs. A reviewer environment failure is a technical blocker, not evidence of a product defect.' } : {}),
     inputArtifacts: inputs, previousFeedback: task.feedback ?? null, userAnswer: task.lastAnswer ?? null,
+    ...(deliveryReturn?.action === 'revise' ? { ownerDeliveryRevision: { version: deliveryReturn.subject.selection.version,
+      reason: deliveryReturn.reason, instructions: 'Use this owner feedback in the authorized work. A revised candidate still requires project checks and any required review and owner approval.' } } : {}),
     ...(isApprovalPlanner(goal, task) ? { planApprovalInstructions: 'Submit a structured plan proposal for the owner. Include the proposed scope, exclusions, rationale or trade-offs, assignments and task dependencies. Implementation and repair cannot start before the owner approves this proposal. Submit the tasks in the plan outcome. Do not try to create or retry them via management actions while preparing the proposal.' } : {}),
     ...(task.workspace?.mode === 'git' && task.workspace?.compositionInput?.inputs?.length ? { selectedGitInputs: {
       baseCommit: task.workspace.compositionBase, version: task.workspace.compositionInput.version,

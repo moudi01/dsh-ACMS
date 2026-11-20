@@ -9,9 +9,10 @@ import { executionOccupancy } from '../core/execution-capacity.js';
 import { readCommandCleanup } from './host-command.js';
 import { goalStopped } from '../core/goal-control.js';
 import { planBlocksWork } from '../core/plan-approval.js';
-import { candidateMergeMatches } from '../core/candidate-confirmation.js';
+import { candidateMergeMatches, requiresDeliveryApproval } from '../core/candidate-confirmation.js';
 import { applyConfirmedCandidate, assertCandidateBranchWrite, candidateGitEnvironment } from './candidate-merge.js';
 import { acquireBareDeliveryFence, assertBareTargetIdentity, bareFenceRef, releaseBareDeliveryFence } from './bare-delivery-target.js';
+import { assertSourceDeliveryTarget } from './source-delivery-target.js';
 
 function contract(engine, projectId) {
   const project = engine.store.require('projects', projectId);
@@ -159,6 +160,7 @@ async function clearCommand(engine, record, field, file) {
 
 async function inspect(engine, record) {
   if (record.bareFence) assertBareTargetIdentity(record.targetRoot, record.targetIdentity);
+  else if (record.candidateMergeId && record.targetGitPaths) assertSourceDeliveryTarget(record.targetRoot, record.targetIdentity, record.targetGitPaths);
   return engine.workspaces.inspectIntegration(record, async (command, args, cwd) => {
     const inspectionCommandId = id('command');
     const cleanupReceipt = receipt(engine, inspectionCommandId);
@@ -298,7 +300,8 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
       artifactHash: task.artifactHash, artifactIds: task.artifactIds, goalContractVersion: contractVersion(goal),
       contract: contract(engine, task.projectId), phase: 'preparing', ...(compositionRecheckId ? { compositionRecheckId } : {}),
       ...(candidateMergeId ? { candidateMergeId, candidateVersion: request.selection.version, confirmedBy: request.confirmedBy,
-        targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead } : {}),
+        targetRef: request.targetRef, basisRef: request.basisRef, basisHead: request.basisHead,
+        ...(request.approvalFingerprint ? { deliveryApprovalFingerprint: request.approvalFingerprint } : {}) } : {}),
     });
     if (candidateMergeId) engine.store.put('goals', { ...currentGoal,
       candidateMerge: { ...request, status: 'preparing', integrationId: saved.id } });
@@ -381,6 +384,8 @@ export async function executeIntegration(engine, taskId, compositionRecheckId = 
         acquireBareDeliveryFence(engine.store.require('integrations', record.id));
       }),
       apply: async (checks, cwd, candidate, ownerOptions) => {
+        assert(ownerOptions || !requiresDeliveryApproval(engine.store.require('goals', record.goalId)),
+          'DELIVERY_APPROVAL_REQUIRED', '此目标的源 Git 写入只能由所有者批准指定候选后执行。');
         const bare = ownerOptions?.targetMode === 'bare';
         const args = ownerOptions ? [...(bare ? ['--git-dir=.', '-c', 'core.bare=true', '-c', 'user.name=ACMS', '-c', 'user.email=acms@localhost'] : []),
           '-c', 'core.hooksPath=' + ownerOptions.hooks, 'update-ref', '--stdin', ...(bare ? ['--create-reflog'] : []), '-m', ownerOptions.message]

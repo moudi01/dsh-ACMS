@@ -17,6 +17,7 @@ import { applyBackup, planBackup } from '../scripts/backup.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { buildHost } from '../scripts/host-bundle.mjs';
 import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
+import { SYSTEM } from '../src/core/util.js';
 
 const basisRef = 'refs/heads/delivery';
 const binary = Buffer.from([0, 8, 255, 128]);
@@ -40,6 +41,7 @@ function ownerRoutes(runtime, registered = createRoutes(runtime)) {
   }));
   return {
     preview: input => post('composition/merge-preview', input),
+    command: (name, args) => post('command', { name, args, requestId: randomUUID() }),
     saveProject: args => post('command', { name: 'project.save', args, requestId: randomUUID() }),
     decision: (action, args, requestId = randomUUID()) => post('command', { name: `goal.candidate_merge.${action}`, args, requestId }),
   };
@@ -58,7 +60,8 @@ async function failure(response, code, status = 409) {
   return body.error;
 }
 
-async function setup(t, { review, autoMerge = false } = {}) {
+async function setup(t, { review, autoMerge = false, deliveryApproval = false, linked = false } = {}) {
+  let revisionFeedback;
   const f = await fixture(t, async input => {
     const cwd = input.task.workspace.path;
     if (input.task.kind === 'review') {
@@ -67,8 +70,10 @@ async function setup(t, { review, autoMerge = false } = {}) {
       await review.release.promise;
       return { outcome: 'reviewed', decision: 'approve', summary: 'Reviewed exact binary candidate' };
     }
-    await fs.unlink(path.join(cwd, 'obsolete.txt'));
-    await fs.writeFile(path.join(cwd, 'README.md'), '# Checked update\n');
+    if (deliveryApproval) await fs.rm(path.join(cwd, 'obsolete.txt'), { force: true });
+    else await fs.unlink(path.join(cwd, 'obsolete.txt'));
+    if (input.task.generation > 1) revisionFeedback = input.prompt;
+    await fs.writeFile(path.join(cwd, 'README.md'), input.task.generation > 1 ? '# Revised and checked\n' : '# Checked update\n');
     await fs.writeFile(path.join(cwd, 'raw.bin'), binary);
     return { outcome: 'completed', artifacts: [{ path: 'raw.bin' }] };
   });
@@ -77,10 +82,13 @@ async function setup(t, { review, autoMerge = false } = {}) {
     if (fs.existsSync('obsolete.txt') || !fs.readFileSync('raw.bin').equals(Buffer.from([0,8,255,128]))) process.exit(4);`] }];
   const base = (await gitProject(f, checks)).trim();
   await git(f.source, 'branch', 'delivery');
-  f.command('project.save', { id: f.project.id, autoMerge });
-  const goal = f.command('goal.create', { projectId: f.project.id, templateId: review ? 'base' : f.template.id, plan: false,
+  const source = linked ? path.join(f.root, 'linked-project') : f.source;
+  if (linked) await git(f.source, 'worktree', 'add', source, 'delivery');
+  const project = linked ? f.command('project.save', { name: 'Linked delivery project', repoRoot: source, mode: 'git', checks, autoMerge, deliveryApproval })
+    : f.command('project.save', { id: f.project.id, autoMerge, ...(deliveryApproval ? { deliveryApproval } : {}) });
+  const goal = f.command('goal.create', { projectId: project.id, templateId: review ? 'base' : f.template.id, plan: false,
     title: 'Owner acceptance', description: 'Assemble verified Git changes', acceptance: 'Merge the exact accepted source tree',
-    ...(autoMerge ? {} : { deliveryMode: 'git-composite' }) });
+    ...(autoMerge || deliveryApproval ? {} : { deliveryMode: 'git-composite' }) });
   const task = f.task({ goalId: goal.id });
   let beforeApply, afterGuard, afterApply;
   let applyCalls = 0;
@@ -121,7 +129,8 @@ async function setup(t, { review, autoMerge = false } = {}) {
     if (request?.status === status) return request;
     assert(request?.status !== 'failed' && request?.status !== 'cancelled', JSON.stringify(diagnostics()));
   }, 75000, diagnostics);
-  return { f, goal, task, base, current, snapshot, diagnostics, checkWork, routes, preview, confirmArgs, ready, waitMerge,
+  return { f, project, goal, task, base, source, current, snapshot, diagnostics, checkWork, routes, preview, confirmArgs, ready, waitMerge,
+    revisionFeedback: () => revisionFeedback,
     applyCalls: () => applyCalls, beforeApply: hook => { beforeApply = hook; }, afterGuard: hook => { afterGuard = hook; }, afterApply: hook => { afterApply = hook; } };
 }
 
@@ -144,6 +153,191 @@ async function setupBare(t, options) {
 async function absentFences(target) {
   assert(!(await fs.readdir(target)).some(name => /ACMS_FENCE|^(?:worktrees|index\.lock)$/.test(name)));
 }
+
+const approvalArgs = (scenario, request, reason) => ({ ...scenario.confirmArgs(request), approvalFingerprint: request.approvalFingerprint, reason });
+
+test('required delivery approval audits the exact new branch and survives restart without writing early', async t => {
+  const s = await setup(t, { deliveryApproval: true });
+  const { f, base, routes, preview } = s;
+  assert.deepEqual(s.goal.deliveryApproval, { project: true, template: false });
+  assert.equal(s.goal.deliveryMode, 'git-composite');
+  assert.equal(s.goal.planApproval, undefined);
+  await f.start();
+  await s.ready();
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  const rejected = await success(await preview());
+  assert.equal(rejected.selection.reviewId, null);
+  await failure(await routes.decision('confirm', s.confirmArgs(rejected)), 'DELIVERY_APPROVAL_REQUIRED');
+  await failure(await routes.decision('approve', approvalArgs(s, rejected, '')), 'INVALID_INPUT', 400);
+  await success(await routes.decision('reject', approvalArgs(s, rejected, 'Use a different delivery branch')));
+  await absent(f.source, rejected.targetRef);
+
+  const pending = await success(await preview());
+  assert.notEqual(pending.id, rejected.id);
+  assert(pending.targetIdentity && pending.targetGitPaths);
+  const accepted = approvalArgs(s, pending, 'Reviewed the candidate tree and target');
+  await failure(await routes.decision('approve', { ...accepted, approvalFingerprint: rejected.approvalFingerprint }), 'STALE_CANDIDATE_CONFIRMATION');
+  assert.throws(() => f.command('goal.candidate_merge.approve', accepted, SYSTEM), { code: 'OWNER_REQUIRED' });
+  await success(await routes.command('company.pause', {}));
+  const approvalRequestId = randomUUID();
+  const [firstReceipt, concurrent] = await Promise.all([routes.decision('approve', accepted, approvalRequestId),
+    routes.decision('approve', accepted)].map(async response => success(await response)));
+  assert.equal(firstReceipt.status, 'queued');
+  assert.deepEqual(concurrent, firstReceipt);
+  await absent(f.source, pending.targetRef);
+  await f.engine.stop();
+  await f.engine.start();
+  assert.equal(s.current().candidateMerge.status, 'queued');
+  await absent(f.source, pending.targetRef);
+  await success(await routes.command('company.resume', {}));
+  const applied = await s.waitMerge('applied');
+  assert.equal(await git(f.source, 'rev-parse', `${applied.targetRef}^{tree}`), pending.selection.tree);
+  assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
+  const laterPreview = await success(await preview());
+  assert.notEqual(laterPreview.id, pending.id);
+  assert.deepEqual(await success(await routes.decision('approve', accepted, approvalRequestId)), firstReceipt);
+  await failure(await routes.decision('approve', { ...accepted, targetRef: laterPreview.targetRef }, approvalRequestId), 'IDEMPOTENCY_CONFLICT');
+  await failure(await routes.decision('approve', { ...accepted, targetRef: laterPreview.targetRef }), 'STALE_CANDIDATE_CONFIRMATION');
+  assert.throws(() => f.command('goal.candidate_merge.approve', accepted, SYSTEM), { code: 'OWNER_REQUIRED' });
+  assert.equal(s.current().candidateMerge.id, laterPreview.id);
+  assert.equal(s.current().candidateMerge.status, 'previewed');
+  await absent(f.source, laterPreview.targetRef);
+  assert.equal(s.applyCalls(), 1);
+  const [prior, approval] = f.store.list('deliveryApprovals');
+  assert.deepEqual([prior.action, prior.reason], ['reject', 'Use a different delivery branch']);
+  assert.deepEqual([approval.action, approval.fingerprint, approval.reason, approval.by.kind], ['approve', pending.approvalFingerprint, accepted.reason, 'owner']);
+  assert.deepEqual(approval.subject.selection, pending.selection);
+  assert.equal(approval.subject.targetIdentity, pending.targetIdentity);
+  assert.equal(approval.subject.authorization, pending.policy);
+  assert.equal(approval.subject.basisHead, base);
+  const decisions = f.store.pageScoped({ goalIds: [s.goal.id], after: 0, limit: 200 }).entries.filter(event => event.type === 'goal.delivery_approval.decided');
+  assert.equal(decisions.length, 2);
+  assert.equal(decisions.at(-1).decision.reason, accepted.reason);
+});
+
+test('required delivery approval supports an authorized linked Git worktree and its common repository', async t => {
+  const s = await setup(t, { deliveryApproval: true, linked: true });
+  await s.f.start();
+  await s.ready();
+  const pending = await success(await s.preview());
+  assert.notEqual(pending.targetGitPaths.gitDir, pending.targetGitPaths.commonDir);
+  await success(await s.routes.decision('approve', approvalArgs(s, pending, 'Reviewed the linked project target')));
+  await s.waitMerge('applied');
+  assert.equal(await git(s.f.source, 'rev-parse', `${pending.targetRef}^{tree}`), pending.selection.tree);
+  assert.equal(await git(s.source, 'rev-parse', 'HEAD'), s.base);
+  assert.equal(await git(s.f.source, 'rev-parse', 'HEAD'), s.base);
+  assert.equal(await sourceStatus(s.source), '');
+});
+
+test('required delivery approval refuses a replaced linked Git marker after the final application guard', async t => {
+  const s = await setup(t, { deliveryApproval: true, linked: true });
+  await s.f.start();
+  await s.ready();
+  const pending = await success(await s.preview());
+  const marker = path.join(s.source, '.git');
+  const held = path.join(s.source, '.git-original-marker');
+  const bytes = await fs.readFile(marker);
+  s.afterGuard(async () => {
+    await fs.rename(marker, held);
+    await fs.writeFile(marker, bytes, { flag: 'wx' });
+  });
+  s.afterApply(async result => {
+    try {
+      assert.notEqual(result.code, 0);
+      assert.match(result.stderr, /Git 目录身份已变化/);
+      await absent(s.source, pending.targetRef);
+    } finally { await fs.rename(held, marker); }
+  });
+  await success(await s.routes.decision('approve', approvalArgs(s, pending, 'Approved only the original Git identity')));
+  assert.match((await s.waitMerge('failed')).reason, /Git 目录身份已变化/);
+  await absent(s.f.source, pending.targetRef);
+  assert.equal(await git(s.source, 'rev-parse', 'HEAD'), s.base);
+  assert.deepEqual(await fs.readFile(marker), bytes);
+});
+
+test('required delivery approval for a bare branch waits for AI review and rejects a changed HEAD or authorization', async t => {
+  const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
+  const s = await setupBare(t, { review, deliveryApproval: true });
+  const originalRefs = await git(s.target, 'show-ref');
+  try {
+    await s.f.start();
+    let entered = false;
+    review.entered.promise.then(() => { entered = true; });
+    await until(() => { s.checkWork(); return entered; }, 75000, s.diagnostics);
+    await failure(await s.previewBare(), 'CANDIDATE_NOT_READY');
+    assert.equal(await git(s.target, 'show-ref'), originalRefs);
+    assert.equal(s.f.store.list('deliveryApprovals').length, 0);
+  } finally { review.release.resolve(); }
+  const reviewed = await s.ready();
+  const old = await success(await s.previewBare());
+  assert.equal(old.selection.reviewId, reviewed.reviewId);
+  const differentHead = await git(s.target, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', 'commit-tree', old.basisTree, '-p', s.base, '-m', 'Advance delivery HEAD');
+  await git(s.target, 'update-ref', basisRef, differentHead, s.base);
+  await failure(await s.routes.decision('approve', approvalArgs(s, old, 'Approve previous HEAD')), 'TARGET_CHANGED');
+  const revokedTarget = await success(await s.previewBare());
+  await success(await s.routes.saveProject({ id: s.project.id, deliveryRepoRoot: null }));
+  await failure(await s.routes.decision('approve', approvalArgs(s, revokedTarget, 'Approve revoked repository')), 'STALE_CANDIDATE_CONFIRMATION');
+  await success(await s.routes.saveProject({ id: s.project.id, deliveryRepoRoot: s.target }));
+  const current = await success(await s.previewBare());
+  await success(await s.routes.decision('approve', approvalArgs(s, current, 'Approve current verified HEAD')));
+  assert.equal(s.f.store.list('deliveryApprovals').length, 1);
+  const merged = await s.waitMerge('applied');
+  assert.equal(await git(s.target, 'rev-parse', `${basisRef}^`), differentHead);
+  assert.equal(await git(s.target, 'rev-parse', `${basisRef}^{tree}`), merged.selection.tree);
+  assert.equal(await git(s.f.source, 'rev-parse', 'HEAD'), s.base);
+});
+
+test('required delivery approval returns a candidate across targets and rechecks, then permits an owner-authorized revision', async t => {
+  const s = await setupBare(t, { deliveryApproval: true });
+  const { f } = s;
+  await f.start();
+  await s.ready();
+  const old = await success(await s.preview());
+  const reason = 'Update the README before release';
+  const returned = await success(await s.routes.decision('revise', approvalArgs(s, old, reason)));
+  assert.equal(returned.status, 'returned');
+  assert.equal(f.adapter.calls.filter(call => call.task.kind === 'work').length, 1);
+  await absent(f.source, old.targetRef);
+  await failure(await s.routes.decision('approve', approvalArgs(s, old, 'Bypass the revision')), 'CONFLICT');
+  await failure(await s.previewBare(), 'DELIVERY_REVISION_REQUIRED');
+  await success(await s.routes.command('goal.composition.recheck', { id: s.goal.id }));
+  assert.equal((await s.ready()).version, old.selection.version);
+  await failure(await s.preview(), 'DELIVERY_REVISION_REQUIRED');
+  await failure(await s.previewBare(), 'DELIVERY_REVISION_REQUIRED');
+  const worker = await success(await s.routes.command('agent.save', { name: 'Reviser', role: 'worker', provider: 'simulation' }));
+  await success(await s.routes.command('task.edit', { id: s.task.id, patch: { description: 'Update the documentation', agentId: worker.id } }));
+  assert.notEqual((await s.ready()).version, old.selection.version);
+  assert.match(JSON.stringify(s.revisionFeedback()), new RegExp(reason));
+  const revised = await success(await s.previewBare());
+  await success(await s.routes.decision('approve', approvalArgs(s, revised, 'Verified the revised README')));
+  await s.waitMerge('applied');
+  assert.equal(await git(s.target, 'show', `${basisRef}:README.md`), '# Revised and checked');
+  assert.equal(f.store.get('deliveryApprovals', old.id).reason, reason);
+});
+
+test('delivery approval is independently snapshotted from a project or published template', async t => {
+  const s = await setup(t);
+  const { f, routes } = s;
+  assert.equal(s.goal.deliveryApproval, undefined);
+  const template = await success(await routes.command('workflow.publish', { id: f.template.id, deliveryApproval: true }));
+  const args = { projectId: s.project.id, title: 'Template approves delivery', description: 'Compile checked inputs', acceptance: 'Pass project tests', templateId: template.id };
+  const gated = await success(await routes.command('goal.create', args));
+  assert.deepEqual(gated.deliveryApproval, { project: false, template: true });
+  assert.equal(gated.planApproval, undefined);
+  await failure(await routes.saveProject({ id: s.project.id, autoMerge: true }), 'DELIVERY_APPROVAL_PROJECT');
+  await failure(await routes.saveProject({ id: s.project.id, checks: [] }), 'DELIVERY_APPROVAL_PROJECT');
+  const copyRoot = path.join(f.root, 'copy-project');
+  await fs.mkdir(copyRoot);
+  const copy = await success(await routes.saveProject({ name: 'Copy project', repoRoot: copyRoot, mode: 'copy' }));
+  await failure(await routes.saveProject({ id: copy.id, deliveryApproval: true }), 'DELIVERY_APPROVAL_PROJECT');
+  await failure(await routes.command('goal.create', { ...args, projectId: copy.id }), 'DELIVERY_APPROVAL_PROJECT');
+  assert.equal(f.store.require('goals', s.goal.id).deliveryApproval, undefined);
+  await success(await routes.command('workflow.publish', { id: template.id, deliveryApproval: false, planApproval: true }));
+  const planOnly = await success(await routes.command('goal.create', args));
+  assert.equal(planOnly.deliveryApproval, undefined);
+  assert.equal(planOnly.planApproval.template, true);
+  assert.deepEqual(f.store.require('goals', gated.id).deliveryApproval, gated.deliveryApproval);
+});
 
 test('owner approves and advances only the selected branch in an isolated bare delivery repository', async t => {
   const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
