@@ -60,7 +60,9 @@
 
 所有者宿主也可读 `GET /api/acms/usage?goalId=<目标 ID>` 或 `GET /api/acms/usage?taskId=<任务 ID>`。默认每页 30 条，可用 `limit` 请求 1 至 100 条，下一页将返回的 `nextBefore` 传给 `before`。汇总按该页受支持的字段分别计算，未知字段的小计为 `null`，明确为零的小计为字符串 `"0"`。
 
-完整范围使用 `GET /api/acms/usage/summary` 并指定相同的 `goalId` 或 `taskId`。顶层覆盖和小计始终包含该范围的全部保留记录。分组可设为 `groupBy=route`（默认）或 `groupBy=date`，后者返回 `dateBasis=started-at-utc`。每页默认 20 组，`limit` 上限 100，下一页把 `nextAfter` 原样传给 `after`。每次查询的完整小计和分组来自同一读取快照。
+完整范围使用 `GET /api/acms/usage/summary` 并指定相同的 `goalId` 或 `taskId`。顶层覆盖和小计始终包含该范围的全部保留记录。分组可设为 `groupBy=route`（默认）或 `groupBy=date`，后者返回 `dateBasis=started-at-utc`。每页默认 20 组，`limit` 上限 100，下一页把 `nextAfter` 原样传给 `after`。路由按固定长度的指纹排序，日期按 UTC 从新到旧排序，未知组排在最后。
+
+提供 `attemptBefore` 时，汇总还返回同一读取快照中的 `attemptPage`，含最多 30 条逐次记录，字段和逐次接口一致。最新页传入 `9007199254740991`，更早一页传入返回的 `attemptPage.nextBefore`。目标面板的主动查询同时更新完整小计、分组和逐次页。
 
 ### 批准计划后派工
 

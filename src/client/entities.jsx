@@ -203,39 +203,33 @@ function UsageTotals({ report, coverageLabel, title }) {
 }
 
 function GoalAttemptUsage({ goalId, tasks }) {
-  const [report, setReport] = useState(null);
-  const [summary, setSummary] = useState(null);
+  const [result, setResult] = useState(null);
   const [taskId, setTaskId] = useState('');
   const [groupBy, setGroupBy] = useState('route');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const scope = taskId ? { taskId } : { goalId };
-  const load = async action => {
+  const load = async (by = groupBy, cursors = {}) => {
     setLoading(true); setError('');
-    try { await action(); }
-    catch (e) { setError(e.message); }
+    try { setResult({ summary: await api.usageSummary(scope, by, cursors), cursors }); }
+    catch (e) { setResult(null); setError(e.message); }
     finally { setLoading(false); }
   };
-  const refresh = () => load(async () => {
-    const [aggregate, attempts] = await Promise.all([api.usageSummary(scope, groupBy), api.attemptUsage(scope)]);
-    setSummary(aggregate);
-    setReport(attempts);
-  });
-  const loadSummary = (by, after) => load(async () => setSummary(await api.usageSummary(scope, by, after)));
+  const summary = result?.summary, report = summary?.attemptPage;
   const scopeLabel = taskId ? '任务' : '目标';
   return <section className="acms-review-state" aria-label="模型执行用量">
     <h3>模型执行用量</h3>
     <p className="acms-sectionnote">此处仅统计 ACMS 任务执行报告的 token。服务账单和订阅额度有独立口径。</p>
     <Field label="用量范围"><select value={taskId} disabled={loading} onChange={event => {
-      setTaskId(event.target.value); setReport(null); setSummary(null); setError('');
+      setTaskId(event.target.value); setResult(null); setError('');
     }}><option value="">整个目标</option>{tasks.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}</select></Field>
     <div className="acms-actions wrap">
-      <ActionButton reason={loading ? '正在读取…' : ''} onClick={refresh}>{report ? '查看最新用量' : '查看执行用量'}</ActionButton>
+      <ActionButton reason={loading ? '正在读取…' : ''} onClick={() => load()}>{result ? '查看最新用量' : '查看执行用量'}</ActionButton>
     </div>
     {error && <p role="alert">{error}</p>}
-    {(summary || report) && <Field label="用量分组"><select value={groupBy} disabled={loading} onChange={event => {
+    {result && <Field label="用量分组"><select value={groupBy} disabled={loading} onChange={event => {
       const by = event.target.value;
-      setGroupBy(by); setSummary(null); loadSummary(by);
+      setGroupBy(by); load(by, { attemptBefore: result.cursors.attemptBefore });
     }}><option value="route">路由与模型</option><option value="date">UTC 日期</option></select></Field>}
     {summary && <>
       <UsageTotals report={summary} coverageLabel={`${scopeLabel}全部保留记录`} title={`完整${scopeLabel} token 小计`} />
@@ -245,12 +239,12 @@ function GoalAttemptUsage({ goalId, tasks }) {
         {summary.groupBy === 'date' ? group.dateUtc ?? '日期未知' :
           [group.provider ?? '路由未知', group.llmProvider, group.model ?? '模型未知', group.reasoningEffort].filter(Boolean).join(' · ')}
       </summary><UsageTotals report={group} coverageLabel="分组覆盖" title="分组 token 小计" /></details>)}
-      {summary.nextAfter !== null && <ActionButton reason={loading ? '正在读取…' : ''} onClick={() => loadSummary(groupBy, summary.nextAfter)}>查看下一组用量</ActionButton>}
+      {summary.nextAfter !== null && <ActionButton reason={loading ? '正在读取…' : ''} onClick={() => load(groupBy, { ...result.cursors, after: summary.nextAfter })}>查看下一组用量</ActionButton>}
     </>}
     {report && (report.attempts.length ? <>
       <UsageTotals report={report} coverageLabel="本页逐次记录" title="本页 token 小计" />
       {report.nextBefore && <ActionButton reason={loading ? '正在读取…' : ''} onClick={() =>
-        load(async () => setReport(await api.attemptUsage(scope, report.nextBefore)))}>查看更早记录</ActionButton>}
+        load(groupBy, { ...result.cursors, attemptBefore: report.nextBefore })}>查看更早记录</ActionButton>}
       <p className="acms-sectionnote">缓存和推理按供应商字段单列，合计沿用供应商报告值。</p>
       {report.attempts.map(item => <details key={item.id} className="acms-run"><summary>
         {tasks.find(task => task.id === item.taskId)?.title ?? item.taskId} · {usageState[item.state]} · {item.model ?? '模型未知'}
@@ -261,7 +255,7 @@ function GoalAttemptUsage({ goalId, tasks }) {
           {Object.entries(item.usage.counts).map(([field, count]) => <React.Fragment key={field}><dt>{usageLabels[field]}</dt><dd>{count ?? '未知'}</dd></React.Fragment>)}
         </dl></>}
       </details>)}
-    </> : <p>暂无执行记录。</p>)}
+    </> : <p>本页暂无执行记录。</p>)}
   </section>;
 }
 

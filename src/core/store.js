@@ -116,8 +116,8 @@ export class Store {
   }
   *attemptUsageRows(scope, entityId) {
     const field = attemptUsageFields[scope];
-    const rows = this.db.prepare(`SELECT body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ?`).iterate(entityId);
-    for (const { body } of rows) yield JSON.parse(body);
+    const rows = this.db.prepare(`SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ? ORDER BY rowid DESC`).iterate(entityId);
+    for (const { cursor, body } of rows) yield { cursor, attempt: JSON.parse(body) };
   }
   put(collection, entity, expectedRevision) {
     const old = this.get(collection, entity.id);

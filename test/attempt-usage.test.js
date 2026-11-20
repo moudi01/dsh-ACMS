@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DshAdapter } from '../src/adapters/dsh.js';
@@ -34,8 +34,6 @@ test('full usage summaries cover retained attempts independently of page, route 
   const receipt = n => ({ source: 'codex-app-server', threadId: 'fixture', turnId: 'fixture-turn', finishedAt: '2026-11-20T00:01:00Z',
     counts: { inputTokens: null, cachedInputTokens: 0, cacheWriteInputTokens: null, outputTokens: null, reasoningOutputTokens: null, totalTokens: n } });
   f.store.transaction(() => {
-    // Insert a later-sorting route first to exercise bounded group eviction
-    // when the first observed group is absent from the requested page.
     f.store.put('attempts', { ...saved, id: 'attempt_zero', taskId: b.id, reasoningEffort: 'low',
       startedAt: '2026-11-20T08:30:00+08:00', meteredUsage: receipt(0) });
     f.store.put('attempts', { ...saved, id: 'attempt_preflight', taskId: b.id, status: 'failed', preflightOnly: true,
@@ -56,16 +54,18 @@ test('full usage summaries cover retained attempts independently of page, route 
   assert.deepEqual(aggregate.summary.inputTokens, { reported: 0, subtotal: null });
   assert.deepEqual(aggregate.summary.cachedInputTokens, { reported: 34, subtotal: '0' });
   assert.equal(aggregate.groups.length, 1);
-  assert.deepEqual(['provider', 'llmProvider', 'model', 'reasoningEffort'].map(key => aggregate.groups[0][key]),
-    ['paired:chosen', 'observed-channel', 'chosen-model', 'high']);
-  assert.equal(aggregate.groups[0].coverage.reported, 33);
-  assert.equal(aggregate.groups[0].coverage.pending, 0);
-  const zero = await summary(f, { goalId: f.goal.id, limit: 1, after: aggregate.nextAfter });
-  assert.deepEqual(zero.summary, aggregate.summary);
-  assert.deepEqual(zero.coverage, aggregate.coverage);
-  assert.equal(zero.groups[0].reasoningEffort, 'low');
-  assert.deepEqual(zero.groups[0].summary.totalTokens, { reported: 1, subtotal: '0' });
-  const missing = await summary(f, { goalId: f.goal.id, limit: 1, after: zero.nextAfter });
+  assert.equal(aggregate.attemptPage, undefined);
+  const second = await summary(f, { goalId: f.goal.id, limit: 1, after: aggregate.nextAfter });
+  assert.deepEqual(second.summary, aggregate.summary);
+  assert.deepEqual(second.coverage, aggregate.coverage);
+  const knownGroups = [...aggregate.groups, ...second.groups];
+  const high = knownGroups.find(group => group.reasoningEffort === 'high');
+  const low = knownGroups.find(group => group.reasoningEffort === 'low');
+  assert.deepEqual(['provider', 'llmProvider', 'model'].map(key => high[key]), ['paired:chosen', 'observed-channel', 'chosen-model']);
+  assert.equal(high.coverage.reported, 33);
+  assert.equal(high.coverage.pending, 0);
+  assert.deepEqual(low.summary.totalTokens, { reported: 1, subtotal: '0' });
+  const missing = await summary(f, { goalId: f.goal.id, limit: 1, after: second.nextAfter });
   assert.equal(missing.groups[0].provider, null);
   assert.deepEqual(missing.groups[0].coverage, { reported: 0, pending: 1, unknown: 1, 'not-executed': 1 });
   assert.equal(missing.groups[0].summary.totalTokens.subtotal, null);
@@ -89,8 +89,56 @@ test('full usage summaries cover retained attempts independently of page, route 
   assert.equal(priorView.attempts.length, 30);
   assert.equal(priorView.coverage.reported, 28);
   assert(priorView.nextBefore);
+  const combined = await summary(f, { goalId: f.goal.id, attemptBefore: Number.MAX_SAFE_INTEGER });
+  assert.deepEqual(combined.attemptPage, priorView);
+  const older = await summary(f, { goalId: f.goal.id, attemptBefore: combined.attemptPage.nextBefore });
+  assert.deepEqual(older.attemptPage, await view(f, { goalId: f.goal.id, before: priorView.nextBefore }));
+  assert.deepEqual(older.summary, aggregate.summary);
   assert.equal((await summary(f, { goalId: f.goal.id, groupBy: 'unknown' }, 400)).error.code, 'INVALID_INPUT');
   assert.equal((await summary(f, { taskId: b.id, limit: 101 }, 400)).error.code, 'INVALID_INPUT');
+  assert.equal((await summary(f, { taskId: b.id, attemptBefore: 0 }, 400)).error.code, 'INVALID_INPUT');
+  assert.equal((await summary(f, { taskId: b.id, groupBy: 'date', after: aggregate.nextAfter }, 400)).error.code, 'INVALID_INPUT');
+});
+
+test('a registered long model can round-trip every route cursor', { skip: process.platform !== 'win32' }, async t => {
+  const f = await fixture(t), long = f.task({ title: 'Long paired route' }), short = f.task({ title: 'Short simulated route' });
+  const paired = new PairedRuntimes(f.company, f.dataDir);
+  const invite = await paired.invite();
+  const token = JSON.parse(invite.prompt.slice(invite.prompt.indexOf('{\n  "protocol"'), invite.prompt.lastIndexOf('\n完成后'))).token;
+  const calls = path.join(f.root, 'long-model-calls.jsonl'), model = 'm'.repeat(4096);
+  await writeFile(invite.responseFile, JSON.stringify({ protocol: 'acms.runner.v1', inviteId: invite.id, token,
+    name: 'Long model fixture', model, command: process.execPath, args: [runner, 'runner', calls, 'complete'], persistent: false }));
+  const candidate = await paired.inspect(invite.id);
+  await paired.accept(invite.id, candidate.fingerprint);
+  const adapter = new DshAdapter({ get: () => null, subagents: { providers: new Map() } }, f.company, f.dataDir, { paired });
+  f.engine.adapter = { start: input => (input.task.id === long.id ? adapter : f.adapter).start(input),
+    reconcile: attempt => (attempt.taskId === long.id ? adapter : f.adapter).reconcile(attempt) };
+  f.store.put('attempts', { id: 'attempt_old_unverified', taskId: long.id, goalId: f.goal.id, status: 'completed', provider: 'auto' });
+  await f.start();
+  const diagnostics = () => [long, short].map(task => taskWaitDiagnostics(f, task.id)());
+  await until(() => {
+    const states = [long, short].map(task => f.store.require('tasks', task.id).status);
+    assert(!states.some(status => ['blocked', 'failed', 'cancelled', 'reconciling'].includes(status)), JSON.stringify(diagnostics()));
+    return states.every(status => status === 'succeeded');
+  }, 45000, diagnostics);
+  assert.equal((await readFile(calls, 'utf8')).trim().split('\n').length, 1);
+
+  let after;
+  const routes = [];
+  for (let index = 0; index < 3; index++) {
+    const page = await summary(f, { goalId: f.goal.id, limit: 1, ...(after ? { after } : {}) });
+    assert.equal(page.groups.length, 1);
+    assert.equal(page.groups[0].coverage.unknown, 1);
+    assert.equal(page.coverage.unknown, 3);
+    if (index < 2) assert.match(page.nextAfter, /^0:[a-f0-9]{64}$/);
+    routes.push(page.groups[0]);
+    after = page.nextAfter;
+  }
+  assert.equal(after, null);
+  assert.equal(routes[2].provider, null);
+  assert.equal(routes.find(group => group.provider === candidate.id)?.model, model);
+  assert(routes.some(group => group.provider === 'simulation'));
+  assert.equal(new Set(routes.map(group => group.key)).size, routes.length);
 });
 
 test('usage attempts use the scoped expression indexes on upgraded stores', async t => {
@@ -128,10 +176,15 @@ test('the scope summary reflects task purge without carrying removed usage into 
       meteredUsage: { source: 'codex-app-server', counts: { totalTokens: amount } },
     });
   });
-  assert.equal((await summary(f, { goalId: f.goal.id })).summary.totalTokens.subtotal, '20');
+  const initial = await summary(f, { goalId: f.goal.id, attemptBefore: Number.MAX_SAFE_INTEGER });
+  assert.equal(initial.summary.totalTokens.subtotal, '20');
+  assert.equal(initial.attemptPage.summary.totalTokens.subtotal, '20');
   const deleted = f.command('task.delete', { id: first.id });
   f.command('task.purge', { id: first.id, confirmTitle: first.title, expectedRevision: deleted.revision });
-  assert.equal((await summary(f, { goalId: f.goal.id })).summary.totalTokens.subtotal, '7');
+  const refreshed = await summary(f, { goalId: f.goal.id, groupBy: 'date', attemptBefore: Number.MAX_SAFE_INTEGER });
+  assert.equal(refreshed.summary.totalTokens.subtotal, '7');
+  assert.equal(refreshed.attemptPage.summary.totalTokens.subtotal, '7');
+  assert.deepEqual(refreshed.attemptPage.attempts.map(row => row.taskId), [second.id]);
   assert.equal((await summary(f, { taskId: first.id }, 404)).error.code, 'NOT_FOUND');
   assert.equal((await summary(f, { taskId: second.id })).summary.totalTokens.subtotal, '7');
 });
@@ -149,18 +202,21 @@ test('complete usage and its group page share one SQLite read snapshot', async t
     for (const row of scopedRows(...args)) {
       yield row;
       if (!updated) {
-        const unseen = attempts.find(item => item.id !== row.id);
+        const unseen = attempts.find(item => item.id !== row.attempt.id);
         writer.put('attempts', attempt(unseen.id, unseen.meteredUsage.counts.totalTokens + 10));
         updated = true;
       }
     }
   };
   try {
-    const before = await summary(f, { goalId: task.goalId });
+    const params = { goalId: task.goalId, attemptBefore: Number.MAX_SAFE_INTEGER };
+    const before = await summary(f, params);
     assert.equal(before.summary.totalTokens.subtotal, '3');
     assert.deepEqual(before.groups[0].summary, before.summary);
-    const after = await summary(f, { goalId: task.goalId });
+    assert.deepEqual(before.attemptPage.summary, before.summary);
+    const after = await summary(f, params);
     assert.equal(after.summary.totalTokens.subtotal, '13');
+    assert.deepEqual(after.attemptPage.summary, after.summary);
     assert.deepEqual(after.groups[0].summary, after.summary);
   } finally { writer.close(); }
 });
