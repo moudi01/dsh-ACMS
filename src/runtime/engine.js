@@ -248,6 +248,7 @@ export class Engine {
       }
       if (this.company.policy().paused) return;
       this.store.transaction(() => {
+        this.fenced();
         releaseGoalPauses(this.company);
         releaseTaskCostWaits(this);
         for (const goal of this.store.list('goals').filter(g => g.contractChange?.status === 'pending' && !g.contractChange.coordinationTaskId)) {
@@ -455,7 +456,7 @@ export class Engine {
   ensureCapacityOwnerEntry(goal, context) {
     const interactions = this.store.list('interactions');
     if (interactions.some(item => item.goalId === goal.id && item.kind === 'capacity' && item.status === 'pending')) return true;
-    const attachable = this.store.list('tasks').filter(task => task.goalId === goal.id && !['succeeded', 'cancelled', 'archived', 'deleted', 'running', 'preparing', 'integrating', 'reconciling', 'stopping'].includes(task.status));
+    const attachable = this.store.list('tasks').filter(task => task.goalId === goal.id && !['succeeded', 'cancelled', 'archived', 'deleted', 'deferred', 'running', 'preparing', 'integrating', 'reconciling', 'stopping'].includes(task.status));
     const target = attachable.find(task => task.status === 'ready') ?? attachable[0];
     if (!target) return false;
     const timeBox = goal.timeBox ?? {};

@@ -1,4 +1,5 @@
 import { goalCostBudgetView, goalCostCurrency, goalCostRoute, validGoalCostMicros } from './goal-cost-budget.js';
+import { contractVersion, matchesGoalContract } from './goal-contract.js';
 import { modelPolicyFingerprint } from './model-selection.js';
 import { assert, digest } from './util.js';
 
@@ -77,6 +78,36 @@ function matchesPlanQuote(plan, goal, task, executor, context) {
 export function isCostPlanEstimateCurrent(company, goal, plan, task, executor) {
   const context = costContext(company, goal, plan.proposalTasks);
   return context.version === plan.costPlan.contextVersion && matchesPlanQuote(plan, goal, task, executor, context);
+}
+
+export function approvedCostPlan(store, goal) {
+  const id = goal.planApproval?.approvedPlanId;
+  const plan = id && store.get('plans', id);
+  return plan?.goalId === goal.id && plan.approvalStatus === 'approved' && plan.acceptedAt && plan.costPlan?.estimate ? plan : null;
+}
+
+export function currentCostPlanTask(store, goal, plan) {
+  if (plan.taskId !== goal.planApproval.taskId || plan.goalContractVersion !== contractVersion(goal) ||
+      goal.contractChange?.status === 'pending') return null;
+  const task = store.get('tasks', plan.taskId);
+  const project = store.get('projects', goal.projectId);
+  return task?.goalId === goal.id && task.kind === 'plan' && task.generation === plan.generation &&
+    task.status === 'succeeded' && matchesGoalContract(goal, task) && project && project.status !== 'deleted' ? task : null;
+}
+
+export function matchesCostPlanWork(task, node, goal, plan) {
+  return task?.kind === 'work' && task.generation === 1 && task.parentId === plan.taskId &&
+    task.origin?.kind === 'manager-plan' && task.origin.planKey === node.key && task.origin.planTaskId === plan.taskId &&
+    task.agentId === node.assigneeAgentId && task.dependencies.length === node.dependencies.length &&
+    node.dependencies.every((id, index) => task.dependencies[index] === id) &&
+    !task.contractObsolete && matchesGoalContract(goal, task) && !goal.supersededTaskIds?.includes(task.id);
+}
+
+export function retainsCostPlanAssignment(store, task, node) {
+  const agent = store.get('agents', task.agentId);
+  // Materialization creates a default worker at revision 1. Explicit
+  // assignees are versioned by the original pricing context instead.
+  return agent?.status === 'available' && (node.assignment !== 'scheduler-default' || agent.revision === 1);
 }
 
 // Existing priced goals with no implemented plan can enter the gate after an

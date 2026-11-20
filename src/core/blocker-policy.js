@@ -27,5 +27,5 @@ export function blockerCoordinationKey(task, kind) {
 // execution must settle before any blocker may change the task state.
 export function ignoresBlocker(task) {
   return task.stopRequested || task.legacyBatch || task.workflowSnapshot ||
-    ['succeeded', 'cancelled', 'archived', 'deleted', 'stopping', 'reconciling'].includes(task.status);
+    ['succeeded', 'cancelled', 'archived', 'deleted', 'deferred', 'stopping', 'reconciling'].includes(task.status);
 }

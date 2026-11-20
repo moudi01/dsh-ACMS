@@ -17,6 +17,10 @@ export function deliveredWork(store, goal) {
 export function goalDeliveryHash(goal, tasks) {
   const rows = tasks.map(t => [t.id, t.artifactHash ?? '', deliveryGeneration(t)]).sort((a, b) => a[0].localeCompare(b[0]));
   const version = contractVersion(goal);
+  if (goal.costBudgetDeferrals?.length) {
+    const deferred = goal.costBudgetDeferrals.map(row => [row.taskId, row.decisionId]).sort((a, b) => a[0].localeCompare(b[0]));
+    return digest({ version, rows, deferred });
+  }
   // Keep unchanged v1 evidence readable across the upgrade.
   if (version === 1 && rows.every(row => row[2] === 1)) return digest(rows.map(row => row.slice(0, 2).join(':')).sort().join('|'));
   return digest({ version, rows });
@@ -49,7 +53,7 @@ export function completeGoalContract(company, task, output, actor, planTasks = n
     assert(remaining.delete(entry?.taskId), 'INVALID_CONTRACT_ASSESSMENT', 'Each replaced deliverable must be a distinct prior task in this goal');
     assert(typeof entry.followUp === 'string', 'INVALID_CONTRACT_ASSESSMENT', 'Identify the replacement task or plan key');
     const followUp = store.get('tasks', planTasks.get(entry.followUp) ?? entry.followUp);
-    assert(followUp?.goalId === goal.id && followUp.kind === 'work' && !['cancelled', 'deleted', 'archived', 'failed'].includes(followUp.status) &&
+    assert(followUp?.goalId === goal.id && followUp.kind === 'work' && !['cancelled', 'deleted', 'archived', 'failed', 'deferred'].includes(followUp.status) &&
       matchesGoalContract(goal, followUp), 'INVALID_CONTRACT_ASSESSMENT', 'Replacement work must exist under the current goal contract');
     const prior = store.require('tasks', entry.taskId);
     return { taskId: prior.id, followUpTaskId: followUp.id, replacedDelivery: {

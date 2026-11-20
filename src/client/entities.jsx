@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { api } from './api.js';
 import { ActionButton, CollapsibleText, Field } from './components.jsx';
 import { entityDeletionReason, entityTasks } from '../core/entity-actions.js';
-import { goalContractCapacityMessage } from '../core/task-actions.js';
+import { goalContractCapacityMessage, OPTIONAL_COST_WAIT } from '../core/task-actions.js';
+import { optionalDependentScope } from '../core/hierarchy.js';
 import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent } from '../core/runtime-budget.js';
 
 export const entityLabels = { project: '项目', goal: '目标', agent: '角色', task: '任务' };
@@ -334,12 +335,51 @@ function GoalCostForecast({ goalId, budgetRevision }) {
           {report.completionMicros === null && <><dt>已覆盖金额小计</dt><dd>{usdFromMicros(report.coveredMicros)}</dd></>}
         </dl>
         {report.plan && <p>已批准 {report.coverage.selected} 项 · 已交付 {report.coverage.delivered} 项 · 执行预留已覆盖 {report.coverage.reserved} 项
+          {report.coverage.deferred > 0 && ` · 已确认延期 ${report.coverage.deferred} 项`}
           {report.coverage.unknown > 0 && ` · 批准范围内费用未知 ${report.coverage.unknown} 项`}
           {report.coverage.outsidePlan > 0 && ` · 未纳入估算 ${report.coverage.outsidePlan} 项`}</p>}
         {report.reasons.length > 0 && <ul>{report.reasons.map(reason => <li key={reason}>{forecastReasons[reason]}</li>)}</ul>}
         {!settled && <p className="acms-sectionnote">估算使用快照时的执行预留和已批准范围。当前计划之外的重试或变更需要重新核算。</p>}
       </>}
     </div>}
+  </section>;
+}
+
+function OptionalCostDecision({ goal, tasks, act, busy }) {
+  const [chosen, setChosen] = useState('');
+  const [reason, setReason] = useState('');
+  const waiting = tasks.filter(task => task.status === 'blocked' && task.blocker?.kind === 'cost-budget' &&
+    task.costBudgetHold?.code === OPTIONAL_COST_WAIT);
+  const seed = waiting.find(task => task.id === chosen) ?? waiting[0];
+  const scope = seed ? optionalDependentScope(tasks, seed.id) : [];
+  const completed = tasks.filter(task => task.status === 'deferred' && task.costBudgetDeferral);
+  if (!waiting.length && !completed.length) return null;
+  const unavailable = busy ? '正在保存，请稍候' : goal.executionControl ? '请先恢复目标。' :
+    goal.costBudget.reservedAttempts ? '仍有费用待结算，先保留可恢复的等待。' :
+    seed?.costBudgetHold.reasonCode !== 'shortfall' ? '费用覆盖尚未核实。' : !reason.trim() ? '请填写延期理由。' : '';
+  return <section aria-label="可选任务预算调整">
+    <h4>可选任务预算调整</h4>
+    {!!waiting.length && <p>{waiting.length} 项可选任务等待费用核对或余量。余额释放后会重新核对。</p>}
+    {seed && <form onSubmit={async event => {
+      event.preventDefault();
+      try {
+        const saved = await act('goal.cost_budget.defer_optional', { id: goal.id, taskId: seed.id, taskIds: scope,
+          holdAttemptId: seed.costBudgetHold.attemptId, planFingerprint: seed.costBudgetHold.planFingerprint,
+          reason: reason.trim() }, '已确认本轮延期');
+        if (saved) setReason('');
+      } catch { /* The owner command displays its error. */ }
+    }}>
+      <Field label="选择等待余量的任务"><select value={seed.id} onChange={event => { setChosen(event.target.value); setReason(''); }}>
+        {waiting.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}
+      </select></Field>
+      <p>本次延期范围 · {scope.map(id => tasks.find(task => task.id === id)?.title ?? id).join('、')}</p>
+      <p className="acms-sectionnote">上次核对的单次费用上界 {usdFromMicros(seed.costBudgetHold.bound.upperMicros)}。确认后继续完成剩余范围和原验收。</p>
+      <Field label="延期理由"><textarea rows={2} value={reason} maxLength={2000} onChange={event => setReason(event.target.value)} /></Field>
+      <ActionButton type="submit" reason={unavailable}>确认可选项本轮延期</ActionButton>
+      <ActionButton type="button" reason={busy ? '正在保存，请稍候' : goal.executionControl ? '请先恢复目标。' : ''}
+        onClick={() => act('task.resume', { id: seed.id }, '已请求按当前额度重新核价')}>重新核对报价</ActionButton>
+    </form>}
+    {completed.map(task => <p key={task.id}>{task.title} · 本轮延期 · {task.costBudgetDeferral.reason}</p>)}
   </section>;
 }
 
@@ -359,6 +399,7 @@ function GoalCostBudget({ goal, tasks, act, busy }) {
     {budget.awaitingReceiptAttempts > 0 && <p>{budget.awaitingReceiptAttempts} 次已清理执行的费用仍未知，预留继续保留。</p>}
     {budget.breach && <p role="alert">执行器报告的费用超过预留上界，后续派发已停。请核对费用回执。</p>}
     {holds.map(reason => <p key={reason}>{reason}</p>)}
+    <OptionalCostDecision goal={goal} tasks={tasks} act={act} busy={busy} />
     <GoalCostForecast goalId={goal.id} budgetRevision={budget.revision} />
     {!budget.breach && !['cancelled', 'archived', 'deleted'].includes(goal.status) && <form className="acms-actions wrap" onSubmit={async event => {
       event.preventDefault();

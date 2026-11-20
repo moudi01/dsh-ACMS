@@ -17,7 +17,7 @@
 const ROLE_LABEL = Object.freeze({ manager: '负责人', worker: '执行者', reviewer: '审查者' });
 const STATUS_LABEL = Object.freeze({
   planning: '规划中', active: '进行中', paused: '已暂停', cancelled: '已取消', succeeded: '已完成',
-  archived: '已归档', ready: '待执行', blocked: '已阻塞', preparing: '准备中', running: '执行中',
+  archived: '已归档', deferred: '本轮延期', ready: '待执行', blocked: '已阻塞', preparing: '准备中', running: '执行中',
   reviewing: '待审查', integrating: '集成中', reconciling: '待核对', stopping: '停止中', failed: '失败',
   deleted: '已删除', available: '可分配', retired: '已释放',
 });
@@ -43,6 +43,7 @@ export const ACTIVITY_EVENT_TYPES = Object.freeze([
   'project.saved', 'project.deleted', 'project.restored',
   'goal.created', 'goal.status.changed', 'goal.succeeded', 'goal.reopened', 'goal.paused', 'goal.resumed',
   'goal.cancelled', 'goal.contract.changed', 'goal.contract.assessed', 'goal.runtime.extended',
+  'goal.cost_budget.optional_deferred',
   'goal.timebox.warning', 'goal.timebox.blocked', 'goal.submitted', 'goal.deleted', 'goal.restored',
   'task.created', 'task.changed', 'task.dependencies', 'task.blocked', 'task.paused.requested',
   'task.cancelled.requested', 'task.resumed', 'task.retry.scheduled', 'task.stop.completed', 'task.succeeded',
@@ -280,6 +281,7 @@ export function describeActivity(event, context = activityContext()) {
     case 'goal.contract.changed': action = `修改了目标「${goalTitle}」的验收合同（版本 ${event.data?.contractVersion ?? '?'}）`; break;
     case 'goal.contract.assessed': action = `处理了目标「${goalTitle}」的合同版本 ${event.data?.contractVersion ?? '?'}`; break;
     case 'goal.runtime.extended': action = `为目标「${goalTitle}」追加了 ${Math.round((event.data?.additionalRuntimeMs ?? 0) / 60000)} 分钟执行时间`; break;
+    case 'goal.cost_budget.optional_deferred': action = `确认目标「${goalTitle}」的 ${event.data?.taskIds?.length ?? 0} 项可选任务本轮延期`; reason = shortReason(event.data?.reason); break;
     case 'goal.timebox.warning': action = `目标「${goalTitle}」触发时间盒预警`; reason = `已用 ${Math.round((event.data?.usedMs ?? 0) / 60000)} 分钟，准备收尾`; break;
     case 'goal.timebox.blocked': action = `目标「${goalTitle}」达到时间盒上限`; reason = shortReason(event.data?.message) ?? '等待负责人收尾或追加授权'; break;
     case 'goal.submitted': action = `外部智能体代表所有者提交了目标「${goalTitle}」`; break;

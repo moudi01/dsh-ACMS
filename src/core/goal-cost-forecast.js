@@ -1,25 +1,11 @@
 import { contractVersion, matchesGoalContract } from './goal-contract.js';
-import { costPlanBalance, isCostPlanEstimateCurrent } from './plan-cost-budget.js';
+import { taskSettledForGoal } from './hierarchy.js';
+import { approvedCostPlan, costPlanBalance, currentCostPlanTask, isCostPlanEstimateCurrent, matchesCostPlanWork, retainsCostPlanAssignment } from './plan-cost-budget.js';
 import { assert, now } from './util.js';
 
 const closed = new Set(['cancelled', 'archived', 'deleted']);
 const inProgress = new Set(['running', 'reconciling', 'integrating']);
 const waiting = new Set(['ready', 'blocked', 'paused', 'running']);
-
-function matchesPlannedTask(task, node, goal, plan) {
-  return task && !closed.has(task.status) && task.kind === 'work' && task.generation === 1 &&
-    task.parentId === plan.taskId && task.origin?.kind === 'manager-plan' && task.origin.planKey === node.key &&
-    task.origin.planTaskId === plan.taskId && task.agentId === node.assigneeAgentId &&
-    task.dependencies.length === node.dependencies.length && node.dependencies.every((id, index) => task.dependencies[index] === id) &&
-    !task.contractObsolete && matchesGoalContract(goal, task) && !goal.supersededTaskIds?.includes(task.id);
-}
-
-function retainsAssignment(store, task, node) {
-  const agent = store.get('agents', task.agentId);
-  // Materialization owns the default worker at revision 1. Explicit assignees
-  // are versioned by the original pricing context instead.
-  return agent?.status === 'available' && (node.assignment !== 'scheduler-default' || agent.revision === 1);
-}
 
 function phaseForecast(estimate, current, finished, mayHaveBegun) {
   const plannedMicros = estimate?.micros ?? null;
@@ -35,7 +21,7 @@ function forecast(company, goal, budget, executor) {
   const ledger = costPlanBalance(budget);
   const booked = BigInt(ledger.settledMicros) + BigInt(ledger.reservedMicros);
   const result = { goalId: goal.id, enabled: true, asOf: now(), ledger: { ...ledger, revision: budget.revision },
-    plan: null, coverage: { selected: 0, unstarted: 0, reserved: 0, delivered: 0, unknown: 0, outsidePlan: 0 },
+    plan: null, coverage: { selected: 0, unstarted: 0, reserved: 0, delivered: 0, deferred: 0, unknown: 0, outsidePlan: 0 },
     unstartedMicros: null, acceptance: null, rework: null, coveredMicros: booked.toString(),
     status: 'unknown', completionBasis: null, completionMicros: null, headroomMicros: null, reasons: [] };
   if (closed.has(goal.status)) return { ...result, status: 'closed' };
@@ -43,18 +29,12 @@ function forecast(company, goal, budget, executor) {
   const reasons = new Set();
   if (ledger.breach) reasons.add('cost-contract-breach');
   if (ledger.awaitingReceiptAttempts > 0) reasons.add('awaiting-cost-receipt');
-  const plan = goal.planApproval?.approvedPlanId && store.get('plans', goal.planApproval.approvedPlanId);
-  const cost = plan?.costPlan;
-  if (plan?.goalId !== goal.id || plan.approvalStatus !== 'approved' || !plan.acceptedAt || !cost?.estimate) {
-    return { ...result, reasons: ['no-approved-estimate', ...reasons] };
-  }
+  const plan = approvedCostPlan(store, goal);
+  if (!plan) return { ...result, reasons: ['no-approved-estimate', ...reasons] };
+  const { costPlan: cost } = plan;
   const { coverage } = result;
-  const planner = store.get('tasks', plan.taskId);
-  const project = store.get('projects', goal.projectId);
-  const contractCurrent = plan.taskId === goal.planApproval.taskId && plan.goalContractVersion === contractVersion(goal) &&
-    goal.contractChange?.status !== 'pending' && planner?.goalId === goal.id && planner.kind === 'plan' &&
-    planner.generation === plan.generation && planner.status === 'succeeded' && matchesGoalContract(goal, planner) &&
-    !!project && project.status !== 'deleted';
+  const planner = currentCostPlanTask(store, goal, plan);
+  const contractCurrent = !!planner;
   const quoteCurrent = contractCurrent && isCostPlanEstimateCurrent(company, goal, plan, planner, executor);
   result.plan = { id: plan.id, fingerprint: plan.fingerprint, executorId: cost.estimate.executorId, quoteId: cost.estimate.quoteId,
     state: !contractCurrent ? 'contract-changed' : quoteCurrent ? 'current' : 'quote-stale' };
@@ -68,7 +48,7 @@ function forecast(company, goal, budget, executor) {
   const taskScope = plan.nodes.length === selected.size && plan.nodes.every(node => selected.has(node.key) && estimates.has(node.key));
   if (!taskScope) reasons.add('work-changed');
   const outside = [...allTasks.values()].filter(task => task.id !== plan.taskId && !byTask.has(task.id));
-  coverage.outsidePlan = outside.filter(task => task.status !== 'succeeded' && !closed.has(task.status) &&
+  coverage.outsidePlan = outside.filter(task => !taskSettledForGoal(task, goal) && !closed.has(task.status) &&
     !task.contractObsolete && !goal.supersededTaskIds?.includes(task.id)).length;
   if (coverage.outsidePlan) reasons.add('unpriced-work');
 
@@ -103,10 +83,13 @@ function forecast(company, goal, budget, executor) {
   for (const node of plan.nodes) {
     const task = allTasks.get(node.taskId), history = allocations.get(node.taskId), claim = history?.active;
     let missing;
-    if (!matchesPlannedTask(task, node, goal, plan) || node.dependencies.some(id => changedTasks.has(id)) ||
+    if (!matchesCostPlanWork(task, node, goal, plan) || closed.has(task.status) || node.dependencies.some(id => changedTasks.has(id)) ||
         !selected.has(node.key) || !estimates.has(node.key)) {
       missing = 'work-changed';
       changedTasks.add(node.taskId);
+    } else if (task.status === 'deferred' && taskSettledForGoal(task, goal) &&
+        task.costBudgetDeferral.planFingerprint === plan.fingerprint && !history?.count && !unverifiedTasks.has(task.id)) {
+      coverage.deferred++;
     } else if (unverifiedTasks.has(task.id) || (task.status === 'succeeded' && !history?.count)) missing = 'unverified-cost';
     else if (task.status === 'succeeded') coverage.delivered++;
     else if (history?.count === 1 && claim?.id === task.activeAttemptId && inProgress.has(task.status) &&
@@ -118,7 +101,7 @@ function forecast(company, goal, budget, executor) {
       missing = 'retry-or-progress-unknown';
       workMayNeedRework = true;
     } else if (!quoteCurrent) missing = result.plan.state;
-    else if (task.costBudgetHold || !retainsAssignment(store, task, node)) missing = 'dispatch-cost-unverified';
+    else if (task.costBudgetHold || !retainsCostPlanAssignment(store, task, node)) missing = 'dispatch-cost-unverified';
     else {
       coverage.unstarted++;
       unstarted += BigInt(estimates.get(node.key).micros);
@@ -130,7 +113,7 @@ function forecast(company, goal, budget, executor) {
   }
   const scopeChanged = !taskScope || changedTasks.size > 0;
   const finished = contractCurrent && !scopeChanged && goal.status === 'succeeded' &&
-    goal.completedContractVersion === contractVersion(goal) && coverage.delivered === coverage.selected;
+    goal.completedContractVersion === contractVersion(goal) && coverage.delivered + coverage.deferred === coverage.selected;
   // A completed scope does not depend on a current quote for future work.
   if (!finished && result.plan.state === 'quote-stale') reasons.add('quote-stale');
   if (finished && ledger.reservedAttempts > ledger.awaitingReceiptAttempts) reasons.add('execution-cleanup-pending');

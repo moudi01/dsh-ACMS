@@ -51,12 +51,16 @@ function denied(budget, code, reason) {
   return { denied: { code, reason, releaseVersion: budget.releaseVersion } };
 }
 
+export function validGoalCostBound(bound, route) {
+  return !!bound && !!route && shortId(bound.executorId) && shortId(bound.quoteId) &&
+    bound.currency === goalCostCurrency && validGoalCostMicros(bound.upperMicros) && digest(bound.route ?? null) === digest(route);
+}
+
 export function reserveGoalCost(store, attempt, bound, route) {
   const budget = store.get('goalCostBudgets', attempt.goalId);
   if (!budget) return {};
   if (budget.breach) return denied(budget, 'COST_CONTRACT_BREACH', '已报告费用超过执行器承诺的上界，请核对执行器回执。');
-  if (!bound || !route || !shortId(bound.executorId) || !shortId(bound.quoteId) ||
-      bound.currency !== goalCostCurrency || !validGoalCostMicros(bound.upperMicros) || digest(bound.route ?? null) !== digest(route)) {
+  if (!validGoalCostBound(bound, route)) {
     return denied(budget, 'COST_BOUND_UNKNOWN', '当前选定的执行路由没有可信的美元费用上界。请核对该路由的执行器支持后重试。');
   }
   const auth = { attemptId: attempt.id, taskId: attempt.taskId, goalId: attempt.goalId,
