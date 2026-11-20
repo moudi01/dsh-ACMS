@@ -9,6 +9,7 @@ const command = (name, args) => server.company.command(OWNER, randomUUID(), name
 const project = command('project.save', { name: 'Budget fixture', repoRoot: server.source, mode: 'copy', checks: [] });
 const goal = command('goal.create', { title: '累计额度续跑测试', description: 'Isolated test', acceptance: 'Reviewed files', projectId: project.id, plan: false });
 const early = command('goal.create', { title: '提前追加额度测试', description: 'Isolated test', acceptance: 'Reviewed files', projectId: project.id, plan: false });
+const priced = command('goal.create', { title: '查看完工成本测试', description: 'Isolated test', acceptance: 'Reviewed files', projectId: project.id, plan: false, costLimitUsd: '0.000007' });
 const used = server.company.policy().maxGoalRuntimeMs + 1000;
 server.company.store.transaction(() => server.company.store.put('goals', { ...goal, runtimeMs: used }));
 const tasks = ['额度任务一', '额度任务二'].map(title => command('task.create', { goalId: goal.id, title }));
@@ -63,10 +64,23 @@ try {
   await expect(budget).toContainText('270.00 分钟');
   expect(server.company.store.require('goals', early.id).runtimeExtraMs).toBe(1800000);
   expect(server.company.store.list('interactions').some(i => i.goalId === early.id)).toBe(false);
+  await page.getByRole('button', { name: '关闭详情' }).click();
+  let forecastReads = 0;
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/acms/cost/forecast') forecastReads++; });
+  await page.getByRole('button', { name: priced.title, exact: true }).click();
+  const forecast = page.getByRole('region', { name: '预计完工成本' });
+  const forecastRead = forecast.getByRole('button', { name: '查看完工估算' });
+  await expect(forecastRead).toBeVisible();
+  expect(forecastReads).toBe(0);
+  await forecastRead.click();
+  await expect(forecast).toContainText('当前没有已通过预算核验的计划估算。');
+  await expect(forecast.getByText('完工预估', { exact: true }).locator('xpath=following-sibling::dd[1]')).toHaveText('未知');
+  await expect(forecast.getByText('预计预算余裕', { exact: true })).toHaveCount(0);
+  expect(forecastReads).toBe(1);
   expect(errors).toEqual([]);
   await verifyLiveBudget(browser);
-  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, earlyExtensionMinutes: 30, bothTasksReviewed: true, materialGatePreserved: true, liveUsageWithoutEvents: true, browserErrors: errors }, null, 2));
-  console.log('Budget UI: early extension, explicit budget reply, preserved material gate, and live usage without events passed.');
+  await writeFile('test-results/budget-ui-result.json', JSON.stringify({ explicitExtensionRequired: true, extensionMinutes: 60, earlyExtensionMinutes: 30, bothTasksReviewed: true, materialGatePreserved: true, liveUsageWithoutEvents: true, costForecastOnDemand: true, browserErrors: errors }, null, 2));
+  console.log('Budget UI: early extension, explicit budget reply, preserved material gate, live usage, and on-demand completion forecast passed.');
 } finally { await browser.close(); await server.close(); }
 
 async function verifyLiveBudget(browser) {

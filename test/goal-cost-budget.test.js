@@ -4,6 +4,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { applyBackup, planBackup } from '../scripts/backup.mjs';
+import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { DshAdapter } from '../src/adapters/dsh.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { Company } from '../src/core/domain.js';
@@ -421,6 +423,231 @@ function planDecision(plan, action, reason) {
   return { planId: plan.id, fingerprint: plan.fingerprint, generation: plan.generation,
     goalContractVersion: plan.goalContractVersion, action, reason };
 }
+
+async function scopedForecast(runtime, goalId, status = 200) {
+  const route = createRoutes(runtime).find(item => item.path === '/api/acms/cost/forecast');
+  assert.deepEqual(route.methods, ['GET']);
+  const response = await route.fetch(new Request(`http://localhost/api/acms/cost/forecast?${new URLSearchParams({ goalId })}`));
+  const result = await response.json();
+  assert.equal(response.status, status, JSON.stringify(result));
+  return result;
+}
+
+async function approveForecastPlan(f, target) {
+  await f.start();
+  const plan = await proposalFor(f, target);
+  await until(() => budget(f.store, target.id).settledAttempts === 1, undefined, () => budget(f.store, target.id));
+  f.command('company.pause', { afterCurrent: true });
+  return scopedCommand(f, 'plan.approval.decide', planDecision(plan, 'approve', 'Approve the fixed-price scope'), 'approve-forecast');
+}
+
+test('completion forecast combines concurrent caps, zero estimates and trusted receipts without double counting', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const parallel = Promise.withResolvers(), finalWork = Promise.withResolvers();
+  const priced = fixedCostAdapter(f, {
+    quoteFor: task => task.kind === 'plan' ? '4' : task.title === 'validate' ? '1' : '18',
+    amountFor: task => task.kind === 'plan' ? '2' : task.title === 'bonus' ? null : '0',
+    beforeResult: ({ task }) => task.kind === 'plan' ? null : task.title === 'validate' ? finalWork.promise : parallel.promise,
+  });
+  t.after(() => { parallel.resolve(); finalWork.resolve(); });
+  planEstimates(priced, { amounts: { core: '2', validate: '0', bonus: '3' }, acceptance: '2', rework: '1' });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const initial = await scopedForecast(f, target.id);
+  assert.deepEqual(initial.coverage, { selected: 3, unstarted: 3, reserved: 0, delivered: 0, unknown: 0, outsidePlan: 0 });
+  assert.equal(initial.plan.fingerprint, plan.fingerprint);
+  assert.equal(initial.ledger.settledMicros, '2');
+  assert.equal(initial.unstartedMicros, '5');
+  assert.equal(initial.completionMicros, '10');
+  assert.equal(initial.headroomMicros, '30');
+  assert.equal(initial.acceptance.remainingMicros, '2');
+  assert.equal(initial.rework.remainingMicros, '1');
+  assert.deepEqual(await scopedForecast(f, f.goal.id), { goalId: f.goal.id, enabled: false });
+  assert.equal((await scopedForecast(f, 'not-a-goal', 404)).error.code, 'NOT_FOUND');
+  assert.deepEqual(priced.calls, [plan.taskId]); // The reads did not dispatch.
+
+  f.command('company.resume');
+  await until(() => priced.calls.length === 3, undefined, () => ({ calls: priced.calls, ledger: budget(f.store, target.id) }));
+  const concurrent = await scopedForecast(f, target.id);
+  assert.deepEqual(concurrent.coverage, { selected: 3, unstarted: 1, reserved: 2, delivered: 0, unknown: 0, outsidePlan: 0 });
+  assert.equal(concurrent.ledger.reservedMicros, '36');
+  assert.equal(concurrent.unstartedMicros, '0');
+  assert.equal(concurrent.completionMicros, '41');
+  assert.equal(concurrent.headroomMicros, '-1');
+  assert.equal(concurrent.status, 'over-limit');
+
+  parallel.resolve();
+  await until(() => priced.calls.length === 4 && budget(f.store, target.id).awaitingReceiptAttempts === 1,
+    undefined, () => ({ calls: priced.calls, ledger: budget(f.store, target.id) }));
+  const progress = await scopedForecast(f, target.id);
+  assert.equal(progress.acceptance.state, 'unknown');
+  assert.equal(progress.acceptance.remainingMicros, null);
+  assert.equal(progress.rework.remainingMicros, '1');
+  assert.equal(progress.completionMicros, null);
+  assert.ok(progress.reasons.includes('phase-remaining-unknown'));
+
+  finalWork.resolve();
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' &&
+    budget(f.store, target.id).reservedAttempts === 1, undefined, () => budget(f.store, target.id));
+  const delivered = await scopedForecast(f, target.id);
+  assert.equal(delivered.ledger.reportedAttempts, 3);
+  assert.equal(delivered.ledger.settledMicros, '2');
+  assert.equal(delivered.ledger.reservedMicros, '18');
+  assert.equal(delivered.acceptance.remainingMicros, '0');
+  assert.equal(delivered.rework.remainingMicros, '0');
+  assert.equal(delivered.completionMicros, null);
+  assert.equal(delivered.headroomMicros, null);
+  assert.equal(delivered.coveredMicros, '20');
+  assert.deepEqual(delivered.reasons, ['awaiting-cost-receipt']);
+  await f.engine.stop();
+
+  const backup = path.join(f.root, 'forecast-backup'), restoredDir = path.join(f.root, 'forecast-restored');
+  await applyBackup(await planBackup({ dataDir: f.dataDir, out: backup }));
+  assert.equal((await restoreBackup({ backup, target: restoredDir })).startable, true);
+  const restoredStore = new Store(path.join(restoredDir, 'company.db'));
+  try {
+    const read = await scopedForecast({ ...f, company: new Company(restoredStore) }, target.id);
+    const snapshot = ({ asOf, ...fields }) => fields;
+    assert.deepEqual(snapshot(read), snapshot(delivered));
+  } finally { restoredStore.close(); }
+});
+
+test('completion forecast keeps prior retry charges and purged task charges without reusing an original estimate', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const retried = Promise.withResolvers();
+  let coreRuns = 0;
+  const priced = fixedCostAdapter(f, { beforeResult: ({ task }) => {
+    if (task.title !== 'core') return;
+    if (++coreRuns === 1) throw new Error('Fixture first execution fails');
+    return retried.promise;
+  } });
+  t.after(() => retried.resolve());
+  planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const validate = f.store.require('tasks', plan.nodes.find(node => node.key === 'validate').taskId);
+  f.command('company.resume');
+  await until(() => coreRuns === 2, undefined, () => ({ calls: priced.calls, ledger: budget(f.store, target.id) }));
+  const progress = await scopedForecast(f, target.id);
+  assert.equal(progress.ledger.settledMicros, '6');
+  assert.equal(progress.ledger.reservedMicros, '7');
+  assert.equal(progress.unstartedMicros, '6');
+  assert.deepEqual(progress.coverage, { selected: 2, unstarted: 1, reserved: 0, delivered: 0, unknown: 1, outsidePlan: 0 });
+  assert.equal(progress.rework.remainingMicros, null);
+  assert.equal(progress.completionMicros, null);
+  assert.ok(progress.reasons.includes('retry-or-progress-unknown'));
+
+  retried.resolve();
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' &&
+    budget(f.store, target.id).settledAttempts === 4, undefined, () => budget(f.store, target.id));
+  const done = await scopedForecast(f, target.id);
+  assert.equal(done.completionMicros, '12');
+  await scopedCommand(f, 'task.delete', { id: validate.id }, 'delete-forecast-task');
+  await scopedCommand(f, 'task.purge', { id: validate.id, confirmTitle: validate.title }, 'purge-forecast-task');
+  assert.equal(f.store.get('tasks', validate.id), null);
+  assert.equal([...f.store.attemptUsageRows('task', validate.id)].length, 0);
+  const purged = await scopedForecast(f, target.id);
+  assert.equal(purged.ledger.settledMicros, '12');
+  assert.equal(purged.ledger.reportedAttempts, 4);
+  assert.equal(purged.completionMicros, null);
+  assert.ok(purged.reasons.includes('work-changed'));
+});
+
+test('completion forecast discloses stale quotations, unpriced new work and changed dependencies', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000040', { plan: true });
+  const priced = fixedCostAdapter(f);
+  planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  assert.equal((await scopedForecast(f, target.id)).completionMicros, '26');
+  const estimate = priced.adapter.taskCost.estimatePlan;
+  priced.adapter.taskCost.estimatePlan = input => ({ ...estimate(input), quoteId: 'fixed-plan-expired' });
+  const stale = await scopedForecast(f, target.id);
+  assert.equal(stale.plan.state, 'quote-stale');
+  assert.equal(stale.completionMicros, null);
+  assert.equal(stale.unstartedMicros, null);
+  assert.equal(stale.ledger.settledMicros, '3');
+  let extra;
+  const writer = new Store(f.store.filename);
+  try {
+    const otherOwner = new Company(writer);
+    priced.adapter.taskCost.estimatePlan = input => {
+      extra ??= otherOwner.command(OWNER, 'add-unpriced-work', 'task.create', { goalId: target.id, title: 'Additional owner work' });
+      return estimate(input);
+    };
+    const snapshot = await scopedForecast(f, target.id);
+    assert.equal(snapshot.completionMicros, '26');
+    assert.equal(snapshot.coverage.outsidePlan, 0);
+  } finally {
+    writer.close();
+    priced.adapter.taskCost.estimatePlan = estimate;
+  }
+  assert.equal((await scopedForecast(f, target.id)).coverage.outsidePlan, 1);
+  const validate = f.store.require('tasks', plan.nodes.find(node => node.key === 'validate').taskId);
+  const revised = await scopedCommand(f, 'task.dependencies', { id: validate.id, dependencies: [extra.id] }, 'change-forecast-dependency');
+  assert.equal(revised.generation, validate.generation);
+  const changed = await scopedForecast(f, target.id);
+  assert.equal(changed.completionMicros, null);
+  assert.equal(changed.unstartedMicros, '8');
+  assert.deepEqual(changed.coverage, { selected: 2, unstarted: 1, reserved: 0, delivered: 0, unknown: 1, outsidePlan: 1 });
+  assert.ok(changed.reasons.includes('unpriced-work'));
+  assert.ok(changed.reasons.includes('work-changed'));
+  assert.deepEqual(priced.calls, [plan.taskId]);
+  const core = f.store.require('tasks', plan.nodes.find(node => node.key === 'core').taskId);
+  await scopedCommand(f, 'task.dependencies', { id: validate.id, dependencies: [core.id] }, 'restore-forecast-dependency');
+  await scopedCommand(f, 'task.edit', { id: core.id, patch: { acceptance: 'Updated inputs for downstream tasks' } }, 'edit-forecast-input');
+  const edited = await scopedForecast(f, target.id);
+  assert.equal(edited.coverage.unknown, 2);
+  assert.equal(edited.coverage.unstarted, 0);
+  assert.equal(edited.unstartedMicros, '0');
+});
+
+test('completion forecast keeps a late receipt unknown even when both approved phase reserves are zero', async t => {
+  const f = await fixture(t, input => {
+    if (input.task.kind !== 'plan') return defaultSimulation(input);
+    const { tasks, ...proposal } = budgetedProposal();
+    return { ...proposal, tasks: tasks.slice(0, 1) };
+  });
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000007', { plan: true });
+  const priced = fixedCostAdapter(f, { amountFor: task => task.kind === 'plan' ? '0' : null });
+  planEstimates(priced, { amounts: { core: '0' }, acceptance: '0', rework: '0' });
+  f.engine.adapter = priced.adapter;
+  const plan = await approveForecastPlan(f, target);
+  const initial = await scopedForecast(f, target.id);
+  assert.equal(initial.unstartedMicros, '0');
+  assert.equal(initial.coverage.unstarted, 1);
+  assert.equal(initial.completionMicros, '0');
+  assert.equal(initial.acceptance.state, 'no-reserve');
+  assert.equal(initial.rework.state, 'no-reserve');
+  f.command('company.resume');
+  await until(() => f.store.require('goals', target.id).status === 'succeeded' &&
+    budget(f.store, target.id).awaitingReceiptAttempts === 1, undefined, () => budget(f.store, target.id));
+  const waitingForReceipt = await scopedForecast(f, target.id);
+  assert.equal(waitingForReceipt.completionMicros, null);
+  assert.equal(waitingForReceipt.headroomMicros, null);
+  assert.equal(waitingForReceipt.ledger.settledMicros, '0');
+  assert.equal(waitingForReceipt.ledger.reportedAttempts, 1);
+  assert.equal(waitingForReceipt.ledger.reservedMicros, '7');
+  assert.equal(waitingForReceipt.coveredMicros, '7');
+  assert.deepEqual(waitingForReceipt.reasons, ['awaiting-cost-receipt']);
+  const authorization = priced.authorizations.find(row => row.taskId === plan.nodes[0].taskId);
+  priced.save('cost-', authorization.id, receipt(authorization, '0'));
+  f.engine.nextCostReceiptCheck = 0;
+  f.engine.kick();
+  await until(() => budget(f.store, target.id).settledAttempts === 2, undefined, () => budget(f.store, target.id));
+  const settled = await scopedForecast(f, target.id);
+  assert.equal(settled.completionMicros, '0');
+  assert.equal(settled.headroomMicros, '7');
+  assert.equal(settled.ledger.reportedAttempts, 2);
+  assert.deepEqual(settled.reasons, []);
+});
 
 test('budget planning commits a host-estimated minimum and defers optional scope without an extra owner approval', async t => {
   let contract;

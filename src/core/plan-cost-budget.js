@@ -53,6 +53,7 @@ function normalizeQuote(quote, executorId, keys) {
 function readPlanEstimate(executor, goal, task, tasks, intent, context) {
   // Use the same scope and policy inputs before and after restart. Workflow
   // status, timestamps and available balance do not describe the priced work.
+  // estimatePlan is a synchronous local pricing read and cannot launch work.
   const input = {
     goal: { id: goal.id, projectId: goal.projectId, contractVersion: goal.contractVersion ?? 1,
       description: goal.description, acceptance: goal.acceptance },
@@ -64,6 +65,18 @@ function readPlanEstimate(executor, goal, task, tasks, intent, context) {
   } catch {
     return null; // Unavailable or invalid host estimate leaves the plan held.
   }
+}
+
+function matchesPlanQuote(plan, goal, task, executor, context) {
+  const cost = plan.costPlan;
+  if (!cost?.estimate || executor?.id !== cost.estimate.executorId) return false;
+  const current = readPlanEstimate(executor, goal, task, plan.proposalTasks, cost.intent, context);
+  return !!current && digest(current) === cost.estimateFingerprint;
+}
+
+export function isCostPlanEstimateCurrent(company, goal, plan, task, executor) {
+  const context = costContext(company, goal, plan.proposalTasks);
+  return context.version === plan.costPlan.contextVersion && matchesPlanQuote(plan, goal, task, executor, context);
 }
 
 // Existing priced goals with no implemented plan can enter the gate after an
@@ -138,9 +151,7 @@ export function recheckCostPlan(company, goal, plan, reprice) {
   assert(!costPlanHasUnscopedWork(company.store, goal.id), 'COST_PLAN_UNSCOPED_WORK',
     '此目标还有未纳入提案的旧任务，请先移除这些未派发任务。');
   if (reprice) {
-    const current = reprice.executor?.id === cost.estimate.executorId ?
-      readPlanEstimate(reprice.executor, goal, reprice.task, plan.proposalTasks, cost.intent, context) : null;
-    assert(current && digest(current) === cost.estimateFingerprint,
+    assert(matchesPlanQuote(plan, goal, reprice.task, reprice.executor, context),
       'COST_PLAN_ESTIMATE_STALE', '受信宿主估算已变化或无法核对。请退回此提案重新估算。');
   }
   const balance = costPlanBalance(company.store.require('goalCostBudgets', goal.id));
