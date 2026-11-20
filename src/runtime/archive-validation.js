@@ -14,8 +14,8 @@ export async function validateDeliveryText(bytes, { signal } = {}) {
   return validateArtifact('text', bytes, signal);
 }
 
-export async function validateCandidateArchive(bytes, { signal } = {}) {
-  return validateArtifact('candidate-read', bytes, signal);
+export async function validateCandidateArchive(bytes, { authority, signal }) {
+  return validateArtifact('candidate-read', bytes, signal, authority);
 }
 
 export async function buildCandidateArchive(candidate, { signal } = {}) {
@@ -24,11 +24,11 @@ export async function buildCandidateArchive(candidate, { signal } = {}) {
   return { ...result, bytes: Buffer.from(result.bytes) };
 }
 
-function validateArtifact(kind, bytes, signal) {
+function validateArtifact(kind, bytes, signal, authority) {
   signal?.throwIfAborted();
   // Transfer an owned copy; the caller still needs the original immutable bytes.
   const input = Uint8Array.from(bytes);
-  return runArchiveWorker({ kind, bytes: input }, [input.buffer], signal);
+  return runArchiveWorker({ kind, bytes: input, authority }, [input.buffer], signal);
 }
 
 async function runArchiveWorker(message, transfer, signal) {

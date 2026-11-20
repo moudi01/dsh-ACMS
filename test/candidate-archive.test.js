@@ -8,12 +8,14 @@ import { Store } from '../src/core/store.js';
 import { createRoutes } from '../src/host/http.js';
 import { createAgentApi } from '../src/host/agent-api.js';
 import { byteSha256, verifyDeliveryArchive } from '../src/runtime/delivery-archive.js';
+import { buildCandidateArchive, validateCandidateArchive } from '../src/runtime/archive-validation.js';
 import { copyContentHash } from '../src/runtime/copy-composition.js';
 import { gitWorktreeFingerprint } from '../src/runtime/git-delivery.js';
 import { run, WorkspaceManager } from '../src/runtime/workspaces.js';
 import { applyBackup, planBackup } from '../scripts/backup.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
 import { fixture, gitProject, until } from './helpers.js';
+import { zip } from './fixtures/delivery-zip.js';
 
 const root = 'http://127.0.0.1/api/acms/composition/';
 const binary = Buffer.from([0, 8, 13, 10, 128, 255]);
@@ -42,6 +44,14 @@ function zipEntries(zip) {
   return found;
 }
 
+function zipMode(zip, filename) {
+  for (let offset = zip.readUInt32LE(zip.length - 6); zip.readUInt32LE(offset) === 0x02014b50;) {
+    const start = offset + 46, length = zip.readUInt16LE(offset + 28);
+    if (zip.subarray(start, start + length).toString('utf8') === filename) return zip.readUInt32LE(offset + 38) >>> 16;
+    offset = start + length + zip.readUInt16LE(offset + 30) + zip.readUInt16LE(offset + 32);
+  }
+}
+
 async function rebuild(root, entries) {
   await fs.mkdir(root);
   for (const [name, bytes] of entries) {
@@ -59,6 +69,34 @@ async function rebuild(root, entries) {
 async function failed(response, status, code) {
   assert.equal(response.status, status);
   assert.equal((await response.json()).error.code, code);
+}
+
+async function rejectSubstitutedArchive(f, routes, selection, archive, originalEntries, change) {
+  const entries = new Map(originalEntries);
+  const manifest = JSON.parse(entries.get('acms-delivery.json'));
+  entries.delete('acms-delivery.json');
+  const executable = change(entries);
+  for (const file of manifest.files) {
+    const bytes = entries.get(file.path);
+    file.sha256 = byteSha256(bytes);
+    file.bytes = bytes.length;
+  }
+  const bytes = zip([{ name: 'acms-delivery.json', data: JSON.stringify(manifest) }, ...[...entries].map(([name, data]) => {
+    const mode = name.endsWith('/') ? 0o40755 : name === executable ? 0o100755 : 0o100644;
+    return { name, data, attributes: (mode << 16) >>> 0 };
+  })]);
+  const proof = verifyDeliveryArchive(bytes);
+  assert.equal(proof.passed, true, 'this archive really is internally consistent under the general #21 contract');
+  const substitute = { ...archive, bytes: bytes.length, archiveSha256: proof.archiveSha256,
+    manifestSha256: proof.manifestSha256, directories: [...entries.keys()].filter(name => name.endsWith('/')).length - 1 };
+  const storage = path.join(f.dataDir, 'deliveries', 'archives');
+  const record = path.join(storage, archive.key + '.json');
+  await fs.writeFile(path.join(storage, substitute.archiveSha256 + '.zip'), bytes);
+  await fs.writeFile(record, JSON.stringify(substitute));
+  try {
+    await failed(await routes.archive(selection), 409, 'ARTIFACT_CORRUPT');
+    await failed(await routes.download(selection, substitute.archiveSha256), 409, 'ARTIFACT_CORRUPT');
+  } finally { await fs.writeFile(record, JSON.stringify(archive)); }
 }
 
 async function archiveFixture(t, mode, { review = false, reviewGate } = {}) {
@@ -81,6 +119,7 @@ async function archiveFixture(t, mode, { review = false, reviewGate } = {}) {
   });
   await fs.writeFile(path.join(f.source, 'obsolete.txt'), 'obsolete baseline');
   await fs.writeFile(path.join(f.source, 'module'), 'previous file');
+  await fs.writeFile(path.join(f.source, 'module.txt'), 'prefix sorts before the directory in Git');
   const baseCommit = mode === 'git' ? (await gitProject(f)).trim() : undefined;
   f.command('project.save', { id: f.project.id, autoMerge: false,
     checks: [{ id: 'joint', command: process.execPath, args: ['-e', 'process.exitCode=0'] }] });
@@ -97,6 +136,8 @@ async function archiveFixture(t, mode, { review = false, reviewGate } = {}) {
   const snapshot = () => f.company.snapshot().goals.find(row => row.id === goal.id);
   const selection = () => ({ goalId: goal.id, version: current().composition.version, deliveryHash: f.company.deliveryHash(goal.id) });
   const complete = () => until(() => {
+    const integration = f.store.list('integrations').find(row => row.goalId === goal.id && row.phase === 'failed');
+    if (integration) assert.fail(integration.reason);
     const failed = f.store.list('attempts').find(row => row.goalId === goal.id && row.status === 'failed');
     if (failed) assert.fail(failed.summary);
     if (current().compositionRecheck?.status === 'failed') assert.fail(current().compositionRecheck.reason);
@@ -154,6 +195,13 @@ test('the owner archives exactly the approved directory tree and repeat download
   assert(!entries.has('source/module') && !entries.has('source/obsolete.txt'));
   assert(!manifest.files.some(entry => entry.role === 'deleted'));
   assert.equal(await copyContentHash(await rebuild(path.join(f.root, 'extract'), entries)), current().composition.contentHash);
+  await rejectSubstitutedArchive(f, routes, chosen, archive, entries, changed => {
+    changed.set('source/raw.bin', Buffer.alloc(binary.length, 89));
+  });
+  await rejectSubstitutedArchive(f, routes, chosen, archive, entries, changed => {
+    changed.delete('source/module/empty/');
+    changed.set('source/module/a-different-empty/', Buffer.alloc(0));
+  });
   const blob = path.join(f.dataDir, 'deliveries', 'archives', archive.archiveSha256 + '.zip');
   await fs.unlink(blob);
   assert.deepEqual(await (await routes.archive(chosen)).json(), archive);
@@ -203,6 +251,16 @@ test('the Git download contains the fixed candidate and checks both version and 
   assert.deepEqual(entries.get('source/raw.bin'), binary);
   assert(!entries.has('source/.git') && !entries.has('source/obsolete.txt'));
   assert.equal(await gitWorktreeFingerprint(await rebuild(path.join(f.root, 'extract'), entries)), current().composition.contentHash);
+  await rejectSubstitutedArchive(f, routes, chosen, archive, entries, changed => {
+    changed.set('source/raw.bin', Buffer.alloc(binary.length, 89));
+  });
+  await rejectSubstitutedArchive(f, routes, chosen, archive, entries, changed => {
+    assert(changed.has('source/raw.bin'));
+    return 'source/raw.bin';
+  });
+  await rejectSubstitutedArchive(f, routes, chosen, archive, entries, changed => {
+    changed.set('source/module/extra-empty/', Buffer.alloc(0));
+  });
   assert.equal(await fs.readFile(path.join(f.source, 'module'), 'utf8'), 'previous file');
   await failed(await routes.download({ ...chosen, version: '1'.repeat(64) }, archive.archiveSha256), 409, 'STALE_COMPOSITION');
   await failed(await routes.download(chosen, '2'.repeat(64)), 409, 'STALE_COMPOSITION');
@@ -239,6 +297,34 @@ test('archive preparation detects a revoked project root before publishing or re
   const archive = await response.json();
   f.command('project.save', { id: f.project.id, checks: [{ id: 'changed', command: process.execPath, args: ['-e', 'process.exit(0)'] }] });
   await failed(await routes.download(chosen, archive.archiveSha256), 409, 'COMPOSITE_NOT_VERIFIED');
+});
+
+test('Git archive proofs match SHA-256 trees with a real executable file mode', async t => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.source, 'module.txt'), 'Git records this as executable');
+  await fs.mkdir(path.join(f.source, 'module'));
+  await fs.writeFile(path.join(f.source, 'module', '组件.js'), 'nested entry');
+  const git = async (...args) => {
+    const result = await run('git', args, f.source);
+    assert.equal(result.code, 0, result.stderr);
+    return result.stdout;
+  };
+  await git('init', '-b', 'main', '--object-format=sha256');
+  await git('add', '.');
+  await git('update-index', '--chmod=+x', 'module.txt');
+  if (process.platform !== 'win32') await fs.chmod(path.join(f.source, 'module.txt'), 0o755);
+  const tree = (await git('write-tree')).trim();
+  const entries = (await git('ls-tree', '-r', '-z', tree)).split('\0').filter(Boolean).map(row => {
+    const [, mode, oid, name] = /^(\d+) blob ([0-9a-f]+)\t(.+)$/s.exec(row);
+    return [name, { mode, oid }];
+  });
+  assert.equal(tree.length, 64);
+  const authority = { mode: 'git', tree };
+  const archive = await buildCandidateArchive({ root: f.source, entries, mode: 'git', authority, evidence: { tree }, maxBytes: 4096 });
+  assert.equal(zipMode(archive.bytes, 'source/module.txt'), 0o100755);
+  const proof = await validateCandidateArchive(archive.bytes, { authority });
+  assert.equal(proof.contentMatches, true);
+  assert.equal(proof.candidate.tree, tree);
 });
 
 test('a valid scoped agent credential cannot access the owner candidate routes', async t => {

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validateDeliveryArchive } from '../src/runtime/archive-validation.js';
 import { byteSha256, verifyDeliveryArchive } from '../src/runtime/delivery-archive.js';
+import { copyContentHash } from '../src/runtime/copy-composition.js';
 import { ARCHIVE_PROMPT_BYTES, promptFor } from '../src/runtime/prompt.js';
 import { buildHost } from '../scripts/host-bundle.mjs';
 import { fixture } from './helpers.js';
@@ -92,9 +93,11 @@ test('isolated host bundle publishes and runs its matching archive worker', asyn
   const file = Buffer.from([0, 255, 13, 10]);
   await mkdir(candidate);
   await writeFile(path.join(candidate, 'binary.dat'), file);
-  const archive = await bundled.buildCandidateArchive({ root: candidate, mode: 'copy', maxBytes: 4096,
+  const authority = { mode: 'copy', contentHash: await copyContentHash(candidate) };
+  const archive = await bundled.buildCandidateArchive({ root: candidate, mode: 'copy', maxBytes: 4096, authority,
     entries: [['binary.dat', { mode: '100644', oid: byteSha256(file) }]], evidence: { version: 'fixture' } });
-  const proof = await bundled.validateCandidateArchive(archive.bytes);
+  const proof = await bundled.validateCandidateArchive(archive.bytes, { authority });
+  assert.equal(proof.contentMatches, true);
   assert.equal(proof.manifestSha256, archive.manifestSha256);
   assert.equal(proof.candidate.version, 'fixture');
   const controller = new AbortController(), pending = bundled.validateDeliveryArchive(deliveryZip([]), { signal: controller.signal });

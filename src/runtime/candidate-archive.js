@@ -39,9 +39,11 @@ function currentFinal(company, selection) {
   assert(completed.version === selection.version && completed.deliveryHash === selection.deliveryHash,
     'STALE_COMPOSITION', '目标交付版本已变化，请刷新并选择当前候选。');
   const evidence = evidenceFor({ goal, candidate, completed });
-  const key = digest(evidence);
+  const authority = evidence.mode === 'git' ? { mode: 'git', tree: candidate.tree }
+    : { mode: 'copy', contentHash: candidate.contentHash };
+  const key = digest({ evidence, authority });
   const maxBytes = Math.min(company.policy().maxArtifactBytes, ARCHIVE_LIMITS.archiveBytes);
-  return { goal, candidate, completed, evidence, key, maxBytes };
+  return { goal, candidate, completed, evidence, authority, key, maxBytes };
 }
 
 async function authorizedFinal(company, selection) {
@@ -102,8 +104,9 @@ async function readArchive(archives, state, record) {
 }
 
 async function verifyArchiveEvidence(bytes, state, record, signal) {
-  const proof = await validateCandidateArchive(bytes, { signal });
-  assert(proof.passed && proof.manifestSha256 === record.manifestSha256 && proof.totals?.files === record.files + 1 &&
+  const proof = await validateCandidateArchive(bytes, { authority: state.authority, signal });
+  assert(proof.passed && proof.contentMatches && proof.manifestSha256 === record.manifestSha256 &&
+    proof.files === record.files && proof.directories === record.directories &&
     digest(proof.candidate ?? null) === digest({ ...state.evidence, materialization: 'clean-directory' }),
   'ARTIFACT_CORRUPT', '归档清单与当前候选的交付证据不一致，请核对备份。');
 }
@@ -112,7 +115,8 @@ function evidenceFor(state) {
   const { candidate, goal, completed } = state;
   return {
     goalId: goal.id, ...completed, mode: goal.deliveryMode === COPY_COMPOSITION ? 'copy' : 'git',
-    contentHash: candidate.contentHash, ...(candidate.baseHash ? { baseHash: candidate.baseHash } : { baseCommit: candidate.baseCommit }),
+    contentHash: candidate.contentHash, ...(candidate.baseHash ? { baseHash: candidate.baseHash }
+      : { baseCommit: candidate.baseCommit, tree: candidate.tree }),
     checks: candidate.checks.map(check => ({
       id: check.id, command: check.command ?? null, checkVersion: check.checkVersion ?? null, environment: check.environment ?? null,
       inputHash: check.inputHash ?? null, code: check.code ?? null, logSha256: check.log?.hash ?? null,
@@ -151,7 +155,8 @@ export async function prepareCandidateArchive(company, dataDir, input, signal) {
     const { evidence } = state;
     const entries = evidence.mode === 'copy' ? await checkoutCopyComposition(state.candidate.snapshot, checkout, dataDir, signal)
       : await checkoutComposition(state.candidate, checkout, temporary, dataDir, run, signal);
-    const built = await buildCandidateArchive({ root: checkout, entries: [...entries], mode: evidence.mode, evidence, maxBytes: state.maxBytes }, { signal });
+    const built = await buildCandidateArchive({ root: checkout, entries: [...entries], mode: evidence.mode, evidence,
+      authority: state.authority, maxBytes: state.maxBytes }, { signal });
     const { bytes, ...summary } = built;
     const record = { format: ARCHIVE_FORMAT, key: state.key, version: state.completed.version,
       deliveryHash: state.completed.deliveryHash, contentHash: state.candidate.contentHash, filename: filenameFor(state),
