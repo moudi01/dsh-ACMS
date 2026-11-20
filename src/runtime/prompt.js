@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { goalRuntimeLimit, goalRuntimeSpent, goalTimeBoxLimit } from '../core/runtime-budget.js';
 import { contractVersion, deliveredWork, deliveryGeneration, taskContractVersion } from '../core/goal-contract.js';
-import { isApprovalPlanner } from '../core/plan-approval.js';
+import { isApprovalPlanner, isCostPlanner } from '../core/plan-approval.js';
+import { costPlanBalance } from '../core/plan-cost-budget.js';
 
 export const ARCHIVE_PROMPT_BYTES = 16 * 1024;
 function archivePromptProjection() {
@@ -29,6 +30,7 @@ function archivePromptProjection() {
 export function promptFor(company, task, attempt, options = {}) {
   const goal = company.store.require('goals', task.goalId); const agent = company.store.require('agents', attempt.agentId);
   const template = goal.templateSnapshot ?? company.store.get('templates', goal.templateId ?? 'base');
+  const costPlanning = isCostPlanner(goal, task) ? costPlanBalance(company.store.require('goalCostBudgets', goal.id)) : null;
   const related = task.dependencies.map(id => company.store.require('tasks', id));
   const archiveProjection = archivePromptProjection();
   const inputs = related.flatMap(t => t.artifactIds.map(id => archiveProjection.project(company.store.require('artifacts', id)))).map(a => ({ id: a.id, path: a.blob, originalPath: a.path, title: a.title, hash: a.hash,
@@ -58,7 +60,10 @@ export function promptFor(company, task, attempt, options = {}) {
     inputArtifacts: inputs, previousFeedback: task.feedback ?? null, userAnswer: task.lastAnswer ?? null,
     ...(deliveryReturn?.action === 'revise' ? { ownerDeliveryRevision: { version: deliveryReturn.subject.selection.version,
       reason: deliveryReturn.reason, instructions: 'Use this owner feedback in the authorized work. A revised candidate still requires project checks and any required review and owner approval.' } } : {}),
-    ...(isApprovalPlanner(goal, task) ? { planApprovalInstructions: 'Submit a structured plan proposal for the owner. Include the proposed scope, exclusions, rationale or trade-offs, assignments and task dependencies. Implementation and repair cannot start before the owner approves this proposal. Submit the tasks in the plan outcome. Do not try to create or retry them via management actions while preparing the proposal.' } : {}),
+    ...(costPlanning ? { costPlanning: { ...costPlanning, basis: 'Current durable goal ledger before this planning dispatch. The host subtracts all held amounts, including this planning attempt when it evaluates the submitted plan. Missing receipts remain held.',
+      estimateSource: 'The host estimates USD from selected scope and a trusted executor source. Your rationale and classifications guide the estimate; do not supply monetary amounts or use duration as price.',
+      instructions: 'Add importance ("required" or "optional") and modelBasis to every task. Required tasks must depend only on required work. Add costPlan: {acceptanceBasis, reworkBasis} explaining the configured verification and rework coverage. If the minimum cannot fit or an estimate is unavailable, report the plan honestly so the owner can decide. Submit tasks as a plan outcome. Do not create implementation through management actions.' } } : {}),
+    ...(isApprovalPlanner(goal, task) && (!costPlanning || goal.planApproval.project || goal.planApproval.template) ? { planApprovalInstructions: 'Submit a structured plan proposal for the owner. Include the proposed scope, exclusions, rationale or trade-offs, assignments and task dependencies. Implementation and repair cannot start before the owner approves this proposal. Submit the tasks in the plan outcome. Do not try to create or retry them via management actions while preparing the proposal.' } : {}),
     ...(task.workspace?.mode === 'git' && task.workspace?.compositionInput?.inputs?.length ? { selectedGitInputs: {
       baseCommit: task.workspace.compositionBase, version: task.workspace.compositionInput.version,
       inputs: task.workspace.compositionInput.inputs,

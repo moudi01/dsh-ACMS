@@ -334,6 +334,29 @@ function PlanDecisionHistory({ plan }) {
   </div>)}{plan.supersededReason && <p>{plan.supersededReason}</p>}</>;
 }
 
+function PlanCostDetails({ goal, plan }) {
+  const cost = plan.costPlan, budget = goal.costBudget;
+  if (!goal.planApproval.costPlanning) return null;
+  if (!cost) return <p>此旧提案尚无可信费用估算。请退回重新规划。</p>;
+  const estimate = cost.estimate;
+  return <section aria-label="计划费用估算">
+    <h4>计划费用估算</h4>
+    <dl className="acms-definition">
+      <dt>提交时可派发余额</dt><dd>{usdFromMicros(cost.submitted.availableMicros)} · 已预留 {usdFromMicros(cost.submitted.reservedMicros)}</dd>
+      <dt>当前可派发余额</dt><dd>{usdFromMicros(budget.availableMicros)}</dd>
+      <dt>最低交付估算</dt><dd>{cost.minimumMicros === null ? '未知' : usdFromMicros(cost.minimumMicros)}</dd>
+      <dt>含可选任务估算</dt><dd>{cost.fullMicros === null ? '未知' : usdFromMicros(cost.fullMicros)}</dd>
+      {estimate && <>
+        <dt>估算来源</dt><dd>{estimate.executorId} · {estimate.quoteId}</dd>
+        <dt>验收计划预留</dt><dd>{usdFromMicros(estimate.acceptance.micros)} · {estimate.acceptance.basis}</dd>
+        <dt>返工计划预留</dt><dd>{usdFromMicros(estimate.rework.micros)} · {estimate.rework.basis}</dd>
+      </>}
+    </dl>
+    {cost.reason && <p>{cost.reason}</p>}
+    {estimate && <p className="acms-sectionnote">计划估算用于范围决策。实际派发仍逐次预留，费用以可信回执结算。</p>}
+  </section>;
+}
+
 function PlanProposal({ goal, task, plan, data, act, busy }) {
   const [reason, setReason] = useState('');
   const attempt = data.attempts.find(item => item.id === plan.attemptId);
@@ -341,6 +364,11 @@ function PlanProposal({ goal, task, plan, data, act, busy }) {
     goal.contractChange?.status === 'pending' ? '请先处理当前目标合同变更。' :
     attempt?.cleanupPending || attempt?.cleanupUncertain ? '请等待规划执行完成清理或核对。' :
     task.status !== 'blocked' ? '请先恢复规划任务。' : !reason.trim() ? '请先填写决定理由。' : '';
+  const budget = goal.costBudget, cost = plan.costPlan;
+  const budgetReason = !goal.planApproval.costPlanning ? '' : !cost?.estimate ? '先退回提案并补齐可信估算。' :
+    budget.breach || BigInt(budget.availableMicros) < BigInt(cost.selectedMicros) ? '当前余额不足以批准此计划版本。' : '';
+  const badge = plan.costRelease?.kind === 'automatic' ? '已按金额核验派工' :
+    goal.planApproval.costPlanning && plan.approvalStatus === 'pending' && cost?.status !== 'fits' ? '等待预算决定' : planLabels[plan.approvalStatus];
   const canDecide = ['pending', 'rejected'].includes(plan.approvalStatus) && !['cancelled', 'archived', 'deleted', 'succeeded'].includes(goal.status);
   const decide = async (action, message) => {
     const result = await act('plan.approval.decide', { planId: plan.id, fingerprint: plan.fingerprint,
@@ -348,7 +376,7 @@ function PlanProposal({ goal, task, plan, data, act, busy }) {
     if (result) setReason('');
   };
   return <>
-    <p role="status"><span className="acms-tag">{planLabels[plan.approvalStatus]}</span> · 规划第 {plan.generation} 代 · 合同 v{plan.goalContractVersion}</p>
+    <p role="status"><span className="acms-tag">{badge}</span> · 规划第 {plan.generation} 代 · 合同 v{plan.goalContractVersion}</p>
     <dl className="acms-definition">
       <dt>提案版本</dt><dd><code title={plan.fingerprint}>{plan.fingerprint.slice(0, 16)}</code></dd>
       <dt>负责人</dt><dd>{data.agents.find(agent => agent.id === plan.managerId)?.name ?? plan.managerId}</dd>
@@ -356,14 +384,23 @@ function PlanProposal({ goal, task, plan, data, act, busy }) {
       {!!plan.scope?.nonGoals?.length && <><dt>范围之外</dt><dd>{plan.scope.nonGoals.join('、')}</dd></>}
       <dt>取舍与依据</dt><dd className="acms-preserve">{plan.rationale || plan.summary}</dd>
     </dl>
+    <PlanCostDetails goal={goal} plan={plan} />
     <details open={plan.approvalStatus === 'pending'}><summary>拟派发任务（{plan.proposalTasks.length}）</summary>
-      {plan.proposalTasks.map(node => <div key={node.key} className="acms-change-diff">
-        <b>{node.title}</b>
-        {node.description !== node.title && <p className="acms-preserve">{node.description}</p>}
-        <p className="acms-preserve">验收要求 · {node.acceptance ?? plan.goalAcceptance}</p>
-        <p>前置任务 · {node.dependencies.map(key => plan.proposalTasks.find(item => item.key === key)?.title ?? key).join('、') || '无'}</p>
-        {node.assignee && <p>拟执行人员 · {data.agents.find(agent => agent.id === node.assignee)?.name ?? node.assignee}</p>}
-      </div>)}
+      {plan.proposalTasks.map(node => {
+        const intent = cost?.intent.nodes.find(item => item.key === node.key);
+        const estimate = cost?.estimate?.tasks.find(item => item.key === node.key)?.estimate;
+        return <div key={node.key} className="acms-change-diff">
+          <b>{node.title}</b>
+          {node.description !== node.title && <p className="acms-preserve">{node.description}</p>}
+          <p className="acms-preserve">验收要求 · {node.acceptance ?? plan.goalAcceptance}</p>
+          <p>前置任务 · {node.dependencies.map(key => plan.proposalTasks.find(item => item.key === key)?.title ?? key).join('、') || '无'}</p>
+          {node.assignee && <p>拟执行人员 · {data.agents.find(agent => agent.id === node.assignee)?.name ?? node.assignee}</p>}
+          {intent && <p>{intent.importance === 'required' ? '必做' : intent.importance === 'optional' ? '可选' : '分类待补充'}
+            {estimate && !cost.selectedKeys.includes(node.key) && ' · 已延期'}
+            {estimate ? ` · 估算 ${usdFromMicros(estimate.micros)} · ${estimate.route.model} · ${estimate.basis}` : ' · 估算未知'}</p>}
+          {intent?.modelBasis && <p className="acms-preserve">选模依据 · {intent.modelBasis}</p>}
+        </div>;
+      })}
     </details>
     <PlanDecisionHistory plan={plan} />
     {canDecide && <>
@@ -371,7 +408,7 @@ function PlanProposal({ goal, task, plan, data, act, busy }) {
       {plan.approvalStatus === 'pending' && <p className="acms-sectionnote">批准后按此版本和依赖派工。拒绝后等待所有者决定是否重新规划。</p>}
       <div className="acms-actions wrap">
         {plan.approvalStatus === 'pending' && <>
-          <ActionButton className="primary" reason={decisionReason} onClick={() => decide('approve', '已批准此计划并派工')}>批准计划并派工</ActionButton>
+          <ActionButton className="primary" reason={decisionReason || budgetReason} onClick={() => decide('approve', '已批准此计划并派工')}>批准计划并派工</ActionButton>
           <ActionButton className="danger" reason={decisionReason} onClick={() => decide('reject', '已拒绝此计划')}>拒绝此计划</ActionButton>
         </>}
         <ActionButton reason={decisionReason} onClick={() => decide('revise', '已安排负责人重新规划')}>{plan.approvalStatus === 'rejected' ? '重新规划' : '退回修改'}</ActionButton>

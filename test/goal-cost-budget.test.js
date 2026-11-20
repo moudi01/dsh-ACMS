@@ -127,15 +127,20 @@ test('only owners opt in at creation, and an unpriced planner is held without st
 test('paid planning uses the same ledger, and its confirmed charge can stop implementation from dispatch', async t => {
   const f = await fixture(t, async input => input.task.kind === 'plan' ? {
     outcome: 'planned', summary: 'Plan under a fixed-cost fixture',
-    tasks: [{ key: 'required', title: 'Required task', description: 'Build a file', acceptance: 'File exists', dependencies: [] }],
+    tasks: [{ key: 'required', title: 'Required task', description: 'Build a file', acceptance: 'File exists', dependencies: [],
+      importance: 'required', modelBasis: 'Use the fixed model' }],
+    costPlan: { acceptanceBasis: 'Verify file', reworkBasis: 'Allow rework' },
   } : defaultSimulation(input));
   const priced = fixedCostAdapter(f, { quoteFor: () => '7', amountFor: () => '7' });
+  planEstimates(priced, { amounts: { required: '7' }, acceptance: '0', rework: '0' });
   f.engine.adapter = priced.adapter;
   const target = goal(f, '0.000010', { plan: true });
   const planner = f.store.list('tasks').find(task => task.goalId === target.id && task.kind === 'plan');
   await f.start();
-  await until(() => f.store.list('tasks').some(task => task.goalId === target.id && task.kind === 'work' && task.costBudgetHold?.code === 'COST_LIMIT_REACHED'),
-    undefined, () => ({ ...taskWaitDiagnostics(f, planner.id)(), cost: budget(f.store, target.id), engineError: f.engine.lastError }));
+  const plan = await proposalFor(f, target);
+  assert.equal(plan.costPlan.status, 'shortfall');
+  assert.equal(plan.costPlan.submitted.availableMicros, '3');
+  assert(!f.store.list('tasks').some(task => task.goalId === target.id && task.kind === 'work'));
   assert.deepEqual(priced.calls, [planner.id]);
   assert.equal(rows(f.store).length, 1);
   assert.equal(rows(f.store)[0].amountMicros, '7');
@@ -378,4 +383,239 @@ test('a stale live host cannot mark paid cleanup after ownership changes at the 
     await f.engine.stop();
     successor.close();
   }
+});
+
+
+function budgetedProposal({ requiredDependsOnOptional = false } = {}) {
+  const node = (key, importance, dependencies = []) => ({ key, title: key, description: 'Prove work for ' + key,
+    acceptance: 'A file exists', dependencies, importance, modelBasis: 'Fixed adapter supports the required tools.',
+    amountMicros: '0' }); // Untrusted numbers must never become an estimate.
+  return { outcome: 'planned', summary: 'Budgeted fixture plan', rationale: 'Only core and validate are necessary.',
+    minimumOutcome: 'Core file with independent verification', nonGoals: ['Optional enhancements can wait'],
+    costPlan: { acceptanceBasis: 'Run configured evidence checks.', reworkBasis: 'Allow one bounded correction.' },
+    tasks: [node('core', 'required', requiredDependsOnOptional ? ['bonus'] : []), node('validate', 'required', ['core']),
+      node('bonus', 'optional')] };
+}
+
+function planEstimates(priced, { amounts = { core: '8', validate: '6', bonus: '25' }, acceptance = '5', rework = '4' } = {}) {
+  const calls = [];
+  priced.adapter.taskCost.estimatePlan = context => {
+    calls.push(context);
+    const basis = 'Isolated fixed price source';
+    return { currency: 'USD', quoteId: 'fixed-plan-v1',
+      acceptance: { micros: acceptance, basis }, rework: { micros: rework, basis },
+      tasks: context.tasks.map(({ key }) => ({ key, micros: amounts[key], route: priced.route, basis })) };
+  };
+  return calls;
+}
+
+async function proposalFor(f, target) {
+  return until(() => {
+    const plan = f.store.list('plans').find(item => item.goalId === target.id && item.approvalStatus !== 'superseded');
+    return plan && !f.store.require('attempts', plan.attemptId).cleanupPending ? plan : null;
+  }, undefined, () => ({ tasks: f.store.list('tasks').filter(task => task.goalId === target.id).map(task => [task.kind, task.status, task.feedback]),
+    plans: f.store.list('plans').filter(item => item.goalId === target.id).map(item => item.approvalStatus), engineError: f.engine.lastError }));
+}
+
+function planDecision(plan, action, reason) {
+  return { planId: plan.id, fingerprint: plan.fingerprint, generation: plan.generation,
+    goalContractVersion: plan.goalContractVersion, action, reason };
+}
+
+test('budget planning commits a host-estimated minimum and defers optional scope without an extra owner approval', async t => {
+  let contract;
+  const f = await fixture(t, input => {
+    if (input.task.kind !== 'plan') return defaultSimulation(input);
+    contract = JSON.parse(input.prompt.split('CONTRACT:\n').at(-1));
+    return budgetedProposal();
+  });
+  const priced = fixedCostAdapter(f);
+  const estimates = planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  const target = goal(f, '0.000040', { plan: true });
+  const premature = { goalId: target.id, title: 'Work outside root plan' };
+  assert.throws(() => f.task(premature), { code: 'PLAN_APPROVAL_REQUIRED' });
+  assert.throws(() => f.command('task.create', premature, SYSTEM), { code: 'PLAN_APPROVAL_REQUIRED' });
+  assert.throws(() => f.command('task.create', premature, { kind: 'agent', id: 'manager', goalId: target.id, grants: ['task.create'] }),
+    { code: 'PLAN_APPROVAL_REQUIRED' });
+  await f.start();
+  const plan = await proposalFor(f, target);
+  assert.equal(contract.costPlanning.availableMicros, '40');
+  assert.equal(contract.costPlanning.reservedAttempts, 0);
+  assert.equal(contract.costPlanning.reportedAttempts, 0);
+  assert.equal(plan.costPlan.submitted.availableMicros, '33');
+  assert.equal(plan.costPlan.submitted.reservedMicros, '7');
+  assert.equal(plan.costPlan.minimumMicros, '23');
+  assert.equal(plan.costPlan.fullMicros, '48');
+  assert.equal(plan.costPlan.estimate.tasks.find(row => row.key === 'core').estimate.micros, '8');
+  assert.equal(plan.costPlan.estimate.acceptance.micros, '5');
+  assert.equal(plan.costPlan.estimate.rework.micros, '4');
+  assert.equal(plan.costPlan.estimate.quoteId, 'fixed-plan-v1');
+  assert.equal(estimates.length, 1);
+  assert.equal(estimates[0].tasks[0].amountMicros, undefined);
+  assert.equal(plan.approvalStatus, 'approved');
+  assert.equal(plan.costRelease.kind, 'automatic');
+  assert.equal(plan.ownerDecision, undefined);
+  assert.deepEqual(plan.nodes.map(row => row.key), ['core', 'validate']);
+  assert.deepEqual(plan.nodes[1].dependencies, [plan.nodes[0].taskId]);
+  assert.equal(f.store.require('goals', target.id).planApproval.approvedPlanId, plan.id);
+  await until(() => plan.nodes.every(row => f.store.require('tasks', row.taskId).status === 'succeeded'), undefined,
+    () => plan.nodes.map(row => taskWaitDiagnostics(f, row.taskId)()));
+  assert.equal(priced.calls.length, 3);
+});
+
+test('insufficient minimum leaves no implementation until explicit addition and same-version owner approval after restart', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  const priced = fixedCostAdapter(f, { amountFor: task => task.kind === 'plan' ? '7' : '3' });
+  planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  const target = goal(f, '0.000020', { plan: true });
+  await f.start();
+  const plan = await proposalFor(f, target);
+  const root = f.store.require('tasks', plan.taskId);
+  assert.equal(plan.costPlan.status, 'shortfall');
+  assert.equal(plan.costPlan.minimumMicros, '23');
+  assert.equal(plan.costPlan.submitted.availableMicros, '13');
+  assert.equal(root.status, 'blocked');
+  assert.deepEqual(priced.calls, [root.id]);
+  const approve = planDecision(plan, 'approve', 'Fund the verified minimum');
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', approve, 'insufficient-approval', 409)).code, 'COST_PLAN_LIMIT');
+  assert.equal((await scopedCommand(f, 'task.resume', { id: root.id }, 'ordinary-continue', 409)).code, 'PLAN_APPROVAL_REQUIRED');
+  assert.equal(budget(f.store, target.id).limitMicros, '20');
+  assert.equal(f.store.list('tasks').filter(task => task.goalId === target.id).length, 1);
+  await f.engine.stop();
+
+  const reopened = new Store(f.store.filename), company = new Company(reopened);
+  const recovered = fixedCostAdapter(f);
+  const engine = new Engine(company, recovered.adapter, new WorkspaceManager(f.dataDir, company), { intervalMs: 20 });
+  const runtime = { ...f, store: reopened, company, adapter: recovered.adapter, engine, workspaces: engine.workspaces };
+  try {
+    await engine.start();
+    assert.equal(reopened.require('plans', plan.id).fingerprint, plan.fingerprint);
+    assert.equal(reopened.require('tasks', root.id).status, 'blocked');
+    assert.deepEqual(recovered.calls, []);
+    await scopedCommand(runtime, 'goal.cost_budget.extend', { id: target.id, additionalCostUsd: '0.000050' }, 'explicit-funding');
+    assert.equal(reopened.require('goals', target.id).planApproval.approvedPlanId, undefined);
+    const approved = await scopedCommand(runtime, 'plan.approval.decide', approve, 'same-plan-approval');
+    assert.equal(approved.costRelease.kind, 'owner');
+    assert.equal(approved.costRelease.balance.availableMicros, '63');
+    assert.deepEqual(approved.nodes.map(node => node.key), ['core', 'validate']);
+    assert.deepEqual(await scopedCommand(runtime, 'plan.approval.decide', approve, 'same-plan-approval'), approved);
+    assert.deepEqual(await scopedCommand(runtime, 'plan.approval.decide', approve, 'new-id-same-approval'), approved);
+    await until(() => approved.nodes.every(row => reopened.require('tasks', row.taskId).status === 'succeeded'), undefined,
+      () => approved.nodes.map(row => ({ taskId: row.taskId, status: reopened.require('tasks', row.taskId).status })));
+    assert.equal(recovered.calls.length, 2);
+    assert.equal(reopened.list('plans').filter(item => item.goalId === target.id).length, 1);
+  } finally { await engine.stop(); reopened.close(); }
+});
+
+test('missing estimates and a required dependency on optional scope both hold proposals without work', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ?
+    budgetedProposal({ requiredDependsOnOptional: input.task.title.includes('Dependency') }) : defaultSimulation(input));
+  const priced = fixedCostAdapter(f);
+  f.engine.adapter = priced.adapter; // The ordinary cost contract can quote a live attempt but not a plan.
+  const missing = goal(f, '0.000100', { plan: true, title: 'Missing estimate' });
+  const dependency = goal(f, '0.000100', { plan: true, title: 'Dependency outside minimum' });
+  await f.start();
+  const [missingPlan, dependencyPlan] = await Promise.all([proposalFor(f, missing), proposalFor(f, dependency)]);
+  assert.equal(missingPlan.costPlan.status, 'incomplete');
+  assert.equal(dependencyPlan.costPlan.status, 'incomplete');
+  assert.match(dependencyPlan.costPlan.reason, /依赖可选/);
+  assert.equal(missingPlan.costPlan.minimumMicros, null);
+  assert.equal(dependencyPlan.costPlan.minimumMicros, null);
+  for (const plan of [missingPlan, dependencyPlan]) {
+    assert.equal((await scopedCommand(f, 'plan.approval.decide', planDecision(plan, 'approve', 'Incomplete proof'),
+      'incomplete-' + plan.id, 409)).code, 'COST_PLAN_ESTIMATE_REQUIRED');
+    assert(!f.store.list('tasks').some(task => task.goalId === plan.goalId && task.kind === 'work'));
+  }
+  assert.equal(priced.calls.length, 2);
+});
+
+test('the human plan gate remains independent and rechecks the accepted estimate context before approval', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  const priced = fixedCostAdapter(f);
+  planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  f.command('project.save', { id: f.project.id, planApproval: true });
+  const target = goal(f, '0.000100', { plan: true });
+  await f.start();
+  const plan = await proposalFor(f, target);
+  assert.equal(plan.costPlan.status, 'fits');
+  assert.deepEqual(plan.costPlan.selectedKeys, ['core', 'validate', 'bonus']);
+  assert.equal(plan.approvalStatus, 'pending');
+  assert.deepEqual(priced.calls, [plan.taskId]);
+  f.command('project.save', { id: f.project.id, checks: [{ id: 'new-check', command: process.execPath, args: ['--version'] }] });
+  const approve = planDecision(plan, 'approve', 'Recheck project policy');
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', approve, 'stale-approval', 409)).code, 'COST_PLAN_ESTIMATE_STALE');
+  assert.deepEqual(priced.calls, [plan.taskId]);
+  const returned = await scopedCommand(f, 'plan.approval.decide', planDecision(plan, 'revise', 'Refresh checks'), 'return-with-changed-checks');
+  assert.equal(returned.approvalStatus, 'returned');
+  const renewed = await until(() => f.store.list('plans').find(item => item.goalId === target.id && item.generation === plan.generation + 1 &&
+    !f.store.require('attempts', item.attemptId).cleanupPending), undefined,
+  () => taskWaitDiagnostics(f, plan.taskId)());
+  assert.equal(renewed.approvalStatus, 'pending');
+  assert.notEqual(renewed.costPlan.contextVersion, plan.costPlan.contextVersion);
+  const approved = await scopedCommand(f, 'plan.approval.decide', planDecision(renewed, 'approve', 'Accept the full affordable plan'), 'full-plan');
+  assert.deepEqual(approved.nodes.map(row => row.key), ['core', 'validate', 'bonus']);
+});
+
+
+test('an unknown planning charge keeps its reservation in both the submitted estimate and the live approval balance', async t => {
+  const f = await fixture(t, input => input.task.kind === 'plan' ? budgetedProposal() : defaultSimulation(input));
+  const priced = fixedCostAdapter(f, { amountFor: task => task.kind === 'plan' ? null : '3' });
+  planEstimates(priced);
+  f.engine.adapter = priced.adapter;
+  const target = goal(f, '0.000027', { plan: true });
+  await f.start();
+  const plan = await proposalFor(f, target), args = planDecision(plan, 'approve', 'Consider the verified minimum');
+  assert.equal(plan.costPlan.status, 'shortfall');
+  assert.equal(plan.costPlan.submitted.reportedAttempts, 0);
+  assert.equal(plan.costPlan.submitted.reservedAttempts, 1);
+  assert.equal(plan.costPlan.submitted.availableMicros, '20');
+  assert.equal(budget(f.store, target.id).awaitingReceiptAttempts, 1);
+  assert.equal((await scopedCommand(f, 'plan.approval.decide', args, 'awaiting-receipt', 409)).code, 'COST_PLAN_LIMIT');
+  const row = rows(f.store).find(entry => entry.taskId === plan.taskId);
+  priced.save('cost-', row.id, receipt(row, '4'));
+  f.engine.nextCostReceiptCheck = 0;
+  f.engine.kick();
+  await until(() => budget(f.store, target.id).reportedAttempts === 1);
+  assert.equal(budget(f.store, target.id).settledMicros, '4');
+  assert.equal(f.store.require('plans', plan.id).costPlan.submitted.availableMicros, '20');
+  assert.deepEqual(priced.calls, [plan.taskId]);
+  const approved = await scopedCommand(f, 'plan.approval.decide', args, 'confirmed-receipt');
+  assert.equal(approved.costRelease.balance.availableMicros, '23');
+  assert.deepEqual(approved.nodes.map(entry => entry.key), ['core', 'validate']);
+});
+
+test('only unimplemented open legacy strict roots receive the new planning gate on startup', async t => {
+  const f = await fixture(t);
+  const create = title => goal(f, '0.000040', { plan: true, title });
+  const pending = create('Legacy pending');
+  const deleted = create('Legacy deleted planner');
+  const cancelled = create('Legacy cancelled goal');
+  const completed = create('Legacy accepted plan');
+  const approved = create('Legacy owner approval');
+  const manual = goal(f, '0.000040', { title: 'Legacy manual' });
+  const rootFor = id => f.store.list('tasks').find(item => item.goalId === id && item.kind === 'plan');
+  const expectedApproval = { ...approved.planApproval, costPlanning: undefined, approvedPlanId: 'existing-owner-approval' };
+  f.store.transaction(() => {
+    for (const target of [pending, deleted, cancelled, completed]) f.store.put('goals', { ...target, planApproval: null });
+    f.store.put('goals', { ...approved, planApproval: expectedApproval });
+    f.store.put('goals', { ...f.store.require('goals', cancelled.id), status: 'cancelled' });
+    const oldRoot = rootFor(deleted.id);
+    f.store.put('tasks', { ...oldRoot, status: 'deleted' });
+    const completeRoot = rootFor(completed.id);
+    f.store.put('plans', { id: completeRoot.id + ':g1', taskId: completeRoot.id, goalId: completed.id, acceptedAt: '2026-11-19T00:00:00Z' });
+  });
+  const reopened = new Store(f.store.filename);
+  try {
+    new Company(reopened);
+    assert.deepEqual(reopened.require('goals', pending.id).planApproval, { taskId: rootFor(pending.id).id, costPlanning: true });
+    for (const target of [deleted, cancelled, completed, manual]) assert(!reopened.require('goals', target.id).planApproval);
+    const retained = reopened.require('goals', approved.id).planApproval;
+    assert.deepEqual(retained, { taskId: approved.planApproval.taskId, project: false, template: false, approvedPlanId: 'existing-owner-approval' });
+    const revision = reopened.require('goals', pending.id).revision;
+    new Company(reopened);
+    assert.equal(reopened.require('goals', pending.id).revision, revision);
+  } finally { reopened.close(); }
 });
