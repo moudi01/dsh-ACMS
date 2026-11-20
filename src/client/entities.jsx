@@ -269,6 +269,41 @@ function GoalRuntimeBudget({ goal, data, open, busy, runtimeNow }) {
     {canExtendGoalRuntime(goal) && <ActionButton reason={busy ? '正在保存，请稍候' : ''} onClick={() => open('goalRuntime', goal)}>追加目标执行额度</ActionButton>}
   </section>;
 }
+function usdFromMicros(value) {
+  const digits = String(value).padStart(7, '0');
+  const fraction = digits.slice(-6).replace(/0+$/, '').padEnd(2, '0');
+  return `US$${digits.slice(0, -6)}.${fraction}`;
+}
+
+function GoalCostBudget({ goal, tasks, act, busy }) {
+  const [additional, setAdditional] = useState('');
+  const budget = goal.costBudget;
+  if (!budget) return null;
+  const holds = [...new Set(tasks.filter(task => task.status === 'blocked' && task.costBudgetHold).map(task => task.costBudgetHold.reason))];
+  return <section className="acms-review-state" aria-label="目标金额上限">
+    <h3>目标金额上限</h3>
+    <dl className="acms-definition">
+      <dt>授权上限</dt><dd>{usdFromMicros(budget.limitMicros)}</dd>
+      <dt>已报告费用</dt><dd>{budget.reportedAttempts ? `${usdFromMicros(budget.settledMicros)} · ${budget.reportedAttempts} 次结算` : '尚无费用回执'}</dd>
+      <dt>已预留上界</dt><dd>{usdFromMicros(budget.reservedMicros)} · {budget.reservedAttempts} 次待结算</dd>
+      <dt>可派发余额</dt><dd>{usdFromMicros(budget.availableMicros)}</dd>
+    </dl>
+    {budget.awaitingReceiptAttempts > 0 && <p>{budget.awaitingReceiptAttempts} 次已清理执行的费用仍未知，预留继续保留。</p>}
+    {budget.breach && <p role="alert">执行器报告的费用超过预留上界，后续派发已停。请核对费用回执。</p>}
+    {holds.map(reason => <p key={reason}>{reason}</p>)}
+    {!budget.breach && !['cancelled', 'archived', 'deleted'].includes(goal.status) && <form className="acms-actions wrap" onSubmit={async event => {
+      event.preventDefault();
+      try {
+        await act('goal.cost_budget.extend', { id: goal.id, additionalCostUsd: additional }, '已追加目标金额上限');
+        setAdditional('');
+      } catch { /* The owner command displays its error. */ }
+    }}>
+      <Field label="追加金额（美元）"><input inputMode="decimal" value={additional} onChange={event => setAdditional(event.target.value)} /></Field>
+      <ActionButton type="submit" reason={busy ? '正在保存，请稍候' : !additional.trim() ? '请输入追加金额' : ''}>追加金额上限</ActionButton>
+    </form>}
+  </section>;
+}
+
 function GoalControls({ goal, companyPaused, act, open, busy }) {
   const control = goal.controlSummary ?? goal.executionControl;
   const phase = control?.phase ?? control?.state ?? (goal.status === 'cancelled' ? 'cancelled' : 'open');
@@ -368,7 +403,7 @@ export function EntityDrawer({ kind, entity, data, close, navigate, open, chat, 
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label={`${entityLabels[kind]}详情`}><header><span>{entityLabels[kind]}详情</span><button aria-label="关闭详情" onClick={close}>×</button></header><h2>{entity.title ?? entity.name}</h2>{kind === 'goal' && <p className="acms-sectionnote">优先级：{Number.isInteger(entity.priority) ? entity.priority : 50}（0–100；只影响后续跨目标派发顺序）</p>}{project && <button className="text" onClick={() => navigate('project', project.id)}>所属项目：{project.name}</button>}<CollapsibleText text={entity.description} lines={3} label="说明" />{entity.repoRoot && <p><code>{entity.repoRoot}</code></p>}{entity.acceptance && <section><h3>验收标准</h3><CollapsibleText text={entity.acceptance} lines={3} label="验收标准" /></section>}<div className="acms-actions wrap"><button onClick={() => open(kind === 'goal' ? 'goalEdit' : kind, entity)}>编辑{entityLabels[kind]}</button><ActionButton className="danger" reason={entityDeletionReason(kind, entity, data)} onClick={() => open('deleteEntity', { ...entity, entityKind: kind })}>删除{entityLabels[kind]}</ActionButton></div>
     {kind === 'agent' && chat && <button className="primary" onClick={() => chat(entity.id)}>与智能体对话</button>}
     {kind === 'goal' && entity.planApproval && act && <GoalPlanApproval goal={entity} data={data} act={act} busy={busy} />}
-    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalAttemptUsage key={entity.id} goalId={entity.id} tasks={tasks} /><GoalReviewState goal={entity} approvals={(data.deliveryApprovals ?? []).filter(record => record.goalId === entity.id).reverse()} deliveryRepository={project?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
+    {kind === 'goal' && act && <><GoalControls goal={entity} companyPaused={data.policy.paused} act={act} open={open} busy={busy} /><GoalRuntimeBudget goal={entity} data={data} open={open} busy={busy} runtimeNow={runtimeNow} /><GoalCostBudget key={entity.id} goal={entity} tasks={tasks} act={act} busy={busy} /><GoalAttemptUsage key={entity.id} goalId={entity.id} tasks={tasks} /><GoalReviewState goal={entity} approvals={(data.deliveryApprovals ?? []).filter(record => record.goalId === entity.id).reverse()} deliveryRepository={project?.deliveryRepository} taskCount={tasks.length} taskLimit={data.policy.maxTasksPerGoal} act={act} busy={busy} /></>}
     {goals.length > 0 && <section><h3>所属目标</h3>{goals.map(g => <button className="acms-entity-link" key={g.id} onClick={() => navigate('goal', g.id)}>{g.title} →</button>)}</section>}
     <section><h3>关联任务（{tasks.length}）</h3>{tasks.slice(0, 8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}{tasks.length > 8 && <details><summary>显示其余 {tasks.length - 8} 项</summary>{tasks.slice(8).map(t => <button className="acms-entity-link" key={t.id} onClick={() => navigate('task', t.id)}>{t.title} →</button>)}</details>}{!tasks.length && <p>暂无关联任务。</p>}</section><ChangeHistory kind={kind} id={entity.id} data={data} /></aside></div>;
 }

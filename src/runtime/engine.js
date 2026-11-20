@@ -20,6 +20,9 @@ import { holdEnvironment, inspectEnvironment, refreshEnvironmentGates } from './
 import { assertGoalOpen, goalStopped, releaseGoalPauses } from '../core/goal-control.js';
 import { readCommandCleanup } from './host-command.js';
 import { withAttemptUsage } from './attempt-usage.js';
+import { markGoalCostCleanup } from '../core/goal-cost-budget.js';
+import { admitTaskCost, assertTaskCostCurrent, holdTaskCost, interruptUnlaunchedTaskCost, matchesTaskCostAuthorization,
+  reconcileTaskCost, releaseTaskCostWaits, settleAvailableTaskCosts } from './goal-cost-budget.js';
 import { preparationForTask } from '../core/project-preparation.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
@@ -44,7 +47,7 @@ export class Engine {
       // yet. Unconfirmed legacy processes block startup instead of being
       // silently released.
       this.legacyMigration = await migrateLegacyForEngine({ store: this.store, adapter: this.adapter, dataDir: this.workspaces.dataDir });
-      this.conversations?.recover(); await this.recover(); await recoverIntegrations(this);
+      this.conversations?.recover(); await this.recover(); settleAvailableTaskCosts(this); await recoverIntegrations(this);
     } catch (e) { this.store.releaseLease(this.owner); throw e; }
     this.listener = event => {
       interruptIntegration(this);
@@ -53,6 +56,14 @@ export class Engine {
           const task = this.store.get('tasks', entry.taskId);
           if (task?.goalId === event.goalId && task.stopRequested && !entry.controller.signal.aborted) {
             entry.controller.abort(new Error(task.stopRequested));
+          }
+        }
+      }
+      if (event.type === 'goal.cost_budget.breached') {
+        for (const [attemptId, entry] of this.live) {
+          const reserved = this.store.get('goalCostAttempts', attemptId);
+          if (reserved?.goalId === event.goalId && reserved.status === 'reserved' && !entry.controller.signal.aborted) {
+            entry.controller.abort(Object.assign(new Error('执行器承诺的费用上界失效。'), { code: 'GOAL_COST_CONTRACT_BREACH' }));
           }
         }
       }
@@ -84,14 +95,17 @@ export class Engine {
             ? { status: 'stopped', cleanupConfirmed: true, reason: `已核实回放期间宿主检查 ${saved.hostCheckCleanup.checkId} 的清理回执` }
             : { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' };
         } else {
-          fact = await this.adapter.reconcile?.(saved) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
+          const authorization = this.store.get('goalCostAttempts', saved.id);
+          fact = authorization ? await reconcileTaskCost(this, saved, authorization) :
+            await this.adapter.reconcile?.(saved) ?? { status: 'unknown', reason: '执行器未提供恢复回执' };
         }
       }
       catch (error) { fact = { status: 'unknown', reason: `恢复查询失败：${error.message}`, actions: ['refresh-receipt', 'inspect-execution'] }; }
       this.fenced();
       // A stop or edit may have discarded the parked result during receipt I/O.
       let previous = this.store.require('attempts', pending.id);
-      if ((previous.resultDeferred || previous.provider?.startsWith('paired:')) && ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
+      if ((previous.resultDeferred || previous.provider?.startsWith('paired:') || this.store.get('goalCostAttempts', previous.id)?.status === 'reserved') &&
+          ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
         fact = { status: 'unknown', reason: '执行回执未确认进程树清理', actions: ['refresh-receipt', 'inspect-execution'] };
       }
       if (previous.cleanupUncertain && fact.cleanupConfirmed !== true) {
@@ -108,6 +122,7 @@ export class Engine {
       const currentTask = this.store.require('tasks', previous.taskId);
       const ownsTask = currentTask.activeAttemptId === previous.id && currentTask.generation === previous.taskGeneration;
       const clean = ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed === true;
+      if (clean) this.store.transaction(() => { this.fenced(); markGoalCostCleanup(this.store, previous.id); });
       if (previous.resultDeferred && ownsTask && clean &&
           (!currentTask.stopRequested || currentTask.stopRequested === 'paused')) {
         this.store.transaction(() => {
@@ -194,6 +209,10 @@ export class Engine {
     try {
       interruptIntegration(this);
       this.fenced(); this.store.heartbeat(this.owner);
+      if (Date.now() >= (this.nextCostReceiptCheck ?? 0)) {
+        this.nextCostReceiptCheck = Date.now() + 1000;
+        settleAvailableTaskCosts(this);
+      }
       // A request made during final cleanup must survive until the live
       // activation settles; recover() deliberately excludes live attempts.
       for (const task of this.store.list('tasks').filter(t => t.recoveryRequested && this.activeIntegration?.taskId !== t.id && ![...this.live.values()].some(entry => entry.taskId === t.id))) {
@@ -230,6 +249,7 @@ export class Engine {
       if (this.company.policy().paused) return;
       this.store.transaction(() => {
         releaseGoalPauses(this.company);
+        releaseTaskCostWaits(this);
         for (const goal of this.store.list('goals').filter(g => g.contractChange?.status === 'pending' && !g.contractChange.coordinationTaskId)) {
           this.company.ensureGoalContractCoordination(goal);
         }
@@ -511,7 +531,8 @@ export class Engine {
     });
   }
   async execute(attempt, controller) {
-    let activation, cleanupFailure, recoveryFailure, preparingWorkspace = false, deliveredResult = false, preflight;
+    let activation, cleanupFailure, recoveryFailure, preparingWorkspace = false, deliveredResult = false, preflight, authorization;
+    let costLaunchInvoked = false;
     const timeout = setTimeout(() => controller.abort(new Error('Execution timeout')), this.company.policy().turnTimeoutMs);
     try {
       let task = this.currentAttemptTask(attempt);
@@ -588,23 +609,50 @@ export class Engine {
       task = this.currentAttemptTask(attempt);
       this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       guardPreparation();
-      this.store.transaction(() => {
-        if (attempt.preparingHost) task = this.store.put('tasks', { ...task, attempts: task.attempts + 1 });
-        attempt = this.store.put('attempts', { ...attempt, status: 'running', preparingHost: false, environment: preflight.report,
-          ...(hostEvidence ? { hostEvidence } : {}) });
-        this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
-      });
-      controller.signal.throwIfAborted();
+      const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence });
       const assertCurrent = () => {
+        controller.signal.throwIfAborted();
         const current = this.currentAttemptTask(attempt);
         assertGoalOpen(this.store.require('goals', current.goalId));
         guardPreparation();
         return current;
       };
-      task = assertCurrent();
-      activation = await this.adapter.start({ task, attempt, agent, routeSelection: preflight.selection,
-        prompt: promptFor(this.company, task, attempt, { modelContext, hostEvidence }), signal: controller.signal,
-        assertCurrent, onAccepted: () => this.conversations?.accepted(attempt) });
+      const admission = this.store.transaction(() => {
+        task = assertCurrent();
+        const cost = admitTaskCost(this, { task, attempt, agent, routeSelection: preflight.selection, prompt });
+        if (cost.denied) {
+          holdTaskCost(this, attempt, task, cost.denied);
+          return cost;
+        }
+        if (attempt.preparingHost) task = this.store.put('tasks', { ...task, attempts: task.attempts + 1 });
+        if (task.costBudgetHold) task = this.store.put('tasks', { ...task, costBudgetHold: null,
+          blocker: task.blocker?.kind === 'cost-budget' ? null : task.blocker });
+        attempt = this.store.put('attempts', { ...attempt, status: 'running', preparingHost: false, environment: preflight.report,
+          ...(hostEvidence ? { hostEvidence } : {}) });
+        this.store.event('attempt.starting', attempt.id, { taskId: task.id }, SYSTEM);
+        return cost;
+      });
+      if (admission.denied) return;
+      authorization = admission.authorization;
+      const onAccepted = () => this.conversations?.accepted(attempt);
+      const input = { task, attempt, agent, routeSelection: preflight.selection, prompt, signal: controller.signal, assertCurrent, onAccepted };
+      if (authorization) {
+        const executor = admission.executor;
+        const authorizeDispatch = () => {
+          const current = assertCurrent();
+          this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
+          assertTaskCostCurrent(this, executor, authorization);
+          return current;
+        };
+        authorizeDispatch();
+        costLaunchInvoked = true;
+        activation = await executor.start({ ...input, assertCurrent: authorizeDispatch,
+          authorization: Object.freeze({ ...authorization, route: Object.freeze({ ...authorization.route }) }) });
+        assert(typeof activation?.dispose === 'function', 'COST_CLEANUP_UNCONFIRMED', '金额受限执行器未返回可核对的清理入口。');
+      } else {
+        task = assertCurrent();
+        activation = await this.adapter.start({ ...input, task });
+      }
       this.store.transaction(() => {
         this.fenced();
         for (const notificationId of attempt.notificationIds ?? []) {
@@ -618,7 +666,14 @@ export class Engine {
       const raw = await activation.result; deliveredResult = true; controller.signal.throwIfAborted();
       const output = parseResult(raw); this.conversations?.finished(attempt, output); await this.accept(attempt, output, controller.signal);
     } catch (error) {
+      if (authorization && !costLaunchInvoked) {
+        if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => interruptUnlaunchedTaskCost(this, attempt, authorization, error));
+        return;
+      }
       if (error.cleanupUncertain) cleanupFailure = error;
+      if (costLaunchInvoked && typeof activation?.dispose !== 'function') {
+        recoveryFailure = Object.assign(new Error('金额预留已交给执行器，启动和清理尚未核对。'), { code: 'COST_CLEANUP_UNCONFIRMED', recoveryRequired: true });
+      }
       const discardResult = deliveredResult && controller.signal.aborted &&
         (this.closing || this.store.get('tasks', attempt.taskId)?.stopRequested);
       if (deliveredResult && !discardResult && activation?.provider?.startsWith('paired:')) recoveryFailure = Object.assign(new Error(`结果已返回，但尚未可靠入库：${error.message}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
@@ -649,8 +704,12 @@ export class Engine {
       clearTimeout(timeout);
       // The slot is not released until the provider confirms process cleanup.
       try {
-        await activation?.dispose?.();
+        const disposal = await activation?.dispose?.();
         if (cleanupFailure) throw cleanupFailure;
+        if (costLaunchInvoked && !recoveryFailure) {
+          assert(disposal?.cleanupConfirmed === true && matchesTaskCostAuthorization(authorization, disposal),
+            'COST_CLEANUP_UNCONFIRMED', '金额受限执行未确认同一预留的进程清理。');
+        }
         let usageReceipt;
         if (this.store.ownsLease(this.owner, this.epoch)) {
           const current = this.store.require('attempts', attempt.id);
@@ -659,13 +718,17 @@ export class Engine {
           }
         }
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
+          this.fenced();
           const saved = withAttemptUsage(this.store.require('attempts', attempt.id), usageReceipt);
           if (recoveryFailure) {
             this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, recovery: { status: 'unknown', reason: recoveryFailure.message, actions: ['refresh-receipt', 'inspect-execution'] } });
             return;
           }
-          this.store.put('attempts', { ...saved, cleanupPending: false });
-          this.store.event('attempt.cleanup.confirmed', saved.id, { taskId: saved.taskId }, SYSTEM);
+          if (authorization && costLaunchInvoked) markGoalCostCleanup(this.store, saved.id);
+          if (!saved.preflightOnly || saved.cleanupPending !== false) {
+            this.store.put('attempts', { ...saved, cleanupPending: false });
+            this.store.event('attempt.cleanup.confirmed', saved.id, { taskId: saved.taskId }, SYSTEM);
+          }
           const task = this.store.require('tasks', saved.taskId);
           // Stop may arrive after acceptance while dispose is still pending.
           // Once cleanup succeeds there is no active attempt left for recover().
@@ -675,6 +738,7 @@ export class Engine {
           }
           this.company.releaseTemporaryAgent(saved.agentId);
         });
+        if (authorization && this.store.ownsLease(this.owner, this.epoch)) settleAvailableTaskCosts(this, attempt.id);
       } catch (e) {
         this.lastError = `Cleanup: ${e.message}`;
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
@@ -1066,6 +1130,14 @@ export class Engine {
         } else {
           holdEnvironment(this, task, [failure, ...observed.failures.filter(f => f.fingerprint !== failure.fingerprint)], observed.report);
         }
+        return;
+      }
+      if (!stopped && error.code === 'GOAL_COST_CONTRACT_BREACH') {
+        const reason = '同目标的一次已报告费用超过承诺上界。请核对执行器回执。';
+        this.store.put('tasks', { ...task, status: 'blocked', retryAt: null, blocker: { kind: 'cost-budget', reason },
+          costBudgetHold: { code: 'COST_CONTRACT_BREACH', reason } });
+        this.store.event('task.cost_budget.blocked', task.id, { code: 'COST_CONTRACT_BREACH' }, SYSTEM);
+        this.updateGoal(task.goalId);
         return;
       }
       const retry = !stopped && !this.closing && task.attempts < this.company.policy().maxAttempts;

@@ -8,6 +8,7 @@ import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
 import { deleteEntity, restoreEntity, recordChange, restartForChange } from './entity-management.js';
 import { canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS, pendingGoalTimeBox } from './runtime-budget.js';
+import { createGoalCostBudget, extendGoalCostBudget, goalCostBudgetView } from './goal-cost-budget.js';
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
@@ -74,6 +75,7 @@ export class Company {
         'project.restore': () => restoreEntity(this, 'project', args, actor),
         'goal.edit': () => this.editGoal(args, actor),
         'goal.runtime.extend': () => this.extendGoalRuntime(args, actor),
+        'goal.cost_budget.extend': () => this.extendGoalCost(args, actor),
         'goal.pause': () => controlGoal(this, args, actor, 'pause'),
         'goal.resume': () => controlGoal(this, args, actor, 'resume'),
         'goal.cancel': () => controlGoal(this, args, actor, 'cancel'),
@@ -277,6 +279,7 @@ export class Company {
   createGoalRecord(args, actor, options = {}) {
     const project = this.store.require('projects', args.projectId);
     assert(project.status !== 'deleted', 'ENTITY_DELETED', '请先恢复项目');
+    if (args.costLimitUsd !== undefined) assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可以启用目标金额上限。');
     assert(args.deliveryMode === undefined || [GIT_COMPOSITION, COPY_COMPOSITION].includes(args.deliveryMode),
       'INVALID_INPUT', '未知的目标交付方式。');
     if (args.deliveryMode) assert(actor.kind === 'owner' && args.deliveryMode === compositionMode(project), 'COMPOSITE_PROJECT',
@@ -293,6 +296,7 @@ export class Company {
     let goal = this.store.put("goals", { id: id("goal"), title: text(args.title, "title", 300), description: text(args.description, "description"), acceptance: text(args.acceptance, "acceptance"), projectId: args.projectId, templateId: template.id, templateSnapshot: clone(template), status: args.plan === false ? "active" : "planning", contractVersion: 1, runtimeMs: 0, priority: integer(args.priority ?? 50, "priority", 0, 100), ...(deliveryMode ? { deliveryMode } : {}),
       ...(deliveryApproval ? { deliveryApproval: { project: project.deliveryApproval === true, template: template.deliveryApproval === true } } : {}),
       ...(options.source ? { source: options.source } : {}), ...(constraints.length ? { constraints } : {}) });
+    if (args.costLimitUsd !== undefined) createGoalCostBudget(this.store, goal.id, args.costLimitUsd, actor);
     if (args.plan !== false) {
       const manager = this.store.list('agents').find(a => a.role === 'manager' && a.status === 'available' && !a.goalId);
       assert(manager, 'MANAGER_REQUIRED', '请先创建可分配的管理角色');
@@ -704,6 +708,12 @@ export class Company {
       ...(planApproval === undefined ? {} : { planApproval }), ...(deliveryApproval === undefined ? {} : { deliveryApproval }), reason: args.reason ?? '' }, actor);
     return saved;
   }
+  extendGoalCost(args, actor) {
+    assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可以追加目标金额上限。');
+    const goal = this.store.require('goals', args.id);
+    assert(!['cancelled', 'archived', 'deleted'].includes(goal.status), 'GOAL_CLOSED', '该目标已关闭。');
+    return goalCostBudgetView(extendGoalCostBudget(this.store, goal.id, args.additionalCostUsd, actor));
+  }
   extendGoalRuntime(args, actor) {
     assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可以追加目标执行额度。');
     const goal = this.store.require('goals', args.id);
@@ -787,6 +797,8 @@ export class Company {
     data.tasks = data.tasks.filter(t => !deleted.has(t.id));
     for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) data[c] = data[c].filter(item => !deleted.has(item.taskId));
     data.attempts = data.attempts.map(({ meteredUsage, ...attempt }) => attempt);
+    const costBudgets = new Map(this.store.list('goalCostBudgets').map(budget => [budget.id, goalCostBudgetView(budget)]));
+    data.goals = data.goals.map(goal => costBudgets.has(goal.id) ? { ...goal, costBudget: costBudgets.get(goal.id) } : goal);
     // Presentation-only activity projection for issue #17. Parents inherit the
     // newest effective descendant activity; unknown history falls back to the
     // record's own creation time instead of inventing a new timestamp.
