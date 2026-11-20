@@ -291,3 +291,74 @@ test('a supported project with an included link blocks composition without follo
   assert(!f.adapter.calls.some(call => call.task.id === task.id));
   assert.equal(f.store.require('goals', goal.id).compositionBase, undefined);
 });
+
+test('copy contract replacements read approved historic versions and select only current deliveries', async t => {
+  const { f, goal, current } = await setup(t, async input => {
+    const title = input.task.title;
+    if (title === 'Old A') {
+      await writeFile(file(input, 'upstream.txt'), 'old upstream');
+      await writeFile(file(input, 'retained.bin'), Buffer.from([0, 100, 255]));
+      return result('upstream.txt');
+    }
+    if (title === 'Old B') {
+      assert.equal(await readFile(file(input, 'upstream.txt'), 'utf8'), 'old upstream');
+      await writeFile(file(input, 'downstream.txt'), 'old downstream');
+      return result('downstream.txt');
+    }
+    if (title === 'New A') {
+      assert.equal(await readFile(file(input, 'upstream.txt'), 'utf8'), 'old upstream');
+      await writeFile(file(input, 'upstream.txt'), 'new upstream');
+      return result('upstream.txt');
+    }
+    assert.equal(await readFile(file(input, 'upstream.txt'), 'utf8'), 'new upstream');
+    assert.equal(await readFile(file(input, 'downstream.txt'), 'utf8'), 'old downstream');
+    await writeFile(file(input, 'downstream.txt'), 'new downstream');
+    return result('downstream.txt');
+  });
+  const oldA = f.task({ title: 'Old A', goalId: goal.id });
+  const oldB = f.task({ title: 'Old B', goalId: goal.id, dependencies: [oldA.id] });
+  await f.start();
+  await waitForComposition(f, goal, current);
+  f.command('company.pause', { afterCurrent: true });
+  const edited = f.command('goal.edit', { id: goal.id, patch: { acceptance: 'Use the changed upstream and downstream' } });
+  const newA = f.task({ title: 'New A', goalId: goal.id, dependencies: [oldA.id] });
+  const newB = f.task({ title: 'New B', goalId: goal.id, dependencies: [oldB.id, newA.id] });
+  f.engine.refreshReadiness();
+  const coordinator = f.store.require('tasks', edited.contractChange.coordinationTaskId);
+  const attempt = f.engine.claim(coordinator, f.store.require('agents', coordinator.agentId));
+  await f.engine.accept(attempt, { outcome: 'coordinated', contractAssessment: { reason: 'Replace both in order', reuse: [], followUps: [
+    { taskId: oldA.id, followUp: newA.id }, { taskId: oldB.id, followUp: newB.id },
+  ] } }, new AbortController().signal);
+  f.store.put('attempts', { ...f.store.require('attempts', attempt.id), cleanupPending: false });
+  f.command('company.resume');
+  await waitForComposition(f, goal, current);
+  assert.deepEqual(current().composition.inputs.map(input => input.taskId), [newA.id, newB.id]);
+  const checkout = path.join(f.root, 'replaced-copy-candidate');
+  await checkoutCopyComposition(current().composition.snapshot, checkout, f.dataDir);
+  assert.equal(await readFile(path.join(checkout, 'upstream.txt'), 'utf8'), 'new upstream');
+  assert.equal(await readFile(path.join(checkout, 'downstream.txt'), 'utf8'), 'new downstream');
+  assert.deepEqual(await readFile(path.join(checkout, 'retained.bin')), Buffer.from([0, 100, 255]));
+});
+
+test('a moved approved directory blocks new copies while an already captured candidate can still be reviewed', async t => {
+  const { f, goal, current } = await setup(t, async input => {
+    if (input.task.kind === 'review') {
+      assert.equal(await readFile(file(input, 'delivery.txt'), 'utf8'), 'accepted directory content');
+      return { outcome: 'reviewed', decision: 'approve', summary: 'Verified the persisted candidate' };
+    }
+    await writeFile(file(input, 'delivery.txt'), 'accepted directory content');
+    return result('delivery.txt');
+  });
+  const a = f.task({ goalId: goal.id });
+  await f.start();
+  await waitForComposition(f, goal, current);
+  const delivered = current().composition;
+  await f.engine.stop();
+  await rename(f.source, path.join(f.root, 'source-held'));
+  await assert.rejects(f.workspaces.prepare({ ...get(f, a), workspace: null }, {}), { code: 'COMPOSITE_BASE', message: /恢复项目目录/ });
+  const review = f.command('review.request', { goalId: goal.id });
+  await f.start();
+  await waitForTask(f, review, 'succeeded');
+  assert.equal(get(f, review).passed, true);
+  assert.equal(get(f, review).workspace.candidateVersion, delivered.version);
+});

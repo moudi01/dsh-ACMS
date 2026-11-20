@@ -83,6 +83,13 @@ export class WorkspaceManager {
     if (project.mode === 'git') await git(['rev-parse', '--show-toplevel'], root, undefined, invoke);
     return root;
   }
+  async validateTaskProject(project, goal, invoke) {
+    try { return await this.validateProject(project, invoke); }
+    catch (error) {
+      if (goal?.deliveryMode !== COPY_COMPOSITION || !['ENOENT', 'ENOTDIR', 'PROJECT_PATH'].includes(error.code)) throw error;
+      throw new AcmsError('COMPOSITE_BASE', '已批准的源目录不可用，请恢复项目目录后继续。', { source: project.repoRoot });
+    }
+  }
   async prepare(task, attempt) {
     // A goal-level review has no single author workspace: materialize the
     // immutable artifact blobs of every delivered task into a fresh copy.
@@ -111,8 +118,9 @@ export class WorkspaceManager {
       await copyProject(sourceTask.workspace.path, destination, { collaboration: true });
       return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration: sourceTask.workspace.collaboration };
     }
-    const project = this.company.store.require('projects', task.projectId); const source = await this.validateProject(project);
+    const project = this.company.store.require('projects', task.projectId);
     const goal = task.goalId && this.company.store.get('goals', task.goalId);
+    const source = await this.validateTaskProject(project, goal);
     if (usesComposition(goal) && ['work', 'repair'].includes(task.kind)) {
       assert(goal.deliveryMode === compositionMode(project), 'COMPOSITE_PROJECT', '当前项目模式与完整候选不匹配。');
       return goal.deliveryMode === COPY_COMPOSITION ? this.prepareCopyCompositionTask(task, attempt, goal, project, source)
@@ -566,7 +574,7 @@ export class WorkspaceManager {
     const store = this.company.store;
     const project = store.require('projects', task.projectId);
     assert(goal.deliveryMode === compositionMode(project), 'COMPOSITE_PROJECT', '当前项目模式与完整候选不匹配。');
-    const source = await this.validateProject(project, execution.run);
+    const source = await this.validateTaskProject(project, goal, execution.run);
     const current = store.require('goals', goal.id);
     const work = store.list('tasks').filter(item => item.goalId === goal.id && item.kind === 'work' &&
       !item.contractObsolete && !item.legacyBatch && !item.workflowSnapshot && item.status !== 'deleted');
