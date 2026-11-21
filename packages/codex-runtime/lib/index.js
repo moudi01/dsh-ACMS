@@ -598,6 +598,19 @@ const codexPackageJsonPath = createRequire(import.meta.url).resolve("@openai/cod
 const codexPackageManifest = JSON.parse(readFileSync(codexPackageJsonPath, "utf8"));
 /** Absolute package-local JavaScript wrapper selected by the package manifest. */
 const CODEX_PACKAGE_BIN = resolve(dirname(codexPackageJsonPath), codexPackageManifest.bin.codex);
+function containmentStartupFacts(records) {
+	if (!Array.isArray(records)) return [];
+	return records.slice(0, 3).flatMap(record => {
+		if (!['helper-lookup', 'helper-compile', 'compiler-cleanup', 'helper-acquire'].includes(record?.phase) ||
+			!['unavailable', 'found', 'compiled', 'failed', 'deadline', 'process-error', 'not-started', 'exited', 'unconfirmed', 'output-missing', 'output-unusable'].includes(record.outcome) ||
+			!Number.isSafeInteger(record.elapsedMs) || record.elapsedMs < 0) return [];
+		return [{
+			phase: record.phase, outcome: record.outcome, elapsedMs: record.elapsedMs,
+			...(typeof record.confirmed === 'boolean' ? { confirmed: record.confirmed } : {}),
+			...(Number.isSafeInteger(record.exitCode) ? { exitCode: record.exitCode } : {}),
+		}];
+	});
+}
 function failureDiagnostic(facts) {
 	const fields = [
 		"product: Codex",
@@ -607,6 +620,11 @@ function failureDiagnostic(facts) {
 	if (facts.httpStatus !== void 0) fields.push(`HTTP status: ${facts.httpStatus}`);
 	const processFields = [["exit code", facts.outcome?.exitCode], ["signal", facts.outcome?.signal]];
 	for (const [label, value] of processFields) if (value !== null && value !== void 0) fields.push(`${label}: ${value}`);
+	for (const { phase, outcome, elapsedMs, confirmed, exitCode } of facts.containment ?? []) {
+		fields.push(phase + ': ' + outcome + ' (' + elapsedMs + 'ms' +
+			(confirmed === undefined ? '' : ', confirmed=' + confirmed) +
+			(exitCode === undefined ? '' : ', exitCode=' + exitCode) + ')');
+	}
 	return `Product subagent failure (${fields.join("; ")})`;
 }
 var CodexRunFailure = class extends Error {
@@ -721,10 +739,14 @@ async function startCodexRun(request, spec) {
 		});
 	} catch (error) {
 		if (error.cleanupUncertain) spec.store.quarantine(error.message);
+		const containment = containmentStartupFacts(error.ownedProcessPhases);
 		throw Object.assign(new CodexRunFailure({
 			stage: "initialize",
-			category: "unknown"
-		}, thrown(error)), error.cleanupUncertain ? { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' } : {});
+			category: "unknown",
+			...(containment.length ? { containment } : {}),
+		}, thrown(error)), error.cleanupUncertain ? { cleanupUncertain: true, code: 'PAIRED_CLEANUP_UNCONFIRMED' }
+			: error.code === 'PAIRED_CONTAINMENT_STARTUP' && error.noProcessStarted === true
+				? { code: error.code, noProcessStarted: true } : {});
 	}
 	const wire = new CodexAppServerWire(child.stdout, child.stdin, spec.permissionMode, spec.model, spec.store, spec);
 	const onStderr = (chunk) => {

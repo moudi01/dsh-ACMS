@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { channel } from 'node:diagnostics_channel';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -195,6 +196,13 @@ test('an uncertain asynchronous spawn failure quarantines before returning to th
 
 test('app-server uses verified native containment on normal completion and startup timeout', { skip: process.platform !== 'win32' }, async t => {
   const f = fixture(t);
+  const native = channel('acms.owned-process.native-phase');
+  const phases = [], observe = phase => phases.push(phase);
+  native.subscribe(observe);
+  t.after(() => {
+    native.unsubscribe(observe);
+    t.diagnostic('Native containment phases ' + JSON.stringify(phases));
+  });
   for (const mode of ['success', 'startup-timeout']) {
     const store = new ThreadStore(f.stateFile, `native-${mode}`);
     const pending = startCodexRun(f.request(), {
@@ -210,4 +218,6 @@ test('app-server uses verified native containment on normal completion and start
       await store.close('failed'); assert.equal(existsSync(store.lockPath), false);
     }
   }
+  assert.deepEqual(phases.filter(phase => phase.phase === 'helper-acquire').map(phase => phase.use), ['cold', 'warm']);
+  assert.equal(phases.filter(phase => phase.phase === 'supervisor-cleanup' && phase.confirmed && phase.supervisorExited && phase.jobConfirmed).length, 2);
 });
