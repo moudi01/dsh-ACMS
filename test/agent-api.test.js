@@ -11,6 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Store } from "../src/core/store.js";
 import { Company } from "../src/core/domain.js";
+import { executionCapacity } from "../src/core/execution-capacity.js";
 import { createAgentApi } from "../src/host/agent-api.js";
 import { createRoutes } from "../src/host/http.js";
 import { OWNER, digest } from "../src/core/util.js";
@@ -80,6 +81,193 @@ function blockTask(f, task) {
 }
 
 const CONTROL_COMMANDS = ["goal.submit", "status.read", "events.read", "interaction.answer", "task.pause", "task.resume"];
+
+test("a monitor checkpoint stays compact across long history and separates advancing observations from its version", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "events.read"] });
+  const task = f.owner("task.create", { goalId: f.goal.id, title: "Current task" });
+  const pending = blockTask(f, task);
+  const privateText = "historical-body-private-C:/fixture/".repeat(180);
+  f.store.acquireLease("checkpoint-fixture");
+  f.store.transaction(() => {
+    for (let i = 0; i < 400; i++) {
+      f.store.put("attempts", { id: "attempt_history_" + i, taskId: task.id, goalId: f.goal.id, status: "completed",
+        summary: privateText, workspace: { path: "C:/fixture/workspace" } });
+    }
+    for (let i = 0; i < 30; i++) {
+      f.store.put("verifications", { id: "verification_history_" + i, taskId: task.id, kind: "checks",
+        passed: i === 29, artifactHash: digest(["fixture", i]), summary: privateText, checks: [{ log: { path: "C:/fixture/log" } }] });
+    }
+  });
+  const conventional = await f.call("/status", { token: c.token });
+  assert.ok(JSON.stringify(conventional.body).length > 1000000);
+  f.store.transaction(() => f.store.touch("agentCredentials", c.credential.id, { lastUsedAt: null }));
+  const beforeCredential = f.store.require("agentCredentials", c.credential.id);
+  // This endpoint may look up individual records but must not use the full historical table readers.
+  const list = f.store.list.bind(f.store);
+  f.store.list = collection => {
+    assert.ok(!["tasks", "attempts", "verifications", "integrations", "interactions"].includes(collection), collection);
+    return list(collection);
+  };
+  const first = await f.call("/checkpoint", { token: c.token });
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const saved = first.body.value;
+  assert.equal(saved.schema, "acms-monitor-checkpoint/1");
+  assert.equal(saved.unchanged, false);
+  assert.equal(saved.snapshot.goal.contract.version, 1);
+  assert.equal(saved.snapshot.taskCounts.blocked, 1);
+  assert.equal(saved.snapshot.nonTerminalTasks.entries[0].id, task.id);
+  assert.deepEqual(saved.snapshot.slots, []);
+  assert.equal(saved.snapshot.pendingInteractions.entries[0].id, pending.id);
+  assert.equal(saved.snapshot.pendingInteractions.entries[0].matchesCurrentTaskState, true);
+  assert.equal(saved.snapshot.delivery.recentVerifications.length, 24);
+  assert.equal(saved.snapshot.delivery.recentVerifications[0].id, "verification_history_29");
+  assert.equal(saved.snapshot.delivery.recentVerifications[0].passed, true);
+  assert.equal(saved.snapshot.delivery.hasOlderVerifications, true);
+  assert.equal(saved.snapshot.scheduling.state, "active");
+  const text = JSON.stringify(first.body);
+  assert.ok(text.length < 12000);
+  assert.doesNotMatch(text, /historical-body-private|C:\/fixture|Which option|tokenHash|"pid"/);
+  assert.match(saved.links.events, new RegExp("&after=" + saved.observed.cursor + "$"));
+  assert.deepEqual(f.store.require("agentCredentials", c.credential.id), beforeCredential);
+  const counts = () => f.store.db.prepare("SELECT COUNT(*) AS count FROM commands").get().count;
+  const beforeCommands = counts();
+  f.store.heartbeat("checkpoint-fixture");
+  f.store.transaction(() => f.store.event("goal.fixture.unrelated", f.otherGoal.id, {}, OWNER));
+  const request = "/checkpoint?ifVersion=" + saved.version;
+  const same = (await f.call(request, { token: c.token })).body.value;
+  assert.equal(same.unchanged, true);
+  assert.equal(same.version, saved.version);
+  assert.equal(Object.hasOwn(same, "snapshot"), false);
+  assert.ok(JSON.stringify(same).length < 700);
+  assert.ok(same.observed.cursor > saved.observed.cursor);
+  assert.deepEqual(same.observed.latestEvent, saved.observed.latestEvent);
+  assert.deepEqual(f.store.require("agentCredentials", c.credential.id), beforeCredential);
+  assert.equal(counts(), beforeCommands);
+
+  f.store.db.prepare("UPDATE leases SET heartbeat=? WHERE resource='scheduler'").run(Date.now() - 60000);
+  const stale = (await f.call(request, { token: c.token })).body.value;
+  assert.equal(stale.unchanged, false);
+  assert.equal(stale.snapshot.scheduling.state, "stale");
+  assert.equal(stale.observed.cursor, same.observed.cursor);
+  assert.deepEqual(Object.values(f.calls), [0, 0, 0, 0, 0]);
+});
+
+test("checkpoint keeps real slots for cancelled or deleted tasks, including legacy and live-only records", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "events.read"] });
+  const cancelled = f.owner("task.create", { goalId: f.goal.id, title: "Cancelled" });
+  f.owner("task.cancel", { id: cancelled.id });
+  const deleted = f.owner("task.create", { goalId: f.goal.id, title: "Deleted" });
+  f.owner("task.delete", { id: deleted.id });
+  const other = f.owner("task.create", { goalId: f.otherGoal.id, title: "Other goal" });
+  f.engine.live = new Map([["attempt_live_disposal", {}]]);
+  f.store.transaction(() => {
+    f.store.put("attempts", { id: "attempt_cancelled_hold", taskId: cancelled.id, goalId: f.goal.id, status: "cancelled", cleanupPending: true });
+    f.store.put("attempts", { id: "attempt_deleted_hold", taskId: deleted.id, status: "failed", cleanupPending: true });
+    f.store.put("attempts", { id: "attempt_live_disposal", taskId: cancelled.id, goalId: f.goal.id, status: "completed" });
+    f.store.put("attempts", { id: "attempt_ineligible_legacy", taskId: deleted.id, status: "running", legacyBatch: true });
+    f.store.put("attempts", { id: "attempt_other_goal", taskId: other.id, goalId: f.otherGoal.id, status: "running" });
+    f.store.put("integrations", { id: "integration_deleted_hold", taskId: deleted.id, phase: "reconciling" });
+    f.store.put("integrations", { id: "integration_cancelled_hold", taskId: cancelled.id, goalId: f.goal.id, phase: "applying" });
+    f.store.put("integrations", { id: "integration_finished", taskId: cancelled.id, goalId: f.goal.id, phase: "completed" });
+  });
+  const first = await f.call("/checkpoint", { token: c.token });
+  assert.equal(first.status, 200);
+  const { snapshot, version } = first.body.value;
+  assert.deepEqual(snapshot.taskCounts, { cancelled: 1, deleted: 1 });
+  assert.equal(snapshot.nonTerminalTasks.total, 0);
+  const shape = ({ id, kind, phase, status, taskId }) => ({ id, kind, phase, status, taskId });
+  const scheduler = executionCapacity(f.store, f.adapter, f.engine.live, f.company.policy()).entries
+    .filter(row => row.goalId === f.goal.id).map(shape).sort((a, b) => a.id.localeCompare(b.id));
+  assert.equal(scheduler.length, 5);
+  assert.deepEqual(snapshot.slots.map(shape), scheduler);
+  assert.equal(snapshot.slots.filter(row => row.phase === "cleanupPending").length, 3);
+
+  f.engine.live.clear();
+  f.store.transaction(() => {
+    const attempt = f.store.require("attempts", "attempt_deleted_hold");
+    f.store.put("attempts", { ...attempt, cleanupPending: false });
+  });
+  const second = (await f.call("/checkpoint?ifVersion=" + version, { token: c.token })).body.value;
+  assert.equal(second.unchanged, false);
+  assert.equal(second.snapshot.slots.length, 3);
+  assert.equal(second.observed.cursor, first.body.value.observed.cursor);
+});
+
+test("checkpoint fingerprints omitted non-terminal task changes", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id] });
+  f.store.transaction(() => {
+    for (let i = 0; i <= 200; i++) f.store.put("tasks", { id: "task_index_" + String(i).padStart(3, "0"),
+      goalId: f.goal.id, projectId: f.project.id, status: "ready", kind: "work", generation: 1 });
+  });
+  const first = (await f.call("/checkpoint", { token: c.token })).body.value;
+  assert.equal(first.snapshot.nonTerminalTasks.total, 201);
+  assert.equal(first.snapshot.nonTerminalTasks.omitted, 1);
+  assert.equal(first.snapshot.nonTerminalTasks.entries.at(-1).id, "task_index_199");
+  f.store.transaction(() => {
+    const task = f.store.require("tasks", "task_index_200");
+    f.store.put("tasks", { ...task, generation: 2 });
+  });
+  const second = (await f.call("/checkpoint?ifVersion=" + first.version, { token: c.token })).body.value;
+  assert.equal(second.unchanged, false);
+  assert.deepEqual(second.snapshot, first.snapshot);
+});
+
+test("the checkpoint's goal and cursor stay in one committed SQLite reading snapshot", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id] });
+  const writer = new Store(f.store.filename);
+  const before = f.store.cursor();
+  const hash = f.company.deliveryHash.bind(f.company);
+  f.company.deliveryHash = goalId => {
+    f.company.deliveryHash = hash;
+    try {
+      new Company(writer).command(OWNER, randomUUID(), "goal.edit", { id: goalId, patch: { acceptance: "Latest owner constraint" } });
+    } finally { writer.close(); }
+    return hash(goalId);
+  };
+  const original = (await f.call("/checkpoint", { token: c.token })).body.value;
+  assert.equal(original.observed.cursor, before);
+  assert.equal(original.snapshot.goal.contract.version, 1);
+  const events = (await f.call("/events?goalId=" + f.goal.id + "&after=" + before, { token: c.token })).body.value;
+  assert.ok(events.entries.some(event => event.type === "goal.contract.changed"));
+  const fresh = (await f.call("/checkpoint?ifVersion=" + original.version, { token: c.token })).body.value;
+  assert.equal(fresh.snapshot.goal.contract.version, 2);
+  assert.notEqual(fresh.snapshot.goal.contract.fingerprint, original.snapshot.goal.contract.fingerprint);
+  assert.equal(fresh.observed.cursor, events.nextCursor);
+});
+
+test("checkpoint requires live goal and read scope even when a client knows the version", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "events.read"] });
+  const available = await f.call("/discover", { token: c.token });
+  assert.ok(available.body.value.operations.includes("GET /checkpoint"));
+  const first = (await f.call("/checkpoint", { token: c.token })).body.value;
+  const conditional = "/checkpoint?ifVersion=" + first.version;
+  const submitter = f.credential({ goalIds: [f.goal.id], commands: ["goal.submit"] });
+  const eventReader = f.credential({ goalIds: [f.goal.id], commands: ["events.read"] });
+  assert.equal((await f.call(conditional)).body.error.code, "UNAUTHORIZED");
+  assert.equal((await f.call(conditional, { token: submitter.token })).body.error.code, "FORBIDDEN");
+  assert.equal((await f.call(conditional, { token: eventReader.token })).body.error.code, "FORBIDDEN");
+  assert.equal((await f.call(conditional + "&goalId=" + f.otherGoal.id, { token: c.token })).body.error.code, "SCOPE_DENIED");
+  assert.equal((await f.call("/checkpoint?ifVersion=bogus", { token: c.token })).body.error.code, "INVALID_REQUEST");
+  assert.equal((await f.call(conditional, { token: c.token, method: "POST" })).body.error.code, "METHOD_NOT_ALLOWED");
+  const narrowed = f.owner("agentCredential.updateScope", { credentialId: c.credential.id,
+    expectedRevision: c.credential.revision, commands: ["status.read"] });
+  const snapshotOnly = (await f.call(conditional, { token: c.token })).body.value;
+  assert.equal(snapshotOnly.unchanged, false);
+  assert.equal(snapshotOnly.snapshot.access.eventsRead, false);
+  assert.equal(snapshotOnly.observed.latestEvent, null);
+  assert.equal(Object.hasOwn(snapshotOnly.links, "events"), false);
+  f.owner("agentCredential.updateScope", { credentialId: c.credential.id,
+    expectedRevision: narrowed.credential.revision, goalIds: [] });
+  assert.equal((await f.call(conditional + "&goalId=" + f.goal.id, { token: c.token })).body.error.code, "SCOPE_DENIED");
+  f.owner("agentCredential.revoke", { credentialId: c.credential.id });
+  assert.equal((await f.call(conditional, { token: c.token })).body.error.code, "UNAUTHORIZED");
+  assert.deepEqual(Object.values(f.calls), [0, 0, 0, 0, 0]);
+});
 
 test("serves a versioned discovery contract and scoped read endpoints without model calls", async t => {
   const f = await apiFixture(t);
@@ -534,6 +722,58 @@ function runChild(args, env = {}) {
     child.on("close", code => resolve({ code, stdout, stderr }));
   });
 }
+
+test("a replacement CLI monitor resumes checkpoint and events across a persistent host restart", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "events.read"] });
+  const replacement = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "events.read"] });
+  const cli = async (baseUrl, token, command, ...options) => {
+    const result = await runChild(["scripts/acms-agent.mjs", command, "--url", baseUrl, "--goal", f.goal.id, "--json", ...options],
+      { ACMS_AGENT_TOKEN: token });
+    assert.equal(result.code, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  const first = await cli(f.api.baseUrl, c.token, "checkpoint");
+  assert.equal(first.value.snapshot.goal.id, f.goal.id);
+  await f.api.close();
+  const store = new Store(f.store.filename);
+  const company = new Company(store);
+  const next = createAgentApi({ ...f.runtime, company, store });
+  try {
+    await next.start();
+    const same = await cli(next.baseUrl, replacement.token, "checkpoint", "--if-version", first.value.version);
+    assert.notEqual(same.instanceId, first.instanceId);
+    assert.equal(same.value.unchanged, true);
+    assert.equal(same.value.observed.cursor, first.value.observed.cursor);
+    company.command(OWNER, randomUUID(), "goal.edit", { id: f.goal.id, patch: { acceptance: "Monitor recovery after host restart" } });
+    const after = ["--after", String(first.value.observed.cursor), "--limit", "1"];
+    const events = await cli(next.baseUrl, replacement.token, "events", ...after);
+    const replay = await cli(next.baseUrl, replacement.token, "events", ...after);
+    assert.deepEqual(replay.value, events.value);
+    const trail = [...events.value.entries];
+    let page = events.value;
+    while (page.hasMore) {
+      const cursor = page.nextCursor;
+      page = (await cli(next.baseUrl, replacement.token, "events", "--after", String(cursor), "--limit", "1")).value;
+      assert.ok(page.nextCursor > cursor);
+      trail.push(...page.entries);
+    }
+    assert.equal(new Set(trail.map(event => event.seq)).size, trail.length);
+    assert.ok(trail.some(event => event.type === "goal.contract.changed"));
+    const ahead = await runChild(["scripts/acms-agent.mjs", "events", "--url", next.baseUrl, "--goal", f.goal.id,
+      "--after", String(events.value.latestCursor + 100)], { ACMS_AGENT_TOKEN: replacement.token });
+    assert.equal(ahead.code, 1);
+    assert.equal(JSON.parse(ahead.stderr).error.code, "CURSOR_AHEAD");
+    const recovered = await cli(next.baseUrl, replacement.token, "checkpoint");
+    assert.equal(recovered.value.snapshot.goal.contract.version, 2);
+    assert.equal(recovered.value.observed.cursor, events.value.latestCursor);
+    assert.match(recovered.value.links.events, new RegExp("&after=" + events.value.latestCursor + "$"));
+    assert.deepEqual(Object.values(f.calls), [0, 0, 0, 0, 0]);
+  } finally {
+    await next.close();
+    store.close();
+  }
+});
 
 test("CLI discovers, submits with a stable key, and replays", async t => {
   const f = await apiFixture(t);

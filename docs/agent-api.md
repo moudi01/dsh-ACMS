@@ -76,7 +76,7 @@
 - 目标级范围：`goalIds` 明确列出、或目标由该凭据提交（`goal.source.principalId`）、或只读且 `allGoals=true` 时目标项目在 `projectIds` 内。写操作不接受 `allGoals` 放行。
 - 项目级范围：`projectIds` 明确列出，或项目由该凭据创建。
 - 越权返回 403 `SCOPE_DENIED`；命令不在白名单返回 403 `FORBIDDEN`；owner-only 操作返回 403 `OWNER_REQUIRED`。错误消息不包含 token、数据库路径或堆栈。
-- 所有数据读取端点统一执行命令检查：`/status`、`/projects`、`/projects/{id}`、`/goals`、`/goals/{id}`、`/tasks`、`/tasks/{id}`、`/artifacts/{id}`、`/reviews`、`/blockers` 都要求 `status.read`，`/events` 要求 `events.read`，`/discover` 只要求有效凭据。缺少读取命令时返回 403 `FORBIDDEN`，不会因为目标或项目在范围内而放行。
+- 所有数据读取端点统一执行命令检查：`/status`、`/checkpoint`、`/projects`、`/projects/{id}`、`/goals`、`/goals/{id}`、`/tasks`、`/tasks/{id}`、`/artifacts/{id}`、`/reviews`、`/blockers` 都要求 `status.read`，`/events` 要求 `events.read`，`/discover` 只要求有效凭据。缺少读取命令时返回 403 `FORBIDDEN`，不会因为目标或项目在范围内而放行。
 
 ## 4. 端点
 
@@ -86,6 +86,7 @@
 | --- | --- | --- | --- |
 | GET | `/discover` | 任意有效凭据 | 版本、操作清单、限额、实例 ID |
 | GET | `/status?goalId=` | `status.read` | 目标、任务、attempt、artifact 元数据、pending interaction、verification、cursor、modelPreferences |
+| GET | `/checkpoint?goalId=&ifVersion=` | `status.read` | 一致的目标监控快照和事件游标，支持只返回新观察值 |
 | GET | `/projects` | `status.read` | 凭据范围内的项目摘要 |
 | GET | `/projects/{id}` | `status.read` | 项目摘要与检查配置 |
 | GET | `/goals` | `status.read` | 范围内目标摘要 |
@@ -133,6 +134,17 @@
 
 `GET /artifacts/{id}` 按凭据的目标范围返回已有不可变产物：`artifact`（元数据）、`goalId`、`taskId`、`size`、`encoding: "base64"`、`content`（完整原始字节的 Base64）与 `sha256`（原始字节的 SHA-256，十六进制）。该接口不接受任意本机路径，只接受 artifact ID；跨目标、撤销/过期凭据返回 403/401，无 `status.read` 返回 403 `FORBIDDEN`。blob 缺失或字节数与记录不符分别返回 410 `ARTIFACT_MISSING`、409 `ARTIFACT_CORRUPT`，超过公司 `maxArtifactBytes` 返回 413 `ARTIFACT_TOO_LARGE`。服务端读取前先校验文件大小，读取后还会核对记录中的 `artifact.hash`（Base64 文本摘要），同长度内容损坏同样返回 `ARTIFACT_CORRUPT`。注意：产物元数据里的 `artifact.hash` 是 ACMS 对 Base64 文本计算的摘要，不是原始字节 SHA-256，两者不能互换；完整性校验以 `sha256` 与 `size` 为准。owner 面板的完整下载使用同一 artifact ID 与 `maxArtifactBytes` 边界，只由 DSH owner 连接访问。
 
+### 4.4 目标监控检查点
+
+`GET /checkpoint` 在一次 SQLite 读取内核对当前凭据权限、目标状态及事件游标。明确授权一个目标的凭据可省略 `goalId`。该入口无需创建任务、调用模型或更新凭据使用时间。
+
+- 响应的 `value` 包含 `schema: "acms-monitor-checkpoint/1"`、`goalId`、`version`、`unchanged` 和 `observed`。第一次查询得到 `snapshot` 和详读链接。后续可传原样的 64 位十六进制 `ifVersion`。状态一致时响应为 `unchanged: true`，只返回观察值和版本，监控可复用已保存的状态。
+- `snapshot` 提供当前合同版本与正文指纹、目标状态、按状态计数（包含已删除的留存任务）、非终态任务与未答事项的索引、调度状态，以及计划、检查、审查和发布证据。正文、产物内容、本机路径、进程 ID 和凭据不进入快照。需要最新用户要求或具体核验材料时，按 `links` 读取已授权的现有端点。
+- `slots` 保留目标任务和集成实际占用的槽，包括任务已取消或删除后仍在核对的资源。独立聊天、模型检测及其他目标不列入该目标的槽。`pendingInteractions.matchesCurrentTaskState` 仅核对当前任务状态和代次，答复权限仍由 `interaction.answer` 和原写入门禁决定。
+- 非终态和未答事项各最多返回 200 条，`total` 和 `omitted` 反映完整索引，省略条目仍计入版本指纹。最近验证、自动合入和候选发布各最多返回 24 条，`hasOlder…` 标记提示可查原记录。候选的 `matchesRecordedVerification` 表示现有记录仍匹配当前候选和检查配置。应用提交也是历史凭据。读取检查点不会重跑检查或核对实际 Git 分支。
+- `observed.checkedAt` 是本次读取时间，`schedulerHeartbeatAt` 是已有调度心跳时间。`scheduling.state` 在无租约、宿主停止中或心跳过期时反映对应状态。心跳有效期为调度间隔的五倍，最短 10 秒。租约状态与心跳都不证明任何进程已清理。单纯推进核查时间、心跳及事件游标不改变状态版本，状态由新鲜转过期仍会更新版本。
+- 有 `events.read` 的客户端可从首份快照的 `observed.cursor` 调用已有 `/events?after=`。事件流的进度以已处理的 `nextCursor` 单独保存，避免条件读取返回的新游标跳过尚未处理的事件。替换监控可带上已保存的版本和游标续读。无本地历史时重新获取完整检查点。收到 `CURSOR_AHEAD` 时也可用此方式对当前数据库重新建立基线。只有 `status.read` 的凭据可查看检查点，`observed.latestEvent` 和事件链接需要 `events.read`。
+
 ## 5. 幂等
 
 - 外部写请求必须提供 8–200 个可见 ASCII 字符（U+0021–U+007E，无空白）的幂等键：请求头 `Idempotency-Key` 或 body `requestId`，两者完全等价。
@@ -169,6 +181,8 @@ SQLite 的 `SQLITE_BUSY`/`SQLITE_LOCKED`（包括写锁超时）统一映射为 
 ```bash
 node scripts/acms-agent.mjs discover --discovery <dataDir>/agent-api.json --token-file <tokenfile>
 node scripts/acms-agent.mjs status --goal goal_... --token-file <tokenfile>
+node scripts/acms-agent.mjs checkpoint --goal goal_... --token-file <tokenfile>
+node scripts/acms-agent.mjs checkpoint --goal goal_... --if-version <version> --token-file <tokenfile>
 node scripts/acms-agent.mjs submit --project project_... --title "目标" --description "说明" --acceptance "验收" --constraint "scope=仅限本仓库" --token-file <tokenfile>
 node scripts/acms-agent.mjs events --goal goal_... --after 0 --wait 5000 --token-file <tokenfile>
 node scripts/acms-agent.mjs pause --task task_... --reason "暂时停止" --token-file <tokenfile>

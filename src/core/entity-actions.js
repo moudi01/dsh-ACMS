@@ -1,4 +1,5 @@
-export const isLiveAttempt = a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending;
+export const LIVE_ATTEMPT_STATUSES = ['preparing', 'running', 'cancelling', 'reconciling'];
+export const isLiveAttempt = a => LIVE_ATTEMPT_STATUSES.includes(a.status) || a.cleanupPending;
 export function entityTasks(kind, entity, data) {
   return data.tasks.filter(t => kind === 'project' ? t.projectId === entity.id : kind === 'goal' ? t.goalId === entity.id : t.agentId === entity.id);
 }

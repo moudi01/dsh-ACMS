@@ -476,8 +476,7 @@ export class Company {
   }
   latestGoalReview(goalId) {
     const goal = this.store.require('goals', goalId);
-    return this.store.list('tasks').filter(t => t.goalId === goalId && t.kind === 'review' && t.reviewScope === 'goal' &&
-      t.status !== 'deleted' && taskContractVersion(t) === contractVersion(goal)).at(-1) ?? null;
+    return this.store.latestGoalReviewForContract(goalId, contractVersion(goal));
   }
   reviewerFor(goalId, excluded = []) {
     const skip = new Set((Array.isArray(excluded) ? excluded : [excluded]).filter(Boolean));

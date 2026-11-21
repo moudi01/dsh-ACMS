@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import { asBusyError, assert, digest, now } from "./util.js";
 import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from "./activity.js";
 import { assertWorktreeRestoreReady } from "./restore-safety.js";
+import { CHECKPOINT_INDEXES } from "./goal-checkpoint-rows.js";
 
 export const SCHEMA_VERSION = "2";
 const attemptUsageFields = { task: "$.taskId", goal: "$.goalId" };
@@ -46,6 +47,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS attempts_usage_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS attempts_usage_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS tasks_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks';
+      CREATE INDEX IF NOT EXISTS delivered_work_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks'
+        AND json_extract(body,'$.kind')='work' AND json_extract(body,'$.status')='succeeded';
+      ${CHECKPOINT_INDEXES}
       CREATE INDEX IF NOT EXISTS cost_attempts_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='goalCostAttempts';
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL, entity_id TEXT, goal_id TEXT, actor TEXT NOT NULL, principal_kind TEXT, on_behalf_of TEXT, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL, at TEXT NOT NULL);
@@ -127,6 +131,20 @@ export class Store {
   tasksForGoal(goalId) {
     return this.db.prepare("SELECT body FROM entities WHERE collection='tasks' AND json_extract(body,'$.goalId')=?")
       .all(goalId).map(({ body }) => JSON.parse(body));
+  }
+
+  deliveredWorkForGoal(goalId) {
+    return this.db.prepare(`SELECT body FROM entities INDEXED BY delivered_work_by_goal WHERE collection='tasks' AND json_extract(body,'$.goalId')=?
+      AND json_extract(body,'$.kind')='work' AND json_extract(body,'$.status')='succeeded' ORDER BY rowid`)
+      .all(goalId).map(({ body }) => JSON.parse(body));
+  }
+
+  latestGoalReviewForContract(goalId, version) {
+    const row = this.db.prepare(`SELECT body FROM entities INDEXED BY tasks_by_goal WHERE collection='tasks' AND json_extract(body,'$.goalId')=?
+      AND json_extract(body,'$.kind')='review' AND json_extract(body,'$.reviewScope')='goal'
+      AND json_extract(body,'$.status')!='deleted' AND COALESCE(json_extract(body,'$.goalContractVersion'),1)=?
+      ORDER BY rowid DESC LIMIT 1`).get(goalId, version);
+    return row ? JSON.parse(row.body) : null;
   }
   *goalCostAttemptRows(goalId) {
     const rows = this.db.prepare("SELECT body FROM entities WHERE collection='goalCostAttempts' AND json_extract(body,'$.goalId')=?").iterate(goalId);

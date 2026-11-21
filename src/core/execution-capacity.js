@@ -26,6 +26,16 @@ function integrationPhase(record, task) {
   return task?.stopRequested ? 'stopping' : 'integrating';
 }
 
+export function attemptSlot(attempt, task) {
+  return { kind: 'attempt', phase: attemptPhase(attempt, task), id: attempt.id, taskId: attempt.taskId,
+    goalId: attempt.goalId ?? task?.goalId ?? null, agentId: attempt.agentId ?? null, status: attempt.status };
+}
+
+export function integrationSlot(record, task) {
+  return { kind: 'integration', phase: integrationPhase(record, task), id: record.id, taskId: record.taskId,
+    goalId: record.goalId ?? task?.goalId ?? null, agentId: task?.agentId ?? null, status: record.phase };
+}
+
 // Occupancy is the scheduler's single source of truth: task attempts, pending
 // Git integrations, owner chats and model probes each consume one slot. The
 // same live activity is counted once even if it appears in several views.
@@ -45,16 +55,8 @@ export function executionCapacity(store, adapter, live, policy) {
   const { attempts, integrations } = liveParts(store, live);
   const tasks = new Map((store?.list('tasks') ?? []).map(task => [task.id, task]));
   const entries = [];
-  for (const attempt of attempts) {
-    const task = tasks.get(attempt.taskId);
-    entries.push({ kind: 'attempt', phase: attemptPhase(attempt, task), id: attempt.id, taskId: attempt.taskId,
-      goalId: attempt.goalId ?? task?.goalId ?? null, agentId: attempt.agentId ?? null, status: attempt.status });
-  }
-  for (const record of integrations) {
-    const task = tasks.get(record.taskId);
-    entries.push({ kind: 'integration', phase: integrationPhase(record, task), id: record.id, taskId: record.taskId,
-      goalId: record.goalId ?? task?.goalId ?? null, agentId: task?.agentId ?? null, status: record.phase });
-  }
+  for (const attempt of attempts) entries.push(attemptSlot(attempt, tasks.get(attempt.taskId)));
+  for (const record of integrations) entries.push(integrationSlot(record, tasks.get(record.taskId)));
   const chatCount = Math.max(0, adapter?.activeChats ?? 0);
   const chatDetails = [...(adapter?.activeChatDetails?.values?.() ?? [])].slice(0, chatCount);
   for (const detail of chatDetails) {

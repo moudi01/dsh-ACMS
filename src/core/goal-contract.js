@@ -10,8 +10,7 @@ export function matchesGoalContract(goal, task, attempt = task) {
 
 export function deliveredWork(store, goal) {
   const superseded = new Set(goal.supersededTaskIds ?? []);
-  return store.list('tasks').filter(task => task.goalId === goal.id && task.kind === 'work' && task.status === 'succeeded' &&
-    !task.legacyBatch && !task.workflowSnapshot && !superseded.has(task.id));
+  return store.deliveredWorkForGoal(goal.id).filter(task => !task.legacyBatch && !task.workflowSnapshot && !superseded.has(task.id));
 }
 
 export function goalDeliveryHash(goal, tasks) {

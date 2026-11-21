@@ -1,6 +1,7 @@
 // Stopping does not mean the old execution has been observed to stop. Keep
 // receipt refresh available for persisted stop intents without a live host.
-export const integrationPending = record => ['preparing', 'checking', 'applying', 'reconciling'].includes(record.phase);
+export const PENDING_INTEGRATION_PHASES = ['preparing', 'checking', 'applying', 'reconciling'];
+export const integrationPending = record => PENDING_INTEGRATION_PHASES.includes(record.phase);
 export const OPTIONAL_COST_WAIT = 'COST_OPTIONAL_DEFERRED';
 
 export function goalTaskCount(tasks, goalId) {
