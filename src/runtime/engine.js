@@ -4,6 +4,7 @@ import path from 'node:path';
 import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
 import { assertTaskReviewContextCurrent, prepareTaskReviewContext } from './review-context.js';
+import { verifyCollaboration } from './collaboration.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { assertPlanAllowsWork, planBlocksDispatch, planBlocksWork } from '../core/plan-approval.js';
@@ -643,11 +644,15 @@ export class Engine {
       const hostEvidence = task.kind === 'review' ? await this.workspaces.reviewEvidence(task, controller.signal) : undefined;
       const taskReviewContext = task.kind === 'review' && task.reviewOf
         ? await prepareTaskReviewContext(this.store, this.workspaces.dataDir, task, attempt, controller.signal) : null;
+      if (['work', 'repair'].includes(task.kind) && task.workspace?.collaboration?.handoff) await verifyCollaboration(task.workspace);
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
       this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       guardPreparation();
       const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence, taskReviewContext });
+      const collaboration = task.workspace?.collaboration;
+      const workHandoff = ['work', 'repair'].includes(task.kind) && collaboration?.handoff
+        ? { revision: collaboration.revision, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') } : null;
       const assertCurrent = () => {
         controller.signal.throwIfAborted();
         const current = this.currentAttemptTask(attempt);
@@ -681,11 +686,12 @@ export class Engine {
       const onAccepted = () => this.conversations?.accepted(attempt);
       const input = { task, attempt, agent, routeSelection: preflight.selection, prompt, signal: controller.signal, assertCurrent, onAccepted };
       const dispatchInput = () => {
-        if (!taskReviewContext) return input;
+        if (!taskReviewContext && !workHandoff) return input;
         this.store.transaction(() => {
           assertCurrent();
-          const reviewContext = { ...taskReviewContext.receipt, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') };
-          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), reviewContext });
+          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id),
+            ...(taskReviewContext ? { reviewContext: { ...taskReviewContext.receipt, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') } } : {}),
+            ...(workHandoff ? { workHandoff } : {}) });
         });
         return { ...input, attempt };
       };
