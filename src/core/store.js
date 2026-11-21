@@ -178,6 +178,11 @@ export class Store {
       AND (json_extract(body,'$.status') IN (${activeStatuses}) OR ${panelAttemptHolds}) ORDER BY rowid DESC`)
       .all(taskId, ...LIVE_ATTEMPT_STATUSES).map(row => ({ ...JSON.parse(row.body), revision: row.revision }));
   }
+  taskPanelAttemptUpdates(taskId, ids) {
+    return this.db.prepare(`SELECT a.body,a.revision FROM json_each(?) AS requested JOIN entities AS a
+      ON a.collection='attempts' AND a.id=requested.value WHERE json_extract(a.body,'$.taskId')=?`)
+      .all(JSON.stringify(ids), taskId).map(row => ({ ...JSON.parse(row.body), revision: row.revision }));
+  }
   taskPanelVerifications(taskId) {
     return this.db.prepare(`SELECT v.body, v.revision FROM entities AS v WHERE v.collection='verifications' AND (
       json_extract(v.body,'$.taskId')=? OR EXISTS (

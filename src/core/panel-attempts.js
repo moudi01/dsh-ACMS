@@ -14,9 +14,11 @@ export function attemptForPanel(attempt) {
 export function taskAttemptHistory(store, params) {
   const taskId = params.get('taskId');
   const rawBefore = params.get('before');
+  const refreshIds = params.getAll('refresh');
   const before = rawBefore === null ? Number.MAX_SAFE_INTEGER : Number(rawBefore);
   assert(typeof taskId === 'string' && taskId.length > 0 && taskId.length <= 200 &&
-    (rawBefore === null || /^\d+$/.test(rawBefore)) && Number.isSafeInteger(before) && before >= 1,
+    (rawBefore === null || /^\d+$/.test(rawBefore)) && Number.isSafeInteger(before) && before >= 1 &&
+    (!refreshIds.length || (rawBefore === null && refreshIds.length <= 32 && refreshIds.every(id => id.length > 0 && id.length <= 200))),
   'INVALID_INPUT', '请选择任务并使用有效的历史游标。');
   return store.readSnapshot(() => {
     const task = store.get('tasks', taskId);
@@ -24,9 +26,10 @@ export function taskAttemptHistory(store, params) {
       (!task.projectId || store.get('projects', task.projectId)?.status !== 'deleted'), 'NOT_FOUND', '当前任务不可查看。');
     const page = store.attemptUsagePage('task', taskId, before, taskAttemptPageSize);
     return { taskId, cursor: store.cursor(),
-      attempts: page.slice(0, taskAttemptPageSize).map(({ attempt }) => attemptForOwner(attempt)),
+      attempts: page.slice(0, taskAttemptPageSize).map(({ attempt, cursor }) => ({ ...attemptForOwner(attempt), historyPosition: cursor })),
       nextBefore: page.length > taskAttemptPageSize ? page[taskAttemptPageSize - 1].cursor : null,
       ...(rawBefore === null ? { activeAttempts: store.taskPanelActiveAttempts(taskId).map(attemptForOwner),
-        verifications: store.taskPanelVerifications(taskId) } : {}) };
+        verifications: store.taskPanelVerifications(taskId),
+        ...(refreshIds.length ? { refreshedAttempts: store.taskPanelAttemptUpdates(taskId, [...new Set(refreshIds)]).map(attemptForOwner) } : {}) } : {}) };
   });
 }

@@ -30,16 +30,19 @@ function Modal({ title, onClose, children, wide }) {
   return <dialog className={`acms-modal ${wide ? 'wide' : ''}`} ref={ref} onClose={onClose} onClick={e => { if (e.target === ref.current) onClose(); }}><header><h2>{title}</h2><button type="button" className="acms-icon-btn" aria-label="关闭对话框" onClick={onClose}>×</button></header>{children}</dialog>;
 }
 function useCompany() {
-  const [data, setData] = useState(null); const [error, setError] = useState(''); const [connected, setConnected] = useState(false); const [updated, setUpdated] = useState(null);
+  const [snapshot, setSnapshot] = useState({ data: null, epoch: 0 });
+  const [error, setError] = useState(''); const [connected, setConnected] = useState(false); const [updated, setUpdated] = useState(null);
   const applied = useRef(null);
   const sequence = useRef(0);
   const refresh = async signal => {
     const request = ++sequence.current;
     const state = await api.snapshot(signal);
     signal?.throwIfAborted();
-    if (!applied.current || request > applied.current.request) {
-      applied.current = { request, state };
-      setData(state);
+    const previous = applied.current;
+    if (!previous || request > previous.request) {
+      const epoch = (previous?.epoch ?? 0) + (previous && state.cursor < previous.state.cursor ? 1 : 0);
+      applied.current = { request, state, epoch };
+      setSnapshot({ data: state, epoch });
       setUpdated(new Date());
       setError('');
       setConnected(true);
@@ -49,23 +52,27 @@ function useCompany() {
   useEffect(() => {
     const controller = new AbortController(); let timer;
     const loop = async () => {
-      let cursor = 0;
+      let cursor = null;
       while (!controller.signal.aborted) {
         try {
-          if (!cursor) cursor = (await refresh(controller.signal)).cursor;
-          const page = await api.events(cursor, controller.signal); cursor = page.nextCursor;
-          if (page.entries.length) await refresh(controller.signal);
+          if (cursor === null) cursor = (await refresh(controller.signal)).cursor;
+          const page = await api.events(cursor, controller.signal);
+          if (page.latestCursor < cursor) cursor = (await refresh(controller.signal)).cursor;
+          else {
+            cursor = page.nextCursor;
+            if (page.entries.length) await refresh(controller.signal);
+          }
           setConnected(true);
         } catch (e) {
           if (controller.signal.aborted) break;
           setError(e.message); setConnected(false);
           await new Promise(resolve => { timer = setTimeout(resolve, 3000); controller.signal.addEventListener('abort', resolve, { once: true }); });
-          cursor = 0;
+          cursor = null;
         }
       }
     }; loop(); return () => { controller.abort(); clearTimeout(timer); };
   }, []);
-  return { data, error, connected, updated, refresh };
+  return { ...snapshot, error, connected, updated, refresh };
 }
 function useRuntimeClock(running) {
   const [, tick] = useState(0);
@@ -77,7 +84,7 @@ function useRuntimeClock(running) {
   return Date.now();
 }
 export function App() {
-  const { data, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
+  const { data, epoch, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
   const [scope, setScope] = useState({}); const [entityView, setEntityView] = useState(null);
   const [conversation, setConversation] = useState(null);
   const chat = (agentId, taskId = null, exact = false) => setConversation({ agentId, taskId: exact ? (taskId ?? null) : (taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null) });
@@ -154,7 +161,7 @@ export function App() {
         {tab === 'settings' && <><PageHead eyebrow="OWNER BOUNDARIES" title="公司设置" description="这些边界由你控制。管理智能体可以在边界内调整执行方式。" /><div className="acms-overview-grid"><section className="acms-panel"><div className="acms-sectionhead"><h2>资源与权限</h2><button onClick={() => open('policy', data.policy)}>编辑边界</button></div><dl className="acms-definition"><dt>最大同时执行</dt><dd>{data.policy.maxConcurrent} 个</dd><dt>协调预留</dt><dd>{data.policy.controlSlots} 个</dd><dt>每个目标任务上限</dt><dd>{data.policy.maxTasksPerGoal} 项</dd><dt>单任务执行尝试</dt><dd>{data.policy.maxAttempts} 次</dd><dt>最大返工</dt><dd>{data.policy.maxReworks} 次</dd><dt>目标时间盒</dt><dd>{data.policy.goalTimeBoxMs ? `${(data.policy.goalTimeBoxMs / 60000).toFixed(1)} 分钟` : '未启用'}</dd><dt>收尾预留</dt><dd>{data.policy.timeBoxReserveMs ? `${(data.policy.timeBoxReserveMs / 60000).toFixed(1)} 分钟` : '未设置'}</dd><dt>单次执行时限</dt><dd>{data.policy.turnTimeoutMs / 60000} 分钟</dd><dt>允许的执行器</dt><dd>{data.policy.allowedProviders.join('、') || '使用已安装执行器'}</dd></dl></section><section className="acms-panel"><div className="acms-sectionhead"><h2>项目与检查</h2><button onClick={() => open('project')}>＋ 添加项目</button></div>{!data.projects.length ? <Empty title="尚未添加项目">指定一个工作目录，并配置验收检查。</Empty> : data.projects.map(p => <button className="acms-project-row" key={p.id} onClick={() => open('project', p)}><b>{p.name}</b><code>{p.repoRoot}</code><span>{p.mode === 'git' ? 'Git 隔离工作副本' : '独立目录副本'} · {p.checks.length} 项检查 · {p.autoMerge ? '自动集成' : '保留交付版本'}</span></button>)}</section></div><section className="acms-panel"><div className="acms-sectionhead"><h2>运行信息</h2><span>ACMS {data.runtime.version}</span></div><dl className="acms-definition"><dt>数据位置</dt><dd><code>{data.runtime.dataDir}</code></dd><dt>宿主通信</dt><dd>DSH 原生通道 · 无独立管理端口</dd><dt>执行器</dt><dd>{data.runtime.providers.map(p => p.name).join('、') || '未安装'}</dd></dl></section></>}
       </div>}
     </main>
-    {task && <TaskDrawer key={task.id} navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
+    {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
     {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={data} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
     {modal && data && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
     {conversation && data && <ConversationWindow key={`${conversation.agentId}:${conversation.taskId}`} {...conversation} data={data} close={() => setConversation(null)} />}

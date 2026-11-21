@@ -76,6 +76,15 @@ test('panel keeps live and held attempts while scoped history retains old eviden
   assert.equal(older.nextBefore, null);
   assert.equal(older.verifications, undefined);
   assert.equal(older.attempts.at(-1).id, 'a-recovery');
+  assert(first.attempts.at(-1).historyPosition > older.attempts[0].historyPosition);
+  f.store.put('attempts', { ...f.store.require('attempts', 'a-recovery'), cleanupPending: false, status: 'completed' });
+  attempt(a, 'a-new-without-event');
+  const updated = (await read('task-attempts?taskId=' + a.id + '&refresh=a-recovery&refresh=b-0')).value;
+  assert.equal(updated.cursor, first.cursor);
+  assert.equal(updated.attempts[0].id, 'a-new-without-event');
+  assert(updated.attempts[0].historyPosition > first.attempts[0].historyPosition);
+  assert.deepEqual(updated.refreshedAttempts.map(item => [item.id, item.status]), [['a-recovery', 'completed']]);
+  assert.equal((await read('task-attempts?taskId=' + a.id + '&before=' + first.nextBefore + '&refresh=a-recovery')).status, 400);
   const visible = [...first.attempts, ...older.attempts];
   assert.equal(new Set(visible.map(item => item.id)).size, 37);
   assert(visible.every(item => item.taskId === a.id && item.meteredUsage === undefined));

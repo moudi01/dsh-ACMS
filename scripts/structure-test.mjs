@@ -19,24 +19,26 @@ const anotherProject = command('project.save', { name: '另一项目', repoRoot:
 const anotherGoal = command('goal.create', { projectId: anotherProject.id, title: '另一个目标', description: 'Fixture', acceptance: 'Fixture', plan: false });
 const anotherTask = command('task.create', { goalId: anotherGoal.id, title: '另一项目的任务' });
 const store = server.company.store;
-function completedAttempt(task, sequence) {
+function completedAttempt(task, sequence, extra = {}) {
   return store.put('attempts', { id: task.id + '-attempt-' + sequence, taskId: task.id, goalId: task.goalId,
     agentId: 'manager', status: 'completed', startedAt: '2026-01-02T03:04:00.000Z',
-    summary: '历史证据 ' + task.title + ' #' + sequence });
+    summary: '历史证据 ' + task.title + ' #' + sequence, ...extra });
 }
 store.transaction(() => {
-  for (let sequence = 0; sequence < 34; sequence++) completedAttempt(parent, sequence);
+  completedAttempt(parent, 0, { status: 'reconciling', cleanupPending: true, recovery: { reason: '旧执行待核对' } });
+  for (let sequence = 1; sequence < 34; sequence++) completedAttempt(parent, sequence);
   completedAttempt(nested, 0);
   completedAttempt(anotherTask, 0);
 });
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
-const errors = []; const diagnostics = []; const historyReads = [];
+const errors = []; const diagnostics = []; const historyReads = []; const eventReads = [];
 page.on('pageerror', e => errors.push(e.message));
 page.on('request', request => {
   const url = new URL(request.url());
   if (/model-(details|check)/.test(url.pathname)) diagnostics.push(request.url());
   if (url.pathname === '/api/acms/task-attempts') historyReads.push(url.searchParams);
+  if (url.pathname === '/api/acms/events') eventReads.push(Number(url.searchParams.get('after')));
 });
 async function pauseHistory(taskId, older) {
   const release = Promise.withResolvers();
@@ -87,7 +89,7 @@ try {
   await details.getByRole('button', { name: '加载更早的执行记录' }).click();
   await oldPage.wait();
   store.transaction(() => {
-    completedAttempt(parent, 34);
+    completedAttempt(parent, 34, { status: 'running', progress: { lastSnippet: '原始执行进度' } });
     store.event('attempt.finished', parent.id, {}, { kind: 'system', id: 'scheduler' });
   });
   await expect(details.locator('.acms-run')).toHaveCount(30);
@@ -100,6 +102,52 @@ try {
   await expect(details.locator('.acms-run')).toHaveCount(35);
   await details.locator('.acms-run').last().locator('summary').click();
   await expect(details.getByText('历史证据 父任务示例 #0', { exact: true })).toBeVisible();
+  const readsBeforeProgress = historyReads.length;
+  const parentRevisionBeforeProgress = store.require('tasks', parent.id).revision;
+  store.transaction(() => {
+    const running = store.require('attempts', parent.id + '-attempt-34');
+    store.put('attempts', { ...running, progress: { lastSnippet: '收到新的执行进度' } });
+    store.event('attempt.progress', running.id, { taskId: parent.id }, { kind: 'system', id: 'scheduler' });
+  });
+  expect(store.require('tasks', parent.id).revision).toBe(parentRevisionBeforeProgress);
+  await expect(details.getByText('收到新的执行进度', { exact: true })).toBeVisible();
+  await expect(details.locator('.acms-run')).toHaveCount(35);
+  await expect(details.getByText('历史证据 父任务示例 #0', { exact: true })).toBeVisible();
+  expect(historyReads.slice(readsBeforeProgress).map(query => query.has('before'))).toEqual([false]);
+
+  const oldestId = parent.id + '-attempt-0';
+  store.transaction(() => {
+    const prior = store.require('attempts', oldestId);
+    store.put('attempts', { ...prior, status: 'completed', cleanupPending: false, summary: '早期回执已核对' });
+    store.event('attempt.cleanup.confirmed', prior.id, { taskId: parent.id }, { kind: 'system', id: 'scheduler' });
+  });
+  await expect(details.getByText('早期回执已核对', { exact: true })).toBeVisible();
+  expect(historyReads.at(-1).getAll('refresh')).toContain(oldestId);
+
+  store.transaction(() => {
+    completedAttempt(parent, 35);
+    store.event('attempt.finished', parent.id + '-attempt-35', { taskId: parent.id }, { kind: 'system', id: 'scheduler' });
+  });
+  await expect(details.locator('.acms-run')).toHaveCount(36);
+  await expect(details.locator('.acms-run').first()).toContainText('历史证据 父任务示例 #35');
+  await expect(details.getByText('早期回执已核对', { exact: true })).toBeVisible();
+  await expect(details.getByRole('button', { name: '加载更早的执行记录' })).toHaveCount(0);
+
+  const cursorBeforeRestore = store.cursor();
+  await expect.poll(() => eventReads.at(-1)).toBe(cursorBeforeRestore);
+  await expect.poll(() => store.events.listenerCount('event')).toBeGreaterThan(1);
+  // Restore a database checkpoint without changing the current task revision
+  // or the latest attempt rows the panel uses to watch this task.
+  store.transaction(() => {
+    store.remove('attempts', oldestId);
+    store.db.prepare('DELETE FROM events WHERE seq=?').run(cursorBeforeRestore);
+  });
+  store.events.emit('event', { type: 'fixture.restored' });
+  await expect(details.locator('.acms-run')).toHaveCount(30);
+  await expect(details.getByText('早期回执已核对', { exact: true })).toHaveCount(0);
+  await details.getByRole('button', { name: '加载更早的执行记录' }).click();
+  await expect(details.locator('.acms-run')).toHaveCount(35);
+  await expect(details.getByText('早期回执已核对', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '＋ 创建子任务' }).click();
   await expect(page.getByLabel('父任务', { exact: true })).toHaveValue(parent.id); await expect(page.getByLabel('授权目标')).toHaveValue(goal.id);
   await page.getByLabel('标题', { exact: true }).fill('界面新建子任务'); await page.getByLabel('任务说明').fill('归属于选定的父任务'); await page.getByLabel('验收标准').fill('保留正确归属');
