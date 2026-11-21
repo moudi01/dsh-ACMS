@@ -169,13 +169,24 @@ try {
   const cursorBeforeRestore = store.cursor();
   await expect.poll(() => eventReads.at(-1)).toBe(cursorBeforeRestore);
   await expect.poll(() => store.events.listenerCount('event')).toBeGreaterThan(1);
+  const restoredSnapshot = await pausePanel(true);
   // Restore a database checkpoint without changing the current task revision
   // or the latest attempt rows the panel uses to watch this task.
   store.transaction(() => {
     store.remove('attempts', oldestId);
     store.db.prepare('DELETE FROM events WHERE seq=?').run(cursorBeforeRestore);
   });
+  expect(store.cursor()).toBeLessThan(cursorBeforeRestore);
   store.events.emit('event', { type: 'fixture.restored' });
+  await restoredSnapshot.wait();
+  await expect(details).toHaveCount(0);
+  const ownerWrite = await fetch(server.url + '/api/acms/command', { method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'project.save', args: { id: project.id, name: '已恢复并写入的项目' }, requestId: crypto.randomUUID() }) });
+  expect(ownerWrite.status).toBe(200);
+  expect(store.cursor()).toBeGreaterThan(cursorBeforeRestore);
+  await restoredSnapshot.finish();
+  await expect(page.getByRole('button', { name: '已恢复并写入的项目', exact: true })).toBeVisible();
   await expect(details.locator('.acms-run')).toHaveCount(30);
   await expect(details.getByText('早期回执已核对', { exact: true })).toHaveCount(0);
   await details.getByRole('button', { name: '加载更早的执行记录' }).click();

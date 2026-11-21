@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture } from './helpers.js';
-import { selectPanelSnapshot } from '../src/client/panel-snapshot.js';
+import { beginPanelRewind, selectPanelSnapshot } from '../src/client/panel-snapshot.js';
 import { Store } from '../src/core/store.js';
 import { createRoutes } from '../src/host/http.js';
 import { OWNER } from '../src/core/util.js';
@@ -95,18 +95,27 @@ test('panel keeps live and held attempts while scoped history retains old eviden
   assert.equal((await read('task-attempts?taskId=' + a.id + '&before=0')).status, 400);
 });
 
-test('panel snapshots accept cursor rollback only from recovery and discard prior-epoch results', () => {
-  const select = (previous, cursor, request, epoch = 0, rewindFrom = null) =>
-    selectPanelSnapshot(previous, { cursor }, request, epoch, rewindFrom);
+test('confirmed panel rewind invalidates in-flight state before a restored database can catch up', () => {
+  const select = (previous, cursor, request, epoch = 0) => selectPanelSnapshot(previous, { cursor }, request, epoch);
   const newest = select(null, 20, 1);
   assert.equal(select(newest, 19, 2), newest);
   const advanced = select(newest, 21, 1);
   assert.equal(advanced.state.cursor, 21);
-  const restored = select(advanced, 8, 3, 0, 20);
-  assert.equal(restored.epoch, 1);
-  assert.equal(restored.state.cursor, 8);
-  assert.equal(select(restored, 22, 4, 0), restored);
-  assert.equal(select(restored, 9, 5, 1).state.cursor, 9);
+  const resetting = beginPanelRewind(advanced, 0);
+  assert.equal(resetting.state, null);
+  assert.equal(resetting.epoch, 1);
+  assert.equal(select(resetting, 22, 4, 0), resetting);
+  assert.equal(beginPanelRewind(resetting, 0), resetting);
+  assert.equal(beginPanelRewind(resetting, 1), resetting);
+
+  for (const cursor of [8, 21, 25]) {
+    const restored = select(resetting, cursor, 3, 1);
+    assert.equal(restored.epoch, 1);
+    assert.equal(restored.state.cursor, cursor);
+    assert.equal(select(restored, 26, 4, 0), restored);
+    assert.equal(beginPanelRewind(restored, 0), restored);
+    assert.equal(select(restored, cursor + 1, 5, 1).state.cursor, cursor + 1);
+  }
 });
 
 test('panel state, capacity and event cursor come from the same SQLite read snapshot', async t => {
