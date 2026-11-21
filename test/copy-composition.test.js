@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, readFile, readdir, rename, rmdir, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Store } from '../src/core/store.js';
+import { createAgentApi } from '../src/host/agent-api.js';
 import { applyBackup, planBackup, verifyBackup } from '../scripts/backup.mjs';
 import { prunePlan } from '../scripts/prune-data.mjs';
 import { restoreBackup } from '../scripts/restore-backup.mjs';
@@ -359,6 +360,31 @@ test('copy contract replacements read approved historic versions and select only
   assert.equal(await readFile(path.join(checkout, 'upstream.txt'), 'utf8'), 'new upstream');
   assert.equal(await readFile(path.join(checkout, 'downstream.txt'), 'utf8'), 'new downstream');
   assert.deepEqual(await readFile(path.join(checkout, 'retained.bin')), Buffer.from([0, 100, 255]));
+  await f.engine.stop();
+  const canonical = f.company.deliveryHash(goal.id);
+  const { token } = f.command('agentCredential.create', { name: 'Copy candidate monitor', projectIds: [goal.projectId],
+    goalIds: [goal.id], commands: ['status.read'] });
+  const api = createAgentApi(f);
+  await api.start();
+  t.after(() => api.close());
+  const deliveredWork = f.store.deliveredWorkForGoal.bind(f.store);
+  const getEntity = f.store.get.bind(f.store);
+  f.store.deliveredWorkForGoal = () => assert.fail('checkpoint does not load the delivery root bodies');
+  f.store.get = (collection, id) => {
+    assert.notEqual(collection, 'tasks', 'checkpoint does not load historical dependency bodies');
+    return getEntity(collection, id);
+  };
+  try {
+    const response = await fetch(api.baseUrl + '/checkpoint', { headers: { authorization: 'Bearer ' + token } });
+    assert.equal(response.status, 200);
+    const { snapshot } = (await response.json()).value;
+    assert.equal(snapshot.delivery.hash, canonical);
+    assert.equal(snapshot.delivery.candidate.matchesRecordedVerification, true);
+    assert.equal(snapshot.delivery.candidate.version, current().composition.version);
+  } finally {
+    f.store.deliveredWorkForGoal = deliveredWork;
+    f.store.get = getEntity;
+  }
 });
 
 test('a moved approved directory blocks new copies while an already captured candidate can still be reviewed', async t => {

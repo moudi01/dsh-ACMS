@@ -187,9 +187,24 @@ async function absentFences(target) {
 
 const approvalArgs = (scenario, request, reason) => ({ ...scenario.confirmArgs(request), approvalFingerprint: request.approvalFingerprint, reason });
 
+async function checkpointReader(t, { f, goal }) {
+  const { token } = f.command('agentCredential.create', { name: 'Delivery monitor', projectIds: [goal.projectId],
+    goalIds: [goal.id], commands: ['status.read', 'events.read'] });
+  const api = createAgentApi(f);
+  await api.start();
+  t.after(() => api.close());
+  return async version => {
+    const response = await fetch(api.baseUrl + '/checkpoint' + (version ? '?ifVersion=' + version : ''),
+      { headers: { authorization: 'Bearer ' + token } });
+    assert.equal(response.status, 200);
+    return (await response.json()).value;
+  };
+}
+
 test('required delivery approval audits the exact new branch and survives restart without writing early', async t => {
   const s = await setup(t, { deliveryApproval: true });
   const { f, base, routes, preview } = s;
+  const checkpoint = await checkpointReader(t, s);
   assert.deepEqual(s.goal.deliveryApproval, { project: true, template: false });
   assert.equal(s.goal.deliveryMode, 'git-composite');
   assert.equal(s.goal.planApproval, undefined);
@@ -226,6 +241,14 @@ test('required delivery approval audits the exact new branch and survives restar
   assert.equal(await git(f.source, 'rev-parse', 'HEAD'), base);
   const laterPreview = await success(await preview());
   assert.notEqual(laterPreview.id, pending.id);
+  const delivery = (await checkpoint()).snapshot.delivery;
+  assert.equal(delivery.hash, pending.selection.deliveryHash);
+  assert.equal(delivery.candidate.matchesRecordedVerification, true);
+  assert.equal(delivery.publication.id, laterPreview.id);
+  assert.equal(delivery.publication.status, 'previewed');
+  assert.equal(delivery.publication.appliedCommit, null);
+  assert.equal(delivery.recentPublications[0].candidateMergeId, pending.id);
+  assert.equal(delivery.recentPublications[0].appliedCommit, applied.result.integratedCommit);
   assert.deepEqual(await success(await routes.decision('approve', accepted, approvalRequestId)), firstReceipt);
   await failure(await routes.decision('approve', { ...accepted, targetRef: laterPreview.targetRef }, approvalRequestId), 'IDEMPOTENCY_CONFLICT');
   await failure(await routes.decision('approve', { ...accepted, targetRef: laterPreview.targetRef }), 'STALE_CANDIDATE_CONFIRMATION');
@@ -289,12 +312,16 @@ test('required delivery approval refuses a replaced linked Git marker after the 
 test('required delivery approval for a bare branch waits for AI review and rejects a changed HEAD or authorization', async t => {
   const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
   const s = await setupBare(t, { review, deliveryApproval: true });
+  const checkpoint = await checkpointReader(t, s);
   const originalRefs = await git(s.target, 'show-ref');
   try {
     await s.f.start();
     let entered = false;
     review.entered.promise.then(() => { entered = true; });
     await until(() => { s.checkWork(); return entered; }, 75000, s.diagnostics);
+    const delivery = (await checkpoint()).snapshot.delivery;
+    assert.equal(delivery.finalReview.passed, null);
+    assert.equal(delivery.finalReview.matchesCurrentDelivery, true);
     await failure(await s.previewBare(), 'CANDIDATE_NOT_READY');
     assert.equal(await git(s.target, 'show-ref'), originalRefs);
     assert.equal(s.f.store.list('deliveryApprovals').length, 0);
@@ -306,7 +333,15 @@ test('required delivery approval for a bare branch waits for AI review and rejec
   await git(s.target, 'update-ref', basisRef, differentHead, s.base);
   await failure(await s.routes.decision('approve', approvalArgs(s, old, 'Approve previous HEAD')), 'TARGET_CHANGED');
   const revokedTarget = await success(await s.previewBare());
+  const beforeRevocation = await checkpoint();
+  assert.equal(beforeRevocation.snapshot.delivery.finalReview.id, reviewed.reviewId);
+  assert.equal(beforeRevocation.snapshot.delivery.finalReview.passed, true);
+  assert.equal(beforeRevocation.snapshot.delivery.publication.matchesCurrentProjectPolicy, true);
   await success(await s.routes.saveProject({ id: s.project.id, deliveryRepoRoot: null }));
+  const afterRevocation = await checkpoint(beforeRevocation.version);
+  assert.equal(afterRevocation.unchanged, false);
+  assert.equal(afterRevocation.snapshot.delivery.publication.matchesCurrentProjectPolicy, false);
+  assert.doesNotMatch(JSON.stringify(afterRevocation), /targetRoot|targetGitPaths|repoRoot|cleanupReceipt/);
   await failure(await s.routes.decision('approve', approvalArgs(s, revokedTarget, 'Approve revoked repository')), 'STALE_CANDIDATE_CONFIRMATION');
   await success(await s.routes.saveProject({ id: s.project.id, deliveryRepoRoot: s.target }));
   const current = await success(await s.previewBare());
@@ -1016,14 +1051,34 @@ test('a pending branch creation survives backup without the reclaimed author wor
 test('existing automatic merge applies task output before the template final review', async t => {
   const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
   const s = await setup(t, { autoMerge: true, review });
+  const checkpoint = await checkpointReader(t, s);
+  let published;
   try {
     await s.f.start();
     let reviewRunning = false;
     review.entered.promise.then(() => { reviewRunning = true; });
     await until(() => { s.checkWork(); return reviewRunning; }, 75000, s.diagnostics);
-    assert.notEqual(await git(s.f.source, 'rev-parse', 'HEAD'), s.base);
+    const appliedHead = await git(s.f.source, 'rev-parse', 'HEAD');
+    assert.notEqual(appliedHead, s.base);
     assert.deepEqual(await fs.readFile(path.join(s.f.source, 'raw.bin')), binary);
     assert.notEqual(s.snapshot().reviewSummary.passed, true);
     assert.equal(s.current().candidateMerge, undefined);
+    const delivery = (await checkpoint()).snapshot.delivery;
+    assert.equal(delivery.publication, null);
+    assert.equal(delivery.recentAutomaticMerges[0].appliedCommit, appliedHead);
+    assert.equal(delivery.recentAutomaticMerges[0].taskId, s.task.id);
+    assert.equal(delivery.finalReview.passed, null);
+    assert.equal(delivery.recentAutomaticMerges.length, 1);
+    published = delivery.recentAutomaticMerges[0];
   } finally { review.release.resolve(); }
+  await until(() => s.current().status === 'succeeded', 75000, s.diagnostics);
+  await success(await s.routes.command('company.pause', { afterCurrent: true }));
+  const edited = await success(await s.routes.command('task.edit', { id: s.task.id, patch: { description: 'Deliver a new revision' } }));
+  assert.equal(edited.status, 'ready');
+  assert.deepEqual((await checkpoint()).snapshot.delivery.recentAutomaticMerges, [published]);
+  await s.f.engine.stop();
+  await s.f.engine.start();
+  assert.equal(s.f.store.require('tasks', edited.id).status, 'ready');
+  assert.deepEqual((await checkpoint()).snapshot.delivery.recentAutomaticMerges, [published]);
+  assert.equal(await git(s.f.source, 'rev-parse', 'HEAD'), published.appliedCommit);
 });

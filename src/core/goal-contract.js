@@ -8,10 +8,9 @@ export function matchesGoalContract(goal, task, attempt = task) {
   return taskContractVersion(task) === contractVersion(goal) && taskContractVersion(attempt) === contractVersion(goal);
 }
 
-export function deliveredWork(store, goal) {
+export function deliveredWork(store, goal, records = store.deliveredWorkForGoal(goal.id)) {
   const superseded = new Set(goal.supersededTaskIds ?? []);
-  return store.list('tasks').filter(task => task.goalId === goal.id && task.kind === 'work' && task.status === 'succeeded' &&
-    !task.legacyBatch && !task.workflowSnapshot && !superseded.has(task.id));
+  return records.filter(task => !task.legacyBatch && !task.workflowSnapshot && !superseded.has(task.id));
 }
 
 export function goalDeliveryHash(goal, tasks) {

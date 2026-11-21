@@ -7,6 +7,7 @@ import { AcmsError, asBusyError, assert, digest, now } from "../core/util.js";
 import { assertCredentialActive, findCredentialByToken, goalAllowed, GOAL_CONTROL_COMMANDS, projectAllowed, stableActor } from "../core/agent-identity.js";
 import { sanitizePreferences } from "../core/model-selection.js";
 import { goalControlView } from "../core/goal-control.js";
+import { monitorCheckpoint } from "./monitor-checkpoint.js";
 
 export const API_VERSION = "1.0";
 export const CONTRACT_VERSION = 1;
@@ -65,7 +66,7 @@ const REQUEST_SCHEMAS = {
     },
   },
 };
-const OPERATIONS = ["GET /discover", "GET /status", "GET /projects", "GET /projects/{id}", "GET /goals", "GET /goals/{id}", "GET /tasks", "GET /tasks/{id}", "GET /artifacts/{id}", "GET /reviews", "GET /blockers", "GET /events", "POST /goals", "POST /projects", "POST /interactions/{id}/answer", "POST /tasks/{id}/pause", "POST /tasks/{id}/resume", ...GOAL_CONTROL_COMMANDS.map(command => "POST /goals/{id}/" + command.slice(5))];
+const OPERATIONS = ["GET /discover", "GET /status", "GET /checkpoint", "GET /projects", "GET /projects/{id}", "GET /goals", "GET /goals/{id}", "GET /tasks", "GET /tasks/{id}", "GET /artifacts/{id}", "GET /reviews", "GET /blockers", "GET /events", "POST /goals", "POST /projects", "POST /interactions/{id}/answer", "POST /tasks/{id}/pause", "POST /tasks/{id}/resume", ...GOAL_CONTROL_COMMANDS.map(command => "POST /goals/{id}/" + command.slice(5))];
 
 function validateExternalKey(value, label = "Idempotency key") {
   assert(typeof value === "string", "INVALID_REQUEST", label + " must be a string");
@@ -372,13 +373,13 @@ async function controlRequest(runtime, credential, request, context, targetId, c
   return { value: goalControl ? goalView(outcome.value) : outcome.value, replayed: outcome.replayed, requestId: key };
 }
 
-function authenticate(company, request) {
+function authenticate(company, request, { trackUse = true } = {}) {
   const header = request.headers.authorization;
   assert(typeof header === "string" && header.startsWith("Bearer "), "UNAUTHORIZED", "A valid bearer credential is required");
   const credential = findCredentialByToken(company.store, header.slice(7).trim());
   assertCredentialActive(credential);
   const lastUsed = Date.parse(credential.lastUsedAt ?? "") || 0;
-  if (Date.now() - lastUsed > 30000) { try { company.store.transaction(() => company.store.touch("agentCredentials", credential.id, { lastUsedAt: now() })); } catch { } }
+  if (trackUse && Date.now() - lastUsed > 30000) { try { company.store.transaction(() => company.store.touch("agentCredentials", credential.id, { lastUsedAt: now() })); } catch { } }
   return credential;
 }
 
@@ -386,12 +387,20 @@ async function dispatch(runtime, state, request, context) {
   const company = runtime.company;
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
   assert(url.pathname === BASE_PATH || url.pathname.startsWith(BASE_PATH + "/"), "NOT_FOUND", "Unknown agent API path");
-  const credential = authenticate(company, request);
-  context.credential = credential;
   const method = request.method ?? "GET";
   const rest = url.pathname.slice(BASE_PATH.length).replace(/^\/+/, "");
-  const parts = rest === "" ? [] : rest.split("/").map(segment => { try { return decodeURIComponent(segment); } catch { throw new AcmsError("INVALID_REQUEST", "Malformed path segment"); } });
   const goalParam = () => url.searchParams.get("goalId") || null;
+  if (rest === "checkpoint") return company.store.readSnapshot(() => {
+    const credential = authenticate(company, request, { trackUse: false });
+    assert(method === "GET", "METHOD_NOT_ALLOWED", "GET required for this endpoint");
+    const goal = resolveGoal(company, credential, goalParam(), "status.read");
+    const ifVersion = url.searchParams.get("ifVersion");
+    assert(ifVersion === null || /^[a-f0-9]{64}$/.test(ifVersion), "INVALID_REQUEST", "ifVersion must be a checkpoint version");
+    return { value: monitorCheckpoint(runtime, credential, goal, ifVersion) };
+  });
+  const credential = authenticate(company, request);
+  context.credential = credential;
+  const parts = rest === "" ? [] : rest.split("/").map(segment => { try { return decodeURIComponent(segment); } catch { throw new AcmsError("INVALID_REQUEST", "Malformed path segment"); } });
   const read = (handler, command = "status.read") => {
     assert(method === "GET", "METHOD_NOT_ALLOWED", "GET required for this endpoint");
     if (command !== null) assertCredentialCommand(credential, command);

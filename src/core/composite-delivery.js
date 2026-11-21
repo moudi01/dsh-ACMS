@@ -18,20 +18,20 @@ export function compositionCheckContract(project) {
     checks: project.checks, preparation: project.preparation ?? null });
 }
 
-export function acceptedGoalComposition(store, goal) {
+export function acceptedGoalComposition(store, goal, { project, roots, standardHash, loadTask } = {}) {
   const candidate = goal.composition;
-  const project = store.get('projects', goal.projectId);
-  if (!usesComposition(goal) || goal.deliveryMode !== compositionMode(project) || !candidate?.passed || goal.compositionRecheck ||
-      candidate.checkContract !== compositionCheckContract(project) ||
+  if (!usesComposition(goal) || !candidate?.passed || goal.compositionRecheck ||
       !candidate.checks?.length || !candidate.checks.every(check => check.passed && check.cleanupConfirmed === true)) return null;
+  const configured = project === undefined ? store.get('projects', goal.projectId) : project;
+  if (goal.deliveryMode !== compositionMode(configured) || candidate.checkContract !== compositionCheckContract(configured)) return null;
   const copy = goal.deliveryMode === COPY_COMPOSITION;
   if (copy ? !candidate.snapshot || candidate.contentHash !== candidate.snapshot.sha256 ||
       candidate.baseHash !== goal.compositionBase?.snapshot?.sha256
     : candidate.baseCommit !== goal.compositionBase?.commit) return null;
   try {
-    const roots = deliveredWork(store, goal);
-    if (candidate.ledgerHash !== goalDeliveryHash(goal, roots)) return null;
-    const current = orderedCompositionTasks(store, goal, roots);
+    const work = roots ?? deliveredWork(store, goal);
+    if (candidate.ledgerHash !== (standardHash ?? goalDeliveryHash(goal, work))) return null;
+    const current = orderedCompositionTasks(store, goal, work, { loadTask });
     return candidate.inputs?.length === current.length && current.every((task, index) => {
       const input = candidate.inputs[index];
       return task.id === input.taskId && task.generation === input.generation && task.artifactHash === input.artifactHash &&
@@ -44,6 +44,14 @@ export function acceptedGoalComposition(store, goal) {
   }
 }
 
+export function goalDeliveryState(store, goal, { roots = deliveredWork(store, goal), project, loadTask } = {}) {
+  const standardHash = goalDeliveryHash(goal, roots);
+  const candidate = acceptedGoalComposition(store, goal, { roots, standardHash, project, loadTask });
+  const hash = candidate ? digest({ standard: standardHash, candidate: candidate.version, content: candidate.contentHash,
+    checks: candidate.checkContract, verifiedChecks: candidate.checks.map(check => [check.id, check.checkVersion, check.inputHash]) }) : standardHash;
+  return { hash, candidate };
+}
+
 export function finalGoalComposition(company, goal, candidate, deliveryHash) {
   if (!candidate || goal.status !== 'succeeded' || goal.executionControl || goal.legacyBatch ||
     goal.contractChange?.status === 'pending' || goal.completedContractVersion !== contractVersion(goal) ||
@@ -54,13 +62,15 @@ export function finalGoalComposition(company, goal, candidate, deliveryHash) {
   return { version: candidate.version, deliveryHash, contractVersion: contractVersion(goal), reviewId: review?.id ?? null };
 }
 
-export function orderedCompositionTasks(store, goal, roots, { consumer = null, includeHistorical = false } = {}) {
+export function orderedCompositionTasks(store, goal, roots, {
+  consumer = null, includeHistorical = false, loadTask = id => store.get('tasks', id),
+} = {}) {
   const overrides = new Map(roots.map(task => [task.id, task]));
   const superseded = new Set(goal.supersededTaskIds ?? []);
   const visited = new Set(), visiting = new Set();
   const selected = [];
   const visit = (id, dependent) => {
-    const task = overrides.get(id) ?? store.get('tasks', id);
+    const task = overrides.get(id) ?? loadTask(id);
     assert(task?.goalId === goal.id && task.status === 'succeeded', 'COMPOSITE_DEPENDENCIES',
       `任务 ${id} 没有当前目标可用的已交付版本，请核对依赖。`);
     const historical = superseded.has(id);

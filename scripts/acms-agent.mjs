@@ -10,6 +10,7 @@ const USAGE = [
   "Commands:",
   "  discover                                  Read the versioned discovery document",
   "  status --goal <goalId>                    Goal, tasks, attempts, artifacts and blockers",
+  "  checkpoint --goal <goalId> [--if-version <version>]  Compact goal state and event cursor",
   "  goals                                     Goals inside the credential scope",
   "  projects                                  Projects inside the credential scope",
   "  tasks --goal <goalId> [--status <status>]  Tasks of one goal",
@@ -108,6 +109,7 @@ async function main() {
   };
   if (command === "discover") return execute("GET", "/discover");
   if (command === "status") return execute("GET", "/status", { query: { goalId: goalIdOf(options) } });
+  if (command === "checkpoint") return execute("GET", "/checkpoint", { query: { goalId: goalIdOf(options), ifVersion: options["if-version"] } });
   if (command === "goals") return execute("GET", "/goals");
   if (command === "projects") return execute("GET", "/projects");
   if (command === "tasks") return execute("GET", "/tasks", { query: { goalId: goalIdOf(options), status: options.status } });
