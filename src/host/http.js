@@ -37,15 +37,24 @@ async function body(request) {
   assert(request.headers.get('content-type')?.split(';')[0] === 'application/json', 'CONTENT_TYPE', 'JSON content type is required');
   const text = await request.text(); assert(text.length <= 262144, 'BODY_LIMIT', 'Request exceeds 256 KiB'); return JSON.parse(text);
 }
-export async function waitForEvents(store, after, signal, timeout = 20000) {
-  if (store.cursor() > after || signal?.aborted) return store.page(after);
+async function waitForEventChange(store, changed, signal, timeout) {
+  if (changed() || signal?.aborted) return;
   await new Promise(resolve => {
     let timer;
     const done = () => { clearTimeout(timer); store.events.off('event', done); signal?.removeEventListener('abort', done); resolve(); };
     store.events.on('event', done); signal?.addEventListener('abort', done, { once: true }); timer = setTimeout(done, timeout);
-    if (store.cursor() > after || signal?.aborted) done();
+    if (changed() || signal?.aborted) done();
   });
+}
+
+export async function waitForEvents(store, after, signal, timeout = 20000) {
+  await waitForEventChange(store, () => store.cursor() > after, signal, timeout);
   return store.page(after);
+}
+
+export async function waitForPanelWatermark(store, after, signal, timeout = 20000) {
+  await waitForEventChange(store, () => store.cursor() !== after, signal, timeout);
+  return { latestCursor: store.cursor() };
 }
 export function createRoutes(runtime) {
   const { company, engine, adapter, workspaces } = runtime;
@@ -131,6 +140,7 @@ export function createRoutes(runtime) {
     '/api/acms/events': async request => {
       const url = new URL(request.url); const after = Number(url.searchParams.get('after') ?? 0);
       assert(Number.isSafeInteger(after) && after >= 0, 'CURSOR', 'Invalid event cursor');
+      if (url.searchParams.get('view') === 'panel') return json(await waitForPanelWatermark(company.store, after, request.signal));
       return json(await waitForEvents(company.store, after, request.signal));
     },
     '/api/acms/activity': async request => {

@@ -54,37 +54,47 @@ function useCompany() {
     return applied.current.state;
   };
   useEffect(() => {
-    const controller = new AbortController(); let timer;
+    const controller = new AbortController();
+    const { signal } = controller;
     const loop = async () => {
-      let cursor = null;
-      while (!controller.signal.aborted) {
+      while (!signal.aborted) {
         try {
-          if (cursor === null) cursor = (await refresh(controller.signal)).cursor;
-          const epoch = applied.current.epoch;
-          const page = await api.events(cursor, controller.signal);
-          controller.signal.throwIfAborted();
-          if (page.latestCursor < cursor) {
+          if (!applied.current?.state) await refresh(signal);
+          const { state, epoch } = applied.current;
+          const { latestCursor } = await api.panelWatermark(state.cursor, signal);
+          signal.throwIfAborted();
+          if (epoch !== applied.current.epoch) continue;
+          if (latestCursor < state.cursor) {
             // The event query has already witnessed a rewind. The database can
             // catch up before the following state read returns.
-            const reset = beginPanelRewind(applied.current, epoch);
-            if (reset !== applied.current) {
-              publish(reset);
-              setConnected(false);
-            }
-            cursor = (await refresh(controller.signal)).cursor;
-          } else {
-            cursor = page.nextCursor;
-            if (page.entries.length) await refresh(controller.signal);
+            publish(beginPanelRewind(applied.current, epoch));
+            setConnected(false);
+            await refresh(signal);
+          } else if (latestCursor > applied.current.state.cursor) {
+            // Only an applied snapshot advances the cursor. A burst already
+            // covered by an owner's refresh needs no background state read.
+            await refresh(signal);
           }
+          setError('');
           setConnected(true);
         } catch (e) {
-          if (controller.signal.aborted) break;
+          if (signal.aborted) break;
           setError(e.message); setConnected(false);
-          await new Promise(resolve => { timer = setTimeout(resolve, 3000); controller.signal.addEventListener('abort', resolve, { once: true }); });
-          cursor = null;
+          await new Promise(resolve => {
+            const done = () => {
+              clearTimeout(timer);
+              signal.removeEventListener('abort', done);
+              resolve();
+            };
+            const timer = setTimeout(done, 3000);
+            signal.addEventListener('abort', done, { once: true });
+            if (signal.aborted) done();
+          });
         }
       }
-    }; loop(); return () => { controller.abort(); clearTimeout(timer); };
+    };
+    void loop();
+    return () => controller.abort();
   }, []);
   return { ...snapshot, error, connected, updated, refresh };
 }

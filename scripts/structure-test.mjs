@@ -2,6 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { startPreview } from './preview-server.mjs';
+import { pauseRead as pauseRouteRead, verifyPanelEvents } from './panel-events-ui-test.mjs';
 
 const server = await startPreview({ seed: false });
 const command = (name, args) => server.company.command({ kind: 'owner', id: 'owner' }, crypto.randomUUID(), name, args);
@@ -40,20 +41,7 @@ page.on('request', request => {
   if (url.pathname === '/api/acms/task-attempts') historyReads.push(url.searchParams);
   if (url.pathname === '/api/acms/events') eventReads.push(Number(url.searchParams.get('after')));
 });
-async function pauseRead(match, beforeRead = false) {
-  const release = Promise.withResolvers();
-  let reached = false, finished = false;
-  await page.route(match, async route => {
-    if (beforeRead) { reached = true; await release.promise; }
-    const response = await route.fetch();
-    if (!beforeRead) { reached = true; await release.promise; }
-    try { await route.fulfill({ response }); } catch {
-      // Chromium can abort this request when the drawer scope or version changes.
-    } finally { finished = true; }
-  }, { times: 1 });
-  return { wait: () => expect.poll(() => reached).toBe(true),
-    finish: async () => { release.resolve(); await expect.poll(() => finished).toBe(true); } };
-}
+const pauseRead = (match, beforeRead) => pauseRouteRead(page, match, beforeRead);
 const pauseHistory = (taskId, older) => pauseRead(url => url.pathname === '/api/acms/task-attempts' &&
   url.searchParams.get('taskId') === taskId && url.searchParams.has('before') === older);
 const pausePanel = beforeRead => pauseRead(url => url.pathname === '/api/acms/state', beforeRead);
@@ -164,7 +152,7 @@ try {
   await expect(details.getByText('早期回执已核对', { exact: true })).toBeVisible();
   await expect(details.getByText('真实较新的状态进度', { exact: true })).toBeVisible();
   expect(server.company.snapshot().tasks.find(t => t.title === '界面新建子任务').parentId).toBe(parent.id);
-  await nextEvents.finish();
+  nextEvents.release();
 
   const cursorBeforeRestore = store.cursor();
   await expect.poll(() => eventReads.at(-1)).toBe(cursorBeforeRestore);
@@ -224,6 +212,7 @@ try {
   await page.getByRole('radio', { name: /^deepseek-flash ·/ }).check(); await expect(page.getByRole('checkbox', { name: '继承父代理上下文' })).toBeVisible(); expect(diagnostics.length).toBe(1);
   await page.setViewportSize({ width: 390, height: 844 }); await expect(page.getByRole('heading', { name: '模型列表' })).toBeVisible(); expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   if (errors.length) throw new Error(errors.join('\n'));
+  await verifyPanelEvents(browser);
   console.log('Hierarchy, scoped navigation, permanent trash deletion, model pairing, manual-only probes and internal-only parent context passed.');
 } catch(e) { console.error(errors); await page.screenshot({ path: 'test-results/ui/structure-failure.png', fullPage: true }); throw e; }
 finally { await browser.close(); await server.close(); }
