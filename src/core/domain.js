@@ -1,5 +1,6 @@
 import { assert, id, now, text, integer, clone, OWNER, SYSTEM, TERMINAL, digest, packageName } from './util.js';
-import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, integrationPending, taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, integrationPending, reviewCancellation, taskDeletionReason, taskPurgeReason } from './task-actions.js';
+import { isLiveAttempt } from './entity-actions.js';
 import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
 import { canCoordinate, findManager } from './coordination.js';
 import { executionOccupancy } from './execution-capacity.js';
@@ -495,6 +496,14 @@ export class Company {
     this.store.event('review.queued', review.id, { goalId: goal.id, scope: 'goal', reviewerId: reviewer.id, deliveryHash, targets: targets.map(t => t.id) }, SYSTEM);
     return review;
   }
+  existingReviewRequest(reviews, goalId, actor, version) {
+    const closing = new Set(reviews.filter(review => TERMINAL.has(review.status) || reviewCancellation(review)).map(review => review.id));
+    assert(!closing.size || !this.store.list('attempts').some(attempt => !attempt.legacyBatch && closing.has(attempt.taskId) && isLiveAttempt(attempt)),
+      'REVIEW_CLEANUP_PENDING', '上一轮审查的执行清理尚未确认。请等待清理或在该审查任务中核对回执，再重新发起。');
+    const active = reviews.find(review => !TERMINAL.has(review.status));
+    if (active) this.store.event('review.request.reused', active.id, { ...version, requestedBy: actor.id ?? actor.kind }, actor, { goalId });
+    return active;
+  }
   reviewRequest(args, actor) {
     this.owner(actor);
     if (args.scope === 'goal' || args.goalId) {
@@ -505,11 +514,10 @@ export class Company {
       assert(goal.status !== 'deleted', 'ENTITY_DELETED', '目标已删除');
       assert(goal.contractChange?.status !== 'pending', 'CONTRACT_PENDING', '请先确认当前目标合同');
       const deliveryHash = this.deliveryHash(goal.id);
-      const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewScope === 'goal' && task.goalId === goal.id && task.deliveryHash === deliveryHash && task.status !== 'deleted' && !TERMINAL.has(task.status));
-      if (active) {
-        this.store.event('review.request.reused', active.id, { goalId: goal.id, deliveryHash, requestedBy: actor.id ?? actor.kind }, actor, { goalId: goal.id });
-        return active;
-      }
+      const reviews = this.store.tasksForGoal(goal.id).filter(task => task.kind === 'review' && task.reviewScope === 'goal' &&
+        task.deliveryHash === deliveryHash && task.status !== 'deleted');
+      const existing = this.existingReviewRequest(reviews, goal.id, actor, { goalId: goal.id, deliveryHash });
+      if (existing) return existing;
       const targets = deliveredWork(this.store, goal);
       assert(targets.length > 0, 'NO_DELIVERABLE', '目标还没有已交付成果，不能发起最终审查');
       const review = this.createGoalReview(goal, deliveryHash);
@@ -521,11 +529,10 @@ export class Company {
     assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
     assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
     assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
-    const active = this.store.list('tasks').find(task => task.kind === 'review' && task.reviewOf === source.id && matchesTaskReview(task, source) && task.status !== 'deleted' && !TERMINAL.has(task.status));
-    if (active) {
-      this.store.event('review.request.reused', active.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, requestedBy: actor.id ?? actor.kind }, actor, { goalId: source.goalId });
-      return active;
-    }
+    const reviews = this.store.tasksForGoal(source.goalId).filter(task => task.kind === 'review' && task.reviewOf === source.id &&
+      matchesTaskReview(task, source) && task.status !== 'deleted');
+    const existing = this.existingReviewRequest(reviews, source.goalId, actor, { sourceTaskId: source.id, artifactHash: source.artifactHash });
+    if (existing) return existing;
     const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);    const review = this.createTask({
       goalId: source.goalId, kind: 'review', title: `审查：${source.title}`,
       description: '审查已交付成果。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
@@ -846,16 +853,14 @@ export class Company {
     };
     data.tasks = data.tasks.map(task => ({ ...task, activityAt: effectiveTaskActivity(task) }));
     // Review state is bound to the current delivery: historical reviews for an
-    // older artifact/delivery must never override the current version, and a
-    // later edit (e.g. cancelling an old review) must not reorder it.
+    // older artifact/delivery must never override the current version. Store
+    // order is creation order, including reviews created in the same millisecond.
     const reviewTasks = data.tasks.filter(task => task.kind === 'review');
-    const byCreationDesc = (a, b) => (Date.parse(b.createdAt ?? '') || 0) - (Date.parse(a.createdAt ?? '') || 0) || (b.revision ?? 0) - (a.revision ?? 0) || String(b.id).localeCompare(String(a.id));
-    const representative = reviews => reviews.slice().sort(byCreationDesc)[0] ?? null;
     const deliveryHashes = new Map(data.goals.map(goal => [goal.id, this.deliveryHash(goal.id)]));
     const reviewSummary = review => review ? ({ id: review.id, status: review.status, passed: review.passed ?? null, reviewScope: review.reviewScope ?? null, createdAt: review.createdAt, updatedAt: review.updatedAt, cancelledAt: review.cancelledAt ?? null, cancelledBy: review.cancelledBy ?? null, cancelReason: review.cancelReason ?? null, deliveryHash: review.deliveryHash ?? null, artifactHash: review.reviewArtifactHash ?? null, goalContractVersion: taskContractVersion(review), reviewedContractVersion: review.reviewedContractVersion ?? 1 }) : null;
     data.tasks = data.tasks.map(task => {
       const current = reviewTasks.filter(review => review.reviewOf === task.id && matchesTaskReview(review, task));
-      return { ...task, reviewSummary: reviewSummary(representative(current)) };
+      return { ...task, reviewSummary: reviewSummary(current.at(-1)) };
     });
     const goalActivity = new Map(data.goals.map(goal => [goal.id, data.tasks.filter(task => task.goalId === goal.id).reduce((max, task) => latest(max, task.activityAt), ownActivity(goal))]));
     data.goals = data.goals.map(g => {
@@ -866,7 +871,7 @@ export class Company {
         controlSummary: goalControlView(g, data.tasks, data.attempts),
         ...(usesComposition(g) ? { compositionVerified: !!composition,
           finalComposition: finalGoalComposition(this, g, composition, deliveryHashes.get(g.id)) } : {}),
-        deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(representative(current)), reviewHistory: reviews.slice().sort(byCreationDesc).slice(0, 12).map(reviewSummary) };
+        deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(current.at(-1)), reviewHistory: reviews.slice(-12).reverse().map(reviewSummary) };
     });
     data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));
     data.modelPreferences = sanitizePreferences(this.store.get("modelPreferences", "model"));

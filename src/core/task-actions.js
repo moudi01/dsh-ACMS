@@ -4,6 +4,11 @@ export const PENDING_INTEGRATION_PHASES = ['preparing', 'checking', 'applying', 
 export const integrationPending = record => PENDING_INTEGRATION_PHASES.includes(record.phase);
 export const OPTIONAL_COST_WAIT = 'COST_OPTIONAL_DEFERRED';
 
+export function reviewCancellation(task) {
+  return task.kind === 'review' && (task.stopRequested === 'cancelled' || task.status === 'cancelled' ||
+    (task.status === 'reconciling' && !!task.cancelledAt));
+}
+
 export function goalTaskCount(tasks, goalId) {
   return tasks.filter(task => task.goalId === goalId && task.status !== 'deleted').length;
 }
