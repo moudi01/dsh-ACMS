@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { lstat, mkdir, readFile, readdir, rename, unlink, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fixture, gitProject, taskWaitDiagnostics, until } from './helpers.js';
+import { integrationWaitDiagnostics, traceContainedFixture } from './fixture-trace.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { checkoutGitBundle, verifiedGitBundle } from '../src/runtime/git-delivery.js';
 import { run } from '../src/runtime/workspaces.js';
@@ -140,23 +141,25 @@ test('restart after publishing a Git bundle reuses the version and captures both
   const base = (await gitProject(f)).trim();
   f.command('project.save', { id: f.project.id, autoMerge: false });
   const task = f.task();
+  const trace = traceContainedFixture(t, f.workspaces);
+  const diagnostics = integrationWaitDiagnostics(f, task.goalId, trace);
   const integrate = f.workspaces.integrate.bind(f.workspaces);
   let published;
   f.workspaces.integrate = async (...args) => {
     const result = await integrate(...args);
-    if (!published) {
+    if (!published) await trace.observe('bundle-published-before-commit', () => {
       published = result.delivery;
       f.store.releaseLease(f.engine.owner);
-    }
+    }, task.id);
     return result;
   };
-  await f.start();
-  await until(() => published, 20000, taskWaitDiagnostics(f, task.id));
+  await trace.observe('engine-start', f.start);
+  await until(() => published, 20000, diagnostics);
   await f.engine.integration;
   assert.equal(f.store.require('tasks', task.id).status, 'integrating');
-  await f.engine.stop();
-  await f.start();
-  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 20000, taskWaitDiagnostics(f, task.id));
+  await trace.observe('engine-stop', () => f.engine.stop());
+  await trace.observe('engine-start-recovery', f.start);
+  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 20000, diagnostics);
   const saved = f.store.require('tasks', task.id);
   assert.deepEqual(saved.integration.delivery, published);
   assert.deepEqual(await readdir(path.dirname(published.path)), [path.basename(published.path)]);
@@ -213,8 +216,10 @@ for (const flag of ['--assume-unchanged', '--skip-worktree']) test(`Git delivery
   const base = (await gitProject(f)).trim();
   f.command('project.save', { id: f.project.id, autoMerge: false });
   const task = f.task();
+  const trace = traceContainedFixture(t, f.workspaces);
   await f.start();
-  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 30000, taskWaitDiagnostics(f, task.id));
+  await until(() => f.store.require('goals', task.goalId).status === 'succeeded', 30000,
+    integrationWaitDiagnostics(f, task.goalId, trace));
   const saved = f.store.require('tasks', task.id);
   assert(!saved.changeSet.some(file => file.path === 'tracked.txt'));
   const delivery = await verifiedGitBundle(saved, f.dataDir);

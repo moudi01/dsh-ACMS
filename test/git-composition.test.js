@@ -38,7 +38,7 @@ async function setup(t, handler, check, { finalReview = false, traceWait = false
 test('a dependent task and final reviewer receive the same selected candidate after the source advances', async t => {
   const binary = Buffer.from([0, 255, 29, 128]);
   let reviewerBytes;
-  const { f, base, goal } = await setup(t, async input => {
+  const { f, base, goal, diagnostics } = await setup(t, async input => {
     if (input.task.origin?.kind === 'goal-contract') return { outcome: 'coordinated', contractAssessment: {
       reason: 'The already delivered inputs cover the revised requirement',
       reuse: f.store.list('tasks').filter(task => task.goalId === goal.id && task.kind === 'work' && task.status === 'succeeded').map(task => task.id),
@@ -66,12 +66,12 @@ test('a dependent task and final reviewer receive the same selected candidate af
     await writeFile(fromWorkspace(input, 'lib/a.cjs'), 'module.exports = 2;\n');
     await writeFile(fromWorkspace(input, 'app.cjs'), "require('./lib/a.cjs');\n");
     return { outcome: 'completed', artifacts: [{ path: 'app.cjs' }] };
-  }, "const fs=require('node:fs'); if(fs.existsSync('app.cjs') && (require('./lib/a.cjs')!==2 || fs.readFileSync('asset.bin')[1]!==255 || fs.existsSync('obsolete.txt'))) process.exit(8)", { finalReview: true });
+  }, "const fs=require('node:fs'); if(fs.existsSync('app.cjs') && (require('./lib/a.cjs')!==2 || fs.readFileSync('asset.bin')[1]!==255 || fs.existsSync('obsolete.txt'))) process.exit(8)", { finalReview: true, traceWait: true });
   const a = f.task({ title: 'A', goalId: goal.id });
   const b = f.task({ title: 'B', goalId: goal.id, dependencies: [a.id] });
   f.command('task.pause', { id: b.id });
   await f.start();
-  await until(() => taskState(f, a).status === 'succeeded', 45000, taskWaitDiagnostics(f, a.id));
+  await until(() => taskState(f, a).status === 'succeeded', 45000, diagnostics);
   const deliveredA = taskState(f, a).integration.delivery;
   assert.equal(goalState(f, goal).compositionBase.commit, base);
   assert.equal(goalState(f, goal).composition, undefined);
@@ -89,9 +89,9 @@ test('a dependent task and final reviewer receive the same selected candidate af
   f.command('task.resume', { id: b.id });
   await until(() => {
     const failed = f.store.list('attempts').find(attempt => attempt.goalId === goal.id && attempt.status === 'failed');
-    if (failed) assert.fail(failed.summary ?? taskState(f, b).feedback);
+    if (failed) assert.fail(JSON.stringify(diagnostics()));
     return goalState(f, goal).status === 'succeeded';
-  }, 45000, taskWaitDiagnostics(f, b.id));
+  }, 45000, diagnostics);
 
   const deliveredB = taskState(f, b);
   assert.equal(deliveredB.workspace.path, unattached.path);
@@ -125,7 +125,7 @@ test('a dependent task and final reviewer receive the same selected candidate af
   const queued = f.command('goal.composition.recheck', { id: goal.id }).compositionRecheck;
   assert.equal(queued.status, 'queued');
   await f.start();
-  await until(() => goalState(f, goal).status === 'succeeded', 45000, () => goalState(f, goal).compositionRecheck);
+  await until(() => goalState(f, goal).status === 'succeeded', 45000, diagnostics);
   const reassessed = goalState(f, goal).composition;
   assert.equal(reassessed.version, result.version);
   assert.notEqual(reassessed.ledgerHash, result.ledgerHash);
@@ -136,7 +136,7 @@ test('a dependent task and final reviewer receive the same selected candidate af
   assert.equal(goalState(f, goal).status, 'active');
   assert.equal(f.company.snapshot().goals.find(row => row.id === goal.id).compositionVerified, false);
   f.command('goal.composition.recheck', { id: goal.id });
-  await until(() => goalState(f, goal).status === 'succeeded', 45000, () => goalState(f, goal).compositionRecheck);
+  await until(() => goalState(f, goal).status === 'succeeded', 45000, diagnostics);
   const withNewCheck = goalState(f, goal).composition;
   assert.equal(withNewCheck.bundle.sha256, result.bundle.sha256);
   assert.deepEqual(withNewCheck.checks.map(check => check.id), ['joint-new']);

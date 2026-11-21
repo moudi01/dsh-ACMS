@@ -1,8 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { channel } from 'node:diagnostics_channel';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { readCommandCleanup } from '../src/runtime/host-command.js';
 import { run } from '../src/runtime/workspaces.js';
 
-const tracedGitCommands = new Set(['add', 'bundle', 'checkout', 'checkout-index', 'check-ref-format', 'commit', 'commit-tree',
+const tracedGitCommands = new Set(['add', 'bundle', 'checkout', 'checkout-index', 'check-ref-format', 'clone', 'commit', 'commit-tree', 'config',
   'diff', 'fetch', 'hash-object', 'init', 'ls-files', 'ls-tree', 'merge', 'merge-base', 'read-tree', 'reflog', 'reset',
   'rev-parse', 'show', 'status', 'symbolic-ref', 'update-index', 'update-ref', 'worktree', 'write-tree']);
 const gitOptionsWithValue = new Set(['-c', '-C', '--git-dir', '--work-tree', '--config-env']);
@@ -63,7 +66,7 @@ export function traceFixtureWorkspace(workspaces, { composition = false } = {}) 
   const trace = fixtureTrace();
   const methods = [['prepare', 'prepare'], ['integrate', 'integrate']];
   if (composition) methods.push(['prepareCompositionTask', 'prepare-git-composition'],
-    ['prepareCopyCompositionTask', 'prepare-copy-composition']);
+    ['prepareCopyCompositionTask', 'prepare-copy-composition'], ['recheckGoalComposition', 'recheck-composition']);
   for (const [method, operation] of methods) {
     const invoke = workspaces[method].bind(workspaces);
     workspaces[method] = (task, ...args) => trace.observe(operation, () => invoke(task, ...args), task?.id);
@@ -76,9 +79,58 @@ export function traceFixtureWorkspace(workspaces, { composition = false } = {}) 
   return trace;
 }
 
+export function traceContainedFixture(t, workspaces) {
+  const trace = traceFixtureWorkspace(workspaces);
+  const context = new AsyncLocalStorage();
+  const phases = channel('acms.owned-process.native-phase');
+  const observeNative = record => {
+    const span = context.getStore();
+    if (!span) return;
+    if (record.phase === 'helper-lookup' || record.phase === 'helper-compile' || record.phase === 'compiler-cleanup') {
+      span.bootstrap ??= [];
+      if (span.bootstrap.length < 4) span.bootstrap.push({ phase: record.phase, outcome: record.outcome, elapsedMs: record.elapsedMs,
+        exitCode: record.exitCode, confirmed: record.confirmed });
+    } else if (record.phase === 'helper-acquire') {
+      span.helper = { use: record.use, outcome: record.outcome, elapsedMs: record.elapsedMs };
+    } else if (record.phase === 'supervisor-handshake') {
+      span.handshake = { outcome: record.outcome, elapsedMs: record.elapsedMs };
+      if (record.outcome === 'started') span.stage = 'running-or-awaiting-native-cleanup';
+    } else if (record.phase === 'supervisor-cleanup') {
+      span.stage = 'native-cleanup-returned';
+      span.nativeCleanup = { outcome: record.outcome, elapsedMs: record.elapsedMs, confirmed: record.confirmed,
+        jobConfirmed: record.jobConfirmed, supervisorExited: record.supervisorExited, exitCode: record.rootExitCode };
+    }
+  };
+  phases.subscribe(observeNative);
+  t.after(() => phases.unsubscribe(observeNative));
+  for (const method of ['runIntegrationCommand', 'runDeliveryCheck']) {
+    const invoke = workspaces[method].bind(workspaces);
+    workspaces[method] = (command, args, cwd, options) => trace.observe(fixtureCommandLabel(command, args), span => context.run(span, async () => {
+      span.source = 'windows-job';
+      span.stage = 'preparing-native-command';
+      const started = performance.now();
+      try {
+        const result = await invoke(command, args, cwd, { ...options, beforeStart: executable => {
+          span.stage = 'guard';
+          options?.beforeStart?.(executable);
+          span.stage = 'awaiting-native-result';
+        } });
+        span.exitCode = result.code;
+        span.timedOut = result.timedOut === true;
+        span.cleanupConfirmed = result.cleanupConfirmed === true;
+        span.stage = 'command-returned';
+        return result;
+      } finally {
+        span.commandMs = Math.round(performance.now() - started);
+      }
+    }));
+  }
+  return trace;
+}
+
 export function simulateFixtureCleanup(workspaces, trace) {
   const invoke = async (command, args, cwd, options, span) => {
-    if (span) span.stage = 'guard';
+    if (span) { span.source = 'fixture-simulated'; span.stage = 'guard'; }
     options.beforeStart?.(command);
     const result = span ? await tracedRun(span, command, args, cwd, options) : await run(command, args, cwd, options);
     if (options.cleanupReceipt) {
@@ -100,17 +152,40 @@ export function compositionWaitDiagnostics(f, goalId, trace) {
     const tasks = store.list('tasks').filter(task => task.goalId === goalId);
     const attempts = store.list('attempts').filter(attempt => attempt.goalId === goalId);
     return {
-      goalStatus: goal.status, compositionRecheck: goal.compositionRecheck?.status,
-      tasks: tasks.map(({ id, kind, status, activeAttemptId, blocker }) =>
-        ({ id, kind, status, activeAttemptId, blockerKind: blocker?.kind })),
+      goalStatus: goal.status, completionPending: goal.completionPending, compositionRecheck: goal.compositionRecheck?.status,
+      scheduler: { ticking: f.engine.ticking, closing: f.engine.closing, activeIntegration: !!f.engine.activeIntegration,
+        queuedIntegrations: f.engine.queuedIntegrations.size },
+      tasks: tasks.map(({ id, kind, status, activeAttemptId, blocker, integrationPending, recoveryRequested, integrationRecovery }) =>
+        ({ id, kind, status, activeAttemptId, blockerKind: blocker?.kind, integrationPending, recoveryRequested, recoveryHold: !!integrationRecovery })),
       attempts: attempts.map(({ id, taskId, status, cleanupPending, cleanupUncertain }) =>
         ({ id, taskId, status, cleanupPending: cleanupPending ?? null, cleanupUncertain: cleanupUncertain ?? null })),
       integrations: store.list('integrations').filter(row => row.goalId === goalId).slice(-8).map(row => ({
-        taskId: row.taskId, phase: row.phase, commandPending: !!row.commandId, inspectionPending: !!row.inspectionCommandId,
+        id: row.id, taskId: row.taskId, phase: row.phase, commandPending: !!row.commandId, inspectionPending: !!row.inspectionCommandId,
+        commandCleanupConfirmed: row.commandCleanupConfirmed ?? null, applyStarted: !!row.applyStartedAt,
       })),
       recentEvents: store.page(Math.max(0, store.cursor() - 15), 15).entries.filter(event => event.goalId === goalId)
         .map(({ seq, type, entityId }) => ({ seq, type, entityId })),
       trace: trace.read(),
     };
+  };
+}
+
+export function integrationWaitDiagnostics(f, goalId, trace) {
+  const state = compositionWaitDiagnostics(f, goalId, trace);
+  return async () => {
+    const snapshot = state();
+    const commands = snapshot.integrations.flatMap(({ id, commandPending, inspectionPending }) => {
+      const row = f.store.require('integrations', id);
+      return [...(commandPending ? [{ integrationId: id, kind: 'execution', commandId: row.commandId }] : []),
+        ...(inspectionPending ? [{ integrationId: id, kind: 'inspection', commandId: row.inspectionCommandId }] : [])];
+    });
+    const receipts = await Promise.all(commands.map(async ({ integrationId, kind, commandId }) => {
+      const proof = await readCommandCleanup(path.join(f.dataDir, 'integration-receipts', commandId + '.json'));
+      // A live engine can consume/unlink the receipt during this diagnostic read.
+      const current = f.store.get('integrations', integrationId);
+      const checkpointMoved = current?.[kind === 'execution' ? 'commandId' : 'inspectionCommandId'] !== commandId;
+      return { integrationId, kind, checkpointMoved, confirmed: !!proof, notStarted: proof?.notStarted === true, exitCode: proof?.exitCode ?? null };
+    }));
+    return { ...snapshot, receipts };
   };
 }
