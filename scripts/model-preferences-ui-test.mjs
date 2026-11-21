@@ -73,6 +73,7 @@ try {
   await expect(costAttempt.getByText("同组配置费率", { exact: true })).toBeVisible();
   await expect(costAttempt.getByText("deepseek-reasoner · medium", { exact: true })).toBeVisible();
   await expect(costAttempt.getByText("所选路线费率", { exact: true })).toBeVisible();
+  await expect(costAttempt.getByText(/^未缓存输入 .*百万 token$/)).toHaveCount(2);
   expect(diagnostics).toEqual([]);
   await page.getByRole("button", { name: "关闭任务详情" }).click();
   if (errors.length) throw new Error(errors.join("\\n"));

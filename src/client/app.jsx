@@ -310,7 +310,7 @@ const costRouteReasons = {
   'incomparable-rates': '输入和输出费率存在取舍，沿用原路线',
 };
 const costSourceStates = { missing: '本机费率未配置', invalid: '本机费率文件无法核验', 'too-large': '本机费率文件超出大小限制', expired: '本机费率已过期' };
-const costRatePair = rate => `输入 ${usdFromMicros(rate.uncachedInputMicros)} · 输出 ${usdFromMicros(rate.outputMicros)} / 百万 token`;
+const costRatePair = rate => `未缓存输入 ${usdFromMicros(rate.uncachedInputMicros)} · 输出 ${usdFromMicros(rate.outputMicros)} / 百万 token`;
 function taskRouteBasis(selection) {
   if (selection.binding?.mode === 'explicit') return '显式绑定';
   if (selection.binding?.mode === 'preference') return '用户偏好第 ' + ((selection.preferenceIndex ?? 0) + 1) + ' 项';

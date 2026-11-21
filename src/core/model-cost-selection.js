@@ -14,20 +14,22 @@ export function chooseCostRoute({ baseline, eligible, binding, requirements, con
       requirements.inheritsParentContext === true || requirements.model || requirements.provider ||
       requirements.llmProvider || requirements.reasoningEffort || !supportsComparison(baseline) ||
       !context.allowsComparison(baseline)) return unchanged('protected-task');
-  if (!baseline.reasoningEffort) return unchanged('unknown-depth');
+  const defaults = { defaultFingerprint: context.defaultFingerprint };
+  if (!baseline.reasoningEffort) return unchanged('unknown-depth', defaults);
 
   const previous = context.previous();
   if (previous) {
     if (!previous.costSelected) return unchanged('retry-default', { previousAttemptId: previous.attemptId });
     const route = eligible.find(candidate => candidate.candidateId === previous.candidateId &&
       candidate.reasoningEffort === previous.reasoningEffort && sameCohort(candidate, baseline) && context.available(candidate));
-    return route ? { candidate: route, evidence: { reason: 'retry-route', previousAttemptId: previous.attemptId } } :
-      unchanged('retry-route-unavailable', { previousAttemptId: previous.attemptId });
+    const evidence = { ...defaults, previousAttemptId: previous.attemptId };
+    return route ? { candidate: route, evidence: { ...evidence, reason: 'retry-route' } } :
+      unchanged('retry-route-unavailable', evidence);
   }
 
   const sheet = context.read();
-  const observation = { sourceState: sheet.state, sourceFingerprint: sheet.fingerprint ?? null,
-    source: sheet.source ?? null, unit: sheet.unit ?? null, expiresAt: sheet.expiresAt ?? null, defaultFingerprint: context.defaultFingerprint };
+  const observation = { ...defaults, sourceState: sheet.state, sourceFingerprint: sheet.fingerprint ?? null,
+    source: sheet.source ?? null, unit: sheet.unit ?? null, expiresAt: sheet.expiresAt ?? null };
   if (sheet.state !== 'ready') return unchanged('rates-unavailable', observation);
   const group = sheet.groups.find(group => group.provider === baseline.provider && group.llmProvider === baseline.llmProvider &&
     group.reasoningEffort === baseline.reasoningEffort && group.prices.has(baseline.model));

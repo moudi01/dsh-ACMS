@@ -260,3 +260,37 @@ test('the same native task retry retains its eligible route and depth after rate
     () => ({ provider: channel, model: economy, reasoningEffort: 'medium' })));
   assert.deepEqual(native.probes, []);
 });
+
+test('a native retry rechecks the same-depth route when the DSH default changes after preflight', async t => {
+  const f = await fixture(t);
+  let changedDuringRetry = false;
+  const native = fakeNative(f, {
+    beforeDetails: async (_provider, model) => {
+      if (model !== economy || native.calls.length !== 1 || changedDuringRetry) return;
+      changedDuringRetry = true;
+      native.defaultSelection.reasoningEffort = 'high';
+    },
+    activation: async (_request, next) => {
+      if (next !== 1) return;
+      native.adapter.metadata.clear();
+      return { stopReason: 'error', diagnostic: 'Recoverable local fixture failure' };
+    },
+  });
+  await saveRates(f);
+  const task = await ownerCommand(f, 'task.create', { title: 'Revalidate retry depth before dispatch', goalId: f.goal.id, costRouting: true });
+  await f.start();
+  await finish(f, task);
+  assert.equal(changedDuringRetry, true);
+  assert.deepEqual(native.calls.map(call => call.options), [
+    { provider: channel, model: economy, reasoningEffort: 'medium' },
+    { provider: channel, model: premium, reasoningEffort: 'high' },
+  ]);
+  const attempts = [...f.store.attemptUsageRows('task', task.id)].map(({ attempt }) => attempt);
+  assert.equal(attempts.length, 3);
+  assert.equal(attempts[1].preflightOnly, true);
+  assert.equal(attempts[1].selection.costComparison.reason, 'retry-route');
+  assert.equal(attempts[0].selection.costComparison.reason, 'retry-route-unavailable');
+  assert.notEqual(attempts[1].selection.costComparison.defaultFingerprint, attempts[0].selection.costComparison.defaultFingerprint);
+  assert.equal(f.store.require('tasks', task.id).attempts, 2);
+  assert.deepEqual(native.probes, []);
+});

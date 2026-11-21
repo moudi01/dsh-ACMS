@@ -283,11 +283,14 @@ export class DshAdapter {
       selection.preferencesRevision === this.preferences().revision,
     'ROUTE_PREFLIGHT_STALE', '执行角色、模型策略或偏好已更新，需要重新选路并预检');
     const comparison = selection.costComparison;
+    if (comparison?.defaultFingerprint) {
+      assert(this.costDefaultFingerprint() === comparison.defaultFingerprint,
+        'ROUTE_PREFLIGHT_STALE', 'DSH 默认模型或思考深度已变化，需要重新选路并预检');
+    }
     if (comparison?.sourceState) {
       const source = readModelCostRates(this.dataDir);
-      assert(source.state === comparison.sourceState && (source.fingerprint ?? null) === comparison.sourceFingerprint &&
-        this.costDefaultFingerprint() === comparison.defaultFingerprint,
-        'ROUTE_PREFLIGHT_STALE', '本机费率或 DSH 默认配置已变化，需要重新选路并预检');
+      assert(source.state === comparison.sourceState && (source.fingerprint ?? null) === comparison.sourceFingerprint,
+        'ROUTE_PREFLIGHT_STALE', '本机费率已变化，需要重新选路并预检');
     }
     if (['lower-listed-rates', 'retry-route'].includes(comparison?.reason)) {
       assert(this.independentNativeRoute(selection.chosen) && this.healthFor(selection.chosen).status !== 'unavailable',
