@@ -21,6 +21,8 @@ export function fileStem(key) {
   return 't-' + encoded.slice(0, 100) + '-' + createHash('sha256').update(key).digest('hex').slice(0, 16);
 }
 
+const leaseOpenFailures = new WeakMap();
+
 export function acquireLease(path) {
   mkdirSync(dirname(path), { recursive: true });
   const token = randomUUID();
@@ -28,12 +30,11 @@ export function acquireLease(path) {
     let fd;
     try {
       fd = openSync(path, 'wx');
-      writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
-      closeSync(fd);
-      return () => { if (readJson(path, {})?.token === token) unlinkSync(path); };
     } catch (error) {
-      if (fd !== undefined) { try { closeSync(fd); } catch {} }
-      if (error.code !== 'EEXIST') throw error;
+      if (error.code !== 'EEXIST') {
+        if (error.code === 'EPERM') leaseOpenFailures.set(error, path);
+        throw error;
+      }
       // Never steal a live or ambiguous lease. A partially written lock may be live.
       let owner;
       try { owner = readJson(path, null); } catch {}
@@ -57,6 +58,14 @@ export function acquireLease(path) {
       busy.code = 'CODEX_THREAD_BUSY';
       throw busy;
     }
+    try {
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
+      closeSync(fd);
+    } catch (error) {
+      try { closeSync(fd); } catch {}
+      throw error;
+    }
+    return () => { if (readJson(path, {})?.token === token) unlinkSync(path); };
   }
   const busy = new Error('codex-runtime: thread lease is busy');
   busy.code = 'CODEX_THREAD_BUSY';
@@ -98,14 +107,26 @@ export class ThreadStore {
     } catch (error) { this.release(); throw error; }
   }
   async publish(signal) {
-    let release;
-    const deadline = Date.now() + 10000;
+    let release, lastFailure;
+    const lock = this.stateFile + '.lock';
+    const deadline = performance.now() + 10000;
     while (!release) {
       signal?.throwIfAborted();
-      try { release = acquireLease(this.stateFile + '.lock'); }
-      catch (error) { if (error.code !== 'CODEX_THREAD_BUSY' || Date.now() >= deadline) throw error; await delay(20, undefined, { signal }); }
+      if (lastFailure && performance.now() >= deadline) throw lastFailure;
+      try { release = acquireLease(lock); }
+      catch (error) {
+        // A read of the same path during recovery can fail with the same code
+        // and syscall. Only the exclusive open of this index lock may wait.
+        const indexOpenDenied = process.platform === 'win32' && error.code === 'EPERM' && leaseOpenFailures.get(error) === lock;
+        if (indexOpenDenied) error.phase = 'index-lock-open';
+        const remaining = deadline - performance.now();
+        if (remaining <= 0 || (error.code !== 'CODEX_THREAD_BUSY' && !indexOpenDenied)) throw error;
+        lastFailure = error;
+        await delay(Math.min(20, remaining), undefined, { signal });
+      }
     }
     try {
+      signal?.throwIfAborted();
       const index = readJson(this.stateFile, {});
       Object.defineProperty(index, this.key, { value: this.summary, enumerable: true, configurable: true, writable: true });
       atomicJson(this.stateFile, index);

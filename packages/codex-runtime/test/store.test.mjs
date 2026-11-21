@@ -1,16 +1,33 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
+import syncFs from 'node:fs'
 import fs from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { ThreadStore, fileStem, readJson } from '../lib/store.js'
+import { acquireLease, ThreadStore, fileStem, readJson } from '../lib/store.js'
 
 const STORE_URL = new URL('../lib/store.js', import.meta.url).href
+const windows = { skip: process.platform !== 'win32' }
 const CHILD_CODE = `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { ThreadStore } from ${JSON.stringify(STORE_URL)};
-const [stateFile, key, mode] = process.argv.slice(1);
+const [stateFile, key, mode, faultCount] = process.argv.slice(1);
+let faults = 0;
+if (Number(faultCount)) {
+  const open = fs.openSync;
+  fs.openSync = (filename, flags, ...args) => {
+    if (filename === stateFile + '.lock' && flags === 'wx' && faults < Number(faultCount)) {
+      faults++;
+      throw Object.assign(new Error('Injected EPERM opening the discovery lock'), { code: 'EPERM', syscall: 'open', path: filename });
+    }
+    return open(filename, flags, ...args);
+  };
+  syncBuiltinESMExports();
+}
 try {
   const store = new ThreadStore(stateFile, key);
   store.update({ threadId: 'thread-' + key, status: 'running', ownerPid: process.pid });
@@ -18,7 +35,7 @@ try {
   store.record('turn/started', { threadId: 'thread-' + key, turn: { id: 'turn-' + key } });
   if (mode === 'once') {
     await store.close('completed');
-    process.send({ type: 'done' });
+    process.send({ type: 'done', faults });
     process.disconnect();
   } else {
     process.on('message', async message => {
@@ -31,7 +48,7 @@ try {
     process.send({ type: 'ready', pid: process.pid, lockPath: store.lockPath });
   }
 } catch (error) {
-  process.send({ type: 'error', code: error.code, message: error.message });
+  process.send({ type: 'error', code: error.code, message: error.message, phase: error.phase });
   process.disconnect();
   process.exitCode = 1;
 }
@@ -51,8 +68,8 @@ async function fixture(t) {
     }
     await fs.rm(stateDir, { recursive: true, force: true, maxRetries: 25, retryDelay: 100 })
   })
-  function start(key, mode = 'hold') {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_CODE, stateFile, key, mode], {
+  function start(key, mode = 'hold', faults = 0) {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_CODE, stateFile, key, mode, String(faults)], {
       windowsHide: true, stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
     })
     children.push(child)
@@ -65,6 +82,25 @@ async function fixture(t) {
     return { child, first }
   }
   return { stateFile, stateDir, start }
+}
+
+function mockFs(t, name, method) {
+  const mock = t.mock.method(syncFs, name, method)
+  syncBuiltinESMExports()
+  t.after(() => { mock.mock.restore(); syncBuiltinESMExports() })
+}
+
+function permissionError(filename, syscall = 'open', code = 'EPERM') {
+  return Object.assign(new Error('Injected permission failure'), { code, errno: -4048, syscall, path: filename })
+}
+
+async function seededPublisher(t) {
+  const f = await fixture(t)
+  const index = JSON.stringify({ legacy: { threadId: 'saved-thread', turns: 2, status: 'idle' } }) + '\n'
+  await fs.writeFile(f.stateFile, index)
+  const store = new ThreadStore(f.stateFile, 'publisher')
+  t.after(() => store.release())
+  return { ...f, store, index, lock: f.stateFile + '.lock' }
 }
 
 test('two processes cannot own the same key; releasing permits a later run', { timeout: 10000 }, async (t) => {
@@ -91,6 +127,196 @@ test('concurrent processes with distinct keys retain every discovery entry', { t
   const index = readJson(f.stateFile, {})
   assert.deepEqual(Object.keys(index).sort(), Array.from({ length: 6 }, (_, i) => `parallel-${i}`))
   assert.ok(Object.values(index).every(summary => summary.status === 'idle' && summary.turns === 1))
+})
+
+test('parallel discovery writers keep all entries after a brief Windows index-lock refusal', { ...windows, timeout: 15000 }, async t => {
+  const f = await fixture(t)
+  const legacy = { threadId: 'legacy-thread', turns: 7, status: 'idle' }
+  await fs.writeFile(f.stateFile, JSON.stringify({ legacy }))
+  const runs = Array.from({ length: 6 }, (_, i) => f.start('writer-' + i, 'once', i === 2 ? 3 : 0))
+  const results = await Promise.all(runs.map(run => run.first))
+  assert.deepEqual(results.map(result => result.type), Array(6).fill('done'), JSON.stringify(results))
+  assert.deepEqual(results.map(result => result.faults), [0, 0, 3, 0, 0, 0])
+  const index = readJson(f.stateFile, {})
+  assert.deepEqual(Object.keys(index).sort(), ['legacy', ...Array.from({ length: 6 }, (_, i) => 'writer-' + i)])
+  assert.deepEqual(index.legacy, legacy)
+  assert.ok(Object.entries(index).filter(([key]) => key !== 'legacy').every(([, record]) => record.status === 'idle' && record.turns === 1))
+  assert.deepEqual((await fs.readdir(f.stateDir)).sort(), ['codex-threads', 'codex-threads.json'])
+})
+
+test('discovery publication waits for the current owner and atomically replaces the index under its own lease', async t => {
+  const f = await seededPublisher(t)
+  const release = acquireLease(f.lock)
+  const owner = await fs.readFile(f.lock, 'utf8')
+  const open = syncFs.openSync, read = syncFs.readFileSync, rename = syncFs.renameSync
+  let commits = 0
+  mockFs(t, 'renameSync', (source, target) => {
+    if (target === f.stateFile) {
+      commits++
+      const publishingOwner = read(f.lock, 'utf8')
+      assert.notEqual(publishingOwner, owner)
+      assert.equal(JSON.parse(publishingOwner).pid, process.pid)
+      assert.throws(() => open(f.lock, 'wx'), { code: 'EEXIST' })
+      assert.equal(read(target, 'utf8'), f.index)
+      assert.equal(JSON.parse(read(source, 'utf8')).publisher.key, 'publisher')
+    }
+    return rename(source, target)
+  })
+  const pending = f.store.publish()
+  try {
+    assert.equal(await fs.readFile(f.lock, 'utf8'), owner)
+    assert.equal(await fs.readFile(f.stateFile, 'utf8'), f.index)
+    assert.equal(commits, 0)
+  } finally { release() }
+  await pending
+  assert.equal(commits, 1)
+  await assert.rejects(fs.lstat(f.lock), { code: 'ENOENT' })
+})
+
+test('persistent index-lock refusal is bounded and preserves the final Windows error diagnosis', windows, async t => {
+  const f = await seededPublisher(t)
+  let time = 0, opens = 0, finalError
+  const open = syncFs.openSync, read = syncFs.readFileSync
+  t.mock.method(performance, 'now', () => time)
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename !== f.lock || flags !== 'wx') return open(filename, flags, ...args)
+    opens++
+    time += 4000
+    finalError = permissionError(filename)
+    throw finalError
+  })
+  mockFs(t, 'readFileSync', (filename, ...args) => {
+    assert.notEqual(filename, f.stateFile, 'publication must not read the index before taking the lock')
+    return read(filename, ...args)
+  })
+  await assert.rejects(f.store.publish(), error => {
+    assert.equal(error, finalError)
+    assert.equal(error.code, 'EPERM')
+    assert.equal(error.errno, -4048)
+    assert.equal(error.syscall, 'open')
+    assert.equal(error.path, f.lock)
+    assert.equal(error.phase, 'index-lock-open')
+    return true
+  })
+  assert.equal(opens, 3)
+  assert.equal(await fs.readFile(f.stateFile, 'utf8'), f.index)
+  await assert.rejects(fs.lstat(f.lock), { code: 'ENOENT' })
+})
+
+test('an index-lock retry does not open or publish after waking past the deadline', windows, async t => {
+  const f = await seededPublisher(t)
+  const denial = permissionError(f.lock)
+  const open = syncFs.openSync
+  let time = 0, attempts = 0
+  t.mock.method(performance, 'now', () => time)
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename === f.lock && flags === 'wx' && ++attempts === 1) {
+      time = 9995
+      queueMicrotask(() => { time = 10006 })
+      throw denial
+    }
+    return open(filename, flags, ...args)
+  })
+  await assert.rejects(f.store.publish(), error => error === denial && error.code === 'EPERM' &&
+    error.phase === 'index-lock-open' && error.path === f.lock)
+  assert.equal(attempts, 1)
+  assert.equal(await fs.readFile(f.stateFile, 'utf8'), f.index)
+  await assert.rejects(fs.lstat(f.lock), { code: 'ENOENT' })
+})
+
+test('aborting a Windows index-lock retry leaves the competing lease and index alone', windows, async t => {
+  const f = await seededPublisher(t)
+  const release = acquireLease(f.lock)
+  const owner = await fs.readFile(f.lock, 'utf8')
+  const controller = new AbortController()
+  const reason = new Error('Owner cancelled discovery publication')
+  const open = syncFs.openSync
+  let time = 0, opens = 0
+  t.mock.method(performance, 'now', () => time)
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename !== f.lock || flags !== 'wx') return open(filename, flags, ...args)
+    opens++
+    queueMicrotask(() => { time = 10006; controller.abort(reason) })
+    throw permissionError(filename)
+  })
+  try {
+    await assert.rejects(f.store.publish(controller.signal), error => error === reason || error.cause === reason)
+    assert.equal(opens, 1)
+    assert.equal(await fs.readFile(f.lock, 'utf8'), owner)
+    assert.equal(await fs.readFile(f.stateFile, 'utf8'), f.index)
+  } finally { release() }
+})
+
+for (const operation of ['token write', 'descriptor close', 'EACCES']) test('index publish does not retry ' + operation, windows, async t => {
+  const f = await seededPublisher(t)
+  const open = syncFs.openSync, write = syncFs.writeFileSync, close = syncFs.closeSync
+  const denied = operation === 'EACCES' ? permissionError(f.lock, 'open', 'EACCES')
+    : permissionError(undefined, operation === 'token write' ? 'write' : 'close')
+  let fd, attempts = 0
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename !== f.lock || flags !== 'wx') return open(filename, flags, ...args)
+    attempts++
+    if (operation === 'EACCES') throw denied
+    return fd = open(filename, flags, ...args)
+  })
+  if (operation === 'token write') mockFs(t, 'writeFileSync', (target, ...args) => {
+    if (fd !== undefined && target === fd) throw denied
+    return write(target, ...args)
+  })
+  if (operation === 'descriptor close') mockFs(t, 'closeSync', target => {
+    close(target)
+    if (target === fd) throw denied
+  })
+  await assert.rejects(f.store.publish(), error => error === denied && error.phase === undefined)
+  assert.equal(attempts, 1)
+  assert.equal(await fs.readFile(f.stateFile, 'utf8'), f.index)
+})
+
+test('a thread-key lease refusal still returns the original error immediately', windows, async t => {
+  const f = await fixture(t)
+  const key = 'thread-lock-denied'
+  const lock = path.join(f.stateDir, 'codex-threads', fileStem(key) + '.lock')
+  const denied = permissionError(lock)
+  const open = syncFs.openSync
+  let attempts = 0
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename !== lock || flags !== 'wx') return open(filename, flags, ...args)
+    attempts++
+    throw denied
+  })
+  assert.throws(() => new ThreadStore(f.stateFile, key), error => error === denied && error.phase === undefined)
+  assert.equal(attempts, 1)
+  await assert.rejects(fs.lstat(f.stateFile), { code: 'ENOENT' })
+})
+
+for (const phase of ['reaper open', 'owner recheck']) test('index publish does not retry an EPERM during ' + phase, { ...windows, timeout: 15000 }, async t => {
+  const f = await seededPublisher(t)
+  const run = f.start('dead-owner')
+  const ready = await run.first
+  assert.equal(ready.type, 'ready')
+  const exit = once(run.child, 'exit')
+  run.child.kill()
+  await exit
+  const owner = JSON.stringify({ pid: ready.pid, token: 'crashed-index-writer' })
+  await fs.writeFile(f.lock, owner)
+  const before = await fs.readFile(f.stateFile, 'utf8')
+  const denied = permissionError(phase === 'reaper open' ? f.lock + '.recover' : f.lock)
+  const open = syncFs.openSync, read = syncFs.readFileSync
+  let attempts = 0, ownerReads = 0
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename === f.lock && flags === 'wx') attempts++
+    if (phase === 'reaper open' && filename === f.lock + '.recover' && flags === 'wx') throw denied
+    return open(filename, flags, ...args)
+  })
+  if (phase === 'owner recheck') mockFs(t, 'readFileSync', (filename, ...args) => {
+    if (filename === f.lock && ++ownerReads === 2) throw denied
+    return read(filename, ...args)
+  })
+  await assert.rejects(f.store.publish(), error => error === denied && error.phase === undefined)
+  assert.equal(attempts, 1)
+  assert.equal(await fs.readFile(f.lock, 'utf8'), owner)
+  assert.equal(await fs.readFile(f.stateFile, 'utf8'), before)
+  await assert.rejects(fs.lstat(f.lock + '.recover'), { code: 'ENOENT' })
 })
 
 test('a crashed owner lease is recoverable without reusing sequence numbers', { timeout: 10000 }, async (t) => {
