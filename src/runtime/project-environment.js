@@ -15,9 +15,16 @@ async function fileHash(file, signal) {
   return hash.digest('hex');
 }
 
-export async function copyProject(source, destination, { collaboration = false, dependencies = false } = {}) {
-  await cp(source, destination, { recursive: true, force: false, errorOnExist: true, filter: async item => item === source ||
-    ((includedProjectInput(path.basename(item), dependencies) || (collaboration && path.basename(item) === '.acms')) && !(await lstat(item)).isSymbolicLink()) });
+export async function copyProject(source, destination, { collaborationFiles = [], dependencies = false } = {}) {
+  const pinned = new Set(collaborationFiles);
+  await cp(source, destination, { recursive: true, force: false, errorOnExist: true, filter: async item => {
+    if (item === source) return true;
+    const parts = path.relative(source, item).split(path.sep);
+    const include = parts[0] === '.acms'
+      ? pinned.size > 0 && (parts.length === 1 || (parts.length === 2 && pinned.has(parts[1])))
+      : includedProjectInput(path.basename(item), dependencies);
+    return include && !(await lstat(item)).isSymbolicLink();
+  } });
 }
 
 async function inputFiles(root, signal, dependencies = false) {

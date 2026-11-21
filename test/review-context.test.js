@@ -281,7 +281,7 @@ console.log(JSON.stringify({ protocol: request.protocol, requestId: request.requ
   return adapter;
 }
 
-for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-rejection']) {
+for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-rejection', 'pinned-history-before-recovery']) {
   test(`paired review evidence rejection releases its slot only with the right receipt (${mode})`, async t => {
     const f = await fixture(t);
     const delayedProof = mode === 'delayed' || mode === 'obsolete-contract';
@@ -300,9 +300,15 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
         const fact = await adapter.reconcile(observed);
         assert.equal(fact.status, 'completed');
         assert.equal(fact.cleanupConfirmed, true);
-        reference = path.join(observed.workspace.path, observed.reviewContext.evidence[0].workspacePath);
+        const historyChanged = mode === 'pinned-history-before-recovery';
+        reference = path.join(observed.workspace.path, historyChanged ? observed.workspace.collaboration.handoff.history.path
+          : observed.reviewContext.evidence[0].workspacePath);
         original = await readFile(reference);
-        await unlink(reference);
+        if (historyChanged) {
+          const altered = Buffer.from(original);
+          altered[5] ^= 1;
+          await writeFile(reference, altered);
+        } else await unlink(reference);
         if (delayedProof) {
           receiptFile = receiptPaths(f.dataDir, observed.execution).file;
           priorReceipt = await readFile(receiptFile, 'utf8');
@@ -310,7 +316,7 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
           mismatched.identity.attemptId = 'another-attempt';
           await writeFile(receiptFile, JSON.stringify(mismatched));
         }
-        if (mode === 'restart-before-rejection') throw new Error('Interrupted before the host evaluated the review result');
+        if (mode === 'restart-before-rejection' || historyChanged) throw new Error('Interrupted before the host evaluated the review result');
       }
       return accept(attempt, output, signal);
     };
@@ -359,7 +365,7 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
   });
 }
 
-test('a paused review cannot reapply a parked answer after its referenced bytes are lost', async t => {
+for (const material of ['artifact', 'author history']) test('a paused review cannot reapply a parked answer after its ' + material + ' is changed', async t => {
   const finished = Promise.withResolvers();
   let evidence;
   const f = await fixture(t, async input => {
@@ -367,7 +373,9 @@ test('a paused review cannot reapply a parked answer after its referenced bytes 
       await writeFile(path.join(input.task.workspace.path, 'proof.md'), 'Recorded proof');
       return { outcome: 'completed', artifacts: [{ path: 'proof.md' }] };
     }
-    evidence = path.join(input.task.workspace.path, contractOf(input.prompt).review.sourceEvidence[0].workspacePath);
+    const workspace = input.task.workspace;
+    evidence = path.join(workspace.path, material === 'author history' ? workspace.collaboration.handoff.history.path
+      : contractOf(input.prompt).review.sourceEvidence[0].workspacePath);
     await finished.promise; return result;
   });
   const author = f.task();
@@ -380,7 +388,11 @@ test('a paused review cannot reapply a parked answer after its referenced bytes 
   const parked = await until(() => attemptsFor(f, review).find(attempt => attempt.resultDeferred && attempt.cleanupPending === false),
     undefined, taskWaitDiagnostics(f, review.id));
   assert.ok(f.store.get('deferredResults', parked.id));
-  await unlink(evidence);
+  if (material === 'author history') {
+    const altered = await readFile(evidence);
+    altered[5] ^= 1;
+    await writeFile(evidence, altered);
+  } else await unlink(evidence);
   f.command('goal.resume', { id: review.goalId });
   await waitFor(f, review, 'blocked');
   const rejected = f.store.require('attempts', parked.id);

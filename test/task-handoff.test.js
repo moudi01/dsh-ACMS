@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile, stat, utimes, writeFile } from 'node:fs/promises';
+import { readFile, readdir, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { defaultSimulation, SimulatedAdapter } from '../src/adapters/simulated.js';
 import { Company } from '../src/core/domain.js';
@@ -137,7 +137,8 @@ test('ordinary dispatch reads a compact focused handoff while retaining scoped e
   const saved = f.store.require('attempts', attempt.id);
   assert.equal(saved.workHandoff.promptUtf8Bytes, Buffer.byteLength(prompt, 'utf8'));
   assert.equal(saved.workHandoff.revision, task.workspace.collaboration.revision);
-  assert.equal(saved.workspace.collaboration.files['task-history.json'], context.handoff.history.sha256);
+  assert.deepEqual(saved.workHandoff.history, context.handoff.history);
+  assert.equal(saved.workspace.collaboration.files[path.basename(saved.workHandoff.history.path)], saved.workHandoff.history.sha256);
   const pointer = await readJson(path.join(f.source, '.acms/CURRENT.json'));
   const projectSnapshot = await readJson(path.join(f.source, '.acms', pointer.path));
   assert.ok(projectSnapshot.tasks.some(row => row.id === foreign.id));
@@ -148,7 +149,7 @@ test('ordinary dispatch reads a compact focused handoff while retaining scoped e
   assert.notEqual(current(f, review).workspace.path, task.workspace.path);
 });
 
-test('unchanged handoff reuses the history file and detects a changed version before reuse', async t => {
+test('unchanged handoff reuses its immutable history and legacy fixed names remain readable', async t => {
   const f = await fixture(t);
   const task = f.task();
   const workspace = await f.workspaces.prepare(task, {});
@@ -160,11 +161,57 @@ test('unchanged handoff reuses the history file and detects a changed version be
   const refreshed = await f.workspaces.prepare({ ...task, workspace }, {});
   assert.equal(refreshed.collaboration.revision, workspace.collaboration.revision);
   assert.equal((await stat(historyPath)).mtimeMs, lastWrite);
+  const legacy = { ...workspace, collaboration: { files: { 'task-history.json': initial.context.handoff.history.sha256 } } };
+  await writeFile(path.join(workspace.path, '.acms/task-history.json'), initial.history);
+  await verifyCollaboration(legacy);
   await writeFile(historyPath, initial.history.map(byte => byte ^ 1));
   await assert.rejects(verifyCollaboration(refreshed), { code: 'COLLABORATION_CHANGED' });
-  const rebuilt = await f.workspaces.prepare({ ...task, workspace: refreshed }, {});
-  await verifyCollaboration(rebuilt);
-  assert.deepEqual((await readHandoff(rebuilt)).history, initial.history);
+  await assert.rejects(f.workspaces.prepare({ ...task, workspace: refreshed }, {}), { code: 'COLLABORATION_CHANGED' });
+  await writeFile(historyPath, initial.history);
+  await verifyCollaboration(refreshed);
+});
+
+test('a resumed review does not dispatch against a modified author history pin', async t => {
+  let reviewCalls = 0;
+  const f = await fixture(t, async input => {
+    if (input.task.kind !== 'review' || ++reviewCalls !== 1) return defaultSimulation(input);
+    return { outcome: 'blocked', kind: 'human', reason: 'Wait for the owner', question: 'Can the review continue?' };
+  });
+  const author = f.task();
+  await f.start();
+  await workDone(f, author);
+  const review = f.command('review.request', { id: author.id });
+  await workDone(f, review, 'blocked');
+  await f.engine.stop();
+  const workspace = current(f, review).workspace;
+  const ref = workspace.collaboration.handoff.history;
+  const file = path.join(workspace.path, ref.path);
+  const original = await readFile(file);
+  const changed = Buffer.from(original);
+  changed[5] ^= 1;
+  await writeFile(file, changed);
+  const answer = () => f.command('interaction.answer', {
+    id: f.store.list('interactions').find(i => i.taskId === review.id && i.status === 'pending').id,
+    answer: 'Continue only with the recorded materials.',
+  });
+  answer();
+  await f.start();
+  await workDone(f, review, 'blocked');
+  const { attempt } = f.store.attemptUsagePage('task', review.id, Number.MAX_SAFE_INTEGER, 1)[0];
+  assert.equal(reviewCalls, 1);
+  assert.equal(attempt.preflightOnly, true);
+  assert.equal(attempt.cleanupPending, false);
+  assert.equal(current(f, review).blocker.kind, 'review-evidence');
+  assert.equal(f.store.list('verifications').some(row => row.kind === 'review'), false);
+  assert.deepEqual(await readFile(path.join(current(f, author).workspace.path, ref.path)), original);
+  assert.deepEqual(await readFile(file), changed);
+  await f.engine.stop();
+  await writeFile(file, original);
+  answer();
+  await f.start();
+  await workDone(f, review);
+  assert.equal(reviewCalls, 2);
+  assert.equal(current(f, review).passed, true);
 });
 
 test('a legacy workspace handoff upgrades on dispatch and survives backup into a separate runtime', async t => {
@@ -183,6 +230,7 @@ test('a legacy workspace handoff upgrades on dispatch and survives backup into a
   await f.engine.stop();
   const sourceWorkspace = current(f, task).workspace;
   const before = await readHandoff(sourceWorkspace);
+  const originalAttempt = f.store.attemptUsagePage('task', task.id, Number.MAX_SAFE_INTEGER, 1)[0].attempt;
   const pending = f.store.list('interactions').find(i => i.taskId === task.id && i.status === 'pending');
   const backup = path.join(f.root, 'handoff-backup');
   const restored = path.join(f.root, 'handoff-restored');
@@ -216,6 +264,18 @@ test('a legacy workspace handoff upgrades on dispatch and survives backup into a
     assert.equal(await readFile(path.join(observed.task.workspace.path, '.acms/shared.md'), 'utf8'), 'New owner notes after backup.');
     assert.deepEqual((await readHandoff(sourceWorkspace)).entry, before.entry);
     assert.equal(current(f, task).status, 'blocked');
+    const originalRef = store.require('attempts', originalAttempt.id).workHandoff.history;
+    const currentRef = observed.data.context.handoff.history;
+    assert.deepEqual(originalRef, originalAttempt.workHandoff.history);
+    assert.notEqual(originalRef.path, currentRef.path);
+    assert.deepEqual(await readFile(path.join(restoredWorkspace.path, originalRef.path)), before.history);
+    assert.deepEqual(await readFile(path.join(restoredWorkspace.path, currentRef.path)), observed.data.history);
+    await engine.stop();
+    const review = company.command({ kind: 'owner', id: 'owner' }, randomUUID(), 'review.request', { id: task.id });
+    const reviewWorkspace = await workspaces.prepare(review, {});
+    const copies = await readdir(path.join(reviewWorkspace.path, '.acms'));
+    assert.ok(copies.includes(path.basename(currentRef.path)));
+    assert.equal(copies.includes(path.basename(originalRef.path)), false);
   } finally {
     await engine.stop();
     store.close();

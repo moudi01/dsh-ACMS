@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { deliveryGeneration, matchesTaskReview, taskContractVersion } from '../core/goal-contract.js';
 import { AcmsError, assert, digest } from '../core/util.js';
+import { verifyCollaboration } from './collaboration.js';
 
 const schema = 'acms-review-context/1';
 export const REVIEW_INLINE_BYTES = 8 * 1024;
@@ -131,21 +132,43 @@ function sourceVersion(store, review) {
     throw unavailable('原交付的产物索引缺失或无法核对。', { sourceTaskId: source.id });
   }
   const version = { taskId: source.id, generation: deliveryGeneration(source), contractVersion: taskContractVersion(source), artifactHash: source.artifactHash };
-  return { version, artifacts, fingerprint: digest([version, artifacts.map(a => [a.id, a.path, a.hash, a.bytes])]) };
+  return { version, artifacts, collaboration: collaborationPin(source.workspace),
+    fingerprint: digest([version, artifacts.map(a => [a.id, a.path, a.hash, a.bytes])]) };
+}
+
+function collaborationPin(workspace) {
+  const record = workspace?.collaboration;
+  return record?.revision ? { revision: record.revision, files: record.files } : null;
+}
+
+async function verifyPinnedCollaboration(root, pin) {
+  if (!pin) return;
+  assert(hashPattern.test(pin.revision) && pin.files?.['context.json'] && pin.files?.['shared.md'],
+    'COLLABORATION_PATH', '固定作者协作版本缺少文件摘要');
+  await verifyCollaboration({ path: root, collaboration: pin });
 }
 
 export function assertTaskReviewContextCurrent(store, task, context) {
   assert(sourceVersion(store, task).fingerprint === context.sourceFingerprint,
     'STALE_REVIEW', '审查材料索引或交付版本已变化。');
+  if (Object.hasOwn(context, 'collaboration')) assert(digest(collaborationPin(task.workspace)) === digest(context.collaboration),
+    'STALE_REVIEW', '审查使用的固定作者协作版本已变化。');
 }
 
 export async function prepareTaskReviewContext(store, dataDir, task, attempt, signal) {
   const source = sourceVersion(store, task);
   assert(component.test(attempt.id), 'REVIEW_EVIDENCE_UNAVAILABLE', '审查执行标识无法核对。');
+  const collaboration = collaborationPin(task.workspace);
   const entries = [];
   let root, reviewMeta, inlineBytes = 0;
   try {
     root = await reviewRoot(dataDir, task);
+    try {
+      assert(!collaboration || digest(collaboration) === digest(source.collaboration), 'COLLABORATION_CHANGED', '固定作者协作版本不匹配');
+      await verifyPinnedCollaboration(root, collaboration);
+    } catch {
+      throw unavailable('审查副本缺少固定作者协作版本或摘要不符。请恢复该版本，或重新发起独立审查。');
+    }
     for (const artifact of source.artifacts) {
       signal?.throwIfAborted();
       const text = textPath.test(artifact.path), capture = text && artifact.bytes <= maxTextBytes;
@@ -196,16 +219,22 @@ export async function prepareTaskReviewContext(store, dataDir, task, attempt, si
     throw unavailable('无法安全读取审查工作区或原交付材料。请核对隔离目录后重试。', { sourceTaskId: source.version.taskId });
   }
   const evidence = entries.map(({ content, ...reference }) => reference);
-  return { entries, receipt: { schema, source: source.version, sourceFingerprint: source.fingerprint,
+  return { entries, receipt: { schema, source: source.version, sourceFingerprint: source.fingerprint, collaboration,
     inlineLimitBytes: REVIEW_INLINE_BYTES, inlineBytes, evidence } };
 }
 
-export async function verifyTaskReviewContext(dataDir, task, receipt, signal) {
-  if (!receipt) return;
+export async function verifyTaskReviewContext(dataDir, task, attempt, signal) {
+  const receipt = attempt.reviewContext;
+  const pin = receipt && Object.hasOwn(receipt, 'collaboration')
+    ? receipt.collaboration : collaborationPin(attempt.workspace ?? task.workspace);
+  if (!receipt && !pin) return;
   let root;
   try {
     root = await reviewRoot(dataDir, task);
-    for (const reference of receipt.evidence) {
+    assert(digest(collaborationPin(task.workspace)) === digest(pin), 'COLLABORATION_CHANGED', '固定作者协作版本已变化');
+    await verifyPinnedCollaboration(root, pin);
+    signal?.throwIfAborted();
+    for (const reference of receipt?.evidence ?? []) {
       const input = await localFile(root, reference.workspacePath);
       const checked = await readEvidence(input.filename, reference, signal);
       if (checked.rawSha256 !== reference.rawSha256) throw unavailable('审查材料字节已经变化。');

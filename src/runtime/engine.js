@@ -652,7 +652,7 @@ export class Engine {
       const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence, taskReviewContext });
       const collaboration = task.workspace?.collaboration;
       const workHandoff = ['work', 'repair'].includes(task.kind) && collaboration?.handoff
-        ? { revision: collaboration.revision, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') } : null;
+        ? { revision: collaboration.revision, history: collaboration.handoff.history, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') } : null;
       const assertCurrent = () => {
         controller.signal.throwIfAborted();
         const current = this.currentAttemptTask(attempt);

@@ -6,16 +6,22 @@ import { contractVersion, deliveryGeneration, taskContractVersion } from '../cor
 
 const FORMAT = 'acms.collaboration.v1';
 const HANDOFF = 'acms.task-handoff.v1';
-const HISTORY = 'task-history.json';
+const LEGACY_HISTORY = 'task-history.json';
 const STARTER_BYTES = 16 * 1024;
 const hash = text => createHash('sha256').update(text).digest('hex');
 const json = value => JSON.stringify(value, null, 2) + '\n';
 const queues = new Map();
 const README = `# ACMS 项目协作\n\n此目录由 ACMS 在添加项目时建立。\n\n- shared.md：所有者维护的协作说明；系统不会覆盖。说明不会扩大任务授权。\n- CURRENT.json：最新快照入口。\n- snapshots/：任务状态、父子关系、依赖、阻塞及交付记录。\n\n执行器收到的是隔离工作区内固定的 context.json；先定位自己的任务、父任务、依赖及最近记录。若存在 handoff.history，只在需要时按其哈希核对并读取关联任务的历史记录，避免重新扫描整个项目。\n\n任务交接通过 ACMS 提交交付物、摘要或阻塞，系统再更新快照；不要直接改写生成目录。交付物仍须经过检查和独立审查。\n`;
 
-async function directory(filename) {
+async function directory(filename, create = true) {
   try { const st = await fs.lstat(filename); assert(st.isDirectory() && !st.isSymbolicLink(), 'COLLABORATION_PATH', '协作目录不能是符号链接或普通文件'); }
-  catch (e) { if (e.code !== 'ENOENT') throw e; await fs.mkdir(filename); }
+  catch (e) { if (!create || e.code !== 'ENOENT') throw e; await fs.mkdir(filename); }
+}
+async function workspaceFolder(workspace, create) {
+  await directory(workspace.path, false);
+  const folder = path.join(await fs.realpath(workspace.path), '.acms');
+  await directory(folder, create);
+  return folder;
 }
 async function regular(filename) {
   try { const st = await fs.lstat(filename); assert(st.isFile() && !st.isSymbolicLink(), 'COLLABORATION_PATH', '协作文件不能是链接或目录'); return st; }
@@ -32,6 +38,18 @@ async function immutable(filename, contents) {
   if (st) { assert(await fs.readFile(filename, 'utf8') === contents, 'COLLABORATION_CHANGED', '协作证据与其哈希不符，已停止使用该文件'); return; }
   try { await fs.writeFile(filename, contents, { flag: 'wx' }); }
   catch (e) { if (e.code !== 'EEXIST') throw e; assert(await fs.readFile(filename, 'utf8') === contents, 'COLLABORATION_CHANGED', '协作证据写入冲突'); }
+}
+async function publishHandoffHistory(folder, revision, contents) {
+  const filename = path.join(folder, historyFilename(revision));
+  if (!await regular(filename)) {
+    const stage = path.join(folder, '.tmp-' + randomUUID());
+    try {
+      await fs.writeFile(stage, contents, { flag: 'wx', flush: true });
+      try { await fs.link(stage, filename); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    } finally { await fs.rm(stage, { force: true }); }
+  }
+  assert(await regular(filename) && hash(await fs.readFile(filename)) === revision, 'COLLABORATION_CHANGED',
+    '交接历史与固定摘要不符，请恢复原版本后继续');
 }
 async function seed(filename, contents) {
   if (await regular(filename)) return;
@@ -134,10 +152,13 @@ function excerpt(text, length) {
   return typeof text === 'string' && text.length > length ? text.slice(0, length).toWellFormed() + '…' : text;
 }
 
+const historyFilename = revision => 'task-history-' + revision + '.json';
+
 function compactHandoff(task, snapshot, goalVersion) {
   const { related, unavailable } = focusedTasks(task, snapshot.tasks);
   const history = json(snapshot);
-  const historyRef = { path: '.acms/' + HISTORY, sha256: hash(history), bytes: Buffer.byteLength(history) };
+  const revision = hash(history);
+  const historyRef = { path: '.acms/' + historyFilename(revision), sha256: revision, bytes: Buffer.byteLength(history) };
   const omissions = { tasks: snapshot.tasks.length, attempts: 0, artifacts: 0, interactions: snapshot.interactions.length };
   for (const row of snapshot.tasks) {
     omissions.attempts += row.attempts.length;
@@ -212,10 +233,14 @@ export async function syncCollaboration(company, project, task, workspace) {
   const { snapshot, goalContractVersion } = company.store.readSnapshot(() => collaborationSnapshot(company, project, task.goalId, shouldCompact));
   const compact = shouldCompact ? compactHandoff(task, snapshot, goalContractVersion) : null;
   const text = compact?.text ?? json(snapshot); const revision = hash(text + notes);
-  const folder = path.join(workspace.path, '.acms'); await directory(folder);
-  const files = new Map([['context.json', text], ['shared.md', notes], ['README.md', README]]);
-  if (compact) files.set(HISTORY, compact.history);
+  const folder = await workspaceFolder(workspace, true);
   const hashes = {};
+  if (compact) {
+    const { sha256 } = compact.metadata.history;
+    await publishHandoffHistory(folder, sha256, compact.history);
+    hashes[historyFilename(sha256)] = sha256;
+  }
+  const files = new Map([['shared.md', notes], ['README.md', README], ['context.json', text]]);
   for (const [file, contents] of files) {
     const filename = path.join(folder, file);
     if (!await regular(filename) || await fs.readFile(filename, 'utf8') !== contents) await atomic(filename, contents);
@@ -226,11 +251,15 @@ export async function syncCollaboration(company, project, task, workspace) {
 }
 
 export async function verifyCollaboration(workspace) {
-  if (workspace.collaboration) { await directory(path.join(workspace.path, '.acms')); }
-  for (const [file, expected] of Object.entries(workspace.collaboration?.files ?? {})) {
-    assert(['context.json', 'shared.md', 'README.md', HISTORY].includes(file), 'COLLABORATION_PATH', '无效协作文件路径');
-    const filename = path.join(workspace.path, '.acms', file); await regular(filename);
-    assert(hash(await fs.readFile(filename)) === expected, 'COLLABORATION_CHANGED', '执行器修改了固定协作上下文；请在普通任务文档中提交交接');
+  const files = Object.entries(workspace.collaboration?.files ?? {});
+  if (!files.length) return;
+  const folder = await workspaceFolder(workspace, false);
+  for (const [file, expected] of files) {
+    assert(/^[a-f0-9]{64}$/.test(expected) && (['context.json', 'shared.md', 'README.md', LEGACY_HISTORY].includes(file) ||
+      file === historyFilename(expected)), 'COLLABORATION_PATH', '无效协作文件路径或摘要');
+    const filename = path.join(folder, file);
+    assert(await regular(filename) && hash(await fs.readFile(filename)) === expected,
+      'COLLABORATION_CHANGED', '固定协作上下文缺失或已修改，请恢复原版本');
   }
 }
 
