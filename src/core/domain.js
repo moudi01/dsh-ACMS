@@ -14,7 +14,7 @@ import { deferOptionalCostScope, withdrawOptionalDeferral } from './cost-optiona
 import { normalizePreferenceOrder, normalizeRequirements, sanitizePreferences } from './model-selection.js';
 import { assertGoalOpen, controlGoal, discardDeferredResult, goalControlView, goalStopped } from './goal-control.js';
 import { normalizePreparation } from './project-preparation.js';
-import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, newCompositionCheck, usesComposition } from './composite-delivery.js';
+import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, goalDeliveryState, newCompositionCheck, usesComposition } from './composite-delivery.js';
 import { decideCandidateMerge, requiresDeliveryApproval } from './candidate-confirmation.js';
 import { decidePlanApproval } from './plan-ledger.js';
 import { PLAN_APPROVAL_REQUIRED, assertPlanAllowsWork, awaitsPlanApproval, isApprovalPlanner, supersedePendingPlan } from './plan-approval.js';
@@ -468,11 +468,7 @@ export class Company {
     return this.store.put('goals', { ...this.store.require('goals', goal.id), status: 'active', completionPending: null, compositionRecheck });
   }
   deliveryHash(goalId) {
-    const goal = this.store.require('goals', goalId);
-    const standard = goalDeliveryHash(goal, deliveredWork(this.store, goal));
-    const candidate = acceptedGoalComposition(this.store, goal);
-    return candidate ? digest({ standard, candidate: candidate.version, content: candidate.contentHash, checks: candidate.checkContract,
-      verifiedChecks: candidate.checks.map(check => [check.id, check.checkVersion, check.inputHash]) }) : standard;
+    return goalDeliveryState(this.store, this.store.require('goals', goalId)).hash;
   }
   latestGoalReview(goalId) {
     const goal = this.store.require('goals', goalId);

@@ -139,12 +139,15 @@ export class Store {
       .all(goalId).map(({ body }) => JSON.parse(body));
   }
 
-  latestGoalReviewForContract(goalId, version) {
-    const row = this.db.prepare(`SELECT body FROM entities INDEXED BY tasks_by_goal WHERE collection='tasks' AND json_extract(body,'$.goalId')=?
+  latestGoalReviewForContract(goalId, version, { evidenceOnly = false } = {}) {
+    const columns = evidenceOnly ? `id, json_extract(body,'$.status') AS status, json_extract(body,'$.passed') AS passed,
+      json_extract(body,'$.deliveryHash') AS deliveryHash` : 'body';
+    const row = this.db.prepare(`SELECT ${columns} FROM entities INDEXED BY tasks_by_goal WHERE collection='tasks' AND json_extract(body,'$.goalId')=?
       AND json_extract(body,'$.kind')='review' AND json_extract(body,'$.reviewScope')='goal'
       AND json_extract(body,'$.status')!='deleted' AND COALESCE(json_extract(body,'$.goalContractVersion'),1)=?
       ORDER BY rowid DESC LIMIT 1`).get(goalId, version);
-    return row ? JSON.parse(row.body) : null;
+    if (!row) return null;
+    return evidenceOnly ? { ...row, passed: row.passed === null ? null : row.passed === 1 } : JSON.parse(row.body);
   }
   *goalCostAttemptRows(goalId) {
     const rows = this.db.prepare("SELECT body FROM entities WHERE collection='goalCostAttempts' AND json_extract(body,'$.goalId')=?").iterate(goalId);

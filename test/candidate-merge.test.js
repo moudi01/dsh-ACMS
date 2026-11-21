@@ -1052,6 +1052,7 @@ test('existing automatic merge applies task output before the template final rev
   const review = { entered: Promise.withResolvers(), release: Promise.withResolvers() };
   const s = await setup(t, { autoMerge: true, review });
   const checkpoint = await checkpointReader(t, s);
+  let published;
   try {
     await s.f.start();
     let reviewRunning = false;
@@ -1067,5 +1068,17 @@ test('existing automatic merge applies task output before the template final rev
     assert.equal(delivery.recentAutomaticMerges[0].appliedCommit, appliedHead);
     assert.equal(delivery.recentAutomaticMerges[0].taskId, s.task.id);
     assert.equal(delivery.finalReview.passed, null);
+    assert.equal(delivery.recentAutomaticMerges.length, 1);
+    published = delivery.recentAutomaticMerges[0];
   } finally { review.release.resolve(); }
+  await until(() => s.current().status === 'succeeded', 75000, s.diagnostics);
+  await success(await s.routes.command('company.pause', { afterCurrent: true }));
+  const edited = await success(await s.routes.command('task.edit', { id: s.task.id, patch: { description: 'Deliver a new revision' } }));
+  assert.equal(edited.status, 'ready');
+  assert.deepEqual((await checkpoint()).snapshot.delivery.recentAutomaticMerges, [published]);
+  await s.f.engine.stop();
+  await s.f.engine.start();
+  assert.equal(s.f.store.require('tasks', edited.id).status, 'ready');
+  assert.deepEqual((await checkpoint()).snapshot.delivery.recentAutomaticMerges, [published]);
+  assert.equal(await git(s.f.source, 'rev-parse', 'HEAD'), published.appliedCommit);
 });

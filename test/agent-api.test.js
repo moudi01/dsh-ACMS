@@ -215,18 +215,84 @@ test("checkpoint fingerprints omitted non-terminal task changes", async t => {
   assert.deepEqual(second.snapshot, first.snapshot);
 });
 
+test("a stable checkpoint never loads full delivered task bodies to compute the delivery hash", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read", "events.read"] });
+  const worker = f.owner("agent.save", { name: "Delivered work test agent", role: "worker" });
+  const description = "Long historical task description. ".repeat(515);
+  const acceptance = "Long historical acceptance criterion. ".repeat(475);
+  const work = Array.from({ length: 65 }, (_, index) => f.owner("task.create", {
+    goalId: f.goal.id, agentId: worker.id, title: "Delivered result " + index, description, acceptance,
+  }));
+  f.store.transaction(() => work.forEach((task, index) => f.store.put("tasks", {
+    ...task, status: "succeeded", artifactHash: digest(["fixture delivery", index]), deliveryGeneration: index + 1,
+  })));
+  const delivered = f.store.deliveredWorkForGoal(f.goal.id);
+  assert.equal(delivered.length, 65);
+  assert.ok(delivered.reduce((size, task) => size + Buffer.byteLength(task.description) + Buffer.byteLength(task.acceptance), 0) > 2300000);
+  const canonical = f.company.deliveryHash(f.goal.id);
+  f.store.deliveredWorkForGoal = () => assert.fail("a monitor must select only delivery metadata");
+  const get = f.store.get.bind(f.store);
+  f.store.get = (collection, id) => {
+    assert.notEqual(collection, "tasks", "a monitor must not fetch a full delivered task by ID");
+    return get(collection, id);
+  };
+  const first = (await f.call("/checkpoint", { token: c.token })).body.value;
+  assert.equal(first.snapshot.delivery.hash, canonical);
+  assert.equal(first.snapshot.taskCounts.succeeded, 65);
+  const second = (await f.call("/checkpoint?ifVersion=" + first.version, { token: c.token })).body.value;
+  assert.equal(second.unchanged, true);
+  assert.ok(JSON.stringify(second).length < 700);
+});
+
+test("checkpoint distinguishes applied automatic merges from speculative commits and deduplicates legacy evidence", async t => {
+  const f = await apiFixture(t);
+  const c = f.credential({ goalIds: [f.goal.id], commands: ["status.read"] });
+  const made = title => f.owner("task.create", { goalId: f.goal.id, title });
+  const durable = made("Has both receipts"), old = made("Old task-only receipt"), checking = made("Unfinished check");
+  const firstCommit = "a".repeat(40), oldCommit = "b".repeat(40), prospective = "c".repeat(40);
+  f.store.transaction(() => {
+    f.store.put("tasks", { ...durable, status: "succeeded", artifactHash: "current task artifact",
+      integration: { status: "merged", integratedCommit: firstCommit } });
+    f.store.put("tasks", { ...old, status: "succeeded", goalContractVersion: 3, artifactHash: "legacy artifact",
+      integration: { integrationId: "legacy_missing_ledger", status: "merged", integratedCommit: oldCommit } });
+    f.store.put("tasks", { ...checking, status: "succeeded",
+      integration: { integrationId: "integration_checking", status: "merged", integratedCommit: prospective } });
+    const base = { taskId: durable.id, goalId: f.goal.id, phase: "completed", goalContractVersion: 2,
+      artifactHash: "original artifact", result: { status: "merged", integratedCommit: firstCommit } };
+    f.store.put("integrations", { ...base, id: "integration_applied" });
+    f.store.put("integrations", { ...base, id: "integration_checking", taskId: checking.id, phase: "checking", integratedCommit: prospective });
+    f.store.put("integrations", { ...base, id: "integration_reviewed_candidate", candidateMergeId: "preview_fixture" });
+    f.store.put("integrations", { ...base, id: "integration_rechecked", compositionRecheckId: "recheck_fixture" });
+    f.store.put("integrations", { ...base, id: "integration_other_goal", goalId: f.otherGoal.id });
+  });
+  const checkpoint = (await f.call("/checkpoint", { token: c.token })).body.value;
+  const receipts = new Map(checkpoint.snapshot.delivery.recentAutomaticMerges.map(row => [row.taskId, row]));
+  assert.equal(receipts.size, 2);
+  assert.equal(checkpoint.snapshot.delivery.recentAutomaticMerges.length, 2);
+  assert.equal(receipts.get(durable.id).integrationId, "integration_applied");
+  assert.equal(receipts.get(durable.id).appliedCommit, firstCommit);
+  assert.equal(receipts.get(durable.id).artifactHash, "original artifact");
+  assert.equal(receipts.get(durable.id).goalContractVersion, 2);
+  assert.equal(receipts.get(old.id).integrationId, "legacy_missing_ledger");
+  assert.equal(receipts.get(old.id).appliedCommit, oldCommit);
+  assert.equal(receipts.get(old.id).goalContractVersion, 3);
+});
+
 test("the checkpoint's goal and cursor stay in one committed SQLite reading snapshot", async t => {
   const f = await apiFixture(t);
   const c = f.credential({ goalIds: [f.goal.id] });
   const writer = new Store(f.store.filename);
   const before = f.store.cursor();
-  const hash = f.company.deliveryHash.bind(f.company);
-  f.company.deliveryHash = goalId => {
-    f.company.deliveryHash = hash;
-    try {
-      new Company(writer).command(OWNER, randomUUID(), "goal.edit", { id: goalId, patch: { acceptance: "Latest owner constraint" } });
-    } finally { writer.close(); }
-    return hash(goalId);
+  const get = f.store.get.bind(f.store);
+  f.store.get = (collection, id) => {
+    if (collection === "projects" && id === f.project.id) {
+      f.store.get = get;
+      try {
+        new Company(writer).command(OWNER, randomUUID(), "goal.edit", { id: f.goal.id, patch: { acceptance: "Latest owner constraint" } });
+      } finally { writer.close(); }
+    }
+    return get(collection, id);
   };
   const original = (await f.call("/checkpoint", { token: c.token })).body.value;
   assert.equal(original.observed.cursor, before);

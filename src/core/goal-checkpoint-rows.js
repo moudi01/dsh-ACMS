@@ -1,5 +1,7 @@
 import { LIVE_ATTEMPT_STATUSES } from './entity-actions.js';
 import { attemptSlot, integrationSlot } from './execution-capacity.js';
+import { usesComposition } from './composite-delivery.js';
+import { deliveredWork } from './goal-contract.js';
 import { PENDING_INTEGRATION_PHASES } from './task-actions.js';
 import { TERMINAL } from './util.js';
 
@@ -12,6 +14,10 @@ const values = states => states.map(state => "'" + state + "'").join(',');
 const occupiedAttempt = column => `COALESCE(json_extract(${column},'$.legacyBatch'),0)=0 AND (
   json_extract(${column},'$.status') IN (${values(LIVE_ATTEMPT_STATUSES)}) OR json_extract(${column},'$.cleanupPending')=1)`;
 const occupiedIntegration = column => `json_extract(${column},'$.phase') IN (${values(PENDING_INTEGRATION_PHASES)})`;
+const gitCommit = expression => `length(${expression}) IN (40,64) AND ${expression} NOT GLOB '*[^0-9a-f]*'`;
+const automaticMergeReceipt = column => `json_extract(${column},'$.phase')='completed'
+  AND json_extract(${column},'$.result.status')='merged' AND ${gitCommit(`json_extract(${column},'$.result.integratedCommit')`)}
+  AND json_extract(${column},'$.candidateMergeId') IS NULL AND json_extract(${column},'$.compositionRecheckId') IS NULL`;
 
 // Use the same predicates in the queries and partial indexes. Inactive attempt
 // history then needs no record reads during a checkpoint.
@@ -23,6 +29,9 @@ export const CHECKPOINT_INDEXES = `
     ON entities(json_extract(body,'$.goalId'),json_extract(body,'$.taskId'))
     WHERE collection='integrations' AND ${occupiedIntegration('body')};
   CREATE INDEX IF NOT EXISTS integrations_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='integrations';
+  CREATE INDEX IF NOT EXISTS automatic_merges_by_goal_task
+    ON entities(json_extract(body,'$.goalId'),json_extract(body,'$.taskId'))
+    WHERE collection='integrations' AND ${automaticMergeReceipt('body')};
   CREATE INDEX IF NOT EXISTS pending_interactions_by_task ON entities(json_extract(body,'$.taskId'))
     WHERE collection='interactions' AND json_extract(body,'$.status')='pending';
   CREATE INDEX IF NOT EXISTS verifications_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='verifications';
@@ -31,6 +40,44 @@ export const CHECKPOINT_INDEXES = `
 const taskFields = ['kind', 'status', 'generation', 'goalContractVersion', 'artifactHash', 'deliveryHash',
   'reviewArtifactHash', 'reviewOf', 'reviewScope', 'stopRequested', 'activeAttemptId', 'activeIntegrationId', 'retryAt'];
 const slotFields = ['goalId', 'taskId', 'cleanupUncertain', 'cleanupPending', 'startedAt', 'createdAt'];
+
+// Preserve the truthiness of a legacy flag without returning its JSON payload.
+const legacyFlag = field => `CASE json_type(t.body,'$.${field}') WHEN 'object' THEN 1 WHEN 'array' THEN 1
+  ELSE json_extract(t.body,'$.${field}') END AS "${field}"`;
+const compositionTaskColumns = `${fields('t', ['goalId', 'kind', 'status', 'goalContractVersion'])},
+  t.body -> '$.dependencies' AS dependencies, t.body -> '$.generation' AS generationJson,
+  t.body -> '$.artifactHash' AS artifactHashJson,
+  json_extract(t.body,'$.workspace.compositionInput.version') AS inputVersion,
+  t.body -> '$.integration.delivery.sha256' AS deliveryShaJson`;
+
+function compositionTask(row) {
+  if (!row) return null;
+  const { dependencies, historicalInputs, inputVersion, deliveryShaJson, artifactHashJson, generationJson, ...task } = row;
+  return {
+    ...task,
+    artifactHash: artifactHashJson === null ? undefined : JSON.parse(artifactHashJson),
+    generation: generationJson === null ? undefined : JSON.parse(generationJson),
+    dependencies: dependencies == null ? [] : JSON.parse(dependencies),
+    workspace: { compositionInput: { version: inputVersion, inputs: historicalInputs == null ? [] : JSON.parse(historicalInputs) } },
+    integration: { delivery: { sha256: deliveryShaJson === null ? undefined : JSON.parse(deliveryShaJson) } },
+  };
+}
+
+export function checkpointDeliverySources(store, goal) {
+  const checkComposition = usesComposition(goal) && goal.composition?.passed === true;
+  const workColumns = fields('t', checkComposition ? ['deliveryGeneration'] : ['artifactHash', 'deliveryGeneration']);
+  const rows = store.db.prepare(`SELECT t.id, ${workColumns}, ${legacyFlag('legacyBatch')}, ${legacyFlag('workflowSnapshot')}
+    ${checkComposition ? ', ' + compositionTaskColumns : ''}
+    FROM entities t INDEXED BY delivered_work_by_goal WHERE ${taskGoal}
+      AND json_extract(t.body,'$.kind')='work' AND json_extract(t.body,'$.status')='succeeded'`).all(goal.id);
+  const work = deliveredWork(store, goal, rows);
+  if (!checkComposition) return { roots: work };
+  // Only dependencies outside the current roots may need historical ancestry.
+  const dependency = store.db.prepare(`SELECT t.id, ${workColumns}, ${compositionTaskColumns},
+    t.body -> '$.workspace.compositionInput.inputs' AS historicalInputs
+    FROM entities t WHERE ${taskGoal} AND t.id=?`);
+  return { roots: work.map(compositionTask), loadTask: id => compositionTask(dependency.get(goal.id, id)) };
+}
 
 function slots(store, goalId, live) {
   const { db } = store;
@@ -48,17 +95,21 @@ function slots(store, goalId, live) {
   // A terminal row still owns its slot while the engine is disposing a live activation.
   const attempts = select('attempts', 'status', occupiedAttempt);
   const known = new Set(attempts.map(attempt => attempt.id));
-  for (const id of live?.keys() ?? []) {
-    if (known.has(id)) continue;
-    const attempt = store.get('attempts', id);
-    if (attempt && !attempt.legacyBatch && (attempt.goalId ?? store.get('tasks', attempt.taskId)?.goalId) === goalId) attempts.push(attempt);
-  }
-  const integrations = select('integrations', 'phase', occupiedIntegration);
+  const taskById = db.prepare(`SELECT ${fields('t', ['goalId', 'status', 'stopRequested'])}
+    FROM entities t WHERE t.collection='tasks' AND t.id=?`);
   const tasks = new Map();
   const task = id => {
-    if (id && !tasks.has(id)) tasks.set(id, store.get('tasks', id));
+    if (id && !tasks.has(id)) tasks.set(id, taskById.get(id));
     return tasks.get(id);
   };
+  const liveAttempt = db.prepare(`SELECT s.id, ${fields('s', [...slotFields, 'status', 'legacyBatch'])}
+    FROM entities s WHERE s.collection='attempts' AND s.id=?`);
+  for (const id of live?.keys() ?? []) {
+    if (known.has(id)) continue;
+    const attempt = liveAttempt.get(id);
+    if (attempt && !attempt.legacyBatch && (attempt.goalId ?? task(attempt.taskId)?.goalId) === goalId) attempts.push(attempt);
+  }
+  const integrations = select('integrations', 'phase', occupiedIntegration);
   const compact = ({ kind, phase, id, taskId, status }, record) => ({
     kind, phase, id, taskId: taskId ?? null, status, recordedAt: record.startedAt ?? record.createdAt ?? null,
   });
@@ -66,6 +117,38 @@ function slots(store, goalId, live) {
     ...attempts.map(record => compact(attemptSlot(record, task(record.taskId)), record)),
     ...integrations.map(record => compact(integrationSlot(record, task(record.taskId)), record)),
   ].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function recentAutomaticMerges(db, goalId, limit) {
+  const ledger = 'entities s INDEXED BY automatic_merges_by_goal_task';
+  const applied = `s.collection='integrations' AND ${automaticMergeReceipt('s.body')}`;
+  const receipt = `s.id AS integrationId, ${fields('s', ['taskId', 'artifactHash', 'goalContractVersion', 'finishedAt'])},
+    json_extract(s.body,'$.result.integratedCommit') AS appliedCommit, json_extract(s.body,'$.updatedAt') AS sortDate`;
+  const legacyCommit = "json_extract(t.body,'$.integration.integratedCommit')";
+  const settledTask = `(json_extract(t.body,'$.status')='succeeded' OR
+    (json_extract(t.body,'$.status')='deleted' AND json_extract(t.body,'$.deletion.previousStatus')='succeeded'))`;
+  return db.prepare(`WITH recorded AS (
+      SELECT ${receipt} FROM ${ledger} WHERE json_extract(s.body,'$.goalId')=? AND ${applied}
+      UNION ALL
+      SELECT ${receipt} FROM ${scopedTasks} CROSS JOIN ${ledger}
+      WHERE ${taskGoal} AND json_extract(s.body,'$.goalId') IS NULL AND json_extract(s.body,'$.taskId')=+t.id AND ${applied}
+    ), legacy AS (
+      SELECT json_extract(t.body,'$.integration.integrationId') AS integrationId, t.id AS taskId,
+        CASE WHEN ${settledTask} THEN json_extract(t.body,'$.artifactHash') END AS artifactHash,
+        COALESCE(json_extract(t.body,'$.integration.goalContractVersion'),
+          CASE WHEN ${settledTask} THEN COALESCE(json_extract(t.body,'$.goalContractVersion'),1) END) AS goalContractVersion,
+        json_extract(t.body,'$.integration.finishedAt') AS finishedAt, ${legacyCommit} AS appliedCommit,
+        json_extract(t.body,'$.updatedAt') AS sortDate
+      FROM ${scopedTasks} WHERE ${taskGoal} AND json_extract(t.body,'$.integration.status')='merged' AND ${gitCommit(legacyCommit)}
+    ), history AS (
+      SELECT * FROM recorded
+      UNION ALL
+      SELECT l.* FROM legacy l
+      WHERE NOT EXISTS (SELECT 1 FROM entities existing WHERE existing.collection='integrations' AND existing.id=l.integrationId)
+        AND NOT EXISTS (SELECT 1 FROM recorded r WHERE r.taskId=l.taskId AND r.appliedCommit=l.appliedCommit)
+    )
+    SELECT integrationId, taskId, artifactHash, goalContractVersion, finishedAt, appliedCommit FROM history
+    ORDER BY COALESCE(finishedAt,sortDate) DESC, taskId, integrationId LIMIT ?`).all(goalId, goalId, goalId, limit);
 }
 
 export function goalCheckpointRows(store, goalId, live, verificationLimit) {
@@ -92,10 +175,7 @@ export function goalCheckpointRows(store, goalId, live, verificationLimit) {
     WHERE v.collection='verifications' AND json_extract(v.body,'$.taskId')=s.id
       AND (s.id!=? OR json_extract(v.body,'$.kind')='goal-review')
     ORDER BY v.rowid DESC LIMIT ?`).all(goalId, goalId, goalId, verificationLimit + 1);
-  const automaticMerges = db.prepare(`SELECT t.id AS taskId, ${fields('t', ['artifactHash', 'goalContractVersion'])},
-      json_extract(t.body,'$.integration.integrationId') AS integrationId, json_extract(t.body,'$.integration.integratedCommit') AS appliedCommit
-    FROM ${scopedTasks} WHERE ${taskGoal} AND json_extract(t.body,'$.status')='succeeded'
-      AND json_extract(t.body,'$.integration.status')='merged' ORDER BY t.rowid DESC LIMIT ?`).all(goalId, verificationLimit + 1);
+  const automaticMerges = recentAutomaticMerges(db, goalId, verificationLimit + 1);
   const publications = db.prepare(`SELECT s.id AS integrationId, ${fields('s', ['candidateMergeId', 'candidateVersion', 'finishedAt'])},
       json_extract(s.body,'$.result.integratedCommit') AS appliedCommit
     FROM entities s INDEXED BY integrations_by_goal WHERE s.collection='integrations' AND json_extract(s.body,'$.goalId')=?

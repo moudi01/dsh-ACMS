@@ -141,7 +141,7 @@
 - 响应的 `value` 包含 `schema: "acms-monitor-checkpoint/1"`、`goalId`、`version`、`unchanged` 和 `observed`。第一次查询得到 `snapshot` 和详读链接。后续可传原样的 64 位十六进制 `ifVersion`。状态一致时响应为 `unchanged: true`，只返回观察值和版本，监控可复用已保存的状态。
 - `snapshot` 提供当前合同版本与正文指纹、目标状态、按状态计数（包含已删除的留存任务）、非终态任务与未答事项的索引、调度状态，以及计划、检查、审查和发布证据。正文、产物内容、本机路径、进程 ID 和凭据不进入快照。需要最新用户要求或具体核验材料时，按 `links` 读取已授权的现有端点。
 - `slots` 保留目标任务和集成实际占用的槽，包括任务已取消或删除后仍在核对的资源。独立聊天、模型检测及其他目标不列入该目标的槽。`pendingInteractions.matchesCurrentTaskState` 仅核对当前任务状态和代次，答复权限仍由 `interaction.answer` 和原写入门禁决定。
-- 非终态和未答事项各最多返回 200 条，`total` 和 `omitted` 反映完整索引，省略条目仍计入版本指纹。最近验证、自动合入和候选发布各最多返回 24 条，`hasOlder…` 标记提示可查原记录。候选的 `matchesRecordedVerification` 表示现有记录仍匹配当前候选和检查配置。应用提交也是历史凭据。读取检查点不会重跑检查或核对实际 Git 分支。
+- 非终态和未答事项各最多返回 200 条，`total` 和 `omitted` 反映完整索引，省略条目仍计入版本指纹。最近验证、自动合入和候选发布各最多返回 24 条，`hasOlder…` 标记提示可查原记录。候选的 `matchesRecordedVerification` 表示现有记录仍匹配当前候选和检查配置。自动合入保留已应用的持久回执，包括后来重新编辑的任务。没有集成台账的旧任务可展示其留存结果，原合同版本缺证据时留空。读取检查点不会重跑检查或核对实际 Git 分支。
 - `observed.checkedAt` 是本次读取时间，`schedulerHeartbeatAt` 是已有调度心跳时间。`scheduling.state` 在无租约、宿主停止中或心跳过期时反映对应状态。心跳有效期为调度间隔的五倍，最短 10 秒。租约状态与心跳都不证明任何进程已清理。单纯推进核查时间、心跳及事件游标不改变状态版本，状态由新鲜转过期仍会更新版本。
 - 有 `events.read` 的客户端可从首份快照的 `observed.cursor` 调用已有 `/events?after=`。事件流的进度以已处理的 `nextCursor` 单独保存，避免条件读取返回的新游标跳过尚未处理的事件。替换监控可带上已保存的版本和游标续读。无本地历史时重新获取完整检查点。收到 `CURSOR_AHEAD` 时也可用此方式对当前数据库重新建立基线。只有 `status.read` 的凭据可查看检查点，`observed.latestEvent` 和事件链接需要 `events.read`。
 

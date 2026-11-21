@@ -1,6 +1,6 @@
 import { candidateMergePolicy } from '../core/candidate-confirmation.js';
-import { acceptedGoalComposition } from '../core/composite-delivery.js';
-import { checkpointObservations, goalCheckpointRows } from '../core/goal-checkpoint-rows.js';
+import { goalDeliveryState } from '../core/composite-delivery.js';
+import { checkpointDeliverySources, checkpointObservations, goalCheckpointRows } from '../core/goal-checkpoint-rows.js';
 import { contractVersion, taskContractVersion } from '../core/goal-contract.js';
 import { digest } from '../core/util.js';
 
@@ -8,8 +8,8 @@ const schema = 'acms-monitor-checkpoint/1';
 const indexLimit = 200;
 const verificationLimit = 24;
 
-function reviewEvidence(company, goal, deliveryHash) {
-  const review = company.latestGoalReview(goal.id);
+function reviewEvidence(store, goal, deliveryHash) {
+  const review = store.latestGoalReviewForContract(goal.id, contractVersion(goal), { evidenceOnly: true });
   if (!review) return null;
   return { id: review.id, status: review.status, passed: review.passed ?? null, deliveryHash: review.deliveryHash ?? null,
     matchesCurrentDelivery: review.deliveryHash === deliveryHash };
@@ -64,8 +64,7 @@ export function monitorCheckpoint(runtime, credential, goal, ifVersion) {
   const { cursor, latestEvent, heartbeat } = checkpointObservations(store, goal.id, canReadEvents);
   const rows = goalCheckpointRows(store, goal.id, engine?.live, verificationLimit);
   const project = store.get('projects', goal.projectId);
-  const deliveryHash = company.deliveryHash(goal.id);
-  const candidate = goal.composition ? acceptedGoalComposition(store, goal) : null;
+  const { hash: deliveryHash, candidate } = goalDeliveryState(store, goal, { ...checkpointDeliverySources(store, goal), project });
   const control = goal.executionControl;
   const snapshot = {
     goal: {
@@ -94,7 +93,7 @@ export function monitorCheckpoint(runtime, credential, goal, ifVersion) {
         matchesRecordedVerification: !!candidate } : null,
       compositionCheck: goal.compositionRecheck ? { id: goal.compositionRecheck.id, status: goal.compositionRecheck.status,
         integrationId: goal.compositionRecheck.integrationId ?? null } : null,
-      finalReview: reviewEvidence(company, goal, deliveryHash),
+      finalReview: reviewEvidence(store, goal, deliveryHash),
       publication: publicationEvidence(company, project, goal, candidate, deliveryHash),
       recentPublications: rows.publications.slice(0, verificationLimit),
       hasOlderPublications: rows.publications.length > verificationLimit,
