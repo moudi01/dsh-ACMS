@@ -16,6 +16,7 @@ import { ConversationWindow } from './conversation.jsx';
 import { AccessPage } from './access.jsx';
 import { ActivityPage } from './activity.jsx';
 import { useTaskAttempts } from './task-attempts.js';
+import { selectPanelSnapshot } from './panel-snapshot.js';
 
 const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', preparing: '准备中', reviewing: '待审查', integrating: '集成中', succeeded: '已完成', failed: '失败', paused: '已暂停', stopping: '停止中', cancelled: '已取消', archived: '已归档', deferred: '本轮延期', reconciling: '待核对', completed: '执行结束', interrupted: '已中断', available: '可分配', retired: '已释放', planning: '规划中', active: '进行中', proposed: '提案', pending: '待处理', answered: '已回答', deleted: '已删除' };
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
@@ -34,15 +35,15 @@ function useCompany() {
   const [error, setError] = useState(''); const [connected, setConnected] = useState(false); const [updated, setUpdated] = useState(null);
   const applied = useRef(null);
   const sequence = useRef(0);
-  const refresh = async signal => {
+  const refresh = async (signal, rewindFrom = null) => {
     const request = ++sequence.current;
+    const epoch = applied.current?.epoch ?? 0;
     const state = await api.snapshot(signal);
     signal?.throwIfAborted();
-    const previous = applied.current;
-    if (!previous || request > previous.request) {
-      const epoch = (previous?.epoch ?? 0) + (previous && state.cursor < previous.state.cursor ? 1 : 0);
-      applied.current = { request, state, epoch };
-      setSnapshot({ data: state, epoch });
+    const chosen = selectPanelSnapshot(applied.current, state, request, epoch, rewindFrom);
+    if (chosen !== applied.current) {
+      applied.current = chosen;
+      setSnapshot({ data: chosen.state, epoch: chosen.epoch });
       setUpdated(new Date());
       setError('');
       setConnected(true);
@@ -57,7 +58,7 @@ function useCompany() {
         try {
           if (cursor === null) cursor = (await refresh(controller.signal)).cursor;
           const page = await api.events(cursor, controller.signal);
-          if (page.latestCursor < cursor) cursor = (await refresh(controller.signal)).cursor;
+          if (page.latestCursor < cursor) cursor = (await refresh(controller.signal, cursor)).cursor;
           else {
             cursor = page.nextCursor;
             if (page.entries.length) await refresh(controller.signal);

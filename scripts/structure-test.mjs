@@ -40,15 +40,13 @@ page.on('request', request => {
   if (url.pathname === '/api/acms/task-attempts') historyReads.push(url.searchParams);
   if (url.pathname === '/api/acms/events') eventReads.push(Number(url.searchParams.get('after')));
 });
-async function pauseHistory(taskId, older) {
+async function pauseRead(match, beforeRead = false) {
   const release = Promise.withResolvers();
   let reached = false, finished = false;
-  const match = url => url.pathname === '/api/acms/task-attempts' && url.searchParams.get('taskId') === taskId &&
-    url.searchParams.has('before') === older;
   await page.route(match, async route => {
+    if (beforeRead) { reached = true; await release.promise; }
     const response = await route.fetch();
-    reached = true;
-    await release.promise;
+    if (!beforeRead) { reached = true; await release.promise; }
     try { await route.fulfill({ response }); } catch {
       // Chromium can abort this request when the drawer scope or version changes.
     } finally { finished = true; }
@@ -56,6 +54,9 @@ async function pauseHistory(taskId, older) {
   return { wait: () => expect.poll(() => reached).toBe(true),
     finish: async () => { release.resolve(); await expect.poll(() => finished).toBe(true); } };
 }
+const pauseHistory = (taskId, older) => pauseRead(url => url.pathname === '/api/acms/task-attempts' &&
+  url.searchParams.get('taskId') === taskId && url.searchParams.has('before') === older);
+const pausePanel = beforeRead => pauseRead(url => url.pathname === '/api/acms/state', beforeRead);
 try {
   await mkdir('test-results/ui', { recursive: true }); await page.goto(server.url);
   await expect(page.getByLabel('项目目标层级')).toContainText('层级演示项目');
@@ -125,13 +126,45 @@ try {
   expect(historyReads.at(-1).getAll('refresh')).toContain(oldestId);
 
   store.transaction(() => {
-    completedAttempt(parent, 35);
-    store.event('attempt.finished', parent.id + '-attempt-35', { taskId: parent.id }, { kind: 'system', id: 'scheduler' });
+    const previous = store.require('attempts', parent.id + '-attempt-34');
+    store.put('attempts', { ...previous, status: 'completed' });
+    completedAttempt(parent, 35, { status: 'running' });
+    store.event('attempt.starting', parent.id + '-attempt-35', { taskId: parent.id }, { kind: 'system', id: 'scheduler' });
   });
   await expect(details.locator('.acms-run')).toHaveCount(36);
   await expect(details.locator('.acms-run').first()).toContainText('历史证据 父任务示例 #35');
   await expect(details.getByText('早期回执已核对', { exact: true })).toBeVisible();
   await expect(details.getByRole('button', { name: '加载更早的执行记录' })).toHaveCount(0);
+
+  const firstSnapshot = await pausePanel(true);
+  const reportProgress = lastSnippet => store.transaction(() => {
+    const current = store.require('attempts', parent.id + '-attempt-35');
+    store.put('attempts', { ...current, progress: { lastSnippet } });
+    store.event('attempt.progress', current.id, { taskId: parent.id }, { kind: 'system', id: 'scheduler' });
+  });
+  reportProgress('等待下一次状态读取');
+  await firstSnapshot.wait();
+
+  const actionSnapshot = await pausePanel(false);
+  await page.getByRole('button', { name: '＋ 创建子任务' }).click();
+  await expect(page.getByLabel('父任务', { exact: true })).toHaveValue(parent.id); await expect(page.getByLabel('授权目标')).toHaveValue(goal.id);
+  await page.getByRole('dialog').getByLabel('标题', { exact: true }).fill('界面新建子任务');
+  await page.getByLabel('任务说明').fill('归属于选定的父任务'); await page.getByLabel('验收标准').fill('保留正确归属');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await actionSnapshot.wait();
+
+  const nextEvents = await pauseRead(url => url.pathname === '/api/acms/events', true);
+  reportProgress('真实较新的状态进度');
+  await firstSnapshot.finish();
+  await nextEvents.wait();
+  await expect(details.getByText('真实较新的状态进度', { exact: true })).toBeVisible();
+  await actionSnapshot.finish();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(details.locator('.acms-run')).toHaveCount(36);
+  await expect(details.getByText('早期回执已核对', { exact: true })).toBeVisible();
+  await expect(details.getByText('真实较新的状态进度', { exact: true })).toBeVisible();
+  expect(server.company.snapshot().tasks.find(t => t.title === '界面新建子任务').parentId).toBe(parent.id);
+  await nextEvents.finish();
 
   const cursorBeforeRestore = store.cursor();
   await expect.poll(() => eventReads.at(-1)).toBe(cursorBeforeRestore);
@@ -148,11 +181,6 @@ try {
   await details.getByRole('button', { name: '加载更早的执行记录' }).click();
   await expect(details.locator('.acms-run')).toHaveCount(35);
   await expect(details.getByText('早期回执已核对', { exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '＋ 创建子任务' }).click();
-  await expect(page.getByLabel('父任务', { exact: true })).toHaveValue(parent.id); await expect(page.getByLabel('授权目标')).toHaveValue(goal.id);
-  await page.getByLabel('标题', { exact: true }).fill('界面新建子任务'); await page.getByLabel('任务说明').fill('归属于选定的父任务'); await page.getByLabel('验收标准').fill('保留正确归属');
-  await page.getByRole('button', { name: '保存', exact: true }).click(); await expect(page.getByRole('dialog')).toHaveCount(0);
-  expect(server.company.snapshot().tasks.find(t => t.title === '界面新建子任务').parentId).toBe(parent.id);
   await page.getByRole('button', { name: '关闭任务详情' }).click();
   await page.screenshot({ path: 'test-results/ui/hierarchy.png', fullPage: true });
   const priorReads = historyReads.length;

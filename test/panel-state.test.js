@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture } from './helpers.js';
+import { selectPanelSnapshot } from '../src/client/panel-snapshot.js';
 import { Store } from '../src/core/store.js';
 import { createRoutes } from '../src/host/http.js';
 import { OWNER } from '../src/core/util.js';
@@ -92,6 +93,20 @@ test('panel keeps live and held attempts while scoped history retains old eviden
     .map(item => item.taskId), Array(9).fill(b.id));
   assert.equal((await read('task-attempts?taskId=' + deleted.id)).status, 404);
   assert.equal((await read('task-attempts?taskId=' + a.id + '&before=0')).status, 400);
+});
+
+test('panel snapshots accept cursor rollback only from recovery and discard prior-epoch results', () => {
+  const select = (previous, cursor, request, epoch = 0, rewindFrom = null) =>
+    selectPanelSnapshot(previous, { cursor }, request, epoch, rewindFrom);
+  const newest = select(null, 20, 1);
+  assert.equal(select(newest, 19, 2), newest);
+  const advanced = select(newest, 21, 1);
+  assert.equal(advanced.state.cursor, 21);
+  const restored = select(advanced, 8, 3, 0, 20);
+  assert.equal(restored.epoch, 1);
+  assert.equal(restored.state.cursor, 8);
+  assert.equal(select(restored, 22, 4, 0), restored);
+  assert.equal(select(restored, 9, 5, 1).state.cursor, 9);
 });
 
 test('panel state, capacity and event cursor come from the same SQLite read snapshot', async t => {
