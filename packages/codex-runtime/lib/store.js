@@ -107,21 +107,21 @@ export class ThreadStore {
     } catch (error) { this.release(); throw error; }
   }
   async publish(signal) {
-    let release;
+    let release, lastFailure;
     const lock = this.stateFile + '.lock';
     const deadline = performance.now() + 10000;
     while (!release) {
       signal?.throwIfAborted();
+      if (lastFailure && performance.now() >= deadline) throw lastFailure;
       try { release = acquireLease(lock); }
       catch (error) {
         // A read of the same path during recovery can fail with the same code
         // and syscall. Only the exclusive open of this index lock may wait.
         const indexOpenDenied = process.platform === 'win32' && error.code === 'EPERM' && leaseOpenFailures.get(error) === lock;
+        if (indexOpenDenied) error.phase = 'index-lock-open';
         const remaining = deadline - performance.now();
-        if (remaining <= 0 || (error.code !== 'CODEX_THREAD_BUSY' && !indexOpenDenied)) {
-          if (indexOpenDenied) error.phase = 'index-lock-open';
-          throw error;
-        }
+        if (remaining <= 0 || (error.code !== 'CODEX_THREAD_BUSY' && !indexOpenDenied)) throw error;
+        lastFailure = error;
         await delay(Math.min(20, remaining), undefined, { signal });
       }
     }

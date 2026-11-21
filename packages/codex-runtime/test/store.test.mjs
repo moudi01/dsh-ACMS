@@ -203,6 +203,27 @@ test('persistent index-lock refusal is bounded and preserves the final Windows e
   await assert.rejects(fs.lstat(f.lock), { code: 'ENOENT' })
 })
 
+test('an index-lock retry does not open or publish after waking past the deadline', windows, async t => {
+  const f = await seededPublisher(t)
+  const denial = permissionError(f.lock)
+  const open = syncFs.openSync
+  let time = 0, attempts = 0
+  t.mock.method(performance, 'now', () => time)
+  mockFs(t, 'openSync', (filename, flags, ...args) => {
+    if (filename === f.lock && flags === 'wx' && ++attempts === 1) {
+      time = 9995
+      queueMicrotask(() => { time = 10006 })
+      throw denial
+    }
+    return open(filename, flags, ...args)
+  })
+  await assert.rejects(f.store.publish(), error => error === denial && error.code === 'EPERM' &&
+    error.phase === 'index-lock-open' && error.path === f.lock)
+  assert.equal(attempts, 1)
+  assert.equal(await fs.readFile(f.stateFile, 'utf8'), f.index)
+  await assert.rejects(fs.lstat(f.lock), { code: 'ENOENT' })
+})
+
 test('aborting a Windows index-lock retry leaves the competing lease and index alone', windows, async t => {
   const f = await seededPublisher(t)
   const release = acquireLease(f.lock)
@@ -210,11 +231,12 @@ test('aborting a Windows index-lock retry leaves the competing lease and index a
   const controller = new AbortController()
   const reason = new Error('Owner cancelled discovery publication')
   const open = syncFs.openSync
-  let opens = 0
+  let time = 0, opens = 0
+  t.mock.method(performance, 'now', () => time)
   mockFs(t, 'openSync', (filename, flags, ...args) => {
     if (filename !== f.lock || flags !== 'wx') return open(filename, flags, ...args)
     opens++
-    queueMicrotask(() => controller.abort(reason))
+    queueMicrotask(() => { time = 10006; controller.abort(reason) })
     throw permissionError(filename)
   })
   try {
