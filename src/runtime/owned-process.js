@@ -4,7 +4,7 @@ import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { lstat, mkdtemp, open, rm, stat } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
@@ -51,7 +51,7 @@ function exitFields(exit) {
     signal: /^SIG[A-Z0-9]{2,10}$/.test(exit?.signal ?? '') ? exit.signal : null };
 }
 
-function compilerStartupError(phases) {
+function helperStartupError(phases) {
   const latest = phases.at(-1);
   const reason = phases.map(item => item.phase + '=' + item.outcome + ' (' + item.elapsedMs + 'ms)').join(', ');
   const error = latest.confirmed
@@ -87,7 +87,20 @@ async function removeCompilerDirectory(directory) {
   catch { return false; }
 }
 
+async function checkHelperOutput(executable) {
+  try {
+    const file = await lstat(executable);
+    if (!file.isFile() || file.size === 0) return 'output-unusable';
+    const handle = await open(executable, 'r');
+    await handle.close();
+    return 'ready';
+  } catch (error) {
+    return error.code === 'ENOENT' ? 'output-missing' : 'output-unusable';
+  }
+}
+
 let helper;
+const helperDirectories = new Set();
 // The host bundler copies the fixed source under a content-addressed filename
 // next to the immutable bundle. Source imports retain the adjacent .cs file.
 const helperResource = typeof __ACMS_OWNED_JOB_RESOURCE__ === 'string' ? __ACMS_OWNED_JOB_RESOURCE__ : './owned-job.cs';
@@ -103,7 +116,7 @@ async function compileHelper(entry) {
     if (files.some(file => !file.isFile())) throw new Error('Expected a compiler and helper source file');
     directory = await mkdtemp(path.join(tmpdir(), 'acms-owned-helper-'));
   } catch {
-    throw compilerStartupError([nativePhase('helper-lookup', lookup, { outcome: 'unavailable', confirmed: true })]);
+    throw helperStartupError([nativePhase('helper-lookup', lookup, { outcome: 'unavailable', confirmed: true })]);
   }
   const phases = [nativePhase('helper-lookup', lookup, { outcome: 'found' })];
   const executable = path.join(directory, 'owned-job.exe');
@@ -112,7 +125,10 @@ async function compileHelper(entry) {
   try {
     compiler = startCompiler([csc, '/nologo', '/target:exe', '/platform:anycpu', '/out:' + executable, source]);
     result = await bounded(compiler.done, compileMs, 'native containment helper compile deadline exceeded');
-    outcome = result.exitCode === 0 ? 'compiled' : 'failed';
+    if (result.exitCode === 0) {
+      const output = await checkHelperOutput(executable);
+      outcome = output === 'ready' ? 'compiled' : output;
+    } else outcome = 'failed';
   } catch (error) { outcome = error.cleanupUncertain ? 'deadline' : 'process-error'; }
   phases.push(nativePhase('helper-compile', compiling, { deadlineMs: compileMs, outcome, ...exitFields(result) }));
 
@@ -129,33 +145,61 @@ async function compileHelper(entry) {
         confirmed: true, ...exitFields(exit), temporaryRemoved });
     });
     phases.push(nativePhase('compiler-cleanup', cleaning, { outcome: 'unconfirmed', deadlineMs: compilerExitMs, confirmed: false }));
-    throw compilerStartupError(phases);
+    throw helperStartupError(phases);
   }
   const compiled = outcome === 'compiled';
   const temporaryRemoved = compiled ? false : await removeCompilerDirectory(directory);
   phases.push(nativePhase('compiler-cleanup', cleaning, { outcome: proof.notStarted ? 'not-started' : 'exited',
     deadlineMs: compilerExitMs, confirmed: true, ...exitFields(proof), temporaryRemoved }));
-  if (!compiled) throw compilerStartupError(phases);
-  process.once('exit', () => { try { rmSync(directory, { recursive: true, force: true }); } catch {} });
+  if (!compiled) throw helperStartupError(phases);
+  if (helperDirectories.size === 0) process.once('exit', () => {
+    for (const owned of helperDirectories) {
+      try { rmSync(owned, { recursive: true, force: true }); } catch {}
+    }
+  });
+  helperDirectories.add(directory);
   return executable;
 }
 
-async function nativeHelper() {
+function helperEntry() {
+  if (helper) return helper;
+  const entry = helper = { state: 'shared' };
+  const release = () => { if (helper === entry) helper = undefined; };
+  entry.promise = compileHelper(entry).then(executable => { entry.state = 'warm'; return executable; }, error => {
+    if (entry.recovery) {
+      entry.state = 'held';
+      entry.recovery.then(release);
+    } else release();
+    throw error;
+  });
+  return entry;
+}
+
+async function nativeHelper(signal) {
   const started = performance.now();
-  const use = helper?.state ?? 'cold';
-  if (!helper) {
-    const entry = helper = { state: 'shared' };
-    const release = () => { if (helper === entry) helper = undefined; };
-    entry.promise = compileHelper(entry).then(executable => { entry.state = 'warm'; return executable; }, error => {
-      if (entry.recovery) {
-        entry.state = 'held';
-        entry.recovery.then(release);
-      } else release();
-      throw error;
-    });
+  let use = helper?.state ?? 'cold';
+  let entry = helperEntry();
+  if (use === 'warm') {
+    const outcome = await checkHelperOutput(await entry.promise);
+    signal?.throwIfAborted();
+    if (entry.replacement) {
+      // A slower probe of the same old generation shares its replacement,
+      // even if that compilation already finished or failed.
+      entry = entry.replacement;
+      use = 'shared';
+    } else if (outcome === 'output-missing') {
+      // A previous supervisor may still be using this generation's directory.
+      helper = undefined;
+      entry.replacement = helperEntry();
+      nativePhase('helper-acquire', started, { use, outcome });
+      entry = entry.replacement;
+      use = 'cold';
+    } else if (outcome === 'output-unusable') {
+      throw helperStartupError([nativePhase('helper-acquire', started, { use, outcome, confirmed: true })]);
+    }
   }
   try {
-    const executable = await helper.promise;
+    const executable = await entry.promise;
     nativePhase('helper-acquire', started, { use, outcome: 'ready' });
     return executable;
   } catch (error) {
@@ -189,7 +233,7 @@ export async function startOwnedProcess(spec, options = {}) {
   }
   const cleanupMs = options.cleanupMs ?? 5000;
   const startupMs = options.startupMs ?? 10000;
-  const executable = options.helperPath ?? await nativeHelper();
+  const executable = options.helperPath ?? await nativeHelper(options.signal);
   options.signal?.throwIfAborted();
   const pipeName = `acms-owned-${randomUUID()}`;
   let connection, receipt, processHandle, rootPid, started = false, cleanup, startupTimer;

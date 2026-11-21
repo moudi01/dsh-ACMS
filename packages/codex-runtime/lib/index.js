@@ -601,8 +601,8 @@ const CODEX_PACKAGE_BIN = resolve(dirname(codexPackageJsonPath), codexPackageMan
 function containmentStartupFacts(records) {
 	if (!Array.isArray(records)) return [];
 	return records.slice(0, 3).flatMap(record => {
-		if (!['helper-lookup', 'helper-compile', 'compiler-cleanup'].includes(record?.phase) ||
-			!['unavailable', 'found', 'compiled', 'failed', 'deadline', 'process-error', 'not-started', 'exited', 'unconfirmed'].includes(record.outcome) ||
+		if (!['helper-lookup', 'helper-compile', 'compiler-cleanup', 'helper-acquire'].includes(record?.phase) ||
+			!['unavailable', 'found', 'compiled', 'failed', 'deadline', 'process-error', 'not-started', 'exited', 'unconfirmed', 'output-missing', 'output-unusable'].includes(record.outcome) ||
 			!Number.isSafeInteger(record.elapsedMs) || record.elapsedMs < 0) return [];
 		return [{
 			phase: record.phase, outcome: record.outcome, elapsedMs: record.elapsedMs,

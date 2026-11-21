@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { channel } from 'node:diagnostics_channel';
 import { EventEmitter } from 'node:events';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import fs, { access, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -161,6 +161,131 @@ test('a nonzero compiler exit records the time and code without compiler output 
   await assert.rejects(access(faults.target()), { code: 'ENOENT' });
   await verifiedExit(await f.startOwnedProcess({ argv: [process.execPath, '-e', 'process.exit(0)'], cwd: f.root }));
   assert.equal(faults.count(), 2);
+});
+
+for (const output of ['missing', 'directory']) test('a zero compiler exit requires a usable helper (' + output + ')', windows, async t => {
+  const f = await fixture(t);
+  const faults = compilerFaults(t);
+  const store = new ThreadStore(path.join(f.root, 'codex-threads.json'), 'compiler-invalid-output');
+  const outcome = output === 'missing' ? 'output-missing' : 'output-unusable';
+  const failure = assert.rejects(startFixture(f, store), error =>
+    error.noProcessStarted && !error.cleanupUncertain && error.message.includes('helper-compile: ' + outcome) &&
+    !error.message.includes(f.root) &&
+    error.facts.containment.some(phase => phase.phase === 'helper-compile' && phase.outcome === outcome && phase.exitCode === 0) &&
+    error.facts.containment.at(-1).confirmed);
+  await faults.spawned;
+  if (output === 'directory') await mkdir(path.join(faults.target(), 'owned-job.exe'));
+  faults.first().emit('exit', 0, null);
+  await failure;
+  assert.equal(faults.killRequests(), 0);
+  assert.equal(store.summary.cleanupPending, undefined);
+  await store.close('failed');
+  await assert.rejects(access(faults.target()), { code: 'ENOENT' });
+  assert.equal(f.phases.some(phase => phase.outcome === 'compiled' || phase.outcome === 'ready'), false);
+  await verifiedExit(await f.startOwnedProcess({ argv: [process.execPath, '-e', 'process.exit(0)'], cwd: f.root }));
+  assert.equal(faults.count(), 2);
+});
+
+test('a missing warm helper is rebuilt once for concurrent requests', windows, async t => {
+  const f = await fixture(t);
+  const executables = [];
+  interceptCompiler(t, (launch, args) => {
+    executables.push(args.find(argument => argument.startsWith('/out:')).slice(5));
+    return launch();
+  });
+  const spec = { argv: [process.execPath, '-e', 'process.exit(0)'], cwd: f.root };
+  await verifiedExit(await f.startOwnedProcess(spec));
+  const oldExecutable = executables[0];
+  assert.match(path.relative(f.root, oldExecutable).split(path.sep).join('/'), /^acms-owned-helper-[a-zA-Z0-9]+\/owned-job\.exe$/);
+  const originalMaterial = path.join(path.dirname(oldExecutable), 'fixture-material');
+  await writeFile(originalMaterial, 'retained');
+  await unlink(oldExecutable);
+  await Promise.all([f.startOwnedProcess(spec).then(verifiedExit), f.startOwnedProcess(spec).then(verifiedExit)]);
+  assert.equal(executables.length, 2);
+  assert.notEqual(executables[1], oldExecutable);
+  assert.equal(await readFile(originalMaterial, 'utf8'), 'retained');
+  const acquisitions = f.phases.filter(phase => phase.phase === 'helper-acquire');
+  assert.equal(acquisitions.filter(phase => phase.outcome === 'ready').length, 3);
+  assert.equal(acquisitions.filter(phase => phase.use === 'warm' && phase.outcome === 'output-missing').length, 1);
+});
+
+test('slow probes of a missing warm helper share one failed replacement', windows, async t => {
+  const f = await fixture(t);
+  const executables = [];
+  interceptCompiler(t, (launch, args) => {
+    executables.push(args.find(argument => argument.startsWith('/out:')).slice(5));
+    if (executables.length !== 2) return launch();
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit('exit', 17, null));
+    return child;
+  });
+  const spec = { argv: [process.execPath, '-e', 'process.exit(0)'], cwd: f.root };
+  await verifiedExit(await f.startOwnedProcess(spec));
+  const original = fs.lstat;
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let probes = 0;
+  const mock = t.mock.method(fs, 'lstat', async (file, ...args) => {
+    if (file === executables[0]) {
+      const probe = ++probes;
+      if (probe === 2) { entered.resolve(); await release.promise; }
+      throw Object.assign(new Error('fixture helper missing'), { code: 'ENOENT' });
+    }
+    return original(file, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const errors = [];
+    const validate = error => {
+      assert.ok(error.noProcessStarted && error.ownedProcessPhases.some(phase => phase.exitCode === 17));
+      errors.push(error);
+      return true;
+    };
+    const first = assert.rejects(f.startOwnedProcess(spec), validate);
+    const second = assert.rejects(f.startOwnedProcess(spec), validate);
+    await entered.promise;
+    try { await first; } finally { release.resolve(); }
+    await second;
+    assert.equal(errors[0], errors[1]);
+    assert.equal(executables.length, 2);
+  } finally {
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+  await verifiedExit(await f.startOwnedProcess(spec));
+  assert.equal(executables.length, 3);
+});
+
+test('denied access to a warm helper keeps the cached compiler generation', windows, async t => {
+  const f = await fixture(t);
+  const executables = [];
+  interceptCompiler(t, (launch, args) => {
+    executables.push(args.find(argument => argument.startsWith('/out:')).slice(5));
+    return launch();
+  });
+  const spec = { argv: [process.execPath, '-e', 'process.exit(0)'], cwd: f.root };
+  await verifiedExit(await f.startOwnedProcess(spec));
+  const original = fs.open;
+  const mock = t.mock.method(fs, 'open', (file, ...args) => {
+    if (file === executables[0]) throw Object.assign(new Error('private access error at ' + file), { code: 'EACCES' });
+    return original(file, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const store = new ThreadStore(path.join(f.root, 'codex-threads.json'), 'helper-access-denied');
+    await assert.rejects(startFixture(f, store), error =>
+      error.noProcessStarted && !error.cleanupUncertain &&
+      error.facts.containment.some(phase => phase.phase === 'helper-acquire' && phase.outcome === 'output-unusable' && phase.confirmed) &&
+      !error.message.includes(f.root) && !error.message.includes('private access error'));
+    assert.equal(store.summary.cleanupPending, undefined);
+    await store.close('failed');
+    assert.equal(executables.length, 1);
+  } finally {
+    mock.mock.restore();
+    syncBuiltinESMExports();
+  }
+  await verifiedExit(await f.startOwnedProcess(spec));
+  assert.equal(executables.length, 1);
 });
 
 for (const mode of ['timeout-exit', 'timeout-unconfirmed', 'process-error-unconfirmed']) test('compiler cleanup requires actual exit evidence (' + mode + ')', windows, async t => {
