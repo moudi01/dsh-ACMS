@@ -11,6 +11,7 @@ import { inside } from '../runtime/workspaces.js';
 import { hasRecordedDeliveryApproval } from '../core/candidate-confirmation.js';
 import { attemptUsageSummary, attemptUsageView } from '../core/usage-view.js';
 import { goalCostForecast } from '../core/goal-cost-forecast.js';
+import { taskAttemptHistory } from '../core/panel-attempts.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -58,7 +59,15 @@ export function createRoutes(runtime) {
       if (input.action === 'stop') return json(runtime.conversations.stop(input.conversationId));
       assert(false, 'CHAT_ACTION', '未知会话操作');
     },
-    '/api/acms/state': async () => json({ ...company.snapshot(), runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing, lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, capacity: executionCapacity(company.store, adapter, engine.live, company.policy()), providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] }, dataDir: runtime.dataDir } }),
+    '/api/acms/state': async request => {
+      const panel = new URL(request.url).searchParams.get('view') === 'panel';
+      const { capacity, ...state } = company.snapshot({ panel, capacity: { adapter, live: engine.live } });
+      return json({ ...state, runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing,
+        lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, capacity,
+        providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] },
+        dataDir: runtime.dataDir } });
+    },
+    '/api/acms/task-attempts': async request => json(taskAttemptHistory(company.store, new URL(request.url).searchParams)),
     '/api/acms/usage': async request => json(attemptUsageView(company.store, new URL(request.url).searchParams)),
     '/api/acms/usage/summary': async request => json(attemptUsageSummary(company.store, new URL(request.url).searchParams)),
     '/api/acms/cost/forecast': async request => json(goalCostForecast(company,

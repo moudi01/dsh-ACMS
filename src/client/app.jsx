@@ -10,11 +10,13 @@ import { goalSummary } from '../core/hierarchy.js';
 import { accruesGoalRuntime, canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS } from '../core/runtime-budget.js';
 import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason } from '../core/task-actions.js';
 import { CAPACITY_LABELS } from '../core/execution-capacity.js';
-import { entityDeletionReason } from '../core/entity-actions.js';
+import { entityDeletionReason, isLiveAttempt } from '../core/entity-actions.js';
 import { EntityDrawer, EntityTrash, ChangeHistory, entityLabels, usdFromMicros } from './entities.jsx';
 import { ConversationWindow } from './conversation.jsx';
 import { AccessPage } from './access.jsx';
 import { ActivityPage } from './activity.jsx';
+import { useTaskAttempts } from './task-attempts.js';
+import { beginPanelRewind, selectPanelSnapshot } from './panel-snapshot.js';
 
 const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', preparing: '准备中', reviewing: '待审查', integrating: '集成中', succeeded: '已完成', failed: '失败', paused: '已暂停', stopping: '停止中', cancelled: '已取消', archived: '已归档', deferred: '本轮延期', reconciling: '待核对', completed: '执行结束', interrupted: '已中断', available: '可分配', retired: '已释放', planning: '规划中', active: '进行中', proposed: '提案', pending: '待处理', answered: '已回答', deleted: '已删除' };
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
@@ -29,28 +31,62 @@ function Modal({ title, onClose, children, wide }) {
   return <dialog className={`acms-modal ${wide ? 'wide' : ''}`} ref={ref} onClose={onClose} onClick={e => { if (e.target === ref.current) onClose(); }}><header><h2>{title}</h2><button type="button" className="acms-icon-btn" aria-label="关闭对话框" onClick={onClose}>×</button></header>{children}</dialog>;
 }
 function useCompany() {
-  const [data, setData] = useState(null); const [error, setError] = useState(''); const [connected, setConnected] = useState(false); const [updated, setUpdated] = useState(null);
-  const refresh = async signal => { const state = await api.snapshot(signal); setData(state); setUpdated(new Date()); setError(''); setConnected(true); return state; };
+  const [snapshot, setSnapshot] = useState({ data: null, epoch: 0 });
+  const [error, setError] = useState(''); const [connected, setConnected] = useState(false); const [updated, setUpdated] = useState(null);
+  const applied = useRef(null);
+  const sequence = useRef(0);
+  const publish = next => {
+    applied.current = next;
+    setSnapshot({ data: next.state, epoch: next.epoch });
+  };
+  const refresh = async signal => {
+    const request = ++sequence.current;
+    const epoch = applied.current?.epoch ?? 0;
+    const state = await api.snapshot(signal);
+    signal?.throwIfAborted();
+    const chosen = selectPanelSnapshot(applied.current, state, request, epoch);
+    if (chosen !== applied.current) {
+      publish(chosen);
+      setUpdated(new Date());
+      setError('');
+      setConnected(true);
+    }
+    return applied.current.state;
+  };
   useEffect(() => {
     const controller = new AbortController(); let timer;
     const loop = async () => {
-      let cursor = 0;
+      let cursor = null;
       while (!controller.signal.aborted) {
         try {
-          if (!cursor) cursor = (await refresh(controller.signal)).cursor;
-          const page = await api.events(cursor, controller.signal); cursor = page.nextCursor;
-          if (page.entries.length) await refresh(controller.signal);
+          if (cursor === null) cursor = (await refresh(controller.signal)).cursor;
+          const epoch = applied.current.epoch;
+          const page = await api.events(cursor, controller.signal);
+          controller.signal.throwIfAborted();
+          if (page.latestCursor < cursor) {
+            // The event query has already witnessed a rewind. The database can
+            // catch up before the following state read returns.
+            const reset = beginPanelRewind(applied.current, epoch);
+            if (reset !== applied.current) {
+              publish(reset);
+              setConnected(false);
+            }
+            cursor = (await refresh(controller.signal)).cursor;
+          } else {
+            cursor = page.nextCursor;
+            if (page.entries.length) await refresh(controller.signal);
+          }
           setConnected(true);
         } catch (e) {
           if (controller.signal.aborted) break;
           setError(e.message); setConnected(false);
           await new Promise(resolve => { timer = setTimeout(resolve, 3000); controller.signal.addEventListener('abort', resolve, { once: true }); });
-          cursor = 0;
+          cursor = null;
         }
       }
     }; loop(); return () => { controller.abort(); clearTimeout(timer); };
   }, []);
-  return { data, error, connected, updated, refresh };
+  return { ...snapshot, error, connected, updated, refresh };
 }
 function useRuntimeClock(running) {
   const [, tick] = useState(0);
@@ -62,7 +98,7 @@ function useRuntimeClock(running) {
   return Date.now();
 }
 export function App() {
-  const { data, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
+  const { data, epoch, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
   const [scope, setScope] = useState({}); const [entityView, setEntityView] = useState(null);
   const [conversation, setConversation] = useState(null);
   const chat = (agentId, taskId = null, exact = false) => setConversation({ agentId, taskId: exact ? (taskId ?? null) : (taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null) });
@@ -139,7 +175,7 @@ export function App() {
         {tab === 'settings' && <><PageHead eyebrow="OWNER BOUNDARIES" title="公司设置" description="这些边界由你控制。管理智能体可以在边界内调整执行方式。" /><div className="acms-overview-grid"><section className="acms-panel"><div className="acms-sectionhead"><h2>资源与权限</h2><button onClick={() => open('policy', data.policy)}>编辑边界</button></div><dl className="acms-definition"><dt>最大同时执行</dt><dd>{data.policy.maxConcurrent} 个</dd><dt>协调预留</dt><dd>{data.policy.controlSlots} 个</dd><dt>每个目标任务上限</dt><dd>{data.policy.maxTasksPerGoal} 项</dd><dt>单任务执行尝试</dt><dd>{data.policy.maxAttempts} 次</dd><dt>最大返工</dt><dd>{data.policy.maxReworks} 次</dd><dt>目标时间盒</dt><dd>{data.policy.goalTimeBoxMs ? `${(data.policy.goalTimeBoxMs / 60000).toFixed(1)} 分钟` : '未启用'}</dd><dt>收尾预留</dt><dd>{data.policy.timeBoxReserveMs ? `${(data.policy.timeBoxReserveMs / 60000).toFixed(1)} 分钟` : '未设置'}</dd><dt>单次执行时限</dt><dd>{data.policy.turnTimeoutMs / 60000} 分钟</dd><dt>允许的执行器</dt><dd>{data.policy.allowedProviders.join('、') || '使用已安装执行器'}</dd></dl></section><section className="acms-panel"><div className="acms-sectionhead"><h2>项目与检查</h2><button onClick={() => open('project')}>＋ 添加项目</button></div>{!data.projects.length ? <Empty title="尚未添加项目">指定一个工作目录，并配置验收检查。</Empty> : data.projects.map(p => <button className="acms-project-row" key={p.id} onClick={() => open('project', p)}><b>{p.name}</b><code>{p.repoRoot}</code><span>{p.mode === 'git' ? 'Git 隔离工作副本' : '独立目录副本'} · {p.checks.length} 项检查 · {p.autoMerge ? '自动集成' : '保留交付版本'}</span></button>)}</section></div><section className="acms-panel"><div className="acms-sectionhead"><h2>运行信息</h2><span>ACMS {data.runtime.version}</span></div><dl className="acms-definition"><dt>数据位置</dt><dd><code>{data.runtime.dataDir}</code></dd><dt>宿主通信</dt><dd>DSH 原生通道 · 无独立管理端口</dd><dt>执行器</dt><dd>{data.runtime.providers.map(p => p.name).join('、') || '未安装'}</dd></dl></section></>}
       </div>}
     </main>
-    {task && <TaskDrawer navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
+    {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
     {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={data} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
     {modal && data && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
     {conversation && data && <ConversationWindow key={`${conversation.agentId}:${conversation.taskId}`} {...conversation} data={data} close={() => setConversation(null)} />}
@@ -336,10 +372,16 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
   const approvalPlanner = goal?.planApproval?.taskId === task.id;
   const planHold = (task.blocker?.kind === 'plan-approval' && task.status !== 'paused') ||
     (goal?.planApproval && !goal.planApproval.approvedPlanId && ['work', 'repair'].includes(task.kind));
-  const attempts = data.attempts.filter(a => a.taskId === task.id).reverse(); const interactions = data.interactions.filter(i => i.taskId === task.id && i.status === 'pending');
-  const awaitingRecovery = canReconcileTask(task, attempts);
-  const recoveryAttempt = attempts.find(a => a.cleanupPending || ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status)) ?? attempts[0];
-  const artifacts = data.artifacts.filter(a => a.taskId === task.id); const verifications = verificationsForTask(task, attempts, data.verifications); const childTasks = data.tasks.filter(t => t.parentId === task.id);
+  const history = useTaskAttempts(task, data);
+  const panelAttempts = data.attempts.filter(a => a.taskId === task.id).reverse();
+  const attempts = history?.attempts ?? panelAttempts;
+  const interactions = data.interactions.filter(i => i.taskId === task.id && i.status === 'pending');
+  const awaitingRecovery = canReconcileTask(task, panelAttempts);
+  const recoveryAttempt = history?.activeAttempts.find(isLiveAttempt) ?? attempts.find(isLiveAttempt) ??
+    panelAttempts.find(isLiveAttempt) ?? attempts[0];
+  const artifacts = data.artifacts.filter(a => a.taskId === task.id);
+  const verifications = history?.verifications ?? verificationsForTask(task, attempts, data.verifications);
+  const childTasks = data.tasks.filter(t => t.parentId === task.id);
   const reviewTasks = data.tasks.filter(t => t.kind === 'review' && t.reviewOf === task.id).sort((a, b) => String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt))); const latestReview = task.reviewSummary;
   const childButton = t => <button className="text" key={t.id} onClick={() => select(t.id)}>{t.title}</button>;
   return <div className="acms-drawer-shade" onClick={e => { if (e.target === e.currentTarget) close(); }}><aside className="acms-drawer" aria-label="任务详情"><header><span className="acms-small-id">{task.id.slice(-8).toUpperCase()}</span><button className="acms-icon-btn" onClick={close} aria-label="关闭任务详情">×</button></header><Badge status={task.status} /><h2>{task.title}</h2><TaskPath task={task} data={data} select={select} navigate={navigate} /><button className="text" onClick={() => navigate('agent', task.agentId)}>负责人：{data.agents.find(a => a.id === task.agentId)?.name ?? '已删除角色'}</button><CollapsibleText text={task.description} lines={3} label="说明" /><p className="acms-sectionnote">目标合同 v{task.goalContractVersion ?? 1}{task.kind === 'review' && task.reviewedContractVersion && <> · 被审合同 v{task.reviewedContractVersion}</>}{data.goals.find(g => g.id === task.goalId)?.supersededTaskIds?.includes(task.id) && <> · 此交付已安排替代工作</>}</p><section><h3>下级任务（{childTasks.length}）</h3>{!childTasks.length ? <p className="acms-muted">暂无下级任务。</p> : <>{childTasks.slice(0, 8).map(childButton)}{childTasks.length > 8 && <details><summary>显示其余 {childTasks.length - 8} 项</summary>{childTasks.slice(8).map(childButton)}</details>}</>}{task.kind !== 'review' && !goalHold && goal && openGoal(goal) && <button onClick={() => open('task', { goalId: task.goalId, projectId: task.projectId, parentId: task.id })}>＋ 创建子任务</button>}</section><section className="acms-review-state"><h3>审查记录（{reviewTasks.length}）</h3>{!reviewTasks.length ? <p className="acms-muted">尚未添加审查。</p> : <>{!latestReview && <p className="acms-sectionnote">当前交付尚无审查；以下为历史审查。</p>}{latestReview && <p><span className="acms-tag">{LABEL[latestReview.status] ?? latestReview.status}</span>{latestReview.status === 'succeeded' ? (latestReview.passed ? ' 已通过' : ' 未通过（失败证据已保留）') : ''}</p>}{latestReview?.status === 'cancelled' && <p className="acms-sectionnote">审查已取消：{latestReview.cancelReason || '未填写原因'}（{latestReview.cancelledBy === 'owner' ? '所有者' : latestReview.cancelledBy ?? '未知'}，{latestReview.cancelledAt ? new Date(latestReview.cancelledAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}）。已交付成果保持不变，可基于当前版本重新发起。</p>}{reviewTasks.slice(0, 5).map(review => <button className="acms-entity-link" key={review.id} onClick={() => select(review.id)}>{review.title} · {LABEL[review.status] ?? review.status} →</button>)}</>}{task.status === 'succeeded' && task.kind !== 'review' && <ActionButton reason={busy ? '正在保存，请稍候' : goalHold} onClick={() => act('review.request', { id: task.id }, '已发起审查')}>{latestReview?.status === 'cancelled' || latestReview?.status === 'failed' ? '重新发起审查' : '添加审查'}</ActionButton>}</section><div className="acms-actions wrap">
@@ -352,7 +394,8 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {task.kind !== 'review' && task.status !== 'deferred' && <ActionButton reason={approvalPlanner && (goal.planApproval.approvedPlanId || task.blocker?.kind === 'plan-approval') ? '请在目标详情查看计划审批。' : ['integrating', 'reconciling', 'stopping'].includes(task.status) ? '请等待集成、停止或执行核对完成后再编辑。' : ''} onClick={() => open('taskEdit', task)}>编辑任务</ActionButton>}
     {!terminal.includes(task.status) && <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : approvalPlanner ? '可暂停规划，或在目标详情取消整个目标。' : ''} onClick={() => act('task.cancel', { id: task.id }, '已请求取消任务')}>取消任务</ActionButton>}
     <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : taskDeletionReason(task, data.tasks, data.attempts)} onClick={() => open('deleteTask', task)}>删除任务</ActionButton></div><section><h3>验收标准</h3><CollapsibleText text={task.acceptance} lines={3} label="验收标准" /></section><section><h3>依赖关系</h3>{task.dependencies.length ? task.dependencies.map(id => <div className="acms-dep" key={id}><Badge status={data.tasks.find(t => t.id === id)?.status} /><button className="text" onClick={() => select(id)}>{data.tasks.find(t => t.id === id)?.title}</button></div>) : <p className="acms-muted">无前置依赖</p>}{['ready', 'blocked', 'paused'].includes(task.status) && <button onClick={() => open('dependencies', task)}>调整依赖</button>}</section>
-    <section className="acms-evidence"><TextIntegrityNotices artifacts={artifacts} /><h3>产物与验收（{artifacts.length}）</h3>{!artifacts.length && !verifications.length ? <p className="acms-muted">尚无产物或验收记录。</p> : <>{artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}{verifications.slice(-6).reverse().map(verification => <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} /><span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span><small>{verification.summary ?? ''}</small><ArchiveChecks checks={verification.checks} />{verification.checks?.some(check => check.checkVersion) && <details><summary>宿主检查证据</summary><ul>{verification.checks.filter(check => check.checkVersion).map(check => <li key={check.id}>{check.id} · {check.reused ? '复用' : '本次运行'} · 退出码 {check.code ?? '未知'}{check.reason && <p>{check.reason}</p>}<dl className="acms-definition"><dt>命令</dt><dd><code>{[check.command, ...(check.args ?? [])].join(' ')}</code></dd><dt>工作目录</dt><dd><code>{check.cwd}</code></dd><dt>输入版本</dt><dd><code>{check.inputHash}</code></dd><dt>宿主环境</dt><dd><code>{check.environment}</code></dd><dt>日志指纹</dt><dd><code>{check.log?.hash}</code></dd></dl></li>)}</ul></details>}</div>)}</>}</section>
+    <section className="acms-evidence"><TextIntegrityNotices artifacts={artifacts} /><h3>产物与验收（{artifacts.length}）</h3>{!artifacts.length && !verifications.length ? <p className="acms-muted">{history?.loading ? '正在读取验收记录…' :
+      history?.error ? '可在执行记录中重试读取验收记录。' : '尚无产物或验收记录。'}</p> : <>{artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}{verifications.slice(-6).reverse().map(verification => <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} /><span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span><small>{verification.summary ?? ''}</small><ArchiveChecks checks={verification.checks} />{verification.checks?.some(check => check.checkVersion) && <details><summary>宿主检查证据</summary><ul>{verification.checks.filter(check => check.checkVersion).map(check => <li key={check.id}>{check.id} · {check.reused ? '复用' : '本次运行'} · 退出码 {check.code ?? '未知'}{check.reason && <p>{check.reason}</p>}<dl className="acms-definition"><dt>命令</dt><dd><code>{[check.command, ...(check.args ?? [])].join(' ')}</code></dd><dt>工作目录</dt><dd><code>{check.cwd}</code></dd><dt>输入版本</dt><dd><code>{check.inputHash}</code></dd><dt>宿主环境</dt><dd><code>{check.environment}</code></dd><dt>日志指纹</dt><dd><code>{check.log?.hash}</code></dd></dl></li>)}</ul></details>}</div>)}</>}</section>
     {task.integration?.delivery && <section aria-label="Git 交付版本"><h3>Git 交付版本</h3><dl className="acms-definition">
       <dt>交付提交</dt><dd><code>{task.integration.delivery.commit}</code></dd>
       <dt>基准提交</dt><dd><code>{task.integration.delivery.baseCommit}</code></dd>
@@ -377,7 +420,7 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {awaitingRecovery && <section className="acms-alert"><h3>执行待核对</h3><p className="acms-preserve">{recoveryAttempt?.recovery?.reason || recoveryAttempt?.cleanupError || '尚无可靠结束回执，资源占位继续保留。'}</p>{task.stopRequested && <p>已请求{task.stopRequested === 'paused' ? '暂停' : '取消'}，确认执行停止且进程树清理后生效。</p>}<p>可重新读取回执，或检查该执行的日志和工作副本。只有身份匹配且已确认进程树清理的回执才能恢复结果或落实停止请求；没有停止请求且确认无完整结果时才允许重试。状态未知时不会重新调用模型。</p></section>}
     {attempts[0]?.progress && <section><h3>最近执行进度</h3><p className="acms-preserve">{attempts[0].progress.lastSnippet?.slice(-4000) || attempts[0].progress.reason || '正在工作…'}</p><small>{attempts[0].progress.toolCalls ?? 0} 次工具调用 · {date(attempts[0].progress.updatedAt)}</small></section>}
     {interactions.map(i => <section className="acms-alert" key={i.id}><h3>需要补充信息</h3><p>{i.reason}</p><p>{i.question}</p><button onClick={() => open('answer', i)}>回复并继续</button></section>)}
-    <section><h3>执行记录</h3>{!attempts.length && <p className="acms-muted">尚未开始执行。</p>}{attempts.map(a => <details className="acms-run" key={a.id}><summary><Badge status={a.status} /><span>{date(a.startedAt)}</span></summary><p className="acms-preserve">{a.summary || '执行进行中'}</p><dl className="acms-definition"><dt>模型</dt><dd>{a.model || '未记录'}</dd><dt>思考深度</dt><dd>{a.reasoningEffort || '外部执行器默认或未公开'}</dd><dt>执行器</dt><dd>{a.provider}</dd><dt>模型通道</dt><dd>{a.llmProvider || a.selection?.chosen?.llmProvider || "未声明"}</dd>{a.selection && <><dt>选择依据</dt><dd>{taskRouteBasis(a.selection)}</dd>{a.selection.fallbacks?.length ? <><dt>回退说明</dt><dd>{(a.selection.fallbacks ?? []).slice(0, 3).map(f => f.model + "：" + f.reason).join("；")}{(a.selection.fallbacks ?? []).length > 3 ? " 等" : ""}</dd></> : null}{a.selection.costComparison && <><TaskRouteCostFacts comparison={a.selection.costComparison} />{a.preflightOnly && <><dt>执行状态</dt><dd>此轮在实际启动前结束</dd></>}</>}{a.selection.blocked ? <><dt>候选阻塞</dt><dd>{a.selection.blocked.code}</dd></> : null}</>}<dt>上下文</dt><dd><code>{a.contextKey}</code></dd><dt>工作副本</dt><dd><code>{a.workspace?.path}</code></dd></dl></details>)}</section><ChangeHistory kind="task" id={task.id} data={data} /><section><h3>目标模板</h3><p>{(data.goals.find(g => g.id === task.goalId)?.templateSnapshot?.name) ?? (data.templates ?? []).find(t => t.id === (data.goals.find(g => g.id === task.goalId)?.templateId ?? 'base'))?.name ?? '基础模板'}</p>{task.reviewScope && <p className="acms-muted">审查范围：{task.reviewScope === 'goal' ? '目标整体交付' : '单个交付物'}</p>}<p className="acms-muted">{task.longLived ? '任务完成后保留临时执行人员，便于后续分配' : '任务完成后临时执行人员退出可分配名单；历史记录保留'}</p></section></aside></div>;
+    <section><h3>执行记录</h3>{!attempts.length && !history?.loading && !history?.error && <p className="acms-muted">尚未开始执行。</p>}{attempts.map(a => <details className="acms-run" key={a.id}><summary><Badge status={a.status} /><span>{date(a.startedAt)}</span></summary><p className="acms-preserve">{a.summary || '执行进行中'}</p><dl className="acms-definition"><dt>模型</dt><dd>{a.model || '未记录'}</dd><dt>思考深度</dt><dd>{a.reasoningEffort || '外部执行器默认或未公开'}</dd><dt>执行器</dt><dd>{a.provider}</dd><dt>模型通道</dt><dd>{a.llmProvider || a.selection?.chosen?.llmProvider || "未声明"}</dd>{a.selection && <><dt>选择依据</dt><dd>{taskRouteBasis(a.selection)}</dd>{a.selection.fallbacks?.length ? <><dt>回退说明</dt><dd>{(a.selection.fallbacks ?? []).slice(0, 3).map(f => f.model + "：" + f.reason).join("；")}{(a.selection.fallbacks ?? []).length > 3 ? " 等" : ""}</dd></> : null}{a.selection.costComparison && <><TaskRouteCostFacts comparison={a.selection.costComparison} />{a.preflightOnly && <><dt>执行状态</dt><dd>此轮在实际启动前结束</dd></>}</>}{a.selection.blocked ? <><dt>候选阻塞</dt><dd>{a.selection.blocked.code}</dd></> : null}</>}<dt>上下文</dt><dd><code>{a.contextKey}</code></dd><dt>工作副本</dt><dd><code>{a.workspace?.path}</code></dd></dl></details>)}{history?.loading && <p role="status" className="acms-muted">正在读取执行记录…</p>}{history?.error && <p role="alert">{history.error}</p>}{history && !history.loading && (history.nextBefore !== null || history.error) && <button onClick={history.load}>{history.error ? '重试读取执行记录' : '加载更早的执行记录'}</button>}</section><ChangeHistory kind="task" id={task.id} data={data} /><section><h3>目标模板</h3><p>{(data.goals.find(g => g.id === task.goalId)?.templateSnapshot?.name) ?? (data.templates ?? []).find(t => t.id === (data.goals.find(g => g.id === task.goalId)?.templateId ?? 'base'))?.name ?? '基础模板'}</p>{task.reviewScope && <p className="acms-muted">审查范围：{task.reviewScope === 'goal' ? '目标整体交付' : '单个交付物'}</p>}<p className="acms-muted">{task.longLived ? '任务完成后保留临时执行人员，便于后续分配' : '任务完成后临时执行人员退出可分配名单；历史记录保留'}</p></section></aside></div>;
 }
 function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }) {
   const { type, value = {} } = modal; const [form, setForm] = useState(() => ({ ...value, ...(type === 'agent' ? initialModelBinding(value, data.runtime) : {}), phases: value.phases ?? [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], checksText: JSON.stringify(value.checks ?? [], null, 2), preparationText: value.preparation ? JSON.stringify(value.preparation, null, 2) : '', ...(type === 'project' ? { deliveryRepoRoot: value.deliveryRepository?.targetRoot ?? '' } : {}), dependencies: value.dependencies ?? [], goalId: value.goalId ?? data.goals.find(g => openGoal(g) && !g.executionControl && (!value.projectId || g.projectId === value.projectId))?.id, projectId: value.projectId ?? data.projects[0]?.id, templateId: value.templateId ?? 'base', priority: value.priority ?? 50 }));

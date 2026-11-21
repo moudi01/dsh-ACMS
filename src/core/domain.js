@@ -3,7 +3,7 @@ import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, integrati
 import { isLiveAttempt } from './entity-actions.js';
 import { contractVersion, taskContractVersion, deliveryGeneration, deliveredWork, goalDeliveryHash, matchesGoalContract, matchesTaskReview } from './goal-contract.js';
 import { canCoordinate, findManager } from './coordination.js';
-import { executionOccupancy } from './execution-capacity.js';
+import { executionCapacity, executionOccupancy } from './execution-capacity.js';
 import { goalSummary, taskSettledForGoal } from './hierarchy.js';
 import { runActionBatch } from './action-batch.js';
 import { authorizeUserAgent, assertUserAgentAnswer, createCredentialRecord, createExternalProject, credentialSnapshot, revokeCredential, submitGoal, updateCredentialScope } from "./external-access.js";
@@ -18,11 +18,22 @@ import { normalizePreparation } from './project-preparation.js';
 import { acceptedGoalComposition, compositionCheckContract, compositionMode, COPY_COMPOSITION, finalGoalComposition, GIT_COMPOSITION, goalDeliveryState, newCompositionCheck, usesComposition } from './composite-delivery.js';
 import { decideCandidateMerge, requiresDeliveryApproval } from './candidate-confirmation.js';
 import { decidePlanApproval } from './plan-ledger.js';
+import { attemptForOwner, attemptForPanel } from './panel-attempts.js';
 import { PLAN_APPROVAL_REQUIRED, assertPlanAllowsWork, awaitsPlanApproval, isApprovalPlanner, supersedePendingPlan } from './plan-approval.js';
 
 const PHASE_IDS = new Set(['plan', 'execute', 'final-review']);
 const BASE_TEMPLATE = { id: 'base', name: '基础模板', version: 1, phases: [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], finalReview: true, published: true };
 const GRANTS = { manager: ['task.create', 'task.edit', 'task.dependencies', 'agent.save', 'task.retry'], worker: [], reviewer: [] };
+function groupBy(records, key) {
+  const groups = new Map();
+  for (const record of records) {
+    const value = record[key];
+    if (!groups.has(value)) groups.set(value, []);
+    groups.get(value).push(record);
+  }
+  return groups;
+}
+
 export class Company {
   constructor(store) {
     this.store = store;
@@ -820,16 +831,26 @@ export class Company {
     this.store.event("model.preferences.changed", "model", { before: sanitizePreferences(previous), after: sanitizePreferences(saved), cleared: true }, actor);
     return sanitizePreferences(saved);
   }
-  snapshot() {
+  snapshot({ panel = false, capacity } = {}) {
+    return this.store.readSnapshot(() => this.#snapshot(panel, capacity));
+  }
+  #snapshot(panel, capacity) {
     const collections = ["projects", "goals", "tasks", "agents", "templates", "templateHistory", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "deliveryApprovals", "actionBatches", "agentCredentials"];
-    const data = Object.fromEntries(collections.map(c => [c, this.store.list(c)]));
+    const data = Object.fromEntries(collections.map(c => [c, panel && c === 'attempts' ?
+      this.store.panelAttempts([...(capacity?.live?.keys() ?? [])]) : this.store.list(c)]));
+    const allAttempts = data.attempts;
+    const tasksById = new Map(data.tasks.map(task => [task.id, task]));
+    const projectsById = new Map(data.projects.map(project => [project.id, project]));
+    const templatesById = new Map(data.templates.map(template => [template.id, template]));
+    const policy = this.policy();
+    if (capacity) data.capacity = executionCapacity(this.store, capacity.adapter, capacity.live, policy, { attempts: allAttempts, tasks: tasksById });
     data.entityTrash = ['project', 'goal', 'agent'].flatMap(kind => data[`${kind}s`].filter(e => e.status === 'deleted' && e.deletion?.rootId === e.id).map(e => ({ ...e, entityKind: kind })));
     for (const c of ['projects', 'goals', 'agents']) data[c] = data[c].filter(e => e.status !== 'deleted');
     const deleted = new Set(data.tasks.filter(t => t.status === 'deleted').map(t => t.id));
     data.trash = data.tasks.filter(t => t.status === 'deleted' && t.deletion?.batchId === t.id).map(t => ({ ...t, purgeReason: taskPurgeReason(t, data.tasks, data.attempts) }));
     data.tasks = data.tasks.filter(t => !deleted.has(t.id));
     for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) data[c] = data[c].filter(item => !deleted.has(item.taskId));
-    data.attempts = data.attempts.map(({ meteredUsage, ...attempt }) => attempt);
+    data.attempts = data.attempts.map(panel ? attemptForPanel : attemptForOwner);
     const costBudgets = new Map(this.store.list('goalCostBudgets').map(budget => [budget.id, goalCostBudgetView(budget)]));
     data.goals = data.goals.map(goal => costBudgets.has(goal.id) ? { ...goal, costBudget: costBudgets.get(goal.id) } : goal);
     // Presentation-only activity projection for issue #17. Parents inherit the
@@ -841,7 +862,12 @@ export class Company {
     // A branch's newest descendant activity belongs to its ancestors too, with
     // cycle protection for malformed parent/review links.
     const children = new Map();
-    for (const task of data.tasks) { const parent = task.reviewOf || task.parentId || null; if (parent) children.set(parent, [...(children.get(parent) ?? []), task]); }
+    for (const task of data.tasks) {
+      const parent = task.reviewOf || task.parentId;
+      if (!parent) continue;
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(task);
+    }
     const memo = new Map();
     const effectiveTaskActivity = (task, stack = new Set()) => {
       if (memo.has(task.id)) return memo.get(task.id);
@@ -856,27 +882,40 @@ export class Company {
     // older artifact/delivery must never override the current version. Store
     // order is creation order, including reviews created in the same millisecond.
     const reviewTasks = data.tasks.filter(task => task.kind === 'review');
-    const deliveryHashes = new Map(data.goals.map(goal => [goal.id, this.deliveryHash(goal.id)]));
+    const reviewsBySource = groupBy(reviewTasks, 'reviewOf');
+    const goalReviews = groupBy(reviewTasks.filter(review => review.reviewScope === 'goal'), 'goalId');
     const reviewSummary = review => review ? ({ id: review.id, status: review.status, passed: review.passed ?? null, reviewScope: review.reviewScope ?? null, createdAt: review.createdAt, updatedAt: review.updatedAt, cancelledAt: review.cancelledAt ?? null, cancelledBy: review.cancelledBy ?? null, cancelReason: review.cancelReason ?? null, deliveryHash: review.deliveryHash ?? null, artifactHash: review.reviewArtifactHash ?? null, goalContractVersion: taskContractVersion(review), reviewedContractVersion: review.reviewedContractVersion ?? 1 }) : null;
     data.tasks = data.tasks.map(task => {
-      const current = reviewTasks.filter(review => review.reviewOf === task.id && matchesTaskReview(review, task));
-      return { ...task, reviewSummary: reviewSummary(current.at(-1)) };
+      const current = reviewsBySource.get(task.id)?.findLast(review => matchesTaskReview(review, task));
+      return { ...task, reviewSummary: reviewSummary(current) };
     });
-    const goalActivity = new Map(data.goals.map(goal => [goal.id, data.tasks.filter(task => task.goalId === goal.id).reduce((max, task) => latest(max, task.activityAt), ownActivity(goal))]));
-    data.goals = data.goals.map(g => {
-      const reviews = reviewTasks.filter(review => review.reviewScope === 'goal' && review.goalId === g.id);
-      const current = reviews.filter(review => review.deliveryHash === deliveryHashes.get(g.id));
-      const composition = usesComposition(g) ? acceptedGoalComposition(this.store, g) : null;
-      return { ...g, contractVersion: contractVersion(g), completedContractVersion: g.completedContractVersion ?? (g.status === 'succeeded' ? contractVersion(g) : null),
-        controlSummary: goalControlView(g, data.tasks, data.attempts),
-        ...(usesComposition(g) ? { compositionVerified: !!composition,
-          finalComposition: finalGoalComposition(this, g, composition, deliveryHashes.get(g.id)) } : {}),
-        deliveryHash: deliveryHashes.get(g.id), taskSummary: goalSummary(g, data.tasks), activityAt: latest(ownActivity(g), goalActivity.get(g.id)), reviewSummary: reviewSummary(current.at(-1)), reviewHistory: reviews.slice(-12).reverse().map(reviewSummary) };
+    const tasksByGoal = groupBy(data.tasks, 'goalId');
+    const attemptsByGoal = groupBy(data.attempts.filter(isLiveAttempt), 'goalId');
+    data.goals = data.goals.map(goal => {
+      const tasks = tasksByGoal.get(goal.id) ?? [];
+      const records = tasks.filter(task => task.kind === 'work' && task.status === 'succeeded');
+      const project = projectsById.get(goal.projectId) ?? null;
+      const { hash, candidate } = goalDeliveryState(this.store, goal, {
+        roots: deliveredWork(this.store, goal, records), project, loadTask: id => tasksById.get(id),
+      });
+      const reviews = goalReviews.get(goal.id) ?? [];
+      const current = reviews.findLast(review => review.deliveryHash === hash);
+      const template = templatesById.get(goal.templateId ?? 'base');
+      const review = reviews.findLast(item => item.status != null && taskContractVersion(item) === contractVersion(goal));
+      return { ...goal, contractVersion: contractVersion(goal),
+        completedContractVersion: goal.completedContractVersion ?? (goal.status === 'succeeded' ? contractVersion(goal) : null),
+        controlSummary: goalControlView(goal, tasks, attemptsByGoal.get(goal.id) ?? []),
+        ...(usesComposition(goal) ? { compositionVerified: !!candidate,
+          finalComposition: finalGoalComposition(this, goal, candidate, hash, { project, template, review }) } : {}),
+        deliveryHash: hash, taskSummary: goalSummary(goal, tasks),
+        activityAt: tasks.reduce((max, task) => latest(max, task.activityAt), ownActivity(goal)),
+        reviewSummary: reviewSummary(current), reviewHistory: reviews.slice(-12).reverse().map(reviewSummary) };
     });
-    data.projects = data.projects.map(p => ({ ...p, activityAt: latest(ownActivity(p), ...data.goals.filter(g => g.projectId === p.id).map(g => g.activityAt)) }));
+    const goalsByProject = groupBy(data.goals, 'projectId');
+    data.projects = data.projects.map(project => ({ ...project,
+      activityAt: (goalsByProject.get(project.id) ?? []).reduce((max, goal) => latest(max, goal.activityAt), ownActivity(project)) }));
     data.modelPreferences = sanitizePreferences(this.store.get("modelPreferences", "model"));
     data.agentCredentials = data.agentCredentials.map(credentialSnapshot);
-    return { ...data, policy: this.policy(), cursor: this.store.cursor() };
-    return { ...data, policy: this.policy(), cursor: this.store.cursor(), agentCredentials: data.agentCredentials.map(credentialSnapshot) };
+    return { ...data, policy, cursor: this.store.cursor(), ...(panel ? { attemptsView: 'panel' } : {}) };
   }
 }
