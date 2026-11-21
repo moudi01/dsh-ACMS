@@ -334,6 +334,10 @@ export class Company {
     assert(goalTaskCount(this.store.list('tasks'), goal.id) < p.maxTasksPerGoal, 'TASK_LIMIT', 'Goal task limit reached');
     assert(['work', 'plan', 'repair', 'review', 'coordination'].includes(kind), 'INVALID_INPUT', 'Invalid task kind');
     assert(actor.kind === 'system' || kind === 'work', 'SYSTEM_TASK', 'Internal task kinds are created by the engine');
+    if (args.costRouting !== undefined) {
+      assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可启用或关闭任务的费率比较。');
+      assert(kind === 'work' && typeof args.costRouting === 'boolean', 'INVALID_INPUT', '费率比较仅适用于普通执行任务。');
+    }
     if (actor.kind !== 'system' && !options.trustedOrigin) for (const key of ['workflowSnapshot', 'stageIndex', 'reviewOf', 'reviewArtifactHash', 'reviewedTaskGeneration', 'reviewedContractVersion', 'reviewScope', 'reviewTargets', 'deliveryHash', 'requestedBy', 'origin', 'coordinationOf', 'coordinationKey', 'reviewTaskId', 'reviewRound', 'feedbackHash']) assert(args[key] === undefined, 'SYSTEM_FIELD', `Internal task field cannot be supplied: ${key}`);
     integer(args.priority ?? 50, 'priority', 0, 100);
     const deps = [...new Set(args.dependencies ?? [])];
@@ -355,6 +359,7 @@ export class Company {
         reviewedContractVersion: args.reviewedContractVersion ?? contractVersion(goal) } : {}),
       generation: 1, attempts: 0, reworks: 0, priority: args.priority ?? 50,
       longLived: args.longLived ?? false, requiresArtifacts: ['work', 'repair'].includes(kind),
+      ...(args.costRouting === undefined ? {} : { costRouting: args.costRouting }),
       requirements: kind === 'review' ? { ...normalizeRequirements(args.requirements), isolation: 'independent-review' } : normalizeRequirements(args.requirements),
       origin: args.origin ?? null, coordinationOf: args.coordinationOf ?? null, coordinationKey: args.coordinationKey ?? null, reviewTaskId: args.reviewTaskId ?? null, reviewRound: args.reviewRound ?? null, feedbackHash: args.feedbackHash ?? null,
       artifactIds: [], stopRequested: null, checksSnapshot: kind === 'work' ? clone(this.store.require('projects', goal.projectId).checks) : [],
@@ -544,8 +549,12 @@ export class Company {
     if (isApprovalPlanner(goal, task)) assert(!goal.planApproval.approvedPlanId && task.blocker?.kind !== 'plan-approval',
       'PLAN_APPROVAL_REQUIRED', '审批记录关联的规划任务不能直接改派或编辑。请在计划审批中退回修改。');
     if (TERMINAL.has(task.status)) this.owner(actor);
-    const patch = args.patch ?? {}; const allowed = ['title', 'description', 'acceptance', 'priority', 'agentId', 'longLived', 'requirements'];
+    const patch = args.patch ?? {}; const allowed = ['title', 'description', 'acceptance', 'priority', 'agentId', 'longLived', 'requirements', 'costRouting'];
     assert(Object.keys(patch).every(k => allowed.includes(k)), 'INVALID_INPUT', 'Task state cannot be set directly');
+    if (Object.hasOwn(patch, 'costRouting')) {
+      assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可启用或关闭任务的费率比较。');
+      assert(task.kind === 'work' && typeof patch.costRouting === 'boolean', 'INVALID_INPUT', '费率比较仅适用于普通执行任务。');
+    }
     if (patch.agentId !== undefined) { text(patch.agentId, 'agentId'); assert(this.store.require('agents', patch.agentId).status === 'available', 'AGENT_RETIRED', '请为任务选择可分配的执行人员'); }
     if (patch.priority !== undefined) integer(patch.priority, 'priority', 0, 100);
     if (patch.requirements !== undefined) patch.requirements = normalizeRequirements(patch.requirements);

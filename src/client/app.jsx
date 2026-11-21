@@ -11,7 +11,7 @@ import { accruesGoalRuntime, canExtendGoalRuntime, goalRuntimeLimit, goalRuntime
 import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason } from '../core/task-actions.js';
 import { CAPACITY_LABELS } from '../core/execution-capacity.js';
 import { entityDeletionReason } from '../core/entity-actions.js';
-import { EntityDrawer, EntityTrash, ChangeHistory, entityLabels } from './entities.jsx';
+import { EntityDrawer, EntityTrash, ChangeHistory, entityLabels, usdFromMicros } from './entities.jsx';
 import { ConversationWindow } from './conversation.jsx';
 import { AccessPage } from './access.jsx';
 import { ActivityPage } from './activity.jsx';
@@ -295,6 +295,41 @@ function ArchiveChecks({ checks }) {
   </div>)}</details>;
 }
 
+const costRouteReasons = {
+  'binding-or-preference': '遵循显式绑定或已命中的用户偏好',
+  'protected-task': '沿用任务要求和执行方式',
+  'unknown-depth': '默认深度未知，沿用原路线',
+  'retry-route': '续用同一任务已选路线',
+  'retry-default': '重试依照当前正常选路',
+  'retry-route-unavailable': '前一次路线当前无法续用，按原规则选路',
+  'unpriced-default': '默认路线缺少可比较组或可用性证据',
+  'unknown-rates': '同组有未知费率，沿用原路线',
+  'no-comparable-peer': '当前没有同组可比较路线',
+  'lower-listed-rates': '两项配置费率均未增加，至少一项更低',
+  'default-listed-rates': '原路线的两项配置费率已不高于同组',
+  'incomparable-rates': '输入和输出费率存在取舍，沿用原路线',
+};
+const costSourceStates = { missing: '本机费率未配置', invalid: '本机费率文件无法核验', 'too-large': '本机费率文件超出大小限制', expired: '本机费率已过期' };
+const costRatePair = rate => `未缓存输入 ${usdFromMicros(rate.uncachedInputMicros)} · 输出 ${usdFromMicros(rate.outputMicros)} / 百万 token`;
+function taskRouteBasis(selection) {
+  if (selection.binding?.mode === 'explicit') return '显式绑定';
+  if (selection.binding?.mode === 'preference') return '用户偏好第 ' + ((selection.preferenceIndex ?? 0) + 1) + ' 项';
+  if (selection.costComparison?.reason === 'lower-listed-rates') return '同组配置费率';
+  if (selection.costComparison?.reason === 'retry-route') return '沿用同任务路线';
+  return '稳定默认顺序';
+}
+function TaskRouteCostFacts({ comparison }) {
+  return <>
+    <dt>费率比较</dt><dd>{costRouteReasons[comparison.reason] ?? costSourceStates[comparison.sourceState] ?? '未知'}</dd>
+    {comparison.baseline && <><dt>原默认路线</dt><dd>{comparison.baseline.model} · {comparison.baseline.reasoningEffort}</dd></>}
+    {comparison.rates && <>
+      <dt>原路线费率</dt><dd>{costRatePair(comparison.baseline.rates)}</dd>
+      <dt>所选路线费率</dt><dd>{costRatePair(comparison.rates)}</dd>
+    </>}
+    {comparison.source && <><dt>本机费率来源</dt><dd>{comparison.source}</dd></>}
+  </>;
+}
+
 function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat }) {
   const goal = data.goals.find(g => g.id === task.goalId);
   const goalHold = goal?.status === 'cancelled' ? '所属目标已取消。' : goal?.executionControl ? '请先恢复所属目标。' : '';
@@ -342,7 +377,7 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {awaitingRecovery && <section className="acms-alert"><h3>执行待核对</h3><p className="acms-preserve">{recoveryAttempt?.recovery?.reason || recoveryAttempt?.cleanupError || '尚无可靠结束回执，资源占位继续保留。'}</p>{task.stopRequested && <p>已请求{task.stopRequested === 'paused' ? '暂停' : '取消'}，确认执行停止且进程树清理后生效。</p>}<p>可重新读取回执，或检查该执行的日志和工作副本。只有身份匹配且已确认进程树清理的回执才能恢复结果或落实停止请求；没有停止请求且确认无完整结果时才允许重试。状态未知时不会重新调用模型。</p></section>}
     {attempts[0]?.progress && <section><h3>最近执行进度</h3><p className="acms-preserve">{attempts[0].progress.lastSnippet?.slice(-4000) || attempts[0].progress.reason || '正在工作…'}</p><small>{attempts[0].progress.toolCalls ?? 0} 次工具调用 · {date(attempts[0].progress.updatedAt)}</small></section>}
     {interactions.map(i => <section className="acms-alert" key={i.id}><h3>需要补充信息</h3><p>{i.reason}</p><p>{i.question}</p><button onClick={() => open('answer', i)}>回复并继续</button></section>)}
-    <section><h3>执行记录</h3>{!attempts.length && <p className="acms-muted">尚未开始执行。</p>}{attempts.map(a => <details className="acms-run" key={a.id}><summary><Badge status={a.status} /><span>{date(a.startedAt)}</span></summary><p className="acms-preserve">{a.summary || '执行进行中'}</p><dl className="acms-definition"><dt>模型</dt><dd>{a.model || '未记录'}</dd><dt>思考深度</dt><dd>{a.reasoningEffort || '外部执行器默认或未公开'}</dd><dt>执行器</dt><dd>{a.provider}</dd><dt>模型通道</dt><dd>{a.llmProvider || a.selection?.chosen?.llmProvider || "未声明"}</dd>{a.selection && <><dt>选择依据</dt><dd>{a.selection.binding?.mode === "explicit" ? "显式绑定" : a.selection.binding?.mode === "preference" ? "用户偏好第 " + ((a.selection.preferenceIndex ?? 0) + 1) + " 项" : "稳定默认顺序"}</dd>{a.selection.fallbacks?.length ? <><dt>回退说明</dt><dd>{(a.selection.fallbacks ?? []).slice(0, 3).map(f => f.model + "：" + f.reason).join("；")}{(a.selection.fallbacks ?? []).length > 3 ? " 等" : ""}</dd></> : null}{a.selection.blocked ? <><dt>候选阻塞</dt><dd>{a.selection.blocked.code}</dd></> : null}</>}<dt>上下文</dt><dd><code>{a.contextKey}</code></dd><dt>工作副本</dt><dd><code>{a.workspace?.path}</code></dd></dl></details>)}</section><ChangeHistory kind="task" id={task.id} data={data} /><section><h3>目标模板</h3><p>{(data.goals.find(g => g.id === task.goalId)?.templateSnapshot?.name) ?? (data.templates ?? []).find(t => t.id === (data.goals.find(g => g.id === task.goalId)?.templateId ?? 'base'))?.name ?? '基础模板'}</p>{task.reviewScope && <p className="acms-muted">审查范围：{task.reviewScope === 'goal' ? '目标整体交付' : '单个交付物'}</p>}<p className="acms-muted">{task.longLived ? '任务完成后保留临时执行人员，便于后续分配' : '任务完成后临时执行人员退出可分配名单；历史记录保留'}</p></section></aside></div>;
+    <section><h3>执行记录</h3>{!attempts.length && <p className="acms-muted">尚未开始执行。</p>}{attempts.map(a => <details className="acms-run" key={a.id}><summary><Badge status={a.status} /><span>{date(a.startedAt)}</span></summary><p className="acms-preserve">{a.summary || '执行进行中'}</p><dl className="acms-definition"><dt>模型</dt><dd>{a.model || '未记录'}</dd><dt>思考深度</dt><dd>{a.reasoningEffort || '外部执行器默认或未公开'}</dd><dt>执行器</dt><dd>{a.provider}</dd><dt>模型通道</dt><dd>{a.llmProvider || a.selection?.chosen?.llmProvider || "未声明"}</dd>{a.selection && <><dt>选择依据</dt><dd>{taskRouteBasis(a.selection)}</dd>{a.selection.fallbacks?.length ? <><dt>回退说明</dt><dd>{(a.selection.fallbacks ?? []).slice(0, 3).map(f => f.model + "：" + f.reason).join("；")}{(a.selection.fallbacks ?? []).length > 3 ? " 等" : ""}</dd></> : null}{a.selection.costComparison && <><TaskRouteCostFacts comparison={a.selection.costComparison} />{a.preflightOnly && <><dt>执行状态</dt><dd>此轮在实际启动前结束</dd></>}</>}{a.selection.blocked ? <><dt>候选阻塞</dt><dd>{a.selection.blocked.code}</dd></> : null}</>}<dt>上下文</dt><dd><code>{a.contextKey}</code></dd><dt>工作副本</dt><dd><code>{a.workspace?.path}</code></dd></dl></details>)}</section><ChangeHistory kind="task" id={task.id} data={data} /><section><h3>目标模板</h3><p>{(data.goals.find(g => g.id === task.goalId)?.templateSnapshot?.name) ?? (data.templates ?? []).find(t => t.id === (data.goals.find(g => g.id === task.goalId)?.templateId ?? 'base'))?.name ?? '基础模板'}</p>{task.reviewScope && <p className="acms-muted">审查范围：{task.reviewScope === 'goal' ? '目标整体交付' : '单个交付物'}</p>}<p className="acms-muted">{task.longLived ? '任务完成后保留临时执行人员，便于后续分配' : '任务完成后临时执行人员退出可分配名单；历史记录保留'}</p></section></aside></div>;
 }
 function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }) {
   const { type, value = {} } = modal; const [form, setForm] = useState(() => ({ ...value, ...(type === 'agent' ? initialModelBinding(value, data.runtime) : {}), phases: value.phases ?? [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], checksText: JSON.stringify(value.checks ?? [], null, 2), preparationText: value.preparation ? JSON.stringify(value.preparation, null, 2) : '', ...(type === 'project' ? { deliveryRepoRoot: value.deliveryRepository?.targetRoot ?? '' } : {}), dependencies: value.dependencies ?? [], goalId: value.goalId ?? data.goals.find(g => openGoal(g) && !g.executionControl && (!value.projectId || g.projectId === value.projectId))?.id, projectId: value.projectId ?? data.projects[0]?.id, templateId: value.templateId ?? 'base', priority: value.priority ?? 50 }));
@@ -393,8 +428,8 @@ function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }
       if (type === 'deleteEntity') { command = `${value.entityKind}.delete`; args = { id: value.id, expectedRevision: value.revision }; }
       if (type === 'purgeTask') { command = 'task.purge'; args = { id: value.id, expectedRevision: value.revision, confirmTitle: form.confirmTitle }; }
       if (type === 'deleteTask') { command = 'task.delete'; args = { id: value.id, expectedRevision: value.revision }; }
-      if (type === 'task') { command = 'task.create'; args = { title: form.title, description: form.description, acceptance: form.acceptance, goalId: form.goalId, parentId: form.parentId || undefined, agentId: form.agentId || undefined, longLived: !!form.longLived }; }
-      if (type === 'taskEdit') { command = 'task.edit'; args = { id: value.id, expectedRevision: value.revision, patch: { title: form.title, description: form.description, acceptance: form.acceptance, priority: Number(form.priority), agentId: form.agentId, longLived: !!form.longLived } }; }
+      if (type === 'task') { command = 'task.create'; args = { title: form.title, description: form.description, acceptance: form.acceptance, goalId: form.goalId, parentId: form.parentId || undefined, agentId: form.agentId || undefined, longLived: !!form.longLived, ...(form.costRouting ? { costRouting: true } : {}) }; }
+      if (type === 'taskEdit') { command = 'task.edit'; args = { id: value.id, expectedRevision: value.revision, patch: { title: form.title, description: form.description, acceptance: form.acceptance, priority: Number(form.priority), agentId: form.agentId, longLived: !!form.longLived, ...(!!form.costRouting !== !!value.costRouting ? { costRouting: !!form.costRouting } : {}) } }; }
       if (type === 'agent') { command = 'agent.save'; args = { id: value.id, name: form.name, description: form.description ?? '', role: form.role ?? 'worker', provider: form.provider ?? 'auto', model: form.model ?? '', llmProvider: form.llmProvider ?? '', reasoningEffort: form.reasoningEffort ?? '', temporary: !!form.temporary, status: form.status ?? 'available', expectedRevision: value.revision }; }
       if (type === 'workflow') { command = 'workflow.publish'; args = { id: value.id, name: form.name, phases: form.phases, ...(form.planApproval === undefined ? {} : { planApproval: form.planApproval }), ...(form.deliveryApproval === undefined ? {} : { deliveryApproval: form.deliveryApproval }), reason: form.reason ?? '', expectedRevision: value.revision }; }
       if (type === 'answer') { command = 'interaction.answer'; args = { id: value.id, answer: form.answer, expectedRevision: value.revision, ...(budgetGoal && extraMinutes > 0 ? { additionalRuntimeMs: extraRuntimeMs } : {}) }; }
@@ -435,6 +470,10 @@ function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }
     {type === 'goalEdit' && <><Field label="标题">{input('title')}</Field><Field label="目标说明">{area('description')}</Field><Field label="验收标准">{area('acceptance')}</Field><Field label="优先级（0–100）" hint="调整只影响后续派发；在途任务、依赖、暂停和清理占位保持不变。"><input type="number" min="0" max="100" value={form.priority ?? 50} onChange={e => change('priority', e.target.value)} /></Field><p className="acms-sectionnote">保存后通知关联任务负责人。执行中的任务会停止旧轮次并按新说明继续；已暂停或等待材料的任务保持等待。</p></>}
     {type === 'goalCancel' && <><p>取消「{value.title}」会终止此目标尚未完成的工作。已交付产物、审查、审计记录和实际合入结果会保留。需要继续工作时可创建新目标。</p><Field label="取消原因（可选）">{area('cancelReason', '', false)}</Field></>}
     {extendingGoal && budgetFields}
+    {(type === 'task' || (type === 'taskEdit' && value.kind === 'work')) && <>
+      <label className="acms-checkbox"><input type="checkbox" checked={!!form.costRouting} onChange={event => change('costRouting', event.target.checked)} />允许此低风险任务比较等价模型费率</label>
+      <p className="acms-sectionnote">仅比较本机已配置的同组费率。任务要求、显式绑定和用户偏好优先。</p>
+    </>}
     {type === 'taskEdit' && <p className="acms-sectionnote">保存后通知原负责人及新负责人。执行中会先停止旧轮次，清理完成后按新要求继续；已完成任务将重新执行和审查，暂停任务保持暂停。</p>}
     {type === 'deleteEntity' && <><p>将“{value.title ?? value.name}”移入回收站。</p><p>{value.entityKind === 'agent' ? '角色不再参与分配，历史执行记录保留。' : '本次一并移入回收站的下级目标和任务可随此记录恢复，源文件与工作副本保留。'}</p></>}
     {type === 'agent' && <><Field label="角色名称">{input('name')}</Field><Field label="职责">{area('description', '职责范围与工作方式', false)}</Field><Field label="角色权限"><select value={form.role ?? 'worker'} onChange={e => change('role', e.target.value)}><option value="worker">执行人员</option><option value="reviewer">独立审查员</option><option value="manager">管理人员：可调整分工与工作流</option></select></Field><ModelPicker form={form} setForm={setForm} data={data} /><Field label="人员类型" hint={form.temporary ? '短期任务完成后退出可分配名单；若任务设置了保留执行人员，则继续保留。' : '任务完成后仍留在可分配名单，可继续承担后续工作。'}><select value={form.temporary ? 'temporary' : 'resident'} onChange={e => change('temporary', e.target.value === 'temporary')}><option value="resident">常驻人员</option><option value="temporary">临时人员</option></select></Field><p className="acms-sectionnote">每轮执行结束都会回收执行资源，与人员是否常驻无关。任务、交付物和历史记录保留。</p></>}

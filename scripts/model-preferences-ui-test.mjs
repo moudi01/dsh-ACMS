@@ -49,9 +49,35 @@ try {
   await expect(page.getByText(/offline-test-model：health_unavailable/)).toBeVisible();
   await expect(page.getByText("模型通道", { exact: true }).first()).toBeVisible();
   await page.screenshot({ path: "test-results/ui/model-selection-evidence.png", fullPage: true });
+  await page.getByRole("button", { name: "编辑任务", exact: true }).click();
+  const taskEdit = page.getByRole("dialog");
+  await expect(taskEdit.getByRole("heading", { name: "编辑任务", exact: true })).toBeVisible();
+  const enableCostRouting = taskEdit.getByLabel("允许此低风险任务比较等价模型费率");
+  await expect(enableCostRouting).not.toBeChecked();
+  await enableCostRouting.check();
+  await taskEdit.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(taskEdit).toHaveCount(0);
+  expect(server.company.store.require("tasks", task.id).costRouting).toBe(true);
+  server.company.store.transaction(() => {
+    const saved = server.company.store.require("tasks", task.id);
+    const baseline = { model: "deepseek-reasoner", reasoningEffort: "medium", rates: { uncachedInputMicros: "900000", outputMicros: "1200000" } };
+    server.company.store.put("attempts", { id: "attempt_ui_cost_rates", taskId: task.id, goalId: task.goalId, agentId: task.agentId,
+      kind: task.kind, provider: "simulation", llmProvider: "preview", model: "deepseek-flash", reasoningEffort: "medium",
+      status: "completed", summary: "本机费率执行证据", contextKey: "acms:ui:cost-rates", startedAt: new Date().toISOString(),
+      taskGeneration: saved.generation, selection: { binding: { mode: "default" }, costComparison: { reason: "lower-listed-rates",
+        source: "本机配置费率", baseline, rates: { uncachedInputMicros: "400000", outputMicros: "700000" } } } });
+    server.company.store.event("task.changed", task.id, { fields: ["attempt"] }, { kind: "owner", id: "owner" });
+  });
+  const costAttempt = page.locator("details.acms-run").filter({ hasText: "本机费率执行证据" });
+  await costAttempt.locator("summary").click();
+  await expect(costAttempt.getByText("同组配置费率", { exact: true })).toBeVisible();
+  await expect(costAttempt.getByText("deepseek-reasoner · medium", { exact: true })).toBeVisible();
+  await expect(costAttempt.getByText("所选路线费率", { exact: true })).toBeVisible();
+  await expect(costAttempt.getByText(/^未缓存输入 .*百万 token$/)).toHaveCount(2);
+  expect(diagnostics).toEqual([]);
   await page.getByRole("button", { name: "关闭任务详情" }).click();
   if (errors.length) throw new Error(errors.join("\\n"));
-  const report = { passed: true, mode: "isolated preview harness with simulation provider", checked: ["ordered preference add, move, label, save, clear", "preferences persisted through command/domain with revision", "viewing and saving preferences never requested model-check or model-details", "attempt selection basis and fallback reasons rendered in task detail"], screenshots: ["test-results/ui/model-preferences.png", "test-results/ui/model-selection-evidence.png"], diagnostics };
+  const report = { passed: true, mode: "isolated preview harness with simulation provider", checked: ["ordered preference add, move, label, save, clear", "preferences persisted through command/domain with revision", "viewing and saving preferences never requested model-check or model-details", "attempt selection basis and fallback reasons rendered in task detail", "task cost routing defaults off, saves opt-in, and displays selected cost evidence"], screenshots: ["test-results/ui/model-preferences.png", "test-results/ui/model-selection-evidence.png"], diagnostics };
   await writeFile("test-results/ui/model-preferences-report.json", JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } catch (error) { console.error("Browser errors:", errors); await page.screenshot({ path: "test-results/ui/model-preferences-failure.png", fullPage: true }); throw error; } finally { await browser.close(); await server.close(); }
