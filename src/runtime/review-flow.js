@@ -5,12 +5,13 @@ import { canCoordinate, createCoordination, feedbackHashOf, findManager, reviewC
 import { acceptedGoalComposition, COPY_COMPOSITION, usesComposition } from '../core/composite-delivery.js';
 import { verifyCopySnapshot } from './copy-composition.js';
 import { verifiedStoredGitBundle } from './git-delivery.js';
+import { assertTaskReviewContextCurrent, verifyTaskReviewContext } from './review-context.js';
 
 // A review only judges the delivered outcome. It never advances or reopens the
 // reviewed task: approval is evidence, rejection opens a manager-led rework
 // entry point. This keeps the task state machine free of a "waiting for review"
 // state and makes reviews optional.
-export async function acceptReviewFlow(engine, review, attempt, output) {
+export async function acceptReviewFlow(engine, review, attempt, output, signal) {
   const { store } = engine;
   assert(output.outcome === "reviewed" && ["approve", "changes_requested"].includes(output.decision), "INVALID_REVIEW", "Reviewer must return a decision");
   if (output.decision === "changes_requested") {
@@ -22,22 +23,25 @@ export async function acceptReviewFlow(engine, review, attempt, output) {
     output = { ...output, rework };
   }
   if (review.reviewScope === "goal") return acceptGoalReview(engine, review, attempt, output);
-  return acceptTaskReview(engine, review, attempt, output, store);
+  return acceptTaskReview(engine, review, attempt, output, store, signal);
 }
 
-async function acceptTaskReview(engine, review, attempt, output, store) {
+async function acceptTaskReview(engine, review, attempt, output, store, signal) {
   const { workspaces } = engine;
   let source = store.require("tasks", review.reviewOf);
   assert(source.status === "succeeded", "STALE_REVIEW", "Only a delivered task can be reviewed");
   assert(matchesTaskReview(review, source), "STALE_REVIEW", "Review targets an obsolete deliverable version");
   assert(attempt.agentId !== source.lastAuthorId, "SELF_REVIEW", "Author cannot approve their own work");
+  const context = store.require('attempts', attempt.id).reviewContext;
   const unchanged = await workspaces.unchanged(source, source.artifactIds);
   assert(unchanged, "ARTIFACT_CHANGED", "Reviewed files changed after delivery");
+  await verifyTaskReviewContext(workspaces.dataDir, review, context, signal);
 
   store.transaction(() => {
     const currentReview = engine.currentAttemptTask(attempt, true);
     source = store.require("tasks", source.id);
     assert(source.status === "succeeded" && matchesTaskReview(review, source), "STALE_REVIEW", "Deliverable changed during review");
+    if (context) assertTaskReviewContextCurrent(store, currentReview, context);
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...currentReview, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
     store.put("verifications", { id: id("verification"), taskId: source.id, goalId: source.goalId, attemptId: attempt.id, artifactHash: source.artifactHash,

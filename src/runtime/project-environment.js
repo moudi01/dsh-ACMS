@@ -210,6 +210,7 @@ function redactLog(value) {
 
 async function fingerprintFiles(paths, cwd, signal) {
   const files = [];
+  let root;
   for (const file of paths) {
     signal?.throwIfAborted();
     let entry = null;
@@ -217,7 +218,9 @@ async function fingerprintFiles(paths, cwd, signal) {
       const filename = /^file:\/\//i.test(file) ? fileURLToPath(file) : path.resolve(cwd, file);
       const actual = await realpath(filename);
       if ((await stat(actual)).isFile()) {
-        const relative = path.relative(cwd, actual);
+        // The workspace root and resolved file must use the same spelling across copies.
+        root ??= await realpath(cwd);
+        const relative = path.relative(root, actual);
         const external = path.isAbsolute(file) || /^file:\/\//i.test(file) ||
           relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
         entry = [external ? actual : relative, await fileHash(actual, signal)];

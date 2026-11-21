@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -97,6 +97,32 @@ async function scopedCommand(runtime, name, args, requestId, status = 200) {
   assert.equal(value.status, status, JSON.stringify(body));
   return body.value ?? body.error;
 }
+
+test('a paid review with rejected evidence settles the same attempt once after confirmed cleanup', async t => {
+  const f = await fixture(t);
+  const target = goal(f, '0.000020');
+  const author = f.task({ goalId: target.id });
+  const fixed = fixedCostAdapter(f, { beforeResult: async ({ task, attempt }) => {
+    if (task.kind !== 'review') return;
+    const { workspacePath } = attempt.reviewContext.evidence[0];
+    await unlink(path.join(task.workspace.path, workspacePath));
+  } });
+  f.engine.adapter = fixed.adapter;
+  await f.start();
+  await waiting(f, author, task => task.status === 'succeeded');
+  const review = f.command('review.request', { id: author.id });
+  await until(() => state(f.store, review).status === 'blocked' && budget(f.store, target.id).settledAttempts === 2,
+    undefined, taskWaitDiagnostics(f, review.id));
+  const attempt = f.store.get('attempts', state(f.store, review).activeAttemptId);
+  assert.equal(attempt.reviewResultRejected.code, 'REVIEW_EVIDENCE_CHANGED');
+  assert.equal(attempt.cleanupPending, false);
+  assert.equal(f.store.require('goalCostAttempts', attempt.id).status, 'settled');
+  assert.equal(budget(f.store, target.id).settledMicros, '6');
+  assert.equal(f.store.list('verifications').some(row => row.attemptId === attempt.id), false);
+  await f.engine.stop(); await f.start();
+  assert.equal(budget(f.store, target.id).settledMicros, '6');
+  assert.deepEqual(fixed.calls, [author.id, review.id]);
+});
 
 test('only owners opt in at creation, and an unpriced planner is held without starting or consuming a retry', async t => {
   const f = await fixture(t), ordinary = f.task();

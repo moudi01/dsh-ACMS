@@ -3,6 +3,7 @@ import { mkdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
+import { assertTaskReviewContextCurrent, prepareTaskReviewContext } from './review-context.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { assertPlanAllowsWork, planBlocksDispatch, planBlocksWork } from '../core/plan-approval.js';
@@ -27,6 +28,8 @@ import { preparationForTask } from '../core/project-preparation.js';
 import { withdrawOptionalDeferral } from '../core/cost-optional.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
+const confirmedExecutionCleanup = fact => ['completed', 'stopped'].includes(fact?.status) && fact.cleanupConfirmed === true;
+const rejectedReviewEvidence = error => ({ code: error.code, reason: error.message });
 const holdsTimeBox = (goal, task, occupiedTaskIds) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
   task.goalId === goal.id && (occupiedTaskIds.has(task.id) ||
     (!task.contractObsolete && matchesGoalContract(goal, task) && (!TERMINAL.has(task.status) || task.status === 'failed')));
@@ -94,7 +97,9 @@ export class Engine {
         } else if (saved.costDeferralRequestId || saved.preparingHost) {
           fact = { status: 'stopped', cleanupConfirmed: true, reason: '宿主依赖准备已清理，模型尚未启动' };
         } else if (saved.deferredReplayAt) {
-          fact = saved.hostCheckCleanup?.replayAt === saved.deferredReplayAt
+          fact = saved.reviewResultRejected?.replayAt === saved.deferredReplayAt && !saved.cleanupUncertain
+            ? { status: 'stopped', cleanupConfirmed: true, reason: '已拒绝的结果回放没有启动新执行，宿主检查均已结束。' }
+            : saved.hostCheckCleanup?.replayAt === saved.deferredReplayAt
             ? { status: 'stopped', cleanupConfirmed: true, reason: `已核实回放期间宿主检查 ${saved.hostCheckCleanup.checkId} 的清理回执` }
             : { status: 'unknown', reason: '结果入库中断，原执行回执无法证明入库检查已清理' };
         } else {
@@ -107,7 +112,7 @@ export class Engine {
       this.fenced();
       // A stop or edit may have discarded the parked result during receipt I/O.
       let previous = this.store.require('attempts', pending.id);
-      if ((previous.resultDeferred || previous.provider?.startsWith('paired:') || this.store.get('goalCostAttempts', previous.id)?.status === 'reserved') &&
+      if ((previous.resultDeferred || previous.reviewResultRejected || previous.provider?.startsWith('paired:') || this.store.get('goalCostAttempts', previous.id)?.status === 'reserved') &&
           ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed !== true) {
         fact = { status: 'unknown', reason: '执行回执未确认进程树清理', actions: ['refresh-receipt', 'inspect-execution'] };
       }
@@ -122,9 +127,18 @@ export class Engine {
         const { meteredUsage, ...recovery } = fact;
         fact = recovery;
       }
+      if (previous.reviewResultRejected) {
+        if (confirmedExecutionCleanup(fact) && !previous.hostCheck) {
+          this.settleRejectedReview(previous, fact, previous.reviewResultRejected);
+          continue;
+        }
+        fact = { ...fact, status: 'unknown', cleanupConfirmed: false, reason: fact.reason ?? '审查结果已拒绝，执行清理仍需确认。',
+          actions: ['refresh-receipt', 'inspect-execution'] };
+        delete fact.result;
+      }
       const currentTask = this.store.require('tasks', previous.taskId);
       const ownsTask = currentTask.activeAttemptId === previous.id && currentTask.generation === previous.taskGeneration;
-      const clean = ['completed', 'stopped'].includes(fact.status) && fact.cleanupConfirmed === true;
+      const clean = confirmedExecutionCleanup(fact);
       if (previous.costDeferralRequestId && clean) {
         this.store.transaction(() => closeOptionalDeferralQuote(this, previous, null, '核价在宿主重启前未完成，本轮未延期。'));
         continue;
@@ -184,6 +198,11 @@ export class Engine {
           continue;
         } catch (e) {
           if (e.cleanupUncertain) hostCleanupFailure = e;
+          if (e.code === 'REVIEW_EVIDENCE_CHANGED' && clean && !hostCleanupFailure &&
+              !this.store.require('attempts', previous.id).hostCheck) {
+            this.settleRejectedReview(previous, fact, rejectedReviewEvidence(e));
+            continue;
+          }
           const stopped = controller.signal.aborted && clean && !hostCleanupFailure && !this.store.require('attempts', previous.id).hostCheck;
           fact = stopped ? { status: 'stopped', cleanupConfirmed: true, reason: e.message } :
             { status: 'unknown', reason: `Recovered result needs inspection: ${e.message}` };
@@ -527,7 +546,7 @@ export class Engine {
       const deferred = current.activeAttemptId && this.store.get('deferredResults', current.activeAttemptId);
       if (deferred && deferred.generation === current.generation) {
         const previous = this.store.get('attempts', deferred.id);
-        if (deferred.taskId !== current.id || !previous?.resultDeferred || previous.cleanupPending || previous.cleanupUncertain || previous.taskId !== current.id ||
+        if (deferred.taskId !== current.id || !previous?.resultDeferred || previous.reviewResultRejected || previous.cleanupPending || previous.cleanupUncertain || previous.taskId !== current.id ||
             previous.taskGeneration !== current.generation) return null;
         // Older schedulers stored a verified stopped receipt as an interruption.
         const recoveredStop = previous.status === 'interrupted' && previous.recovery?.status === 'stopped' && previous.recovery.cleanupConfirmed === true;
@@ -622,16 +641,19 @@ export class Engine {
       assertGoalOpen(this.store.require('goals', task.goalId));
       guardPreparation();
       const hostEvidence = task.kind === 'review' ? await this.workspaces.reviewEvidence(task, controller.signal) : undefined;
+      const taskReviewContext = task.kind === 'review' && task.reviewOf
+        ? await prepareTaskReviewContext(this.store, this.workspaces.dataDir, task, attempt, controller.signal) : null;
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
       this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       guardPreparation();
-      const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence });
+      const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence, taskReviewContext });
       const assertCurrent = () => {
         controller.signal.throwIfAborted();
         const current = this.currentAttemptTask(attempt);
         assertGoalOpen(this.store.require('goals', current.goalId));
         guardPreparation();
+        if (taskReviewContext) assertTaskReviewContextCurrent(this.store, current, taskReviewContext.receipt);
         return current;
       };
       const admission = this.store.transaction(() => {
@@ -658,6 +680,15 @@ export class Engine {
       authorization = admission.authorization;
       const onAccepted = () => this.conversations?.accepted(attempt);
       const input = { task, attempt, agent, routeSelection: preflight.selection, prompt, signal: controller.signal, assertCurrent, onAccepted };
+      const dispatchInput = () => {
+        if (!taskReviewContext) return input;
+        this.store.transaction(() => {
+          assertCurrent();
+          const reviewContext = { ...taskReviewContext.receipt, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') };
+          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), reviewContext });
+        });
+        return { ...input, attempt };
+      };
       if (authorization) {
         const executor = admission.executor;
         const authorizeDispatch = () => {
@@ -667,13 +698,14 @@ export class Engine {
           return current;
         };
         authorizeDispatch();
+        const dispatch = dispatchInput();
         costLaunchInvoked = true;
-        activation = await executor.start({ ...input, assertCurrent: authorizeDispatch,
+        activation = await executor.start({ ...dispatch, assertCurrent: authorizeDispatch,
           authorization: Object.freeze({ ...authorization, route: Object.freeze({ ...authorization.route }) }) });
         assert(typeof activation?.dispose === 'function', 'COST_CLEANUP_UNCONFIRMED', '金额受限执行器未返回可核对的清理入口。');
       } else {
         task = assertCurrent();
-        activation = await this.adapter.start({ ...input, task });
+        activation = await this.adapter.start({ ...dispatchInput(), task });
       }
       this.store.transaction(() => {
         this.fenced();
@@ -703,6 +735,17 @@ export class Engine {
       }
       const discardResult = deliveredResult && controller.signal.aborted &&
         (this.closing || this.store.get('tasks', attempt.taskId)?.stopRequested);
+      if ((deliveredResult || attempt.deferredReplayAt) && !discardResult && error.code === 'REVIEW_EVIDENCE_CHANGED') {
+        if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
+          this.fenced();
+          const saved = this.store.require('attempts', attempt.id);
+          const replayAt = attempt.deferredReplayAt === saved.deferredReplayAt && !saved.hostCheck && !saved.cleanupUncertain
+            ? saved.deferredReplayAt : null;
+          this.store.put('attempts', { ...saved, resultAccepted: false, cleanupPending: true,
+            reviewResultRejected: { ...rejectedReviewEvidence(error), ...(replayAt ? { replayAt } : {}) } });
+        });
+        return;
+      }
       if (deliveredResult && !discardResult && activation?.provider?.startsWith('paired:')) recoveryFailure = Object.assign(new Error(`结果已返回，但尚未可靠入库：${error.message}`, { cause: error }), { code: 'RESULT_RECONCILIATION_REQUIRED', recoveryRequired: true });
       // Adapter bookkeeping can fail after the receipt is committed but before
       // activation.result resolves. Only a clean stopped receipt permits retry;
@@ -740,13 +783,34 @@ export class Engine {
         let usageReceipt;
         if (this.store.ownsLease(this.owner, this.epoch)) {
           const current = this.store.require('attempts', attempt.id);
-          if (!current.meteredUsage && current.execution?.runtime === 'codex-app-server') {
+          const pairedReview = current.reviewResultRejected && current.provider?.startsWith('paired:') && !authorization;
+          if (pairedReview || (!current.meteredUsage && current.execution?.runtime === 'codex-app-server')) {
             try { usageReceipt = await this.adapter.reconcile?.(current); } catch { /* Unavailable receipt leaves usage unknown. */ }
           }
         }
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
           this.fenced();
           const saved = withAttemptUsage(this.store.require('attempts', attempt.id), usageReceipt);
+          if (saved.reviewResultRejected) {
+            const paired = saved.provider?.startsWith('paired:') && !authorization;
+            const cleanReplay = saved.reviewResultRejected.replayAt && saved.reviewResultRejected.replayAt === saved.deferredReplayAt;
+            const cleanLive = !saved.deferredReplayAt && !recoveryFailure && typeof activation?.dispose === 'function';
+            const cleanFact = paired && cleanLive ? usageReceipt : cleanReplay || cleanLive
+              ? { status: 'stopped', cleanupConfirmed: true, reason: '已确认本次执行适配器清理完成。' } : null;
+            if (!saved.hostCheck && !recoveryFailure && confirmedExecutionCleanup(cleanFact)) {
+              this.settleRejectedReview(saved, cleanFact, saved.reviewResultRejected, usageReceipt);
+            } else {
+              const fact = { status: 'unknown', reason: '审查结果已拒绝，执行清理仍需确认。',
+                actions: ['refresh-receipt', 'inspect-execution'] };
+              this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, recovery: fact });
+              const task = this.store.require('tasks', saved.taskId);
+              if (task.activeAttemptId === saved.id && task.generation === saved.taskGeneration) {
+                this.store.put('tasks', { ...task, status: 'reconciling' });
+              }
+              this.store.event('attempt.recovery', saved.id, { taskId: saved.taskId, fact }, SYSTEM);
+            }
+            return;
+          }
           if (recoveryFailure) {
             this.store.put('attempts', { ...saved, status: 'reconciling', cleanupPending: true, recovery: { status: 'unknown', reason: recoveryFailure.message, actions: ['refresh-receipt', 'inspect-execution'] } });
             return;
@@ -771,13 +835,46 @@ export class Engine {
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
           const saved = this.store.require('attempts', attempt.id), task = this.store.require('tasks', attempt.taskId);
           this.store.put('attempts', { ...saved, acceptedTaskStatus: saved.acceptedTaskStatus ?? (saved.resultAccepted ? task.status : null), status: 'reconciling', cleanupPending: true, cleanupUncertain: true, cleanupError: e.message, cleanupDetails: e.cleanup ?? saved.cleanupDetails ?? null });
-          this.store.put('tasks', { ...task, status: 'reconciling' });
+          if (!saved.reviewResultRejected || (task.activeAttemptId === saved.id && task.generation === saved.taskGeneration)) {
+            this.store.put('tasks', { ...task, status: 'reconciling' });
+          }
           this.store.event('attempt.cleanup.failed', attempt.id, { taskId: task.id }, SYSTEM);
         });
       }
       try { await this.workspaces.publishProject?.(this.store.require('projects', this.store.require('tasks', attempt.taskId).projectId)); }
       catch (e) { this.lastError = `协作文档更新失败：${e.message}`; }
     }
+  }
+  settleRejectedReview(attempt, fact, rejection, usage = fact) {
+    this.store.transaction(() => {
+      this.fenced();
+      const current = this.store.require('attempts', attempt.id);
+      assert(confirmedExecutionCleanup(fact) && !current.hostCheck, 'CLEANUP_UNCONFIRMED', '已拒绝的审查仍需可靠清理回执。');
+      if (!ACTIVE.has(current.status) && !current.cleanupPending) return;
+      const task = this.store.require('tasks', attempt.taskId);
+      const ownsTask = task.activeAttemptId === attempt.id && task.generation === attempt.taskGeneration;
+      const stop = recoverStopIntent(task) ?? (this.store.require('goals', task.goalId).status === 'cancelled' ? 'cancelled' : null);
+      const status = ownsTask && stop ? 'interrupted' : 'failed';
+      const execution = Number.isFinite(Date.parse(fact.finishedAt))
+        ? this.store.put('attempts', { ...current, recoveredFinishedAt: fact.finishedAt }) : current;
+      const finished = this.finishAttempt(execution, status, rejection.reason);
+      if (this.store.get('deferredResults', attempt.id)) this.store.remove('deferredResults', attempt.id);
+      this.store.put('attempts', { ...withAttemptUsage(finished, usage), status,
+        resultAccepted: false, reviewResultRejected: rejection, resultDeferred: false, deferredReplayAt: null,
+        cleanupPending: false, cleanupUncertain: false,
+        recovery: { status: 'cleanup-confirmed', reason: fact.reason ?? null } });
+      markGoalCostCleanup(this.store, attempt.id);
+      if (ownsTask && stop) {
+        this.store.put('tasks', { ...task, status: stop, stopRequested: null, recoveryRequested: false, resumeOnStart: false });
+        this.store.event('task.stop.completed', task.id, { status: stop, attemptId: attempt.id }, SYSTEM);
+      } else if (ownsTask && ['running', 'reconciling'].includes(task.status)) {
+        const blocked = this.store.put('tasks', { ...task, status: 'blocked', recoveryRequested: false, resumeOnStart: false, retryAt: null });
+        this.blockForOwner(blocked, 'review-evidence', rejection.reason, '请核对原交付和审查材料，再回复以启动新的独立审查。');
+      }
+      this.company.releaseTemporaryAgent(attempt.agentId);
+      this.store.event('attempt.failed', attempt.id, { taskId: attempt.taskId, code: rejection.code, message: rejection.reason, retry: false }, SYSTEM);
+      this.store.event('attempt.cleanup.confirmed', attempt.id, { taskId: attempt.taskId }, SYSTEM);
+    });
   }
   currentAttemptTask(attempt, applyingResult = false) {
     this.fenced();
@@ -956,7 +1053,7 @@ export class Engine {
         assert(Object.keys(supplied).every(id => digest(current[id] ?? null) === digest(supplied[id])),
           'STALE_REVIEW', 'Host evidence changed after review dispatch');
       }
-      await this.acceptReview(task, attempt, output); return;
+      await this.acceptReview(task, attempt, output, signal); return;
     }
     assert(output.outcome === 'completed', 'INVALID_RESULT', 'Execution did not submit a completed result');
     let collected;
@@ -1017,7 +1114,7 @@ export class Engine {
       failures: [...new Map([...failures, ...observed.failures].map(f => [f.fingerprint, f])).values()] }, true);
   }
   scheduleRepair(task, reason, evidence) { return scheduleRepairFlow(this, task, reason, evidence); }
-  async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
+  async acceptReview(review, attempt, output, signal) { return acceptReviewFlow(this, review, attempt, output, signal); }
   queueIntegration(taskId, compositionRecheckId = null, candidateMergeId = null) {
     if (this.queuedIntegrations.has(taskId)) return;
     this.queuedIntegrations.add(taskId);
@@ -1139,6 +1236,15 @@ export class Engine {
         }
         this.store.put('tasks', { ...task, status: 'ready', retryAt: null, attempts: previousAttempts });
         this.store.event('attempt.route.recheck', attempt.id, { taskId: task.id }, SYSTEM);
+        return;
+      }
+      if (error.code === 'REVIEW_EVIDENCE_UNAVAILABLE' && !aborted && !stopped && !this.closing) {
+        this.fenced();
+        this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true, cleanupPending: false,
+          reviewContextFailure: { code: error.code, artifactId: error.details?.artifactId ?? null } });
+        this.store.event('attempt.cleanup.confirmed', attempt.id, { taskId: task.id }, SYSTEM);
+        const held = this.store.put('tasks', { ...task, attempts: previousAttempts, retryAt: null });
+        this.blockForOwner(held, 'review-evidence', error.message, '请恢复对应交付版本的原始材料，再回复以继续审查。');
         return;
       }
       if (selectionBlocked(error) && !stopped && !this.closing) {

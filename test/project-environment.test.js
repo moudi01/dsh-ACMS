@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, stat, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { runContained } from '../src/runtime/host-command.js';
-import { prepareDependencies } from '../src/runtime/project-environment.js';
+import { checkIdentity, inputFingerprint, prepareDependencies, verifyInCopy } from '../src/runtime/project-environment.js';
 import { fixture, gitProject, hostedWindows, until, taskWaitDiagnostics } from './helpers.js';
 import { cleanupError } from '../src/runtime/owned-process.js';
 import { environmentFailure } from '../src/runtime/preflight.js';
@@ -265,6 +265,34 @@ for (const mode of ['timeout', 'cancel']) test(`dependency preparation uses boun
   }
   for (const pid of pids) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
   assert.equal(f.adapter.calls.length, 0);
+});
+
+test('relative check declarations match the private copy through an aliased project root', windows, async t => {
+  const f = await fixture(t);
+  const parent = path.join(f.root, 'project-paths');
+  const alias = path.join(f.root, 'project-alias');
+  const source = path.join(parent, 'source');
+  const aliasedSource = path.join(alias, 'source');
+  const localInput = path.join(source, 'small.md');
+  const outsideInput = path.join(parent, 'settings.json');
+  await mkdir(source, { recursive: true });
+  await symlink(await realpath(parent), alias, 'junction');
+  await writeFile(localInput, 'approved');
+  await writeFile(outsideInput, '{}');
+  const check = { id: 'alias-check', command: process.execPath, inputs: ['small.md'],
+    args: ['-e', "if (require('node:fs').readFileSync('small.md', 'utf8') !== 'approved') process.exitCode = 3;"] };
+  const identity = await checkIdentity(check, aliasedSource);
+
+  const verified = await verifyInCopy({ dataDir: f.dataDir, source: aliasedSource, inputHash: await inputFingerprint(aliasedSource),
+    check, identity, invoke: runContained });
+  assert.equal(verified.passed, true);
+  assert.equal(verified.reusable, true);
+  assert.equal(verified.checkVersion, identity.version);
+
+  const bound = { ...check, inputs: [...check.inputs, '../settings.json', localInput] };
+  const boundIdentity = await checkIdentity(bound, aliasedSource);
+  assert.equal(boundIdentity.version, (await checkIdentity(bound, source)).version);
+  assert.deepEqual(boundIdentity.inputs.map(([, [file]]) => file), ['small.md', await realpath(outsideInput), await realpath(localInput)]);
 });
 
 test('host evidence is reused only for the same inputs and check, and builds cannot replace the original delivery', windows, async t => {
