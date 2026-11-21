@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { assert, digest, id } from "./util.js";
+import { chooseCostRoute } from './model-cost-selection.js';
 export const SELECTOR_VERSION = "1";
 export const MAX_PREFERENCES = 20;
 export const MAX_CANDIDATES = 50;
@@ -179,7 +180,7 @@ function blockedCode(candidates, exclusions) {
   if (authorized.length && authorized.every(candidate => exclusions.get(candidate.candidateId) === "capability_unknown")) return "CAPABILITY_UNKNOWN";
   return "NO_ELIGIBLE_CANDIDATE";
 }
-export function selectRoute({ candidates = [], preferences = { order: [], revision: 0 }, requirements, binding = {}, policy = {}, ignoreHealth = false } = {}) {
+export function selectRoute({ candidates = [], preferences = { order: [], revision: 0 }, requirements, binding = {}, policy = {}, ignoreHealth = false, costRouting = null } = {}) {
   const normalizedRequirements = normalizeRequirements(requirements ?? {});
   const order = Array.isArray(preferences.order) ? preferences.order : [];
   const mode = bindingActive(binding) ? "explicit" : "auto";
@@ -231,6 +232,9 @@ export function selectRoute({ candidates = [], preferences = { order: [], revisi
       fallbacks.push(syntheticFallback(entry, reason));
     }
   }
+  const cost = chosen && costRouting ? chooseCostRoute({ baseline: chosen, eligible, binding: bindingDescriptor,
+    requirements: normalizedRequirements, context: costRouting }) : null;
+  if (cost) chosen = cost.candidate;
   const limitedFallbacks = fallbacks.slice(0, MAX_CANDIDATES);
   return {
     selectorVersion: SELECTOR_VERSION,
@@ -245,6 +249,7 @@ export function selectRoute({ candidates = [], preferences = { order: [], revisi
     policyFingerprint: modelPolicyFingerprint(policy),
     preferencesRevision: preferences.revision ?? 0,
     taskRequirements: normalizedRequirements,
+    ...(cost ? { costComparison: cost.evidence } : {}),
     decidedAt: new Date().toISOString()
   };
 }

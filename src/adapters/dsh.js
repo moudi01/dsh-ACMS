@@ -8,6 +8,7 @@ import { inside } from '../runtime/workspaces.js';
 import { PairedRuntimes } from './paired.js';
 import { unknownExecution } from '../runtime/execution-receipt.js';
 import { environmentFailure } from '../runtime/preflight.js';
+import { readModelCostRates } from '../runtime/model-cost-rates.js';
 
 const TASK_TOOLS = ['read', 'write', 'edit', 'bash', 'terminal_open'];
 
@@ -142,7 +143,7 @@ export class DshAdapter {
         disposeMs: null, effectiveTotalMs: companyMs, effectiveLimitKnown: false, earliestKnownTimeoutMs: companyMs, runnerSource: 'unknown' }, failures };
   }
   async inspectTaskRoute(task, agent) {
-    const selection = await this.select(agent, { requirements: task.requirements });
+    const selection = await this.select(agent, { requirements: task.requirements, task });
     if (selection.status !== 'selected') return { selection, report: { entry: 'unknown', mounted: 'unknown', authorization: 'unknown', failures: [] } };
     const provider = this.providerFor(selection);
     const report = await this.inspectEntry(provider, selection.chosen, task);
@@ -192,10 +193,36 @@ export class DshAdapter {
   candidates(catalog) {
     return buildCandidates({ providers: this.providers(), catalog, policy: this.company.policy() });
   }
-  async select(agent, { ignoreHealth = false, requirements } = {}) {
+  costDefaultFingerprint() {
+    const { provider, model, reasoningEffort } = this.defaultModel();
+    return digest([provider ?? null, model ?? null, reasoningEffort ?? null]);
+  }
+  independentNativeRoute(route) {
+    const registration = this.ctx.subagents.providers.get(route.provider);
+    return registration?.inheritsParentContext === false && registration.capabilities?.agentOptions === true &&
+      typeof registration.prepareContinuable === 'function';
+  }
+  previousTaskRoute(task, agent) {
+    const rows = this.company.store?.attemptUsageRows?.('task', task.id);
+    if (!rows) return null;
+    for (const { attempt } of rows) {
+      if (attempt.id === task.activeAttemptId || attempt.preflightOnly || attempt.taskGeneration !== task.generation ||
+          attempt.agentId !== agent.id || !attempt.selection?.chosen) continue;
+      return { ...attempt.selection.chosen, attemptId: attempt.id,
+        costSelected: ['lower-listed-rates', 'retry-route'].includes(attempt.selection.costComparison?.reason) };
+    }
+    return null;
+  }
+  async select(agent, { ignoreHealth = false, requirements, task } = {}) {
+    const costRouting = task?.costRouting === true ? {
+      kind: task.kind, defaultFingerprint: this.costDefaultFingerprint(),
+      read: () => readModelCostRates(this.dataDir), previous: () => this.previousTaskRoute(task, agent),
+      available: route => this.healthFor(route).status !== 'unavailable',
+      allowsComparison: route => this.independentNativeRoute(route),
+    } : null;
     const catalog = await this.modelCatalog();
     const policy = this.company.policy();
-    return selectRoute({ candidates: this.candidates(catalog), preferences: this.preferences(), requirements: requirements ?? {}, binding: bindingFromAgent(agent), policy, ignoreHealth });
+    return selectRoute({ candidates: this.candidates(catalog), preferences: this.preferences(), requirements: requirements ?? {}, binding: bindingFromAgent(agent), policy, ignoreHealth, costRouting });
   }
   async modelContext(requirements) {
     const selection = await this.select({ provider: "auto", model: "" }, { requirements });
@@ -255,9 +282,20 @@ export class DshAdapter {
       selection.policyFingerprint === modelPolicyFingerprint(this.company.policy()) &&
       selection.preferencesRevision === this.preferences().revision,
     'ROUTE_PREFLIGHT_STALE', '执行角色、模型策略或偏好已更新，需要重新选路并预检');
+    const comparison = selection.costComparison;
+    if (comparison?.sourceState) {
+      const source = readModelCostRates(this.dataDir);
+      assert(source.state === comparison.sourceState && (source.fingerprint ?? null) === comparison.sourceFingerprint &&
+        this.costDefaultFingerprint() === comparison.defaultFingerprint,
+        'ROUTE_PREFLIGHT_STALE', '本机费率或 DSH 默认配置已变化，需要重新选路并预检');
+    }
+    if (['lower-listed-rates', 'retry-route'].includes(comparison?.reason)) {
+      assert(this.independentNativeRoute(selection.chosen) && this.healthFor(selection.chosen).status !== 'unavailable',
+        'ROUTE_PREFLIGHT_STALE', '已选费率或续用路线的可用性已变化，需要重新选路并预检');
+    }
   }
   async start({ task, attempt, agent, prompt, signal, onAccepted, routeSelection, assertCurrent }) {
-    const selection = routeSelection ?? await this.select(agent, { requirements: task.requirements });
+    const selection = routeSelection ?? await this.select(agent, { requirements: task.requirements, task });
     const beforeDispatch = () => {
       signal.throwIfAborted();
       assertCurrent?.();

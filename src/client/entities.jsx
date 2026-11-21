@@ -270,7 +270,7 @@ function GoalRuntimeBudget({ goal, data, open, busy, runtimeNow }) {
     {canExtendGoalRuntime(goal) && <ActionButton reason={busy ? '正在保存，请稍候' : ''} onClick={() => open('goalRuntime', goal)}>追加目标执行额度</ActionButton>}
   </section>;
 }
-function usdFromMicros(value) {
+export function usdFromMicros(value) {
   const digits = String(value).padStart(7, '0');
   const fraction = digits.slice(-6).replace(/0+$/, '').padEnd(2, '0');
   return `US$${digits.slice(0, -6)}.${fraction}`;
