@@ -10,7 +10,9 @@ export const api = {
   conversation: (input, signal) => request('conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input), signal }),
   messages: (id, signal, before) => request(`conversation?id=${encodeURIComponent(id)}${before ? `&before=${encodeURIComponent(before)}` : ''}`, { signal }),
   pairing: input => request('pairing', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
-  snapshot: signal => request('state', { signal }),
+  snapshot: signal => request('state?view=panel', { signal }),
+  taskAttempts: (taskId, before, signal) =>
+    request(`task-attempts?${new URLSearchParams({ taskId, ...(before === null ? {} : { before }) })}`, { signal }),
   usageSummary: (scope, groupBy, { after, attemptBefore = Number.MAX_SAFE_INTEGER } = {}) =>
     request(`usage/summary?${new URLSearchParams({ ...scope, groupBy, attemptBefore, ...(after != null ? { after } : {}) })}`),
   costForecast: goalId => request(`cost/forecast?goalId=${encodeURIComponent(goalId)}`),

@@ -6,9 +6,11 @@ import { asBusyError, assert, digest, now } from "./util.js";
 import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from "./activity.js";
 import { assertWorktreeRestoreReady } from "./restore-safety.js";
 import { CHECKPOINT_INDEXES } from "./goal-checkpoint-rows.js";
+import { LIVE_ATTEMPT_STATUSES } from "./entity-actions.js";
 
 export const SCHEMA_VERSION = "2";
 const attemptUsageFields = { task: "$.taskId", goal: "$.goalId" };
+const panelAttemptHolds = "(json_extract(body,'$.cleanupPending')=1 OR json_extract(body,'$.cleanupUncertain')=1)";
 
 /**
  * Events that count as effective business activity for issue #17 ordering.
@@ -44,6 +46,7 @@ export class Store {
         collection TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL,
         body TEXT NOT NULL CHECK(json_valid(body)), PRIMARY KEY(collection,id));
       CREATE INDEX IF NOT EXISTS entities_status ON entities(collection,json_extract(body,'$.status'));
+      CREATE INDEX IF NOT EXISTS panel_attempt_holds ON entities(collection) WHERE collection='attempts' AND ${panelAttemptHolds};
       CREATE INDEX IF NOT EXISTS attempts_usage_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS attempts_usage_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS tasks_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks';
@@ -153,6 +156,40 @@ export class Store {
     const rows = this.db.prepare("SELECT body FROM entities WHERE collection='goalCostAttempts' AND json_extract(body,'$.goalId')=?").iterate(goalId);
     for (const { body } of rows) yield JSON.parse(body);
   }
+  panelAttempts(liveIds) {
+    const activeStatuses = LIVE_ATTEMPT_STATUSES.map(() => '?').join(',');
+    return this.db.prepare(`WITH recent AS (
+      SELECT a.rowid FROM entities AS a WHERE a.collection='attempts' AND NOT EXISTS (
+        SELECT 1 FROM entities AS t WHERE t.collection='tasks' AND t.id=json_extract(a.body,'$.taskId')
+          AND json_extract(t.body,'$.status')='deleted'
+      ) ORDER BY a.rowid DESC LIMIT 8
+    )
+    SELECT body,revision FROM entities WHERE rowid IN (
+      SELECT rowid FROM recent
+      UNION SELECT rowid FROM entities WHERE collection='attempts' AND json_extract(body,'$.status') IN (${activeStatuses})
+      UNION SELECT rowid FROM entities WHERE collection='attempts' AND ${panelAttemptHolds}
+      UNION SELECT e.rowid FROM json_each(?) AS live JOIN entities AS e ON e.collection='attempts' AND e.id=live.value
+    ) ORDER BY rowid`).all(...LIVE_ATTEMPT_STATUSES, JSON.stringify(liveIds))
+      .map(row => ({ ...JSON.parse(row.body), revision: row.revision }));
+  }
+  taskPanelActiveAttempts(taskId) {
+    const activeStatuses = LIVE_ATTEMPT_STATUSES.map(() => '?').join(',');
+    return this.db.prepare(`SELECT body,revision FROM entities WHERE collection='attempts' AND json_extract(body,'$.taskId')=?
+      AND (json_extract(body,'$.status') IN (${activeStatuses}) OR ${panelAttemptHolds}) ORDER BY rowid DESC`)
+      .all(taskId, ...LIVE_ATTEMPT_STATUSES).map(row => ({ ...JSON.parse(row.body), revision: row.revision }));
+  }
+  taskPanelVerifications(taskId) {
+    return this.db.prepare(`SELECT v.body, v.revision FROM entities AS v WHERE v.collection='verifications' AND (
+      json_extract(v.body,'$.taskId')=? OR EXISTS (
+        SELECT 1 FROM entities AS a WHERE a.collection='attempts' AND a.id=json_extract(v.body,'$.attemptId')
+          AND json_extract(a.body,'$.taskId')=?
+      )
+    ) AND NOT EXISTS (
+      SELECT 1 FROM entities AS t WHERE t.collection='tasks' AND t.id=json_extract(v.body,'$.taskId')
+        AND json_extract(t.body,'$.status')='deleted'
+    ) ORDER BY v.rowid DESC LIMIT 6`).all(taskId, taskId).reverse()
+      .map(row => ({ ...JSON.parse(row.body), revision: row.revision }));
+  }
   attemptUsagePage(scope, entityId, before, limit) {
     const field = attemptUsageFields[scope];
     return this.db.prepare(`SELECT rowid AS cursor, body FROM entities WHERE collection='attempts' AND json_extract(body,'${field}') = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?`)
@@ -212,18 +249,15 @@ export class Store {
    */
   activity(types = EFFECTIVE_ACTIVITY_EVENTS) {
     const marks = types.map(() => "?").join(",");
-    const rows = this.db.prepare(`SELECT entity_id AS id, at, body FROM events WHERE entity_id IS NOT NULL AND type IN (${marks})`).all(...types);
-    const attemptTask = new Map(this.list("attempts").map(item => [item.id, item.taskId]));
-    const interactionTask = new Map(this.list("interactions").map(item => [item.id, item.taskId]));
-    const byEntity = new Map();
-    for (const row of rows) {
-      let taskId = null;
-      try { taskId = JSON.parse(row.body)?.taskId ?? null; } catch { taskId = null; }
-      const target = taskId ?? attemptTask.get(row.id) ?? interactionTask.get(row.id) ?? row.id;
-      const current = byEntity.get(target);
-      if (!current || String(row.at) > String(current)) byEntity.set(target, row.at);
-    }
-    return byEntity;
+    const rows = this.db.prepare(`WITH effective AS (
+      SELECT e.at, COALESCE(
+        CASE WHEN json_valid(e.body) THEN json_extract(e.body,'$.taskId') END,
+        (SELECT json_extract(a.body,'$.taskId') FROM entities AS a WHERE a.collection='attempts' AND a.id=e.entity_id),
+        (SELECT json_extract(i.body,'$.taskId') FROM entities AS i WHERE i.collection='interactions' AND i.id=e.entity_id),
+        e.entity_id
+      ) AS target FROM events AS e WHERE e.entity_id IS NOT NULL AND e.type IN (${marks})
+    ) SELECT target, MAX(at) AS at FROM effective GROUP BY target`).all(...types);
+    return new Map(rows.map(({ target, at }) => [target, at]));
   }
   page(after = 0, limit = 200) {
     const entries = this.db.prepare("SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?").all(after, limit).map(r => ({ seq: r.seq, at: r.at, type: r.type, entityId: r.entity_id, actor: r.actor, ...JSON.parse(r.body) }));
