@@ -3,6 +3,7 @@ import { mkdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
+import { assertTaskReviewContextCurrent, prepareTaskReviewContext } from './review-context.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { assertPlanAllowsWork, planBlocksDispatch, planBlocksWork } from '../core/plan-approval.js';
@@ -622,16 +623,19 @@ export class Engine {
       assertGoalOpen(this.store.require('goals', task.goalId));
       guardPreparation();
       const hostEvidence = task.kind === 'review' ? await this.workspaces.reviewEvidence(task, controller.signal) : undefined;
+      const taskReviewContext = task.kind === 'review' && task.reviewOf
+        ? await prepareTaskReviewContext(this.store, this.workspaces.dataDir, task, attempt, controller.signal) : null;
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
       this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       guardPreparation();
-      const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence });
+      const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence, taskReviewContext });
       const assertCurrent = () => {
         controller.signal.throwIfAborted();
         const current = this.currentAttemptTask(attempt);
         assertGoalOpen(this.store.require('goals', current.goalId));
         guardPreparation();
+        if (taskReviewContext) assertTaskReviewContextCurrent(this.store, current, taskReviewContext.receipt);
         return current;
       };
       const admission = this.store.transaction(() => {
@@ -658,6 +662,15 @@ export class Engine {
       authorization = admission.authorization;
       const onAccepted = () => this.conversations?.accepted(attempt);
       const input = { task, attempt, agent, routeSelection: preflight.selection, prompt, signal: controller.signal, assertCurrent, onAccepted };
+      const dispatchInput = () => {
+        if (!taskReviewContext) return input;
+        this.store.transaction(() => {
+          assertCurrent();
+          const reviewContext = { ...taskReviewContext.receipt, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') };
+          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), reviewContext });
+        });
+        return { ...input, attempt };
+      };
       if (authorization) {
         const executor = admission.executor;
         const authorizeDispatch = () => {
@@ -667,13 +680,14 @@ export class Engine {
           return current;
         };
         authorizeDispatch();
+        const dispatch = dispatchInput();
         costLaunchInvoked = true;
-        activation = await executor.start({ ...input, assertCurrent: authorizeDispatch,
+        activation = await executor.start({ ...dispatch, assertCurrent: authorizeDispatch,
           authorization: Object.freeze({ ...authorization, route: Object.freeze({ ...authorization.route }) }) });
         assert(typeof activation?.dispose === 'function', 'COST_CLEANUP_UNCONFIRMED', '金额受限执行器未返回可核对的清理入口。');
       } else {
         task = assertCurrent();
-        activation = await this.adapter.start({ ...input, task });
+        activation = await this.adapter.start({ ...dispatchInput(), task });
       }
       this.store.transaction(() => {
         this.fenced();
@@ -956,7 +970,7 @@ export class Engine {
         assert(Object.keys(supplied).every(id => digest(current[id] ?? null) === digest(supplied[id])),
           'STALE_REVIEW', 'Host evidence changed after review dispatch');
       }
-      await this.acceptReview(task, attempt, output); return;
+      await this.acceptReview(task, attempt, output, signal); return;
     }
     assert(output.outcome === 'completed', 'INVALID_RESULT', 'Execution did not submit a completed result');
     let collected;
@@ -1017,7 +1031,7 @@ export class Engine {
       failures: [...new Map([...failures, ...observed.failures].map(f => [f.fingerprint, f])).values()] }, true);
   }
   scheduleRepair(task, reason, evidence) { return scheduleRepairFlow(this, task, reason, evidence); }
-  async acceptReview(review, attempt, output) { return acceptReviewFlow(this, review, attempt, output); }
+  async acceptReview(review, attempt, output, signal) { return acceptReviewFlow(this, review, attempt, output, signal); }
   queueIntegration(taskId, compositionRecheckId = null, candidateMergeId = null) {
     if (this.queuedIntegrations.has(taskId)) return;
     this.queuedIntegrations.add(taskId);
@@ -1139,6 +1153,15 @@ export class Engine {
         }
         this.store.put('tasks', { ...task, status: 'ready', retryAt: null, attempts: previousAttempts });
         this.store.event('attempt.route.recheck', attempt.id, { taskId: task.id }, SYSTEM);
+        return;
+      }
+      if (error.code === 'REVIEW_EVIDENCE_UNAVAILABLE' && !aborted && !stopped && !this.closing) {
+        this.fenced();
+        this.store.put('attempts', { ...this.store.require('attempts', attempt.id), preflightOnly: true, cleanupPending: false,
+          reviewContextFailure: { code: error.code, artifactId: error.details?.artifactId ?? null } });
+        this.store.event('attempt.cleanup.confirmed', attempt.id, { taskId: task.id }, SYSTEM);
+        const held = this.store.put('tasks', { ...task, attempts: previousAttempts, retryAt: null });
+        this.blockForOwner(held, 'review-evidence', error.message, '请恢复对应交付版本的原始材料，再回复以继续审查。');
         return;
       }
       if (selectionBlocked(error) && !stopped && !this.closing) {
