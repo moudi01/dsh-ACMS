@@ -36,12 +36,16 @@ export async function verifyPanelEvents(browser) {
   const page = await browser.newPage();
   const { store } = server.company;
   const command = (name, args) => server.company.command(OWNER, crypto.randomUUID(), name, args);
-  const states = [], polls = [], responses = [], errors = [];
+  const states = [], polls = [], immediatePolls = [], responses = [], errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.on('request', request => {
     const url = new URL(request.url());
     if (stateRoute(url)) states.push(url);
-    if (eventRoute(url)) polls.push(Number(url.searchParams.get('after')));
+    if (eventRoute(url)) {
+      const after = Number(url.searchParams.get('after'));
+      polls.push(after);
+      if (url.searchParams.get('wait') === '0') immediatePolls.push(after);
+    }
   });
   page.on('response', response => {
     const url = new URL(response.url());
@@ -180,6 +184,45 @@ export async function verifyPanelEvents(browser) {
     expect(states.length - startingReads).toBe(2);
     await expect(page.getByRole('button', { name: /追平后重新读取项目乙/ })).toBeVisible();
     await expect(errorBox).toHaveCount(0);
+
+    // Startup after a transport break can change in-memory capacity while
+    // leaving the database cursor and business state unchanged.
+    const runtimeCursor = store.cursor();
+    const releaseDisconnect = Promise.withResolvers();
+    let disconnectReady = false;
+    await page.route(eventRoute, async route => {
+      disconnectReady = true;
+      await releaseDisconnect.promise;
+      await route.abort('failed');
+    }, { times: 1 });
+    server.adapter.activeProbes = 1;
+    await page.reload();
+    await page.getByRole('button', { name: '查看执行资源' }).click();
+    const probe = page.getByRole('region', { name: '执行容量' }).getByRole('button', { name: /模型连通性检测/ });
+    await expect(probe).toHaveCount(1);
+    await expect.poll(() => disconnectReady).toBe(true);
+    startingReads = states.length;
+    const recoveryChecks = immediatePolls.length;
+    const pollsBeforeReconnect = polls.length;
+    server.adapter.activeProbes = 0;
+    releaseDisconnect.resolve();
+    await expect(errorBox).toBeVisible();
+    await expect.poll(() => polls.length, { timeout: 10000 }).toBeGreaterThan(pollsBeforeReconnect);
+    await expect.poll(() => store.events.listenerCount('event'), { timeout: 10000 }).toBeGreaterThan(1);
+    store.events.emit('event', { type: 'fixture.connected' });
+    await expect(page.getByText('已连接 DSH', { exact: true })).toBeVisible();
+    await expect(probe).toHaveCount(0);
+    expect(store.cursor()).toBe(runtimeCursor);
+    expect(states.length - startingReads).toBe(1);
+    expect(immediatePolls.slice(recoveryChecks)).toEqual([runtimeCursor]);
+
+    const priorHeartbeat = polls.length;
+    startingReads = states.length;
+    await expect.poll(() => store.events.listenerCount('event')).toBeGreaterThan(1);
+    store.events.emit('event', { type: 'fixture.heartbeat' });
+    await expect.poll(() => polls.length).toBeGreaterThan(priorHeartbeat);
+    expect(states.length - startingReads).toBe(0);
+    expect(immediatePolls.slice(recoveryChecks)).toEqual([runtimeCursor]);
 
     await page.close();
     await expect.poll(() => store.events.listenerCount('event')).toBe(1);

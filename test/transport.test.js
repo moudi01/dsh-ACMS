@@ -75,6 +75,23 @@ test('panel events return only a durable watermark and legacy consumers retain f
   t.diagnostic('Burst 501 event bytes, legacy=' + sizes.reduce((a, b) => a + b, 0) + ', panel=' + Buffer.byteLength(body));
 });
 
+test('only the panel may read an immediate equal watermark for reconnect', async t => {
+  const f = await fixture(t);
+  const events = createRoutes(f).find(route => route.path.endsWith('/events'));
+  const latestCursor = f.store.cursor();
+  const url = 'http://dsh/api/acms/events?after=' + latestCursor + '&wait=0';
+  const immediate = events.fetch(new Request(url + '&view=panel'));
+  assert.equal(f.store.events.listenerCount('event'), 0);
+  assert.deepEqual(await (await immediate).json(), { latestCursor });
+
+  const controller = new AbortController();
+  const legacy = events.fetch(new Request(url, { signal: controller.signal }));
+  assert.equal(f.store.events.listenerCount('event'), 1);
+  controller.abort();
+  assert.deepEqual(await (await legacy).json(), { entries: [], nextCursor: latestCursor, latestCursor });
+  assert.equal(f.store.events.listenerCount('event'), 0);
+});
+
 test('panel watermark waits on cursor zero and cleans its subscription on cancellation', async () => {
   const store = new Store(':memory:');
   const controller = new AbortController();

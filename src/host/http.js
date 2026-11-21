@@ -53,7 +53,7 @@ export async function waitForEvents(store, after, signal, timeout = 20000) {
 }
 
 export async function waitForPanelWatermark(store, after, signal, timeout = 20000) {
-  await waitForEventChange(store, () => store.cursor() !== after, signal, timeout);
+  if (timeout > 0) await waitForEventChange(store, () => store.cursor() !== after, signal, timeout);
   return { latestCursor: store.cursor() };
 }
 export function createRoutes(runtime) {
@@ -140,7 +140,10 @@ export function createRoutes(runtime) {
     '/api/acms/events': async request => {
       const url = new URL(request.url); const after = Number(url.searchParams.get('after') ?? 0);
       assert(Number.isSafeInteger(after) && after >= 0, 'CURSOR', 'Invalid event cursor');
-      if (url.searchParams.get('view') === 'panel') return json(await waitForPanelWatermark(company.store, after, request.signal));
+      if (url.searchParams.get('view') === 'panel') {
+        const timeout = url.searchParams.get('wait') === '0' ? 0 : undefined;
+        return json(await waitForPanelWatermark(company.store, after, request.signal, timeout));
+      }
       return json(await waitForEvents(company.store, after, request.signal));
     },
     '/api/acms/activity': async request => {

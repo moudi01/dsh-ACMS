@@ -57,11 +57,15 @@ function useCompany() {
     const controller = new AbortController();
     const { signal } = controller;
     const loop = async () => {
+      let reconnecting = false;
       while (!signal.aborted) {
         try {
-          if (!applied.current?.state) await refresh(signal);
+          if (!applied.current?.state) {
+            await refresh(signal);
+            reconnecting = false;
+          }
           const { state, epoch } = applied.current;
-          const { latestCursor } = await api.panelWatermark(state.cursor, signal);
+          const { latestCursor } = await api.panelWatermark(state.cursor, signal, reconnecting);
           signal.throwIfAborted();
           if (epoch !== applied.current.epoch) continue;
           if (latestCursor < state.cursor) {
@@ -70,15 +74,17 @@ function useCompany() {
             publish(beginPanelRewind(applied.current, epoch));
             setConnected(false);
             await refresh(signal);
-          } else if (latestCursor > applied.current.state.cursor) {
-            // Only an applied snapshot advances the cursor. A burst already
-            // covered by an owner's refresh needs no background state read.
+          } else if (reconnecting || latestCursor > applied.current.state.cursor) {
+            // Reconnecting also reconciles host-local state such as probes.
+            // Only an applied snapshot advances the durable cursor.
             await refresh(signal);
           }
+          reconnecting = false;
           setError('');
           setConnected(true);
         } catch (e) {
           if (signal.aborted) break;
+          reconnecting = true;
           setError(e.message); setConnected(false);
           await new Promise(resolve => {
             const done = () => {
