@@ -27,6 +27,7 @@ import { admitTaskCost, assertTaskCostCurrent, closeOptionalDeferralQuote, holdT
   reconcileTaskCost, releaseTaskCostWaits, settleAvailableTaskCosts } from './goal-cost-budget.js';
 import { preparationForTask } from '../core/project-preparation.js';
 import { withdrawOptionalDeferral } from '../core/cost-optional.js';
+import { reviewCancellation } from '../core/task-actions.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 const confirmedExecutionCleanup = fact => ['completed', 'stopped'].includes(fact?.status) && fact.cleanupConfirmed === true;
@@ -37,7 +38,8 @@ function rejectedReviewEvidence(task, error) {
 const holdsTimeBox = (goal, task, occupiedTaskIds) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
   task.goalId === goal.id && (occupiedTaskIds.has(task.id) ||
     (!task.contractObsolete && matchesGoalContract(goal, task) && (!TERMINAL.has(task.status) || task.status === 'failed')));
-const recoverStopIntent = task => task.stopRequested ?? (task.status === 'cancelled' && task.origin?.kind === 'timebox' ? 'cancelled' : null);
+const recoverStopIntent = task => task.stopRequested ??
+  (reviewCancellation(task) || (task.status === 'cancelled' && task.origin?.kind === 'timebox') ? 'cancelled' : null);
 const checkReceipt = (engine, commandId) => path.join(engine.workspaces.dataDir, 'check-receipts', commandId + '.json');
 export class Engine {
   constructor(company, adapter, workspaces, options = {}) {
@@ -1298,9 +1300,8 @@ export class Engine {
         return;
       }
       const retry = !stopped && !this.closing && task.attempts < this.company.policy().maxAttempts;
-      // Recovery must still know about the cancellation if the host loses the
-      // time-box execution before dispose records cleanup confirmation.
-      const pendingStop = stopped === 'cancelled' && task.origin?.kind === 'timebox' ? stopped : null;
+      // Preserve cancellation across disposal and host interruption.
+      const pendingStop = stopped === 'cancelled' && (task.kind === 'review' || task.origin?.kind === 'timebox') ? stopped : null;
       this.store.put('tasks', { ...task, status: stopped ?? (this.closing ? 'paused' : retry ? 'ready' : 'failed'), resumeOnStart: this.closing && !stopped, stopRequested: pendingStop, feedback: `${error.code ?? 'EXECUTION_FAILED'}: ${error.message}`, retryAt: retry ? Date.now() + 1000 * task.attempts : null });
       this.store.event('attempt.failed', attempt.id, { taskId: task.id, code: error.code, message: error.message, retry }, SYSTEM);
       if (!retry && !stopped && !this.closing && !task.repairOf && task.kind === 'work') this.scheduleRepair(this.store.require('tasks', task.id), error.message, { code: error.code ?? null });

@@ -201,7 +201,7 @@ export function createRoutes(runtime) {
   return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing', '/api/acms/composition/archive', '/api/acms/composition/merge-preview'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
     try { return await handler(request); } catch (e) {
       const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : ['NOT_FOUND'].includes(e.code) ? 404
-        : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED',
+        : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'REVIEW_CLEANUP_PENDING', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED',
           'CANDIDATE_NOT_READY', 'STALE_CANDIDATE_CONFIRMATION', 'TARGET_CHANGED', 'TARGET_BASE_CHANGED',
           'PLAN_APPROVAL_REQUIRED', 'STALE_PLAN_APPROVAL', 'PLAN_CLEANUP_PENDING', 'PLAN_CONFLICT',
           'DELIVERY_APPROVAL_REQUIRED', 'DELIVERY_REVISION_REQUIRED', 'DELIVERY_APPROVAL_PROJECT',
