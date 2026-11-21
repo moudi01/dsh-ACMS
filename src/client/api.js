@@ -19,7 +19,8 @@ export const api = {
   usageSummary: (scope, groupBy, { after, attemptBefore = Number.MAX_SAFE_INTEGER } = {}) =>
     request(`usage/summary?${new URLSearchParams({ ...scope, groupBy, attemptBefore, ...(after != null ? { after } : {}) })}`),
   costForecast: goalId => request(`cost/forecast?goalId=${encodeURIComponent(goalId)}`),
-  events: (after, signal) => request(`events?after=${after}`, { signal }),
+  panelWatermark: (after, signal, immediate = false) =>
+    request(`events?view=panel&after=${after}${immediate ? '&wait=0' : ''}`, { signal }),
   activity: (query = {}, signal) => {
     const params = new URLSearchParams();
     for (const key of ['before', 'after', 'limit', 'projectId', 'goalId', 'taskId']) if (query[key] !== undefined && query[key] !== null && query[key] !== '') params.set(key, query[key]);
