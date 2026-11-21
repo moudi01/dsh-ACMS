@@ -32,16 +32,16 @@ async function acceptTaskReview(engine, review, attempt, output, store, signal) 
   assert(source.status === "succeeded", "STALE_REVIEW", "Only a delivered task can be reviewed");
   assert(matchesTaskReview(review, source), "STALE_REVIEW", "Review targets an obsolete deliverable version");
   assert(attempt.agentId !== source.lastAuthorId, "SELF_REVIEW", "Author cannot approve their own work");
-  const context = store.require('attempts', attempt.id).reviewContext;
+  const dispatched = store.require('attempts', attempt.id);
   const unchanged = await workspaces.unchanged(source, source.artifactIds);
   assert(unchanged, "ARTIFACT_CHANGED", "Reviewed files changed after delivery");
-  await verifyTaskReviewContext(workspaces.dataDir, review, context, signal);
+  await verifyTaskReviewContext(workspaces.dataDir, review, dispatched, signal);
 
   store.transaction(() => {
     const currentReview = engine.currentAttemptTask(attempt, true);
     source = store.require("tasks", source.id);
     assert(source.status === "succeeded" && matchesTaskReview(review, source), "STALE_REVIEW", "Deliverable changed during review");
-    if (context) assertTaskReviewContextCurrent(store, currentReview, context);
+    if (dispatched.reviewContext) assertTaskReviewContextCurrent(store, currentReview, dispatched.reviewContext);
     engine.finishAttempt(attempt, "completed", output.summary);
     store.put("tasks", { ...currentReview, status: "succeeded", passed: output.decision === "approve", summary: output.summary ?? "" });
     store.put("verifications", { id: id("verification"), taskId: source.id, goalId: source.goalId, attemptId: attempt.id, artifactHash: source.artifactHash,

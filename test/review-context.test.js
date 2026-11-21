@@ -257,6 +257,11 @@ if (request.mode !== 'task') throw new Error('only local fixture tasks are suppo
 const contract = JSON.parse(request.prompt.split('CONTRACT:\\n')[1]);
 let output;
 if (contract.task.kind === 'review') {
+  if (contract.collaboration) {
+    const context = JSON.parse(await readFile(contract.collaboration.index, 'utf8'));
+    const history = context.handoff?.history;
+    if (history && createHash('sha256').update(await readFile(history.path)).digest('hex') !== history.sha256) throw new Error('wrong author history pin');
+  }
   for (const entry of contract.review.sourceEvidence) {
     const bytes = await readFile(entry.workspacePath);
     if (createHash('sha256').update(bytes).digest('hex') !== entry.rawSha256) throw new Error('wrong review evidence');
@@ -281,10 +286,15 @@ console.log(JSON.stringify({ protocol: request.protocol, requestId: request.requ
   return adapter;
 }
 
-for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-rejection']) {
+for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-rejection', 'pinned-history-before-recovery',
+  'author-history-before-recovery', 'author-history-delayed']) {
   test(`paired review evidence rejection releases its slot only with the right receipt (${mode})`, async t => {
     const f = await fixture(t);
-    const delayedProof = mode === 'delayed' || mode === 'obsolete-contract';
+    const authorHistory = mode.startsWith('author-history-');
+    const pause = mode === 'delayed' || mode === 'author-history-delayed';
+    const delayedProof = pause || mode === 'obsolete-contract';
+    const contextChanged = mode === 'pinned-history-before-recovery' || authorHistory;
+    const rejectionCode = authorHistory ? 'ARTIFACT_CHANGED' : 'REVIEW_EVIDENCE_CHANGED';
     f.command('policy.update', { patch: { maxConcurrent: 1 } });
     const author = f.task();
     await f.start(); await waitFor(f, author, 'succeeded'); await f.engine.stop();
@@ -300,9 +310,19 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
         const fact = await adapter.reconcile(observed);
         assert.equal(fact.status, 'completed');
         assert.equal(fact.cleanupConfirmed, true);
-        reference = path.join(observed.workspace.path, observed.reviewContext.evidence[0].workspacePath);
+        const workspace = authorHistory ? state(f, author).workspace : observed.workspace;
+        reference = path.join(workspace.path, contextChanged ? workspace.collaboration.handoff.history.path
+          : observed.reviewContext.evidence[0].workspacePath);
         original = await readFile(reference);
-        await unlink(reference);
+        if (contextChanged) {
+          const altered = Buffer.from(original);
+          altered[5] ^= 1;
+          await writeFile(reference, altered);
+        } else await unlink(reference);
+        if (authorHistory) {
+          const reviewHistory = path.join(observed.workspace.path, observed.workspace.collaboration.handoff.history.path);
+          assert.deepEqual(await readFile(reviewHistory), original);
+        }
         if (delayedProof) {
           receiptFile = receiptPaths(f.dataDir, observed.execution).file;
           priorReceipt = await readFile(receiptFile, 'utf8');
@@ -310,7 +330,9 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
           mismatched.identity.attemptId = 'another-attempt';
           await writeFile(receiptFile, JSON.stringify(mismatched));
         }
-        if (mode === 'restart-before-rejection') throw new Error('Interrupted before the host evaluated the review result');
+        if (mode === 'restart-before-rejection' || (contextChanged && !delayedProof)) {
+          throw new Error('Interrupted before the host evaluated the review result');
+        }
       }
       return accept(attempt, output, signal);
     };
@@ -321,8 +343,14 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
       assert.equal(executionOccupancy(f.store, adapter, f.engine.live).used, 1);
       assert.equal(f.store.require('attempts', observed.id).cleanupPending, true);
       if (delayedProof) {
-        assert.equal(f.store.require('attempts', observed.id).reviewResultRejected.code, 'REVIEW_EVIDENCE_CHANGED');
-        if (mode === 'delayed') f.command('task.pause', { id: review.id });
+        assert.equal(f.store.require('attempts', observed.id).reviewResultRejected?.code, rejectionCode);
+        if (authorHistory) {
+          await f.engine.stop();
+          await f.start();
+          assert.equal(executionOccupancy(f.store, adapter, f.engine.live).used, 1);
+          assert.equal(f.store.require('attempts', observed.id).cleanupPending, true);
+        }
+        if (pause) f.command('task.pause', { id: review.id });
         else {
           f.command('company.pause', { afterCurrent: true });
           const revised = f.command('goal.edit', { id: author.goalId, patch: { acceptance: 'Use the revised owner contract' } });
@@ -335,12 +363,13 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
       await f.start();
     }
     const blocked = f.store.require('attempts', observed.id);
-    assert.equal(blocked.reviewResultRejected.code, 'REVIEW_EVIDENCE_CHANGED');
+    assert.equal(blocked.reviewResultRejected?.code, rejectionCode);
+    if (authorHistory) assert.equal(blocked.reviewResultRejected.reason, 'Reviewed files changed after delivery');
     assert.equal(blocked.status, delayedProof ? 'interrupted' : 'failed');
     assert.equal(blocked.cleanupPending, false);
     assert.equal(blocked.resultAccepted, false);
     const task = state(f, review);
-    assert.equal(task.status, mode === 'delayed' ? 'paused' : mode === 'obsolete-contract' ? 'cancelled' : 'blocked');
+    assert.equal(task.status, pause ? 'paused' : mode === 'obsolete-contract' ? 'cancelled' : 'blocked');
     if (!delayedProof) assert.equal(task.blocker.kind, 'review-evidence');
     assert.equal(f.store.list('verifications').some(row => row.attemptId === observed.id), false);
     if (mode === 'obsolete-contract') {
@@ -359,7 +388,7 @@ for (const mode of ['live', 'delayed', 'obsolete-contract', 'restart-before-reje
   });
 }
 
-test('a paused review cannot reapply a parked answer after its referenced bytes are lost', async t => {
+for (const material of ['artifact', 'author history']) test('a paused review cannot reapply a parked answer after its ' + material + ' is changed', async t => {
   const finished = Promise.withResolvers();
   let evidence;
   const f = await fixture(t, async input => {
@@ -367,7 +396,9 @@ test('a paused review cannot reapply a parked answer after its referenced bytes 
       await writeFile(path.join(input.task.workspace.path, 'proof.md'), 'Recorded proof');
       return { outcome: 'completed', artifacts: [{ path: 'proof.md' }] };
     }
-    evidence = path.join(input.task.workspace.path, contractOf(input.prompt).review.sourceEvidence[0].workspacePath);
+    const workspace = input.task.workspace;
+    evidence = path.join(workspace.path, material === 'author history' ? workspace.collaboration.handoff.history.path
+      : contractOf(input.prompt).review.sourceEvidence[0].workspacePath);
     await finished.promise; return result;
   });
   const author = f.task();
@@ -380,7 +411,11 @@ test('a paused review cannot reapply a parked answer after its referenced bytes 
   const parked = await until(() => attemptsFor(f, review).find(attempt => attempt.resultDeferred && attempt.cleanupPending === false),
     undefined, taskWaitDiagnostics(f, review.id));
   assert.ok(f.store.get('deferredResults', parked.id));
-  await unlink(evidence);
+  if (material === 'author history') {
+    const altered = await readFile(evidence);
+    altered[5] ^= 1;
+    await writeFile(evidence, altered);
+  } else await unlink(evidence);
   f.command('goal.resume', { id: review.goalId });
   await waitFor(f, review, 'blocked');
   const rejected = f.store.require('attempts', parked.id);

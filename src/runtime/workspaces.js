@@ -118,8 +118,9 @@ export class WorkspaceManager {
         await checkoutGitBundle(delivery, destination, this.dataDir, git);
         return { path: destination, mode: 'review-copy', artifactHash: task.reviewArtifactHash };
       }
-      await copyProject(sourceTask.workspace.path, destination, { collaboration: true });
-      return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration: sourceTask.workspace.collaboration };
+      const collaboration = sourceTask.workspace.collaboration;
+      await copyProject(sourceTask.workspace.path, destination, { collaborationFiles: Object.keys(collaboration?.files ?? {}) });
+      return { path: destination, source: sourceTask.workspace.path, mode: 'review-copy', artifactHash: task.reviewArtifactHash, collaboration };
     }
     const project = this.company.store.require('projects', task.projectId);
     const goal = task.goalId && this.company.store.get('goals', task.goalId);

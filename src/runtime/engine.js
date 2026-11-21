@@ -4,6 +4,7 @@ import path from 'node:path';
 import { assert, id, now, parseResult, digest, SYSTEM, OWNER, TERMINAL } from '../core/util.js';
 import { promptFor } from './prompt.js';
 import { assertTaskReviewContextCurrent, prepareTaskReviewContext } from './review-context.js';
+import { verifyCollaboration } from './collaboration.js';
 import { selectionBlocked } from '../core/model-selection.js';
 import { acceptPlanFlow } from '../core/plan-ledger.js';
 import { assertPlanAllowsWork, planBlocksDispatch, planBlocksWork } from '../core/plan-approval.js';
@@ -29,7 +30,10 @@ import { withdrawOptionalDeferral } from '../core/cost-optional.js';
 
 const ACTIVE = new Set(['preparing', 'running', 'cancelling', 'reconciling']);
 const confirmedExecutionCleanup = fact => ['completed', 'stopped'].includes(fact?.status) && fact.cleanupConfirmed === true;
-const rejectedReviewEvidence = error => ({ code: error.code, reason: error.message });
+function rejectedReviewEvidence(task, error) {
+  if (task?.kind !== 'review' || !task.reviewOf || !['REVIEW_EVIDENCE_CHANGED', 'ARTIFACT_CHANGED'].includes(error.code)) return null;
+  return { code: error.code, reason: error.message };
+}
 const holdsTimeBox = (goal, task, occupiedTaskIds) => task?.kind === 'coordination' && task.origin?.kind === 'timebox' &&
   task.goalId === goal.id && (occupiedTaskIds.has(task.id) ||
     (!task.contractObsolete && matchesGoalContract(goal, task) && (!TERMINAL.has(task.status) || task.status === 'failed')));
@@ -198,9 +202,10 @@ export class Engine {
           continue;
         } catch (e) {
           if (e.cleanupUncertain) hostCleanupFailure = e;
-          if (e.code === 'REVIEW_EVIDENCE_CHANGED' && clean && !hostCleanupFailure &&
+          const rejection = rejectedReviewEvidence(currentTask, e);
+          if (rejection && clean && !hostCleanupFailure &&
               !this.store.require('attempts', previous.id).hostCheck) {
-            this.settleRejectedReview(previous, fact, rejectedReviewEvidence(e));
+            this.settleRejectedReview(previous, fact, rejection);
             continue;
           }
           const stopped = controller.signal.aborted && clean && !hostCleanupFailure && !this.store.require('attempts', previous.id).hostCheck;
@@ -643,11 +648,15 @@ export class Engine {
       const hostEvidence = task.kind === 'review' ? await this.workspaces.reviewEvidence(task, controller.signal) : undefined;
       const taskReviewContext = task.kind === 'review' && task.reviewOf
         ? await prepareTaskReviewContext(this.store, this.workspaces.dataDir, task, attempt, controller.signal) : null;
+      if (['work', 'repair'].includes(task.kind) && task.workspace?.collaboration?.handoff) await verifyCollaboration(task.workspace);
       controller.signal.throwIfAborted();
       task = this.currentAttemptTask(attempt);
       this.adapter.assertTaskRouteCurrent?.(agent, preflight.selection);
       guardPreparation();
       const prompt = promptFor(this.company, task, attempt, { modelContext, hostEvidence, taskReviewContext });
+      const collaboration = task.workspace?.collaboration;
+      const workHandoff = ['work', 'repair'].includes(task.kind) && collaboration?.handoff
+        ? { revision: collaboration.revision, history: collaboration.handoff.history, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') } : null;
       const assertCurrent = () => {
         controller.signal.throwIfAborted();
         const current = this.currentAttemptTask(attempt);
@@ -681,11 +690,12 @@ export class Engine {
       const onAccepted = () => this.conversations?.accepted(attempt);
       const input = { task, attempt, agent, routeSelection: preflight.selection, prompt, signal: controller.signal, assertCurrent, onAccepted };
       const dispatchInput = () => {
-        if (!taskReviewContext) return input;
+        if (!taskReviewContext && !workHandoff) return input;
         this.store.transaction(() => {
           assertCurrent();
-          const reviewContext = { ...taskReviewContext.receipt, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') };
-          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id), reviewContext });
+          attempt = this.store.put('attempts', { ...this.store.require('attempts', attempt.id),
+            ...(taskReviewContext ? { reviewContext: { ...taskReviewContext.receipt, promptUtf8Bytes: Buffer.byteLength(prompt, 'utf8') } } : {}),
+            ...(workHandoff ? { workHandoff } : {}) });
         });
         return { ...input, attempt };
       };
@@ -735,14 +745,16 @@ export class Engine {
       }
       const discardResult = deliveredResult && controller.signal.aborted &&
         (this.closing || this.store.get('tasks', attempt.taskId)?.stopRequested);
-      if ((deliveredResult || attempt.deferredReplayAt) && !discardResult && error.code === 'REVIEW_EVIDENCE_CHANGED') {
+      const rejection = (deliveredResult || attempt.deferredReplayAt) && !discardResult
+        ? rejectedReviewEvidence(this.store.get('tasks', attempt.taskId), error) : null;
+      if (rejection) {
         if (this.store.ownsLease(this.owner, this.epoch)) this.store.transaction(() => {
           this.fenced();
           const saved = this.store.require('attempts', attempt.id);
           const replayAt = attempt.deferredReplayAt === saved.deferredReplayAt && !saved.hostCheck && !saved.cleanupUncertain
             ? saved.deferredReplayAt : null;
           this.store.put('attempts', { ...saved, resultAccepted: false, cleanupPending: true,
-            reviewResultRejected: { ...rejectedReviewEvidence(error), ...(replayAt ? { replayAt } : {}) } });
+            reviewResultRejected: { ...rejection, ...(replayAt ? { replayAt } : {}) } });
         });
         return;
       }
