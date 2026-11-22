@@ -13,6 +13,7 @@ import { attemptUsageSummary, attemptUsageView } from '../core/usage-view.js';
 import { goalCostForecast } from '../core/goal-cost-forecast.js';
 import { taskAttemptHistory } from '../core/panel-attempts.js';
 import { panelEvidence, panelArtifactCounts, panelArtifactLinks } from '../core/panel-evidence.js';
+import { dashboardPage, dashboardSnapshot, workbenchPage } from '../core/panel-dashboard.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -59,6 +60,12 @@ export async function waitForPanelWatermark(store, after, signal, timeout = 2000
 }
 export function createRoutes(runtime) {
   const { company, engine, adapter, workspaces } = runtime;
+  const panelRuntime = async ({ capacity, ...state }) => ({ ...state, runtime: {
+    version: '0.1.0', supportsGracefulPause: true, running: !engine.closing,
+    lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, capacity,
+    providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] },
+    dataDir: runtime.dataDir,
+  } });
   const handlers = {
     '/api/acms/conversation': async request => {
       assert(runtime.conversations, 'CHAT_UNAVAILABLE', '会话服务未加载，请等待插件更新');
@@ -70,13 +77,20 @@ export function createRoutes(runtime) {
       assert(false, 'CHAT_ACTION', '未知会话操作');
     },
     '/api/acms/state': async request => {
-      const panel = new URL(request.url).searchParams.get('view') === 'panel';
-      const { capacity, ...state } = company.snapshot({ panel, capacity: { adapter, live: engine.live } });
-      return json({ ...state, runtime: { version: '0.1.0', supportsGracefulPause: true, running: !engine.closing,
-        lastError: engine.lastError, activeProbes: adapter.activeProbes ?? 0, capacity,
-        providers: adapter.providers?.() ?? [], modelCatalog: await adapter.modelCatalog?.() ?? { models: [], defaultSelection: null, warnings: [] },
-        dataDir: runtime.dataDir } });
+      const view = new URL(request.url).searchParams.get('view');
+      return json(await panelRuntime(view === 'dashboard' ? dashboardSnapshot(company, adapter, engine.live) :
+        company.snapshot({ panel: view === 'panel', capacity: { adapter, live: engine.live } })));
     },
+    '/api/acms/panel-context': async request => {
+      const query = new URL(request.url).searchParams;
+      const taskId = query.get('taskId'), goalId = query.get('goalId');
+      assert(!(taskId !== null && goalId !== null) &&
+        [taskId, goalId].every(id => id === null || id.length > 0 && id.length <= 200), 'INVALID_INPUT', '无效的详情范围。');
+      const snapshot = company.panelContext({ taskId, goalId, capacity: { adapter, live: engine.live } });
+      return json(await panelRuntime(snapshot));
+    },
+    '/api/acms/dashboard': async request => json(dashboardPage(company, new URL(request.url).searchParams)),
+    '/api/acms/workbench': async request => json(workbenchPage(company, new URL(request.url).searchParams)),
     '/api/acms/task-attempts': async request => json(taskAttemptHistory(company.store, new URL(request.url).searchParams)),
     '/api/acms/evidence': async request => json(panelEvidence(company.store, new URL(request.url).searchParams)),
     '/api/acms/artifact-counts': async request => json(panelArtifactCounts(company.store, new URL(request.url).searchParams)),

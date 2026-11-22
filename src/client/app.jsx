@@ -3,9 +3,9 @@ import { api } from './api.js';
 import { initialModelBinding, modelName } from './models.js';
 import { Field, ActionButton, DirectoryField, CollapsibleText } from './components.jsx';
 import { ModelPicker, ModelsPage, EnvironmentFacts } from './model-picker.jsx';
-import { ProjectHierarchy, TaskPath, CompletedGoals } from './hierarchy.jsx';
+import { DashboardHierarchy, DashboardMore, ProjectHierarchy, TaskPath, CompletedGoals, useDashboardPage } from './hierarchy.jsx';
 import { defaultProjectId, graphSections, graphLayout, hiddenDependencies } from './graph.js';
-import { activeViewTasks, compareActivity, completedTasks, isCompleted, isQueuedReview, orderByActivity, verificationsForTask, visibleCounts } from './display.js';
+import { activeViewTasks, compareActivity, completedTasks, isCompleted, isQueuedReview, orderByActivity, taskBoardColumn, verificationsForTask, visibleCounts } from './display.js';
 import { goalSummary } from '../core/hierarchy.js';
 import { accruesGoalRuntime, canExtendGoalRuntime, goalRuntimeLimit, goalRuntimeSpent, MAX_GOAL_RUNTIME_MS } from '../core/runtime-budget.js';
 import { canReconcileTask, goalContractCapacityMessage, goalTaskCount, taskDeletionReason } from '../core/task-actions.js';
@@ -18,11 +18,13 @@ import { ActivityPage } from './activity.jsx';
 import { useTaskAttempts } from './task-attempts.js';
 import { beginPanelRewind, selectPanelSnapshot } from './panel-snapshot.js';
 import { EvidencePager, useCompletedArtifactCounts, useEvidence } from './evidence.jsx';
+import { useWorkbenchPage } from './workbench.js';
 
 const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', preparing: '准备中', reviewing: '待审查', integrating: '集成中', succeeded: '已完成', failed: '失败', paused: '已暂停', stopping: '停止中', cancelled: '已取消', archived: '已归档', deferred: '本轮延期', reconciling: '待核对', completed: '执行结束', interrupted: '已中断', available: '可分配', retired: '已释放', planning: '规划中', active: '进行中', proposed: '提案', pending: '待处理', answered: '已回答', deleted: '已删除' };
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
 const tabs = [['overview', '公司总览', '◈'], ['activity', '动态日志', '◷'], ['projects', '项目与目标', '▱'], ['tasks', '任务工作台', '▤'], ['agents', '组织管理', '♧'], ['models', '模型列表', '◇'], ['workflows', '目标模板', '⇢'], ['artifacts', '产物与验收', '▧'], ['access', '外部接入', '⇄'], ['settings', '公司设置', '⚙']];
 const terminal = ['succeeded', 'cancelled', 'archived', 'deferred'];
+const EMPTY_FILTER_OPTIONS = { items: [], next: null };
 const openGoal = goal => !['succeeded', 'cancelled', 'archived'].includes(goal.status);
 function date(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'; }
 function Badge({ status }) { return <span className="acms-badge" data-status={status}><i />{LABEL[status] ?? status}</span>; }
@@ -31,11 +33,13 @@ function Modal({ title, onClose, children, wide }) {
   const ref = useRef(); useEffect(() => { ref.current.showModal(); }, []);
   return <dialog className={`acms-modal ${wide ? 'wide' : ''}`} ref={ref} onClose={onClose} onClick={e => { if (e.target === ref.current) onClose(); }}><header><h2>{title}</h2><button type="button" className="acms-icon-btn" aria-label="关闭对话框" onClick={onClose}>×</button></header>{children}</dialog>;
 }
-function useCompany() {
+function useCompany(view) {
   const [snapshot, setSnapshot] = useState({ data: null, epoch: 0 });
   const [error, setError] = useState(''); const [connected, setConnected] = useState(false); const [updated, setUpdated] = useState(null);
   const applied = useRef(null);
   const sequence = useRef(0);
+  const requestedView = useRef({ name: view });
+  if (requestedView.current.name !== view) requestedView.current = { name: view };
   const publish = next => {
     applied.current = next;
     setSnapshot({ data: next.state, epoch: next.epoch });
@@ -43,8 +47,11 @@ function useCompany() {
   const refresh = async signal => {
     const request = ++sequence.current;
     const epoch = applied.current?.epoch ?? 0;
-    const state = await api.snapshot(signal);
+    const selection = requestedView.current;
+    const result = await api.snapshot(signal, selection.name);
     signal?.throwIfAborted();
+    if (selection !== requestedView.current) return applied.current?.state;
+    const state = { ...result, presentation: selection.name };
     const chosen = selectPanelSnapshot(applied.current, state, request, epoch);
     if (chosen !== applied.current) {
       publish(chosen);
@@ -54,6 +61,17 @@ function useCompany() {
     }
     return applied.current.state;
   };
+  useEffect(() => {
+    if (!applied.current?.state || applied.current.state.presentation === view) return;
+    const controller = new AbortController();
+    refresh(controller.signal).catch(error => {
+      if (!controller.signal.aborted) {
+        setError(error.message);
+        setConnected(false);
+      }
+    });
+    return () => controller.abort();
+  }, [view]);
   useEffect(() => {
     const controller = new AbortController();
     const { signal } = controller;
@@ -75,7 +93,7 @@ function useCompany() {
             publish(beginPanelRewind(applied.current, epoch));
             setConnected(false);
             await refresh(signal);
-          } else if (reconnecting || latestCursor > applied.current.state.cursor) {
+          } else if (reconnecting || latestCursor > applied.current.state.cursor || applied.current.state.presentation !== requestedView.current.name) {
             // Reconnecting also reconciles host-local state such as probes.
             // Only an applied snapshot advances the durable cursor.
             await refresh(signal);
@@ -103,7 +121,7 @@ function useCompany() {
     void loop();
     return () => controller.abort();
   }, []);
-  return { ...snapshot, error, connected, updated, refresh };
+  return { ...snapshot, data: snapshot.data?.presentation === view ? snapshot.data : null, error, connected, updated, refresh };
 }
 function useRuntimeClock(running) {
   const [, tick] = useState(0);
@@ -114,34 +132,83 @@ function useRuntimeClock(running) {
   }, [running]);
   return Date.now();
 }
+function usePanelContext(scope, cursor, epoch, enabled, selection, retry) {
+  const [result, setResult] = useState(null);
+  const key = JSON.stringify([epoch, scope, enabled]);
+  const active = useRef(null);
+  if (active.current?.key !== key || active.current.selection !== selection) active.current = { key, selection };
+  const requestScope = active.current;
+  useEffect(() => {
+    if (!enabled) return;
+    const controller = new AbortController();
+    const current = () => !controller.signal.aborted && active.current === requestScope;
+    api.panelContext(scope, controller.signal).then(value => {
+      if (current()) setResult({ scope: requestScope, data: value });
+    }).catch(error => {
+      if (current()) setResult({ scope: requestScope, error: error.message, code: error.code });
+    });
+    return () => controller.abort();
+  }, [enabled, requestScope, cursor, retry]);
+  return enabled && result?.scope === requestScope ? result : null;
+}
 export function App() {
-  const { data, epoch, error, connected, updated, refresh } = useCompany(); const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
+  const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selection, setSelection] = useState(null);
+  const selected = selection?.id;
   const [scope, setScope] = useState({}); const [entityView, setEntityView] = useState(null);
+  const view = tab === 'overview' || tab === 'tasks' ? 'dashboard' : 'panel';
+  const { data, epoch, error, connected, updated, refresh } = useCompany(view);
+  const currentEpoch = useRef(epoch);
+  currentEpoch.current = epoch;
   const [conversation, setConversation] = useState(null);
+  const needsContext = !!(data?.dashboardView && (selected || entityView || modal || conversation));
+  const contextScope = selected ? { taskId: selected } : entityView?.kind === 'goal' ? { goalId: entityView.id } :
+    modal?.type === 'goalEdit' ? { goalId: modal.value.id } : {};
+  const [contextRetry, setContextRetry] = useState(0);
+  const context = usePanelContext(contextScope, data?.cursor, epoch, needsContext, selection, contextRetry);
+  const detailData = needsContext ? context?.data : data;
   const chat = (agentId, taskId = null, exact = false) => setConversation({ agentId, taskId: exact ? (taskId ?? null) : (taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null) });
-  const navigate = (kind, id) => { setModal(null); setSelected(kind === 'task' ? id : null); setEntityView(kind === 'task' ? null : { kind, id }); };
+  const navigate = (kind, id) => { setModal(null); setSelection(kind === 'task' ? { id } : null); setEntityView(kind === 'task' ? null : { kind, id }); };
   const selectTask = id => navigate('task', id);
   const [busy, setBusy] = useState(false); const [notice, setNotice] = useState(''); const [actionError, setActionError] = useState('');
-  useEffect(() => { if (selected && data && !data.tasks.some(t => t.id === selected)) setSelected(null); }, [data?.tasks, selected]);
+  const taskUnavailable = selection && data && (data.dashboardView
+    ? context?.code === 'NOT_FOUND' : !data.tasks.some(task => task.id === selected));
+  useEffect(() => {
+    if (taskUnavailable) setSelection(current => current === selection ? null : current);
+  }, [selection, taskUnavailable]);
+  const refreshPanel = () => {
+    if (context?.error && !taskUnavailable) setContextRetry(retry => retry + 1);
+    refresh().catch(error => setActionError(error.message));
+  };
   const act = async (name, args, success = '已保存') => {
     setBusy(true); setActionError('');
-    try { const result = await api.command(name, args); await refresh(); setNotice(result?.collaborationWarning ?? success); return result; }
+    try {
+      const result = await api.command(name, args);
+      if (name === 'task.delete' && currentEpoch.current === epoch && result?.status === 'deleted' && result.id === selected) {
+        setSelection(current => current === selection ? null : current);
+      }
+      await refresh(); setNotice(result?.collaborationWarning ?? success); return result;
+    }
     catch (e) { setActionError(`${e.code ? `${e.code} · ` : ''}${e.message}`); throw e; }
     finally { setBusy(false); }
   };
   const safeAct = (name, args, message) => act(name, args, message).catch(() => {});
-  const open = (type, value) => { setActionError(''); setModal({ type, value, epoch }); };
+  const open = (type, value) => {
+    setActionError('');
+    const hydrate = !!(data?.dashboardView && value?.id && value.revision === undefined && ['project', 'goalEdit', 'answer'].includes(type));
+    setModal({ type, value, epoch, hydrate });
+  };
   const close = () => { setModal(null); setActionError(''); };
-  const task = selected && data?.tasks.find(t => t.id === selected);
-  const entity = entityView && data?.[`${entityView.kind}s`]?.find(e => e.id === entityView.id);
+  const task = selected && detailData?.tasks?.find(t => t.id === selected);
+  const entity = entityView && detailData?.[`${entityView.kind}s`]?.find(e => e.id === entityView.id);
   const detailGoalId = entityView?.kind === 'goal' ? entity?.id : null;
   const budgetGoalId = modal?.type === 'goalRuntime' ? modal.value.id : modal?.type === 'answer' && modal.value.kind === 'budget' ? modal.value.goalId : null;
-  const budgetGoal = budgetGoalId ? data?.goals.find(goal => goal.id === budgetGoalId) : null;
+  const budgetGoal = budgetGoalId ? detailData?.goals?.find(goal => goal.id === budgetGoalId) : null;
   const runtimeGoals = [detailGoalId, budgetGoal?.id].filter(Boolean);
-  const liveRuntime = runtimeGoals.length > 0 && data.attempts.some(attempt => runtimeGoals.includes(attempt.goalId) && accruesGoalRuntime(attempt));
+  const liveRuntime = runtimeGoals.length > 0 && detailData?.attempts.some(attempt => runtimeGoals.includes(attempt.goalId) && accruesGoalRuntime(attempt));
   const runtimeNow = useRuntimeClock(liveRuntime);
-  const active = data?.attempts.filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending) ?? [];
-  const pending = data?.interactions.filter(i => i.status === 'pending') ?? [];
+  const active = data?.attempts?.filter(a => ['preparing', 'running', 'cancelling', 'reconciling'].includes(a.status) || a.cleanupPending) ?? [];
+  const pending = data?.interactions?.filter(i => i.status === 'pending') ?? [];
+  const questions = data?.pendingQuestions ?? pending.length;
   const pendingPlans = (data?.plans ?? []).filter(plan => plan.approvalStatus === 'pending' &&
     data.goals.some(goal => goal.id === plan.goalId && openGoal(goal)) &&
     data.tasks.some(task => task.id === plan.taskId && task.generation === plan.generation && task.blocker?.planId === plan.id));
@@ -150,12 +217,22 @@ export function App() {
     return !!goal.deliveryApproval && !!candidate && !goal.deliveryApproval.returnedVersions?.includes(candidate.version) &&
       (!previous || previous.selection.deliveryHash !== candidate.deliveryHash || previous.selection.version !== candidate.version || previous.status === 'previewed');
   });
+  useEffect(() => {
+    if (!modal?.hydrate || !detailData) return;
+    const collection = { project: 'projects', goalEdit: 'goals', answer: 'interactions' }[modal.type];
+    const value = detailData[collection]?.find(item => item.id === modal.value.id);
+    if (value) setModal(current => current === modal ? { ...modal, value, hydrate: false } : current);
+    else {
+      setActionError('当前记录已不可用，请刷新后重试。');
+      setModal(current => current === modal ? null : current);
+    }
+  }, [modal, detailData]);
   return <div className="acms-app">
     <aside className="acms-nav"><div className="acms-brand"><Logo /><div><b>ACMS</b><span>AGENT COMPANY</span></div><small>01</small></div>
-      <div className="acms-nav-label">工作空间</div><nav aria-label="ACMS 主导航">{tabs.map(([key, name, icon]) => <button key={key} data-active={tab === key} onClick={() => { setTab(key); setScope({}); setSelected(null); setEntityView(null); }}><span aria-hidden="true">{icon}</span>{name}{key === 'overview' && pending.length > 0 && <em>{pending.length}</em>}</button>)}</nav>
+      <div className="acms-nav-label">工作空间</div><nav aria-label="ACMS 主导航">{tabs.map(([key, name, icon]) => <button key={key} data-active={tab === key} onClick={() => { setTab(key); setScope({}); setSelection(null); setEntityView(null); }}><span aria-hidden="true">{icon}</span>{name}{key === 'overview' && questions > 0 && <em>{questions}</em>}</button>)}</nav>
       <div className="acms-nav-bottom"><span className={`acms-live ${connected ? 'online' : ''}`}><i />{connected ? '已连接 DSH' : '正在连接'}</span><small>本机运行 · 数据由你掌握</small><div className="acms-owner"><span>你</span><div><b>公司所有者</b><small>Owner · 最高权限</small></div></div></div>
     </aside>
-    <main className="acms-main"><header className="acms-topbar"><span>工作空间 <b>/</b> {tabs.find(x => x[0] === tab)?.[1] ?? ({ runs: '当前执行', inbox: '待处理事项' })[tab]}</span><div><span className="acms-sync">{updated ? `更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}` : '正在读取公司状态'}</span><button onClick={() => refresh().catch(e => setActionError(e.message))}>刷新</button></div></header>
+    <main className="acms-main"><header className="acms-topbar"><span>工作空间 <b>/</b> {tabs.find(x => x[0] === tab)?.[1] ?? ({ runs: '当前执行', inbox: '待处理事项' })[tab]}</span><div><span className="acms-sync">{updated ? `更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}` : '正在读取公司状态'}</span><button onClick={refreshPanel}>刷新</button></div></header>
       {(error || actionError) && <div className="acms-alert error" role="alert">{actionError || `连接中断，保留上次数据：${error}`}</div>}
       {notice && <div className="acms-toast" role="status">{notice}<button aria-label="关闭提示" onClick={() => setNotice('')}>×</button></div>}
       {!data ? <Empty title="正在连接公司服务">从 DSH 宿主读取任务、组织与运行状态。</Empty> : <div className="acms-content">
@@ -164,26 +241,29 @@ export function App() {
           {data.policy.paused && <div className="acms-alert">{data.policy.pauseMode === 'after-current' ? '已停止接续新任务。当前执行可正常完成，之后保持暂停；点击恢复调度后才会继续。' : '公司调度已暂停。任务和上下文已保留，运行中的任务正在停止。'}</div>}
           {!data.runtime.providers.length && <div className="acms-alert">尚未检测到执行器。请在 DSH 安装或启用子智能体 provider；你仍可配置项目、组织与流程。</div>}
           <div className="acms-metrics">{[
-            ['进行中的目标', data.goals.filter(g => goalSummary(g, data.tasks).total > 0 && ['active', 'planning'].includes(g.status)).length, 'AUTHORIZED GOALS', () => { setScope({ activeGoals: true }); setTab('projects'); }],
+            ['进行中的目标', data.activeGoals ?? data.goals.filter(g => goalSummary(g, data.tasks).total > 0 && ['active', 'planning'].includes(g.status)).length, 'AUTHORIZED GOALS', () => { setScope({ activeGoals: true }); setTab('projects'); }],
             ['执行资源', `${data.runtime.capacity?.used ?? active.length} / ${data.runtime.capacity?.limit ?? data.policy.maxConcurrent}`, 'ACTIVE RUNS', () => setTab('runs')],
-            ['审查进行中', data.tasks.filter(isQueuedReview).length, 'REVIEW QUEUE', () => { setScope({ reviewQueue: true }); setTab('tasks'); }],
-            ['需要你处理', pending.length, 'YOUR INBOX', () => setTab('inbox')],
+            ['审查进行中', data.reviewQueue ?? data.tasks.filter(isQueuedReview).length, 'REVIEW QUEUE', () => { setScope({ reviewQueue: true }); setTab('tasks'); }],
+            ['需要你处理', questions, 'YOUR INBOX', () => setTab('inbox')],
           ].map(([label, value, hint, go]) => <button key={label} className="acms-metric-link" onClick={go} aria-label={`查看${label}`}><span>{label}</span><strong>{value}</strong><small>{hint} ↗</small></button>)}</div>
           <div className="acms-overview-grid"><section className="acms-panel"><div className="acms-sectionhead"><h2>项目、目标与任务</h2><div className="acms-actions"><button className="text" onClick={() => { setScope({ completed: true }); setTab('projects'); }}>已完成目标 ↗</button><button className="text" onClick={() => setTab('tasks')}>查看全部任务 ↗</button></div></div>
-            {!data.goals.length ? <Empty title="从一个明确的目标开始" action={<button className="primary" onClick={() => open('goal')}>创建第一个目标</button>}>目标是要交付的结果，项目是存放文件的目录；任务由负责人自动拆解生成。创建目标时可一起配置项目，无需先创建任务。</Empty> : <ProjectHierarchy data={data} navigate={navigate} select={selectTask} open={open} onGoal={(projectId, goalId) => { setScope({ projectId, goalId }); setTab('tasks'); }} /> }</section>
+            {data.dashboardView && data.projects.total > 0 ? <DashboardHierarchy key={epoch} data={data} navigate={navigate} select={selectTask} open={open}
+              onGoal={(projectId, goalId) => { setScope({ projectId, goalId }); setTab('tasks'); }} /> :
+              (data.dashboardView || !data.goals.length) ? <Empty title="从一个明确的目标开始" action={<button className="primary" onClick={() => open('goal')}>创建第一个目标</button>}>目标是要交付的结果，项目是存放文件的目录；任务由负责人自动拆解生成。创建目标时可一起配置项目，无需先创建任务。</Empty> : <ProjectHierarchy data={data} navigate={navigate} select={selectTask} open={open} onGoal={(projectId, goalId) => { setScope({ projectId, goalId }); setTab('tasks'); }} /> }</section>
+            {data.dashboardView ? <DashboardPending key={epoch} data={data} open={open} navigate={navigate} /> :
             <section className="acms-panel"><div className="acms-sectionhead"><h2>等待你的决定</h2><span className="acms-count">{pending.length + pendingPlans.length + pendingDeliveries.length}</span></div><p className="acms-sectionnote">这些等待只影响相关任务，其余工作继续。</p>
               {!pending.length && !pendingPlans.length && !pendingDeliveries.length && <Empty title="暂时没有待办决定">智能体会先尝试自行解决可处理的问题。</Empty>}
               {pendingPlans.map(plan => <div className="acms-inbox" key={plan.id}><span className="acms-tag">计划审批</span><h3>{data.goals.find(goal => goal.id === plan.goalId)?.title}</h3><p>{plan.proposalTasks.length} 项任务待批准</p><button onClick={() => navigate('goal', plan.goalId)}>查看计划提案 →</button></div>)}
               {pendingDeliveries.map(goal => <div className="acms-inbox" key={goal.id}><span className="acms-tag">交付审批</span><h3>{goal.title}</h3><p>候选已完成验收</p><button onClick={() => navigate('goal', goal.id)}>查看交付审批 →</button></div>)}
               {pending.map(i => <div className="acms-inbox"  key={i.id}><span className="acms-tag">{i.kind}</span><h3>{data.tasks.find(t => t.id === i.taskId)?.title}</h3><p>{i.question}</p><button onClick={() => open('answer', i)}>查看并回复 →</button></div>)}
-            </section></div>
-          <section className="acms-panel"><div className="acms-sectionhead"><h2>最近的执行</h2><span className="acms-muted">执行结束后会自动进入检查与交付</span></div><RunTable attempts={data.attempts.slice(-8).reverse()} data={data} select={selectTask} navigate={navigate} /></section>
+            </section>}</div>
+          <section className="acms-panel"><div className="acms-sectionhead"><h2>最近的执行</h2><span className="acms-muted">执行结束后会自动进入检查与交付</span></div><RunTable attempts={(data.recent ?? data.attempts.slice(-8)).slice().reverse()} data={data} select={selectTask} navigate={navigate} /></section>
         </>}
         {tab === 'projects' && <ProjectsPage data={data} navigate={navigate} select={selectTask} open={open} scope={scope} act={safeAct} busy={busy} onGoal={(projectId, goalId, options = {}) => { setScope({ projectId, goalId, ...(options.completed ? { completed: true } : {}) }); setTab('tasks'); }} />}
         {tab === 'activity' && <ActivityPage key={epoch} data={data} select={selectTask} navigate={navigate} updated={updated} open={open} />}
         {tab === 'runs' && <><PageHead title="当前执行" description="占用口径与调度器一致：任务执行、Git 集成、独立对话和模型检测各占一个名额。" /><CapacityPanel capacity={data.runtime.capacity} data={data} select={selectTask} chat={chat} openModels={() => setTab('models')} /><section className="acms-panel"><div className="acms-sectionhead"><h2>任务执行明细</h2><span className="acms-muted">点击任务查看执行详情</span></div><RunTable attempts={active} data={data} select={selectTask} navigate={navigate} /></section></>}
         {tab === 'inbox' && <><PageHead title="待处理事项" description="只处理需要你提供材料或作出决定的分支。" />{!pending.length && <Empty title="暂无待处理事项" />}{pending.map(i => <section className="acms-panel" key={i.id}><button className="text" onClick={() => selectTask(i.taskId)}>{data.tasks.find(t => t.id === i.taskId)?.title}</button><p>{i.question}</p><button onClick={() => open('answer', i)}>查看并回复</button></section>)}</>}
-        {tab === 'tasks' && <Tasks navigate={navigate} data={data} epoch={epoch} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={next => setScope(next ?? {})} />}
+        {tab === 'tasks' && <Tasks key={epoch} navigate={navigate} snapshot={data} epoch={epoch} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={next => setScope(next ?? {})} />}
         {tab === 'models' && <ModelsPage data={data} refresh={refresh} />}
         {tab === 'agents' && <><PageHead eyebrow="PEOPLE & CAPABILITIES" title="组织管理" description="选择角色使用的模型，按工作需要设置常驻或临时人员。" action={<button className="primary" onClick={() => open('agent')}>＋ 创建角色</button>} /><div className="acms-agent-grid">{data.agents.map(a => <button key={a.id} className="acms-agent-card" onClick={() => navigate('agent', a.id)}><div className="acms-agent-top"><span className={`acms-avatar ${a.role}`}>{ROLE[a.role]}</span><Badge status={a.status} /></div><h3>{a.name}</h3><p>{a.description || '按任务范围执行工作，并提交可验收的交付物。'}</p><div className="acms-tags"><span>{a.temporary ? '临时人员' : '常驻人员'}</span></div><footer><span>{modelName(a, data.runtime)}</span><span>详情与编辑 ↗</span></footer></button>)}</div></>}
         {tab === 'workflows' && <><PageHead eyebrow="GOAL TEMPLATES" title="目标模板" description="模板描述整个目标如何实现；任务是最小执行粒度，不再有阶段。基础模板为 拆分 → 执行 → 最终审查。" action={<button className="primary" onClick={() => open('workflow')}>＋ 新建模板</button>} /><div className="acms-flow-list">{(data.templates ?? []).map(t => <section key={t.id} className="acms-panel"><div className="acms-sectionhead"><div><h2>{t.name}</h2><span className="acms-muted">版本 {t.version} · {t.finalReview ? '含最终审查' : '不含最终审查'}</span></div><button onClick={() => open('workflow', t)}>编辑并发布新版本</button></div><div className="acms-flow-stages">{(t.phases ?? []).map((p, i) => <React.Fragment key={p.id}>{i > 0 && <span className="acms-flow-arrow">→</span>}<div className={`acms-stage ${p.id === 'execute' ? 'work' : 'review'}`}><small>阶段 {i + 1}</small><h3>{p.name}</h3><span>{p.id === 'plan' ? '负责人拆分' : p.id === 'final-review' ? '目标交付后总体审查' : '执行与交付'}</span></div></React.Fragment>)}</div></section>)}</div></>}
@@ -192,13 +272,32 @@ export function App() {
         {tab === 'settings' && <><PageHead eyebrow="OWNER BOUNDARIES" title="公司设置" description="这些边界由你控制。管理智能体可以在边界内调整执行方式。" /><div className="acms-overview-grid"><section className="acms-panel"><div className="acms-sectionhead"><h2>资源与权限</h2><button onClick={() => open('policy', data.policy)}>编辑边界</button></div><dl className="acms-definition"><dt>最大同时执行</dt><dd>{data.policy.maxConcurrent} 个</dd><dt>协调预留</dt><dd>{data.policy.controlSlots} 个</dd><dt>每个目标任务上限</dt><dd>{data.policy.maxTasksPerGoal} 项</dd><dt>单任务执行尝试</dt><dd>{data.policy.maxAttempts} 次</dd><dt>最大返工</dt><dd>{data.policy.maxReworks} 次</dd><dt>目标时间盒</dt><dd>{data.policy.goalTimeBoxMs ? `${(data.policy.goalTimeBoxMs / 60000).toFixed(1)} 分钟` : '未启用'}</dd><dt>收尾预留</dt><dd>{data.policy.timeBoxReserveMs ? `${(data.policy.timeBoxReserveMs / 60000).toFixed(1)} 分钟` : '未设置'}</dd><dt>单次执行时限</dt><dd>{data.policy.turnTimeoutMs / 60000} 分钟</dd><dt>允许的执行器</dt><dd>{data.policy.allowedProviders.join('、') || '使用已安装执行器'}</dd></dl></section><section className="acms-panel"><div className="acms-sectionhead"><h2>项目与检查</h2><button onClick={() => open('project')}>＋ 添加项目</button></div>{!data.projects.length ? <Empty title="尚未添加项目">指定一个工作目录，并配置验收检查。</Empty> : data.projects.map(p => <button className="acms-project-row" key={p.id} onClick={() => open('project', p)}><b>{p.name}</b><code>{p.repoRoot}</code><span>{p.mode === 'git' ? 'Git 隔离工作副本' : '独立目录副本'} · {p.checks.length} 项检查 · {p.autoMerge ? '自动集成' : '保留交付版本'}</span></button>)}</section></div><section className="acms-panel"><div className="acms-sectionhead"><h2>运行信息</h2><span>ACMS {data.runtime.version}</span></div><dl className="acms-definition"><dt>数据位置</dt><dd><code>{data.runtime.dataDir}</code></dd><dt>宿主通信</dt><dd>DSH 原生通道 · 无独立管理端口</dd><dt>执行器</dt><dd>{data.runtime.providers.map(p => p.name).join('、') || '未安装'}</dd></dl></section></>}
       </div>}
     </main>
-    {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
-    {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={data} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
-    {modal && data && (modal.type !== 'artifact' || modal.epoch === epoch) && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
-    {conversation && data && <ConversationWindow key={`${conversation.agentId}:${conversation.taskId}`} {...conversation} data={data} close={() => setConversation(null)} />}
+    {needsContext && context?.error && <div className="acms-toast" role="alert">{context.error}
+      <button aria-label="关闭详情" onClick={() => { setSelection(null); setEntityView(null); setModal(null); setConversation(null); }}>×</button></div>}
+    {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={detailData} select={selectTask} close={() => setSelection(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
+    {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={detailData} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
+    {modal && detailData && !modal.hydrate && (modal.type !== 'artifact' || modal.epoch === epoch) && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`}
+      modal={modal} data={detailData} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
+    {conversation && detailData && <ConversationWindow key={`${conversation.agentId}:${conversation.taskId}`} {...conversation} data={detailData} close={() => setConversation(null)} />}
   </div>;
 }
 function PageHead({ eyebrow, title, description, action }) { return <div className="acms-pagehead"><div><div className="acms-eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>; }
+function DashboardPending({ data, navigate, open }) {
+  const page = useDashboardPage('pending', null, data.cursor, data.pending);
+  return <section className="acms-panel"><div className="acms-sectionhead"><h2>等待你的决定</h2><span className="acms-count">{page.total}</span></div>
+    <p className="acms-sectionnote">这些等待只影响相关任务，其余工作继续。</p>
+    {!page.total && <Empty title="暂时没有待办决定">智能体会先尝试自行解决可处理的问题。</Empty>}
+    {page.items.map(item => <div className="acms-inbox" key={item.id}>
+      <span className="acms-tag">{item.kind === 'plan' ? '计划审批' : item.kind === 'delivery' ? '交付审批' : item.interactionKind}</span>
+      <h3>{item.title}</h3>
+      {item.kind === 'question' ? <><p>{item.question}</p><button onClick={() => open('answer', { id: item.id })}>查看并回复 →</button></> : <>
+        <p>{item.kind === 'plan' ? `${item.count} 项任务待批准` : '候选已完成验收'}</p>
+        <button onClick={() => navigate('goal', item.goalId)}>{item.kind === 'plan' ? '查看计划提案 →' : '查看交付审批 →'}</button>
+      </>}
+    </div>)}
+    <DashboardMore page={page} label="待办" />
+  </section>;
+}
 function EvidencePage({ data, navigate, open }) {
   const [projectId, setProjectId] = useState('');
   const [goalId, setGoalId] = useState('');
@@ -257,7 +356,19 @@ function EvidencePage({ data, navigate, open }) {
     </section>
   </>;
 }
-function RunTable({ attempts, data, select, navigate }) { return !attempts.length ? <p className="acms-sectionnote">还没有执行记录。创建目标后，规划、执行和审查会自动衔接。</p> : <div className="acms-table-scroll"><table><thead><tr><th>任务</th><th>智能体</th><th>状态</th><th>开始时间</th><th>耗时</th></tr></thead><tbody>{attempts.map(a => <tr key={a.id}><td><button className="text" onClick={() => select(a.taskId)}>{data.tasks.find(t => t.id === a.taskId)?.title}</button></td><td>{navigate ? <button className="text" onClick={() => navigate('agent', a.agentId)}>{data.agents.find(g => g.id === a.agentId)?.name ?? '已删除角色'}</button> : data.agents.find(g => g.id === a.agentId)?.name ?? '已删除角色'}</td><td><Badge status={a.status} /></td><td>{date(a.startedAt)}</td><td>{a.elapsedMs ? `${(a.elapsedMs / 1000).toFixed(1)} 秒` : '—'}</td></tr>)}</tbody></table></div>; }
+function RunTable({ attempts, data, select, navigate }) {
+  if (!attempts.length) return <p className="acms-sectionnote">还没有执行记录。创建目标后，规划、执行和审查会自动衔接。</p>;
+  return <div className="acms-table-scroll"><table><thead><tr><th>任务</th><th>智能体</th><th>状态</th><th>开始时间</th><th>耗时</th></tr></thead><tbody>
+    {attempts.map(attempt => {
+      const agentName = attempt.agentName ?? data.agents?.find(agent => agent.id === attempt.agentId)?.name ?? '已删除角色';
+      return <tr key={attempt.id}><td><button className="text" onClick={() => select(attempt.taskId)}>
+        {attempt.taskTitle ?? data.tasks?.find(task => task.id === attempt.taskId)?.title}</button></td>
+        <td>{navigate ? <button className="text" onClick={() => navigate('agent', attempt.agentId)}>{agentName}</button> : agentName}</td>
+        <td><Badge status={attempt.status} /></td><td>{date(attempt.startedAt)}</td>
+        <td>{attempt.elapsedMs ? `${(attempt.elapsedMs / 1000).toFixed(1)} 秒` : '—'}</td></tr>;
+    })}
+  </tbody></table></div>;
+}
 function CapacityPanel({ capacity, data, select, chat, openModels }) {
   if (!capacity) return <section className="acms-panel"><div className="acms-sectionhead"><h2>执行容量</h2></div><p className="acms-sectionnote">当前宿主未提供执行容量数据。请刷新页面；若仍为空，说明宿主插件版本过旧，需先完成升级。</p></section>;
   const entries = capacity.entries ?? [];
@@ -281,8 +392,9 @@ function CapacityPanel({ capacity, data, select, chat, openModels }) {
     </div>
   </section>;
 }
-function Tasks({ data, epoch, select, create, createGoal, act, busy, open, scope, navigate, clearScope }) {
-  const autoProject = defaultProjectId(data.projects, data.tasks);
+function Tasks({ snapshot, epoch, select, create, createGoal, act, busy, open, scope, navigate, clearScope }) {
+  const bounded = snapshot.dashboardView;
+  const autoProject = bounded ? snapshot.defaultProjectId : defaultProjectId(snapshot.projects, snapshot.tasks);
   const [mode, setMode] = useState(scope.reviewQueue ? 'board' : 'tree'); const [project, setProject] = useState(() => scope.status || scope.reviewQueue || scope.allProjects ? '' : scope.projectId ?? autoProject); const [goal, setGoal] = useState(scope.goalId ?? '');
   useEffect(() => {
     if (scope.status || scope.reviewQueue || scope.allProjects) { setProject(''); setGoal(''); return; }
@@ -292,28 +404,70 @@ function Tasks({ data, epoch, select, create, createGoal, act, busy, open, scope
   const [view, setView] = useState(scope.completed ? 'completed' : 'active');
   useEffect(() => { if (scope.completed) setView('completed'); }, [scope]);
   const [search, setSearch] = useState(''); const [showReviews, setShowReviews] = useState(true); const [showTrash, setShowTrash] = useState(false); const [completedStatus, setCompletedStatus] = useState('');
+  const page = useWorkbenchPage({
+    projectId: project, goalId: goal, search, status: view === 'completed' ? completedStatus : scope.status ?? '',
+    completed: view === 'completed' ? '1' : '0', reviewQueue: scope.reviewQueue ? '1' : '0', showReviews: showReviews ? '1' : '0',
+  }, snapshot.cursor, bounded && !showTrash);
+  const trash = usePanelContext({}, snapshot.cursor, epoch, bounded && showTrash);
+  const pageData = bounded ? { ...snapshot, evidenceView: 'panel', tasks: page?.tasks ?? [], projects: page?.projects ?? snapshot.projects.items,
+    goals: page?.goals ?? [], agents: page?.agents ?? [], knownTasks: page?.knownTasks ?? [] } : snapshot;
+  const data = showTrash && trash?.data ? trash.data : pageData;
+  const projectOptions = useDashboardPage('project-options', null, snapshot.cursor, page?.projectOptions ?? snapshot.projects, bounded && !showTrash);
+  const goalOptions = useDashboardPage('goal-options', project || null, snapshot.cursor, page?.goalOptions ?? EMPTY_FILTER_OPTIONS, bounded && !showTrash);
+  const options = (records, extra) => orderByActivity([...new Map([...records, ...extra].map(item => [item.id, item])).values()]);
+  const projectChoices = options(data.projects, bounded && !showTrash ? projectOptions.items : []);
+  const goalChoices = options(data.goals, bounded && !showTrash ? goalOptions.items : []).filter(item => !project || item.projectId === project);
   const scoped = data.tasks.filter(t => t.status !== 'deleted' && (!scope.reviewQueue || isQueuedReview(t)) && (!project || t.projectId === project) && (!goal || t.goalId === goal) && (showReviews || t.kind !== 'review') && `${t.title} ${t.description}`.toLowerCase().includes(search.toLowerCase()));
-  const counts = visibleCounts(scoped);
-  const active = activeViewTasks(scoped).filter(t => !scope.status || t.status === scope.status).sort(compareActivity);
-  const done = completedTasks(scoped).filter(t => !completedStatus || t.status === completedStatus);
+  const counts = bounded ? page?.counts ?? visibleCounts([]) : visibleCounts(scoped);
+  const active = bounded ? page?.tasks ?? [] : activeViewTasks(scoped).filter(t => !scope.status || t.status === scope.status).sort(compareActivity);
+  const done = bounded ? page?.tasks ?? [] : completedTasks(scoped).filter(t => !completedStatus || t.status === completedStatus);
   const visible = view === 'completed' ? done : active;
   const columns = [['ready', '待执行'], ['running', '执行中'], ['reviewing', '审查与集成'], ['blocked', '阻塞与暂停'], ['succeeded', '已结束']];
-  const col = status => status === 'preparing' ? 'running' : ['integrating', 'reviewing'].includes(status) ? 'reviewing' : ['blocked', 'paused', 'failed', 'reconciling', 'stopping'].includes(status) ? 'blocked' : terminal.includes(status) ? 'succeeded' : status;
+  const col = taskBoardColumn;
   const scopedOpenGoals = data.goals.filter(g => openGoal(g) && (!project || g.projectId === project));
-  const createTaskReason = !scopedOpenGoals.length ? (project ? '当前项目没有进行中的目标；请先新建目标，再创建任务。' : '请先创建一个进行中的目标，任务需要归属于目标。') : '';
+  const hasGoals = page?.hasOpenGoals ?? scopedOpenGoals.length > 0;
+  const createTaskReason = !hasGoals ? (project ? '当前项目没有进行中的目标；请先新建目标，再创建任务。' : '请先创建一个进行中的目标，任务需要归属于目标。') : '';
   const createTaskGoalId = goal && scopedOpenGoals.some(g => g.id === goal) ? goal : undefined;
   return <><PageHead eyebrow="TASK WORKSPACE" title="任务工作台" description="查看依赖、调整分工，并追踪每一项交付的完整过程。" action={<div className="acms-actions"><button onClick={() => createGoal(project ? { projectId: project } : {})}>＋ 新建目标</button><ActionButton className="primary" reason={createTaskReason} onClick={() => create({ ...(project ? { projectId: project } : {}), ...(createTaskGoalId ? { goalId: createTaskGoalId } : {}) })}>＋ 新建任务</ActionButton></div>} />
-    <div className="acms-toolbar"><button onClick={() => setShowTrash(!showTrash)}>{showTrash ? '返回任务看板' : `回收站（${data.trash?.length ?? 0}）`}</button><input aria-label="搜索任务" placeholder="搜索任务…" value={search} onChange={e => setSearch(e.target.value)} /><select aria-label="筛选项目" value={project} onChange={e => { setProject(e.target.value); setGoal(''); }}><option value="">全部项目</option>{orderByActivity(data.projects).map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select><select aria-label="筛选目标" value={goal} onChange={e => setGoal(e.target.value)}><option value="">全部目标</option>{orderByActivity(data.goals.filter(g => !project || g.projectId === project)).map(g => <option value={g.id} key={g.id}>{g.title}</option>)}</select><label className="acms-checkbox"><input type="checkbox" checked={showReviews} disabled={scope.reviewQueue} onChange={e => setShowReviews(e.target.checked)} />显示审查任务</label><button disabled={scope.reviewQueue} title={scope.reviewQueue ? '清除审查队列筛选后可查看已完成任务' : undefined} aria-pressed={view === 'completed'} onClick={() => setView(view === 'completed' ? 'active' : 'completed')}>{view === 'completed' ? `返回进行中（${active.length}）` : `已完成（${counts.completed}）`}</button>{view === 'completed' && <select aria-label="筛选完成状态" value={completedStatus} onChange={e => setCompletedStatus(e.target.value)}><option value="">全部完成状态</option><option value="succeeded">完成</option><option value="archived">归档</option><option value="cancelled">取消</option></select>}{view === 'active' && <div className="acms-segment"><button data-active={mode === 'tree'} onClick={() => setMode('tree')}>层级</button><button data-active={mode === 'board'} onClick={() => setMode('board')}>看板</button><button data-active={mode === 'graph'} onClick={() => setMode('graph')}>依赖图</button></div>}</div>
-    <p className="acms-visible-count" aria-live="polite">当前{scope.reviewQueue ? '审查队列' : view === 'completed' ? '已完成' : '进行中'}视图：可见 {visible.length} / 共 {counts.total} 项{counts.completed ? `（已完成/归档/取消 ${counts.completed} 项）` : ''}{view === 'active' && counts.completed > 0 ? ' · 已完成任务已隐藏，可切换到已完成列表' : ''}</p>
+    <div className="acms-toolbar">
+      <button onClick={() => setShowTrash(!showTrash)}>{showTrash ? '返回任务看板' : `回收站（${data.trash?.length ?? snapshot.trashCount ?? 0}）`}</button>
+      <input aria-label="搜索任务" placeholder="搜索任务…" maxLength={300} value={search} onChange={e => setSearch(e.target.value)} />
+      <select aria-label="筛选项目" value={project} onChange={e => { setProject(e.target.value); setGoal(''); }}>
+        <option value="">全部项目</option>{projectChoices.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+      </select>
+      {bounded && !showTrash && <DashboardMore page={projectOptions} label="项目筛选项" />}
+      <select aria-label="筛选目标" value={goal} onChange={e => setGoal(e.target.value)}>
+        <option value="">全部目标</option>{goalChoices.map(g => <option value={g.id} key={g.id}>{g.title}</option>)}
+      </select>
+      {bounded && !showTrash && <DashboardMore page={goalOptions} label="目标筛选项" />}
+      <label className="acms-checkbox"><input type="checkbox" checked={showReviews} disabled={scope.reviewQueue} onChange={e => setShowReviews(e.target.checked)} />显示审查任务</label>
+      <button disabled={scope.reviewQueue} title={scope.reviewQueue ? '清除审查队列筛选后可查看已完成任务' : undefined} aria-pressed={view === 'completed'} onClick={() => setView(view === 'completed' ? 'active' : 'completed')}>
+        {view === 'completed' ? `返回进行中（${page?.activeTotal ?? active.length}）` : `已完成（${counts.completed}）`}
+      </button>
+      {view === 'completed' && <select aria-label="筛选完成状态" value={completedStatus} onChange={e => setCompletedStatus(e.target.value)}>
+        <option value="">全部完成状态</option><option value="succeeded">完成</option><option value="archived">归档</option><option value="cancelled">取消</option>
+      </select>}
+      {view === 'active' && <div className="acms-segment"><button data-active={mode === 'tree'} onClick={() => setMode('tree')}>层级</button>
+        <button data-active={mode === 'board'} onClick={() => setMode('board')}>看板</button><button data-active={mode === 'graph'} onClick={() => setMode('graph')}>依赖图</button></div>}
+    </div>
+    <p className="acms-visible-count" aria-live="polite">当前{scope.reviewQueue ? '审查队列' : view === 'completed' ? '已完成' : '进行中'}视图：可见 {page?.visibleTotal ?? visible.length} / 共 {counts.total} 项{counts.completed ? `（已完成/归档/取消 ${counts.completed} 项）` : ''}{view === 'active' && counts.completed > 0 ? ' · 已完成任务已隐藏，可切换到已完成列表' : ''}</p>
     {scope.reviewQueue && <p className="acms-review-queue-filter">当前筛选：审查进行中（含待执行、准备中、执行中、待审查、集成中、阻塞、暂停、停止中及待核对；不含已结束审查）。<button className="text" onClick={() => { setSearch(''); setShowReviews(true); setShowTrash(false); setView('active'); clearScope({ allProjects: true }); }}>清除审查队列筛选</button></p>}
     {scope.status && view === 'active' && <p>当前仅显示指定状态的任务。<button className="text" onClick={() => clearScope()}>显示全部状态</button></p>}
-    {showTrash ? <section className="acms-panel"><EntityTrash data={data} act={act} busy={busy} /><h2>任务回收站</h2><p className="acms-sectionnote">可恢复任务，或彻底删除任务记录。未完成任务恢复后保持暂停。</p>{!data.trash?.length ? <Empty title="回收站为空">已删除任务会出现在这里。</Empty> : data.trash.map(t => <div className="acms-trash-row" key={t.id}><div><h3>{t.title}</h3><small>删除于 {date(t.deletion?.at)}</small></div><ActionButton reason={busy ? '正在保存，请稍候' : !data.projects.some(p => p.id === t.projectId) || !data.goals.some(g => g.id === t.goalId) ? '请先恢复所属项目或目标' : ''} onClick={() => act('task.restore', { id: t.id, expectedRevision: t.revision }, '任务已恢复；未完成任务保持暂停')}>恢复任务</ActionButton><ActionButton className="danger" reason={busy ? '正在保存，请稍候' : t.purgeReason || ''} onClick={() => open('purgeTask', t)}>彻底删除</ActionButton></div>)}</section>
-      : view === 'completed' ? <CompletedTaskList key={epoch} tasks={done} data={data} select={select} scope={goal ? { goalId: goal } : project ? { projectId: project } : {}} />
+    {showTrash && bounded && !trash?.data ? <p role={trash?.error ? 'alert' : 'status'}>{trash?.error ?? '正在读取回收站…'}</p> :
+      showTrash ? <section className="acms-panel"><EntityTrash data={data} act={act} busy={busy} /><h2>任务回收站</h2><p className="acms-sectionnote">可恢复任务，或彻底删除任务记录。未完成任务恢复后保持暂停。</p>{!data.trash?.length ? <Empty title="回收站为空">已删除任务会出现在这里。</Empty> : data.trash.map(t => <div className="acms-trash-row" key={t.id}><div><h3>{t.title}</h3><small>删除于 {date(t.deletion?.at)}</small></div><ActionButton reason={busy ? '正在保存，请稍候' : !data.projects.some(p => p.id === t.projectId) || !data.goals.some(g => g.id === t.goalId) ? '请先恢复所属项目或目标' : ''} onClick={() => act('task.restore', { id: t.id, expectedRevision: t.revision }, '任务已恢复；未完成任务保持暂停')}>恢复任务</ActionButton><ActionButton className="danger" reason={busy ? '正在保存，请稍候' : t.purgeReason || ''} onClick={() => open('purgeTask', t)}>彻底删除</ActionButton></div>)}</section>
+      : page?.loading ? <p role="status">正在读取范围内的任务…</p>
+      : page?.error ? <p role="alert">{page.error} <button type="button" onClick={page.retry}>重试读取任务</button></p>
+      : view === 'completed' ? <CompletedTaskList key={epoch} tasks={done} data={data} select={select}
+        pageCounts={page?.artifactCounts} scope={goal ? { goalId: goal } : project ? { projectId: project } : {}} />
       : scope.reviewQueue && !active.length ? <Empty title="当前范围没有进行中的审查">已结束审查不计入队列；可以调整搜索、项目或目标筛选，或清除审查队列筛选返回任务列表。</Empty>
       : mode === 'tree' ? <ProjectHierarchy navigate={navigate} data={data} tasks={active} select={select} open={open} projectId={project} goalId={goal} />
       : !active.length ? <Empty title="当前范围没有任务">{search ? `没有任务匹配“${search}”，清空搜索或切换筛选后再试。` : project || goal ? '所选项目或目标当前没有任务；可切换筛选、查看已完成列表，或创建目标让负责人自动生成执行计划。' : '创建目标后，负责人会自动生成执行计划。'}</Empty>
       : mode === 'graph' ? <Graph data={data} tasks={active} project={project} goal={goal} select={select} />
-      : <div className="acms-board">{columns.map(([key, label]) => <section key={key} className="acms-column"><header><span><i data-status={key} />{label}</span><small>{active.filter(t => col(t.status) === key).length}</small></header>{active.filter(t => col(t.status) === key).map(t => <button className="acms-task-card" key={t.id} onClick={() => select(t.id)}><div className="acms-card-meta"><span>{t.id.slice(-8).toUpperCase()}</span><span>{t.kind === 'plan' ? '规划' : t.kind === 'review' ? '审查' : t.kind === 'repair' ? '修复' : '执行'}</span></div><h3>{t.title}</h3><TaskPath task={t} data={data} /><p className="acms-clamp-2">{t.description}</p><div className="acms-tags">{t.longLived && <span>保留执行人员</span>}{t.dependencies.length > 0 && <span>{t.dependencies.length} 项依赖</span>}</div><footer><span className="acms-person-dot">{data.agents.find(a => a.id === t.agentId)?.name ?? '待分配'}</span><Badge status={t.status} /></footer></button>)}</section>)}</div>}
+      : <div className="acms-board">{columns.map(([key, label]) => <section key={key} className="acms-column"><header><span><i data-status={key} />{label}</span><small>{page?.boardCounts ? page.boardCounts[key] ?? 0 : active.filter(t => col(t.status) === key).length}</small></header>{active.filter(t => col(t.status) === key).map(t => <button className="acms-task-card" key={t.id} onClick={() => select(t.id)}><div className="acms-card-meta"><span>{t.id.slice(-8).toUpperCase()}</span><span>{t.kind === 'plan' ? '规划' : t.kind === 'review' ? '审查' : t.kind === 'repair' ? '修复' : '执行'}</span></div><h3>{t.title}</h3><TaskPath task={t} data={data} /><p className="acms-clamp-2">{t.description}</p><div className="acms-tags">{t.longLived && <span>保留执行人员</span>}{t.dependencies.length > 0 && <span>{t.dependencies.length} 项依赖</span>}</div><footer><span className="acms-person-dot">{data.agents.find(a => a.id === t.agentId)?.name ?? '待分配'}</span><Badge status={t.status} /></footer></button>)}</section>)}</div>}
+    {!showTrash && (page?.previous || page?.nextPage) && <div className="acms-actions">
+      {page.previous && <button type="button" onClick={page.previous}>上一页任务</button>}
+      {page.nextPage && <button type="button" onClick={page.nextPage}>下一页任务</button>}
+    </div>}
   </>;
 }
 
@@ -330,15 +484,16 @@ function ProjectsPage({ data, navigate, select, open, scope, onGoal, act, busy }
   </>;
 }
 
-function CompletedTaskList({ tasks, data, select, scope }) {
+function CompletedTaskList({ tasks, data, select, pageCounts, scope }) {
   const scoped = data.evidenceView === 'panel';
-  const { counts, error, retry } = useCompletedArtifactCounts(scope, data.cursor, scoped && tasks.length > 0);
+  const { counts, error, retry } = useCompletedArtifactCounts(scope, data.cursor, scoped && !pageCounts && tasks.length > 0);
   if (!tasks.length) return <Empty title="没有匹配的已完成任务">完成、归档或取消的任务会出现在这里；调整搜索、项目或状态筛选后再试。</Empty>;
   return <section className="acms-panel acms-completed" aria-label="已完成任务"><div className="acms-sectionhead"><h2>已完成任务</h2><span className="acms-count">{tasks.length}</span></div>
   {error && <p role="alert">{error} <button onClick={retry}>重试读取产物数量</button></p>}
   <div className="acms-completed-list">{tasks.map(task => {
     const project = data.projects.find(p => p.id === task.projectId); const goal = data.goals.find(g => g.id === task.goalId);
-    const count = scoped ? (counts ? counts[task.id] ?? 0 : null) : data.artifacts.filter(a => a.taskId === task.id).length;
+    const count = pageCounts ? pageCounts[task.id] ?? 0 : scoped ? (counts ? counts[task.id] ?? 0 : null) :
+      data.artifacts.filter(a => a.taskId === task.id).length;
     return <div className="acms-completed-row" key={task.id}><div><button className="text" onClick={() => select(task.id)}>{task.title}</button><small>{project?.name ?? '未知项目'} · {goal?.title ?? '未知目标'} · {task.kind === 'review' ? '审查' : task.kind === 'plan' ? '规划' : '任务'}</small></div><Badge status={task.status} /><span className="acms-muted">{count === null ? (error ? '产物数量不可用' : '正在读取产物数量…') : `${count} 份产物`}</span><time className="acms-muted">{date(task.activityAt)}</time><button className="text" onClick={() => select(task.id)}>详情与证据 ↗</button></div>;
   })}</div></section>;
 }
@@ -346,18 +501,23 @@ function CompletedTaskList({ tasks, data, select, scope }) {
 const graphOpenSections = new Map();
 
 function Graph({ data, tasks, project, goal, select }) {
-  const model = graphSections({ projects: data.projects, goals: data.goals, tasks, projectId: project, goalId: goal, knownTasks: data.tasks });
+  const known = [...(data.knownTasks ?? []), ...data.tasks];
+  const model = graphSections({ projects: data.projects, goals: data.goals, tasks, projectId: project, goalId: goal, knownTasks: known });
   if (!model.sections.length) return <Empty title="当前范围没有任务">切换项目或目标，或清空搜索后再查看依赖图。</Empty>;
   const heading = <p className="acms-graph-scope" aria-live="polite">{model.scopeLabel} · {tasks.length} 项任务{model.mode === 'projects' ? ' · 按项目与目标分区，默认收起' : ''}</p>;
   const warning = model.crossScope.length > 0 && <div className="acms-alert" role="alert">检测到 {model.crossScope.length} 条跨分区依赖，未绘制跨区连线：{[...new Set(model.crossScope.map(entry => entry.taskTitle))].join('、')}。这是归属数据异常，请先核对任务归属；图不会自动修正数据。</div>;
-  if (model.mode === 'single') { const section = model.sections[0]; return <div className="acms-graph-view">{heading}{warning}<GraphCanvas id={section.key} tasks={section.tasks} known={data.tasks} select={select} /></div>; }
-  return <div className="acms-graph-view">{heading}{warning}{model.sections.map(section => <GraphSection key={section.key} section={section} known={data.tasks} select={select} openByDefault={model.mode !== 'projects'} />)}</div>;
+  if (model.mode === 'single') { const section = model.sections[0]; return <div className="acms-graph-view">{heading}{warning}<GraphCanvas id={section.key} tasks={section.tasks} known={known} select={select} /></div>; }
+  return <div className="acms-graph-view">{heading}{warning}{model.sections.map(section => <GraphSection key={section.key} section={section} known={known} select={select} openByDefault={model.mode !== 'projects'} />)}</div>;
 }
 
 function GraphSection({ section, known, select, openByDefault }) {
   const detail = [section.counts.open ? `未完成 ${section.counts.open}` : '', section.counts.reviewing ? `待审查 ${section.counts.reviewing}` : '', section.counts.blocked ? `阻塞 ${section.counts.blocked}` : ''].filter(Boolean).join(' · ');
-  return <details className="acms-graph-section" data-scope={section.key} open={graphOpenSections.get(section.key) ?? openByDefault} onToggle={event => { graphOpenSections.set(section.key, event.currentTarget.open); }}>
-    <summary><span className="acms-level-tag">{section.kind === 'project' ? '项目' : '目标'}</span><b>{section.title}</b><small>{section.counts.total} 项任务{detail ? ` · ${detail}` : ' · 全部完成'}</small></summary>
+  return <details className="acms-graph-section" data-scope={section.key} open={graphOpenSections.get(section.key) ?? openByDefault} onToggle={event => {
+    if (event.target === event.currentTarget) graphOpenSections.set(section.key, event.currentTarget.open);
+  }}>
+    <summary onClick={event => { graphOpenSections.set(section.key, !event.currentTarget.parentElement.open); }}>
+      <span className="acms-level-tag">{section.kind === 'project' ? '项目' : '目标'}</span><b>{section.title}</b><small>{section.counts.total} 项任务{detail ? ` · ${detail}` : ' · 全部完成'}</small>
+    </summary>
     {section.groups ? section.groups.map(group => <div className="acms-graph-goal" key={group.key}><h3>{group.title}<small>{group.counts.total} 项任务</small></h3><GraphCanvas id={group.key} tasks={group.tasks} known={known} select={select} /></div>) : <GraphCanvas id={section.key} tasks={section.tasks} known={known} select={select} />}
   </details>;
 }

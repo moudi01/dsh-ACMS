@@ -87,6 +87,12 @@ function taskArtifactCount(store, taskId) {
   return store.db.prepare(`SELECT count(*) AS total FROM entities AS e INDEXED BY artifacts_by_task
     WHERE e.collection='artifacts' AND ${property('e', 'taskId')}=?`).get(taskId).total;
 }
+export function artifactCountsForTasks(store, taskIds) {
+  const rows = store.db.prepare(`SELECT wanted.value AS id, (SELECT count(*) FROM entities AS e INDEXED BY artifacts_by_task
+    WHERE e.collection='artifacts' AND ${property('e', 'taskId')}=wanted.value) AS total FROM json_each(?) AS wanted`)
+    .all(JSON.stringify(taskIds));
+  return Object.fromEntries(rows.map(({ id, total }) => [id, total]));
+}
 
 export function panelEvidence(store, params) {
   const collection = params.get('kind');

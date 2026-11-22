@@ -59,6 +59,7 @@ try {
   await expect(page.locator('dialog')).toHaveCount(0); await expect(page.getByRole('heading', { name: '可删除的任务', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '回收站（1）', exact: true }).click(); await expect(page.getByRole('heading', { name: '可删除的任务', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '恢复任务', exact: true }).click(); await expect(page.getByRole('heading', { name: '回收站为空', exact: true })).toBeVisible();
+  await expect(page.getByLabel('任务详情')).toHaveCount(0);
   const brandTask = server.company.snapshot().tasks.find(t => t.title === '确认品牌素材');
   issueCommand('task.pause', { id: brandTask.id });
   await page.getByRole('button', { name: /^公司总览/ }).click(); await page.getByRole('button', { name: '查看并回复 →' }).click();

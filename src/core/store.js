@@ -8,6 +8,7 @@ import { assertWorktreeRestoreReady } from "./restore-safety.js";
 import { CHECKPOINT_INDEXES } from "./goal-checkpoint-rows.js";
 import { LIVE_ATTEMPT_STATUSES } from "./entity-actions.js";
 import { PANEL_EVIDENCE_INDEXES } from "./panel-evidence.js";
+import { DASHBOARD_INDEXES } from "./panel-dashboard.js";
 
 export const SCHEMA_VERSION = "2";
 const attemptUsageFields = { task: "$.taskId", goal: "$.goalId" };
@@ -55,6 +56,7 @@ export class Store {
         AND json_extract(body,'$.kind')='work' AND json_extract(body,'$.status')='succeeded';
       ${CHECKPOINT_INDEXES}
       ${PANEL_EVIDENCE_INDEXES}
+      ${DASHBOARD_INDEXES}
       CREATE INDEX IF NOT EXISTS cost_attempts_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='goalCostAttempts';
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL, entity_id TEXT, goal_id TEXT, actor TEXT NOT NULL, principal_kind TEXT, on_behalf_of TEXT, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL, at TEXT NOT NULL);
@@ -136,6 +138,37 @@ export class Store {
   tasksForGoal(goalId) {
     return this.db.prepare("SELECT body FROM entities WHERE collection='tasks' AND json_extract(body,'$.goalId')=?")
       .all(goalId).map(({ body }) => JSON.parse(body));
+  }
+
+  taskContext(goalId, taskId) {
+    const rows = this.db.prepare(`SELECT body,revision FROM entities INDEXED BY tasks_by_goal WHERE collection='tasks'
+      AND json_extract(body,'$.goalId')=? ORDER BY rowid`).all(goalId);
+    const tasks = rows.map(row => ({ ...JSON.parse(row.body), revision: row.revision }));
+    const byId = new Map(tasks.map(task => [task.id, task]));
+    // Preserve named legacy dependencies and ancestors even when their records
+    // are outside the displayed goal. The owner commands verify current edges.
+    for (const task of tasks) for (const id of [task.parentId, task.reviewOf, ...(task.dependencies ?? [])]) {
+      if (!id || byId.has(id)) continue;
+      const related = this.get('tasks', id);
+      byId.set(id, related);
+      if (related) tasks.push(related);
+    }
+    if (taskId) {
+      const associated = [taskId, ...tasks.filter(task => task.reviewOf === taskId && task.status !== 'deleted').map(task => task.id)];
+      const incoming = this.db.prepare(`WITH linked AS (SELECT value AS id FROM json_each(?))
+        SELECT e.id,e.revision,json_extract(e.body,'$.title') AS title,json_extract(e.body,'$.status') AS status,
+          json_extract(e.body,'$.parentId') AS parentId,json_extract(e.body,'$.reviewOf') AS reviewOf,
+          json_extract(e.body,'$.dependencies') AS dependencies,json_extract(e.body,'$.goalId') AS goalId
+        FROM entities e WHERE e.collection='tasks' AND json_extract(e.body,'$.goalId') IS NOT ?
+        AND json_extract(e.body,'$.status') IS NOT 'deleted'
+        AND (json_extract(e.body,'$.parentId') IN linked OR json_extract(e.body,'$.reviewOf') IN linked OR EXISTS (
+          SELECT 1 FROM json_each(e.body,'$.dependencies') AS dep WHERE dep.value IN linked
+        )) ORDER BY e.rowid`).all(JSON.stringify(associated), goalId);
+      for (const row of incoming) if (!byId.has(row.id)) {
+        tasks.push({ ...row, dependencies: row.dependencies ? JSON.parse(row.dependencies) : [] });
+      }
+    }
+    return tasks;
   }
 
   deliveredWorkForGoal(goalId) {

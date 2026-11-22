@@ -152,9 +152,9 @@ export async function verifyPanelEvents(browser) {
     const manual = await pauseRead(page, eventRoute, true);
     await page.reload();
     await manual.wait();
-    startingReads = states.length;
     await page.getByRole('button', { name: '公司设置', exact: true }).click();
     await page.getByRole('button', { name: '编辑边界', exact: true }).click();
+    startingReads = states.length;
     await page.getByLabel('最大并发', { exact: true }).fill('5');
     await page.getByRole('button', { name: '保存', exact: true }).click();
     await expect(page.getByRole('dialog')).toHaveCount(0);
