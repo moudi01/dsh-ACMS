@@ -435,7 +435,8 @@ function Tasks({ snapshot, epoch, select, create, createGoal, act, busy, open, s
       showTrash ? <section className="acms-panel"><EntityTrash data={data} act={act} busy={busy} /><h2>任务回收站</h2><p className="acms-sectionnote">可恢复任务，或彻底删除任务记录。未完成任务恢复后保持暂停。</p>{!data.trash?.length ? <Empty title="回收站为空">已删除任务会出现在这里。</Empty> : data.trash.map(t => <div className="acms-trash-row" key={t.id}><div><h3>{t.title}</h3><small>删除于 {date(t.deletion?.at)}</small></div><ActionButton reason={busy ? '正在保存，请稍候' : !data.projects.some(p => p.id === t.projectId) || !data.goals.some(g => g.id === t.goalId) ? '请先恢复所属项目或目标' : ''} onClick={() => act('task.restore', { id: t.id, expectedRevision: t.revision }, '任务已恢复；未完成任务保持暂停')}>恢复任务</ActionButton><ActionButton className="danger" reason={busy ? '正在保存，请稍候' : t.purgeReason || ''} onClick={() => open('purgeTask', t)}>彻底删除</ActionButton></div>)}</section>
       : page?.loading ? <p role="status">正在读取范围内的任务…</p>
       : page?.error ? <p role="alert">{page.error} <button type="button" onClick={page.retry}>重试读取任务</button></p>
-      : view === 'completed' ? <CompletedTaskList key={epoch} tasks={done} data={data} select={select} scope={goal ? { goalId: goal } : project ? { projectId: project } : {}} />
+      : view === 'completed' ? <CompletedTaskList key={epoch} tasks={done} data={data} select={select}
+        pageCounts={page?.artifactCounts} scope={goal ? { goalId: goal } : project ? { projectId: project } : {}} />
       : scope.reviewQueue && !active.length ? <Empty title="当前范围没有进行中的审查">已结束审查不计入队列；可以调整搜索、项目或目标筛选，或清除审查队列筛选返回任务列表。</Empty>
       : mode === 'tree' ? <ProjectHierarchy navigate={navigate} data={data} tasks={active} select={select} open={open} projectId={project} goalId={goal} />
       : !active.length ? <Empty title="当前范围没有任务">{search ? `没有任务匹配“${search}”，清空搜索或切换筛选后再试。` : project || goal ? '所选项目或目标当前没有任务；可切换筛选、查看已完成列表，或创建目标让负责人自动生成执行计划。' : '创建目标后，负责人会自动生成执行计划。'}</Empty>
@@ -461,15 +462,16 @@ function ProjectsPage({ data, navigate, select, open, scope, onGoal, act, busy }
   </>;
 }
 
-function CompletedTaskList({ tasks, data, select, scope }) {
+function CompletedTaskList({ tasks, data, select, pageCounts, scope }) {
   const scoped = data.evidenceView === 'panel';
-  const { counts, error, retry } = useCompletedArtifactCounts(scope, data.cursor, scoped && tasks.length > 0);
+  const { counts, error, retry } = useCompletedArtifactCounts(scope, data.cursor, scoped && !pageCounts && tasks.length > 0);
   if (!tasks.length) return <Empty title="没有匹配的已完成任务">完成、归档或取消的任务会出现在这里；调整搜索、项目或状态筛选后再试。</Empty>;
   return <section className="acms-panel acms-completed" aria-label="已完成任务"><div className="acms-sectionhead"><h2>已完成任务</h2><span className="acms-count">{tasks.length}</span></div>
   {error && <p role="alert">{error} <button onClick={retry}>重试读取产物数量</button></p>}
   <div className="acms-completed-list">{tasks.map(task => {
     const project = data.projects.find(p => p.id === task.projectId); const goal = data.goals.find(g => g.id === task.goalId);
-    const count = scoped ? (counts ? counts[task.id] ?? 0 : null) : data.artifacts.filter(a => a.taskId === task.id).length;
+    const count = pageCounts ? pageCounts[task.id] ?? 0 : scoped ? (counts ? counts[task.id] ?? 0 : null) :
+      data.artifacts.filter(a => a.taskId === task.id).length;
     return <div className="acms-completed-row" key={task.id}><div><button className="text" onClick={() => select(task.id)}>{task.title}</button><small>{project?.name ?? '未知项目'} · {goal?.title ?? '未知目标'} · {task.kind === 'review' ? '审查' : task.kind === 'plan' ? '规划' : '任务'}</small></div><Badge status={task.status} /><span className="acms-muted">{count === null ? (error ? '产物数量不可用' : '正在读取产物数量…') : `${count} 份产物`}</span><time className="acms-muted">{date(task.activityAt)}</time><button className="text" onClick={() => select(task.id)}>详情与证据 ↗</button></div>;
   })}</div></section>;
 }

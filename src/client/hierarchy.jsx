@@ -21,28 +21,54 @@ export function useDashboardPage(section, parent, cursor, embedded = null, enabl
   const [page, setPage] = useState(null);
   const key = JSON.stringify([section, parent]);
   const embeddedRef = useRef(embedded);
+  const cursorRef = useRef(cursor);
   embeddedRef.current = embedded;
-  const publish = (current, value, after) => {
-    if (current.signal.aborted) return;
-    const previous = current.page;
-    const keepOlder = !value.reset && (after || previous?.loadedOlder && value.next);
-    const items = !keepOlder ? value.items : after ?
-      [...new Map([...previous.items, ...value.items].map(row => [row.id, row])).values()] :
-      [...new Map([...value.items, ...previous.items.filter(row => !value.items.some(item => item.id === row.id))].map(row => [row.id, row])).values()];
-    current.page = { ...value, items, key, loading: false, error: '', loadedOlder: !!keepOlder,
-      next: !after && keepOlder ? previous.next : value.next };
-    setPage(current.page);
-  };
+  cursorRef.current = cursor;
+  const read = (current, after = null) => api.dashboard(section, { parent, after, signal: current.signal });
+  async function readDepth(current, depth) {
+    // Reconfirm membership from the current first page through the depth the
+    // owner has already loaded. Every request remains a normal bounded page.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const head = await read(current);
+      let last = head, loadedDepth = 1;
+      const items = new Map(head.items.map(row => [row.id, row]));
+      while (last.next && loadedDepth < depth) {
+        last = await read(current, last.next);
+        if (last.cursor !== head.cursor || last.reset) break;
+        for (const row of last.items) items.set(row.id, row);
+        loadedDepth++;
+      }
+      if (last.cursor === head.cursor && !last.reset) return { ...head, items: [...items.values()], next: last.next, depth: loadedDepth };
+    }
+    throw new Error('列表在读取期间发生变化，请重试。');
+  }
+  async function nextView(current, previous, after) {
+    if (after) {
+      const tail = await read(current, after);
+      if (!tail.reset && !current.queued && tail.cursor === previous.cursor && tail.cursor >= cursorRef.current) {
+        const items = [...new Map([...previous.items, ...tail.items].map(row => [row.id, row])).values()];
+        return { ...tail, items, depth: previous.depth + 1 };
+      }
+      return readDepth(current, previous.depth + 1);
+    }
+    if (previous?.depth > 1) return readDepth(current, previous.depth);
+    const head = embeddedRef.current ? { ...embeddedRef.current, cursor: cursorRef.current } : await read(current);
+    return { ...head, depth: 1 };
+  }
   const load = async (current, after) => {
     if (!current || current.loading || current.signal.aborted) return;
     current.loading = true;
     if (!after) current.queued = false;
     const previous = current.page;
+    const embeddedAtStart = embeddedRef.current;
     if (previous) setPage({ ...previous, loading: true, error: '' });
     try {
-      const value = !after && embeddedRef.current ? embeddedRef.current :
-        await api.dashboard(section, { parent, after, signal: current.signal });
-      publish(current, value, after);
+      const value = await nextView(current, previous, after);
+      if (!current.signal.aborted) {
+        if (value.cursor >= cursorRef.current && embeddedAtStart === embeddedRef.current) current.queued = false;
+        current.page = { ...value, key, loading: false, error: '' };
+        setPage(current.page);
+      }
     } catch (error) {
       if (!current.signal.aborted) {
         current.page = { ...previous, key, items: previous?.items ?? [], loading: false, error: error.message, retryAfter: after };
@@ -173,6 +199,7 @@ function TaskTree({ tasks, known = [], select, createChild, listKey, emptyNote }
   const branch = (task, seen = new Set()) => {
     if (seen.has(task.id)) return null; const next = new Set([...seen, task.id]); const children = index.get(task.id) ?? []; const open = expanded(task.id);
     const childShowAll = listOpen.get(`children:${task.id}`) === true; const shownChildren = childShowAll ? children : children.slice(0, MAX_TASKS);
+    const childCount = task.childCount ?? children.length;
     const parentId = taskParentId(task);
     const parent = !ids.has(parentId) ? knownById.get(parentId) : null;
     return <li key={task.id}>
@@ -181,8 +208,8 @@ function TaskTree({ tasks, known = [], select, createChild, listKey, emptyNote }
           ? <button type="button" className="acms-twisty" aria-expanded={open} aria-label={`${open ? '收起' : '展开'}“${task.title}”的子任务`} onClick={() => toggle(task.id)}>{open ? '▾' : '▸'}</button>
           : <span className="acms-twisty-space" aria-hidden="true" />}
         <button type="button" className="acms-task-title" onClick={() => select(task.id)}><small>{task.kind === 'review' ? '审查' : task.parentId ? '子任务' : task.kind === 'plan' ? '规划任务' : '任务'}</small><strong>{task.title}</strong><span>{statuses[task.status] ?? task.status}</span></button>
-        {isCompleted(task) && hasOpenDescendant(task, index) && <em className="acms-tag">已完成 · 含未完成后代</em>}
-        {children.length > 0 && <small className="acms-muted">{children.length} 项子任务</small>}
+        {isCompleted(task) && (task.hasOpenDescendant ?? hasOpenDescendant(task, index)) && <em className="acms-tag">已完成 · 含未完成后代</em>}
+        {childCount > 0 && <small className="acms-muted">{childCount} 项子任务{childCount > children.length && ` · ${childCount - children.length} 项在其他页`}</small>}
         {parent && <button type="button" className="text" onClick={() => select(parent.id)}>父任务：{parent.title}（不在本页）</button>}
         {createChild && task.kind !== 'review' && <button className="text" type="button" onClick={() => createChild(task)}>＋ 子任务</button>}
       </div>
@@ -223,9 +250,10 @@ export function ProjectHierarchy({ data, select, open, onGoal, navigate, project
   const bump = useBump();
   // Current view = every unfinished task plus completed ancestors needed to
   // discover it. Completed branches with open descendants stay expandable.
-  const scopedTasks = activeViewTasks(tasks.filter(visibleTask));
+  const scopedTasks = data.dashboardView ? tasks.filter(visibleTask) : activeViewTasks(tasks.filter(visibleTask));
   const projects = orderByActivity(data.projects.filter(p => (!projectId || p.id === projectId) && p.status !== 'deleted'));
-  const goalsOf = project => orderByActivity(data.goals.filter(g => g.projectId === project.id && (!goalId || g.id === goalId) && goalVisibleInActiveView(g, scopedTasks)));
+  const goalsOf = project => orderByActivity(data.goals.filter(g => g.projectId === project.id && (!goalId || g.id === goalId) &&
+    (!isCompleted(g) || (g.scopeHasUnfinished ?? goalVisibleInActiveView(g, scopedTasks)))));
   const toggleDetails = (key, value) => { detailsOpen.set(key, value); bump(); };
   const toggleList = (key, value) => { listOpen.set(key, value); bump(); };
   return <div className="acms-project-tree" aria-label="项目目标层级">{projects.map(project => {
@@ -240,10 +268,10 @@ export function ProjectHierarchy({ data, select, open, onGoal, navigate, project
         const goalKey = `goal:${goal.id}`; const goalOpen = detailsOpen.get(goalKey) === true;
         const goalTasks = scopedTasks.filter(task => task.goalId === goal.id);
         const all = data.tasks.filter(task => task.goalId === goal.id && task.status !== 'deleted');
-        const rollup = goalSummary(goal, all);
-        const openDescendants = goalTasks.filter(task => !isCompleted(task)).length;
+        const rollup = data.dashboardView ? goal.taskSummary : goalSummary(goal, all);
+        const openDescendants = goal.scopeHasUnfinished ?? goalTasks.some(task => !isCompleted(task));
         return <details className="acms-goal-group" key={goal.id} open={goalOpen} onToggle={event => toggleDetails(goalKey, event.currentTarget.open)}>
-          <summary><span className="acms-level-tag">目标</span>{navigate ? <button className="text acms-entity-title" onClick={event => { event.preventDefault(); navigate('goal', goal.id); }}>{goal.title}</button> : <strong>{goal.title}</strong>}<span>{statuses[rollup.status] ?? rollup.status} · {rollup.done}/{rollup.total} 项完成{goalTasks.length ? ` · 显示 ${goalTasks.length} 项` : ''}</span>{isCompleted(goal) && openDescendants > 0 && <em className="acms-tag">已完成 · 含未完成后代</em>}{goal.contractChange?.status === 'pending' && <em className="acms-tag">合同 v{goal.contractVersion} 待确认</em>}{goal.reviewSummary?.status === 'cancelled' && <em className="acms-tag">最终审查已取消</em>}</summary>
+          <summary><span className="acms-level-tag">目标</span>{navigate ? <button className="text acms-entity-title" onClick={event => { event.preventDefault(); navigate('goal', goal.id); }}>{goal.title}</button> : <strong>{goal.title}</strong>}<span>{statuses[rollup.status] ?? rollup.status} · {rollup.done}/{rollup.total} 项完成{goalTasks.length ? ` · 显示 ${goalTasks.length} 项` : ''}</span>{isCompleted(goal) && openDescendants && <em className="acms-tag">已完成 · 含未完成后代</em>}{goal.contractChange?.status === 'pending' && <em className="acms-tag">合同 v{goal.contractVersion} 待确认</em>}{goal.reviewSummary?.status === 'cancelled' && <em className="acms-tag">最终审查已取消</em>}</summary>
           {data.dashboardView ? goalOpen && <ScopedGoalDescription goal={goal} cursor={data.cursor} /> :
             <CollapsibleText text={goal.description} lines={2} label="说明" />}
           <div className="acms-actions">{open && <button className="text" onClick={() => open('goalEdit', goal)}>编辑目标</button>}{onGoal && <button className="text" onClick={() => onGoal(project.id, goal.id)}>查看此目标的任务 →</button>}{open && !['succeeded', 'cancelled', 'archived'].includes(goal.status) && <button className="text" onClick={() => open('task', { goalId: goal.id, projectId: project.id })}>＋ 添加任务</button>}</div>

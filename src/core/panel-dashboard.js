@@ -4,9 +4,10 @@ import { checkpointDeliverySources } from './goal-checkpoint-rows.js';
 import { finalGoalComposition, goalDeliveryState } from './composite-delivery.js';
 import { attemptForPanel } from './panel-attempts.js';
 import { executionCapacity } from './execution-capacity.js';
-import { activeViewTasks, compareActivity, isCompleted, isQueuedReview, taskBoardColumn, visibleCounts } from '../client/display.js';
+import { activeViewTasks, compareActivity, hasOpenDescendant, isCompleted, isQueuedReview, taskBoardColumn, taskParentId, visibleCounts } from '../client/display.js';
 import { defaultProjectId } from '../client/graph.js';
 import { PENDING_INTEGRATION_PHASES } from './task-actions.js';
+import { artifactCountsForTasks } from './panel-evidence.js';
 
 const field = key => `json_extract(body,'$.${key}')`;
 const taskFields = ['goalId', 'projectId', 'kind', 'status', 'parentId', 'reviewOf', 'createdAt', 'agentId', 'title',
@@ -15,11 +16,29 @@ const taskFields = ['goalId', 'projectId', 'kind', 'status', 'parentId', 'review
 const recovered = `(${field('cancelReason')}='${ENVIRONMENT_RECOVERED_REASON}')`;
 const resolved = "json_type(body,'$.environmentResolution') IN ('object','array','text','integer','true')";
 const taskKeys = [...taskFields.map(field), recovered, resolved];
+const candidateVersion = field('composition.version');
+const candidateVersionType = "json_type(body,'$.composition.version')";
+const completedDeliveryHash = field('completedDeliveryHash');
+const approvalState = field('candidateMerge.status');
+const approvedVersion = field('candidateMerge.selection.version');
+const approvedHash = field('candidateMerge.selection.deliveryHash');
+const returnedVersions = field('deliveryApproval.returnedVersions');
+const returnedVersionsType = "json_type(body,'$.deliveryApproval.returnedVersions')";
+const deliveryFields = [candidateVersion, candidateVersionType, completedDeliveryHash, approvalState, approvedVersion,
+  approvedHash, returnedVersions, returnedVersionsType];
+const possibleDelivery = `collection='goals' AND ${field('deliveryApproval')} IS NOT NULL
+  AND ${field('composition.passed')}=1 AND ${field('status')}='succeeded'`;
+const decidedDelivery = `CASE
+  WHEN ${candidateVersionType} IS NOT 'text' THEN 0
+  WHEN ${approvalState} IS NOT 'previewed' AND ${approvedVersion}=${candidateVersion} AND ${approvedHash}=${completedDeliveryHash} THEN 1
+  WHEN ${returnedVersionsType}='array' THEN EXISTS (
+    SELECT 1 FROM json_each(${returnedVersions}) returned WHERE returned.type='text' AND returned.value=${candidateVersion}
+  )
+  ELSE 0 END`;
 export const DASHBOARD_INDEXES = `
   CREATE INDEX IF NOT EXISTS dashboard_task_fields ON entities(id,${taskKeys.join(',')}) WHERE collection='tasks';
   CREATE INDEX IF NOT EXISTS dashboard_pending_plans ON entities(collection) WHERE collection='plans' AND ${field('approvalStatus')}='pending';
-  CREATE INDEX IF NOT EXISTS dashboard_pending_delivery ON entities(collection) WHERE collection='goals'
-    AND ${field('deliveryApproval')} IS NOT NULL AND ${field('composition.passed')}=1 AND ${field('status')}='succeeded';
+  CREATE INDEX IF NOT EXISTS dashboard_pending_delivery ON entities(${deliveryFields.join(',')}) WHERE ${possibleDelivery};
 `;
 
 function compactTasks(store) {
@@ -119,7 +138,11 @@ function goalBadge(store, { hasCancelledReview, ...row }, tasks) {
   return { ...row, reviewSummary: review?.status === 'cancelled' ? { status: 'cancelled' } : null };
 }
 
+const pendingByRows = new WeakMap();
+
 function dashboardPending(company, rows) {
+  const priorPending = pendingByRows.get(rows);
+  if (priorPending) return priorPending;
   const { store } = company;
   const goals = new Map(rows.goals.map(goal => [goal.id, goal]));
   const tasks = new Map(rows.visible.map(task => [task.id, task]));
@@ -132,8 +155,11 @@ function dashboardPending(company, rows) {
     .map(row => ({ ...row, kind: 'plan', title: goals.get(row.goalId).title }));
 
   const deliveries = [];
-  for (const row of store.db.prepare(`SELECT body,revision FROM entities INDEXED BY dashboard_pending_delivery WHERE collection='goals'
-    AND ${field('deliveryApproval')} IS NOT NULL AND ${field('composition.passed')}=1 AND ${field('status')}='succeeded' ORDER BY rowid`).iterate()) {
+  // A publishable candidate necessarily matches its persisted completion
+  // hash. These compact comparisons only exclude decisions proven to apply to
+  // that candidate; everything else still goes through full verification.
+  for (const row of store.db.prepare(`SELECT body,revision FROM entities INDEXED BY dashboard_pending_delivery
+    WHERE ${possibleDelivery} AND NOT (${decidedDelivery}) ORDER BY rowid`).iterate()) {
     const goal = rowWithBody(row);
     const project = store.get('projects', goal.projectId);
     const { hash, candidate } = goalDeliveryState(store, goal, { ...checkpointDeliverySources(store, goal), project });
@@ -142,7 +168,7 @@ function dashboardPending(company, rows) {
     const asset = finalGoalComposition(company, goal, candidate, hash, { project, template, review });
     const prior = goal.candidateMerge;
     if (asset && !goal.deliveryApproval.returnedVersions?.includes(asset.version) &&
-      (!prior || prior.selection.deliveryHash !== asset.deliveryHash || prior.selection.version !== asset.version || prior.status === 'previewed')) {
+      (!prior || prior.selection?.deliveryHash !== asset.deliveryHash || prior.selection?.version !== asset.version || prior.status === 'previewed')) {
       deliveries.push({ id: goal.id, goalId: goal.id, kind: 'delivery', title: goal.title });
     }
   }
@@ -150,7 +176,9 @@ function dashboardPending(company, rows) {
     FROM entities WHERE collection='interactions' AND ${field('status')}='pending' ORDER BY rowid`).all()
     .filter(row => tasks.has(row.taskId) || !taskIds.has(row.taskId))
     .map(row => ({ ...row, kind: 'question', title: tasks.get(row.taskId)?.title }));
-  return { questions: questions.length, entries: [...plans, ...deliveries, ...questions] };
+  const pending = { questions: questions.length, entries: [...plans, ...deliveries, ...questions] };
+  pendingByRows.set(rows, pending);
+  return pending;
 }
 
 function take(rows, limit, after) {
@@ -248,6 +276,8 @@ export function workbenchPage(company, params) {
     const active = activeViewTasks(scoped);
     const visible = (completed ? scoped.filter(isCompleted) : active).filter(task => !status || task.status === status);
     const boardCounts = Object.fromEntries([...group(visible, task => taskBoardColumn(task.status))].map(([key, tasks]) => [key, tasks.length]));
+    const children = group(visible, taskParentId);
+    const visibleGoals = group(visible, task => task.goalId);
     const { picked, next } = rankedPage(visible, digest(filters).slice(0, 16), after);
     const taskDetails = store.db.prepare(`SELECT t.id, substr(${field('description')},1,360) AS description, ${field('dependencies')} AS dependencies,
       ${field('longLived')} AS longLived
@@ -256,6 +286,7 @@ export function workbenchPage(company, params) {
     const tasks = picked.map(({ id, goalId, projectId, agentId, title, kind, status, parentId, reviewOf, activityAt }) => {
       const detail = details.get(id);
       return { id, goalId, projectId, agentId, title, kind, status, parentId, reviewOf, activityAt,
+        childCount: children.get(id)?.length ?? 0, hasOpenDescendant: isCompleted({ status }) && hasOpenDescendant({ id }, children),
         description: detail?.description ?? '', longLived: detail?.longLived === 1,
         dependencies: detail?.dependencies ? JSON.parse(detail.dependencies) : [] };
     });
@@ -278,7 +309,10 @@ export function workbenchPage(company, params) {
     };
     const scopedGoals = rows.goals.filter(goal => !projectId || goal.projectId === projectId);
     const projects = include(rows.projects, projectId, projectIds);
-    const goals = include(scopedGoals, goalId, goalIds).map(goal => goalBadge(store, goal, rows.visibleByGoal.get(goal.id)));
+    const goals = include(scopedGoals, goalId, goalIds).map(goal => ({
+      ...goalBadge(store, goal, rows.visibleByGoal.get(goal.id)),
+      scopeHasUnfinished: (visibleGoals.get(goal.id) ?? []).some(task => !isCompleted(task)),
+    }));
     const roles = [...new Set(tasks.map(task => task.agentId))].flatMap(id => {
       const agent = id && store.get('agents', id);
       return agent ? [{ id, name: agent.name }] : [];
@@ -286,6 +320,7 @@ export function workbenchPage(company, params) {
     return { filters, counts, boardCounts, activeTotal: active.length, visibleTotal: visible.length,
       hasOpenGoals: scopedGoals.some(goal => !['succeeded', 'cancelled', 'archived'].includes(goal.status)),
       tasks, knownTasks, projects, goals, agents: roles, next,
+      ...(completed ? { artifactCounts: artifactCountsForTasks(store, tasks.map(task => task.id)) } : {}),
       projectOptions: take(rows.projects.toSorted(compareActivity), taskPageSize, null),
       goalOptions: take(scopedGoals.toSorted(compareActivity), taskPageSize, null),
       cursor: store.cursor() };
@@ -326,9 +361,13 @@ export function dashboardPage(company, params) {
       const goal = store.get('goals', parent);
       assert(goal && goal.status !== 'deleted' && store.get('projects', goal.projectId)?.status !== 'deleted', 'NOT_FOUND', '目标已不可用。');
       const owned = rows.visible.filter(task => task.goalId === parent);
-      const tasks = activeViewTasks(owned).sort(compareActivity).map(({ id, goalId, projectId, title, kind, status, parentId, reviewOf, activityAt }) =>
-        ({ id, goalId, projectId, title, kind, status, parentId, reviewOf, activityAt }));
-      result = { ...take(tasks, 40, after), about: goal.description };
+      const tasks = activeViewTasks(owned).sort(compareActivity);
+      const children = group(tasks, taskParentId);
+      const page = take(tasks, 40, after);
+      result = { ...page, about: goal.description,
+        items: page.items.map(({ id, goalId, projectId, title, kind, status, parentId, reviewOf, activityAt }) =>
+          ({ id, goalId, projectId, title, kind, status, parentId, reviewOf, activityAt,
+            childCount: children.get(id)?.length ?? 0, hasOpenDescendant: isCompleted({ status }) && hasOpenDescendant({ id }, children) })) };
     }
     return { ...result, section, parent, cursor: store.cursor() };
   });

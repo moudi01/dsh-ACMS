@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture } from './helpers.js';
 import { createRoutes } from '../src/host/http.js';
-import { OWNER } from '../src/core/util.js';
+import { OWNER, digest } from '../src/core/util.js';
 import { compareActivity } from '../src/client/display.js';
 import { Store } from '../src/core/store.js';
 import { dashboardSnapshot, workbenchPage } from '../src/core/panel-dashboard.js';
+import { compositionCheckContract, goalDeliveryState } from '../src/core/composite-delivery.js';
+import { goalDeliveryHash } from '../src/core/goal-contract.js';
 
 test('dashboard and workbench only decode indexed projections on first read and open full goal context by ID', async t => {
   const f = await fixture(t);
@@ -165,4 +167,107 @@ test('dashboard badges use current plan generation and the latest matching revie
   assert.deepEqual(dashboard.pending.items.map(row => row.id), ['plan_current']);
   const workbench = workbenchPage(f.company, new URLSearchParams({ projectId: f.project.id }));
   assert.equal(workbench.goals.find(goal => goal.id === f.goal.id).reviewSummary?.status, 'cancelled');
+});
+
+test('a completed workbench page reads artifact counts only for its forty task IDs', async t => {
+  const f = await fixture(t);
+  f.store.transaction(() => {
+    for (let i = 0; i < 4000; i++) {
+      const id = 'task_artifact_count_' + String(i).padStart(4, '0');
+      f.store.put('tasks', { id, projectId: f.project.id, goalId: f.goal.id, title: 'Completed ' + i,
+        kind: 'work', status: 'succeeded', artifactIds: ['artifact_y_' + i], createdAt: '2000-01-01T00:00:00.000Z' });
+      if (i !== 0) {
+        f.store.put('artifacts', { id: 'artifact_x_' + i, taskId: id });
+        f.store.put('artifacts', { id: 'artifact_y_' + i, taskId: id });
+      }
+    }
+  });
+  const requestIds = [];
+  const prepare = f.store.db.prepare.bind(f.store.db);
+  f.store.db.prepare = sql => {
+    const statement = prepare(sql);
+    if (!sql.includes('wanted.value AS id') || !sql.includes('INDEXED BY artifacts_by_task')) return statement;
+    return { all(ids) { requestIds.push(JSON.parse(ids)); return statement.all(ids); } };
+  };
+  const params = new URLSearchParams({ projectId: f.project.id, completed: '1' });
+  const first = workbenchPage(f.company, params);
+  params.set('after', first.next);
+  const second = workbenchPage(f.company, params);
+  assert.equal(first.visibleTotal, 4000);
+  assert.equal(first.tasks.length, 40);
+  assert.equal(second.tasks.length, 40);
+  assert.deepEqual(requestIds, [first.tasks.map(row => row.id), second.tasks.map(row => row.id)]);
+  assert.deepEqual(Object.keys(first.artifactCounts), requestIds[0]);
+  assert.deepEqual(Object.keys(second.artifactCounts), requestIds[1]);
+  assert.equal(first.artifactCounts[first.tasks[0].id], 0);
+  assert.equal(first.artifactCounts[first.tasks[1].id], 2);
+  assert(Object.values(second.artifactCounts).every(count => count === 2));
+  t.diagnostic('Completed rows counted from 4,000-task scope: ' + requestIds.map(ids => ids.length).join(' + '));
+});
+
+test('dashboard only loads deliverable source records for unresolved candidate versions', async t => {
+  const f = await fixture(t);
+  const baseHash = digest('baseline'), contentHash = digest('accepted bytes');
+  const checkContract = compositionCheckContract(f.project);
+  const selectionFor = (version, deliveryHash) => ({ version, deliveryHash });
+  f.store.transaction(() => {
+    for (let i = 0; i < 400; i++) {
+      const goalId = 'goal_decided_' + i;
+      const version = 'candidate-' + i;
+      const artifactHash = digest('artifact-' + i);
+      const snapshotSha256 = digest('delivery-' + i);
+      const task = f.store.put('tasks', { id: 'task_decided_' + i, goalId, projectId: f.project.id, kind: 'work', status: 'succeeded',
+        generation: 1, deliveryGeneration: 1, artifactHash, dependencies: [], workspace: { compositionInput: { version: 'source-1' } },
+        integration: { delivery: { sha256: snapshotSha256 } } });
+      const goal = { id: goalId, title: 'Delivery ' + i, projectId: f.project.id, status: 'succeeded', templateId: f.template.id,
+        description: 'fixture-long-delivery '.repeat(396), contractVersion: 1, completedContractVersion: 1,
+        deliveryMode: 'copy-composite', compositionBase: { snapshot: { sha256: baseHash } },
+        deliveryApproval: { returnedVersions: i >= 200 && i < 399 ? [version] : [] } };
+      const composition = { version, passed: true, checkContract, ledgerHash: goalDeliveryHash(goal, [task]),
+        snapshot: { sha256: contentHash }, baseHash, contentHash,
+        inputs: [{ taskId: task.id, generation: 1, artifactHash, snapshotSha256, baseline: 'source-1' }],
+        checks: [{ id: 'acceptance', checkVersion: 1, inputHash: contentHash, passed: true, cleanupConfirmed: true }] };
+      const { hash, candidate } = goalDeliveryState(f.store, { ...goal, composition }, { project: f.project, roots: [task] });
+      assert.equal(candidate, composition);
+      f.store.put('goals', { ...goal, composition, completedDeliveryHash: hash,
+        ...(i < 200 ? { candidateMerge: { status: i % 2 ? 'rejected' : 'applied', selection: selectionFor(version, hash) } } : {}) });
+    }
+  });
+  let sourceReads = 0;
+  const prepare = f.store.db.prepare.bind(f.store.db);
+  f.store.db.prepare = sql => { if (sql.includes('INDEXED BY delivered_work_by_goal')) sourceReads++; return prepare(sql); };
+  const fullGoals = [];
+  const parse = JSON.parse;
+  JSON.parse = (json, ...args) => {
+    if (typeof json === 'string' && json.startsWith('{"id":"goal_decided_') && json.includes('fixture-long-delivery')) fullGoals.push(Buffer.byteLength(json));
+    return parse(json, ...args);
+  };
+  const dashboard = () => dashboardSnapshot(f.company, f.adapter, f.engine.live);
+  try {
+    assert.deepEqual(dashboard().pending.items.map(item => item.id), ['goal_decided_399']);
+    assert.equal(sourceReads, 1);
+    assert.equal(fullGoals.length, 1);
+    assert.equal(dashboard().pending.total, 1);
+    assert.equal(sourceReads, 1);
+    assert.equal(fullGoals.length, 1);
+    t.diagnostic(`400 candidate goals: first read decoded 1 full goal (${fullGoals[0]} B) and read 1 delivery source. Warm read reused both.`);
+
+    const reopened = f.store.require('goals', 'goal_decided_0');
+    f.store.put('goals', { ...reopened, candidateMerge: { ...reopened.candidateMerge, status: 'previewed' } });
+    for (const [index, change] of [[1, 'hash'], [200, 'version']]) {
+      const current = f.store.require('goals', 'goal_decided_' + index);
+      const composition = change === 'version' ? { ...current.composition, version: 'subsequent-candidate' } :
+        { ...current.composition, checks: [{ ...current.composition.checks[0], inputHash: digest('new accepted input') }] };
+      const { hash } = goalDeliveryState(f.store, { ...current, composition });
+      f.store.put('goals', { ...current, composition, completedDeliveryHash: hash });
+    }
+    fullGoals.length = 0;
+    sourceReads = 0;
+    assert.deepEqual(dashboard().pending.items.map(item => item.id),
+      ['goal_decided_0', 'goal_decided_1', 'goal_decided_200', 'goal_decided_399']);
+    assert.equal(fullGoals.length, 4);
+    assert.equal(sourceReads, 4);
+  } finally {
+    JSON.parse = parse;
+  }
 });

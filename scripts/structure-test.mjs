@@ -3,7 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { startPreview } from './preview-server.mjs';
 import { pauseRead as pauseRouteRead, verifyPanelEvents } from './panel-events-ui-test.mjs';
-import { verifyScopedWorkbench } from './workbench-ui-test.mjs';
+import { verifyDashboardDepth, verifyPagedParentTree, verifyScopedWorkbench } from './workbench-ui-test.mjs';
 
 const server = await startPreview({ seed: false });
 const command = (name, args) => server.company.command({ kind: 'owner', id: 'owner' }, crypto.randomUUID(), name, args);
@@ -215,6 +215,8 @@ try {
   if (errors.length) throw new Error(errors.join('\n'));
   await verifyPanelEvents(browser);
   await verifyScopedWorkbench(browser);
+  await verifyDashboardDepth(browser);
+  await verifyPagedParentTree(browser);
   console.log('Hierarchy, scoped navigation, permanent trash deletion, model pairing, manual-only probes and internal-only parent context passed.');
 } catch(e) { console.error(errors); await page.screenshot({ path: 'test-results/ui/structure-failure.png', fullPage: true }); throw e; }
 finally { await browser.close(); await server.close(); }
