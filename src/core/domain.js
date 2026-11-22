@@ -832,12 +832,28 @@ export class Company {
     return sanitizePreferences(saved);
   }
   snapshot({ panel = false, capacity } = {}) {
-    return this.store.readSnapshot(() => this.#snapshot(panel, capacity));
+    return this.store.readSnapshot(() => this.#snapshot(panel, capacity, null));
   }
-  #snapshot(panel, capacity) {
+  panelContext({ taskId, goalId, capacity }) {
+    return this.store.readSnapshot(() => {
+      const task = taskId ? this.store.get('tasks', taskId) : null;
+      if (taskId) assert(task && task.status !== 'deleted', 'NOT_FOUND', '任务已不可用。');
+      const requested = goalId ?? task?.goalId;
+      const goal = requested ? this.store.get('goals', requested) : null;
+      if (requested) assert(goal && goal.status !== 'deleted' && this.store.get('projects', goal.projectId)?.status !== 'deleted',
+        'NOT_FOUND', '相关目标已不可用。');
+      return this.#snapshot(true, capacity, goal, taskId);
+    });
+  }
+  #snapshot(panel, capacity, goalScope, taskId) {
     const collections = ["projects", "goals", "tasks", "agents", "templates", "templateHistory", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "deliveryApprovals", "actionBatches", "agentCredentials"];
-    const data = Object.fromEntries(collections.filter(c => !panel || (c !== 'artifacts' && c !== 'verifications')).map(c => [c, panel && c === 'attempts' ?
-      this.store.panelAttempts([...(capacity?.live?.keys() ?? [])]) : this.store.list(c)]));
+    const list = collection => {
+      if (goalScope && collection === 'goals') return [goalScope];
+      if (goalScope && collection === 'tasks') return this.store.taskContext(goalScope.id, taskId);
+      if (panel && collection === 'attempts') return this.store.panelAttempts([...(capacity?.live?.keys() ?? [])]);
+      return this.store.list(collection);
+    };
+    const data = Object.fromEntries(collections.filter(c => !panel || (c !== 'artifacts' && c !== 'verifications')).map(c => [c, list(c)]));
     const allAttempts = data.attempts;
     const tasksById = new Map(data.tasks.map(task => [task.id, task]));
     const projectsById = new Map(data.projects.map(project => [project.id, project]));

@@ -10,7 +10,13 @@ export const api = {
   conversation: (input, signal) => request('conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input), signal }),
   messages: (id, signal, before) => request(`conversation?id=${encodeURIComponent(id)}${before ? `&before=${encodeURIComponent(before)}` : ''}`, { signal }),
   pairing: input => request('pairing', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
-  snapshot: signal => request('state?view=panel', { signal }),
+  snapshot: (signal, view = 'panel') => request(`state?view=${view}`, { signal }),
+  dashboard: (section, { parent, after, signal } = {}) => {
+    const query = new URLSearchParams({ section, ...(parent ? { parent } : {}), ...(after ? { after } : {}) });
+    return request(`dashboard?${query}`, { signal });
+  },
+  workbench: (filters, after, signal) => request(`workbench?${new URLSearchParams({ ...filters, ...(after ? { after } : {}) })}`, { signal }),
+  panelContext: (scope, signal) => request(`panel-context?${new URLSearchParams(scope)}`, { signal }),
   taskAttempts: (taskId, before, signal, refreshIds, includeEvidence = true) => {
     const query = new URLSearchParams({ taskId, ...(before === null ? {} : { before }) });
     for (const id of refreshIds) query.append('refresh', id);

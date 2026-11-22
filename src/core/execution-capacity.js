@@ -9,9 +9,9 @@ export const CAPACITY_LABELS = {
 };
 export const CAPACITY_PHASES = Object.keys(CAPACITY_LABELS);
 
-function liveParts(store, live, records = store?.list('attempts') ?? []) {
+function liveParts(store, live, records = store?.list('attempts') ?? [], pendingIntegrations) {
   const attempts = records.filter(a => !a.legacyBatch && (isLiveAttempt(a) || live?.has(a.id)));
-  const integrations = store?.list('integrations').filter(integrationPending) ?? [];
+  const integrations = pendingIntegrations ?? store?.list('integrations').filter(integrationPending) ?? [];
   return { attempts, integrations };
 }
 
@@ -52,7 +52,7 @@ export function executionOccupancy(store, adapter, live) {
 // `used` is computed from the same parts as executionOccupancy so the panel and
 // dispatch decisions cannot drift apart.
 export function executionCapacity(store, adapter, live, policy, snapshot) {
-  const { attempts, integrations } = liveParts(store, live, snapshot?.attempts);
+  const { attempts, integrations } = liveParts(store, live, snapshot?.attempts, snapshot?.integrations);
   const tasks = snapshot?.tasks ?? new Map((store?.list('tasks') ?? []).map(task => [task.id, task]));
   const entries = [];
   for (const attempt of attempts) entries.push(attemptSlot(attempt, tasks.get(attempt.taskId)));

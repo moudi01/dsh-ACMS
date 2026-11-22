@@ -9,6 +9,12 @@ import { activityAt } from './graph.js';
 
 export const COMPLETED_STATUSES = new Set(['succeeded', 'cancelled', 'archived', 'deferred']);
 export const isCompleted = item => COMPLETED_STATUSES.has(item?.status);
+export function taskBoardColumn(status) {
+  if (status === 'preparing') return 'running';
+  if (status === 'integrating') return 'reviewing';
+  if (['paused', 'failed', 'reconciling', 'stopping'].includes(status)) return 'blocked';
+  return COMPLETED_STATUSES.has(status) ? 'succeeded' : status;
+}
 
 // Shared by the overview metric and its destination. Waiting/paused/cleanup
 // reviews are still in the queue; failed and other terminal reviews are not.
