@@ -29,7 +29,7 @@ export function taskAttemptHistory(store, params) {
       attempts: page.slice(0, taskAttemptPageSize).map(({ attempt, cursor }) => ({ ...attemptForOwner(attempt), historyPosition: cursor })),
       nextBefore: page.length > taskAttemptPageSize ? page[taskAttemptPageSize - 1].cursor : null,
       ...(rawBefore === null ? { activeAttempts: store.taskPanelActiveAttempts(taskId).map(attemptForOwner),
-        verifications: store.taskPanelVerifications(taskId),
+        ...(params.get('evidence') === '0' ? {} : { verifications: store.taskPanelVerifications(taskId) }),
         ...(refreshIds.length ? { refreshedAttempts: store.taskPanelAttemptUpdates(taskId, [...new Set(refreshIds)]).map(attemptForOwner) } : {}) } : {}) };
   });
 }

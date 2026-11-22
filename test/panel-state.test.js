@@ -8,9 +8,9 @@ import { OWNER } from '../src/core/util.js';
 
 const routesFor = fixture => {
   const routes = new Map(createRoutes(fixture).map(route => [route.path, route.fetch]));
-  return async resource => {
+  return async (resource, options) => {
     const url = new URL('/api/acms/' + resource, 'http://dsh');
-    const response = await routes.get(url.pathname)(new Request(url));
+    const response = await routes.get(url.pathname)(new Request(url, options));
     return { status: response.status, value: await response.json() };
   };
 };
@@ -41,29 +41,31 @@ test('panel keeps live and held attempts while scoped history retains old eviden
   });
   f.engine.live.set('a-memory-only', {});
   const read = routesFor(f);
-  const counted = { tasks: 0, attempts: 0, deliveries: 0 };
+  const counted = { tasks: 0, attempts: 0, deliveries: 0, artifacts: 0, verifications: 0 };
   const list = f.store.list.bind(f.store), delivered = f.store.deliveredWorkForGoal.bind(f.store);
   f.store.list = collection => {
-    if (collection === 'tasks' || collection === 'attempts') counted[collection]++;
+    if (Object.hasOwn(counted, collection)) counted[collection]++;
     return list(collection);
   };
   f.store.deliveredWorkForGoal = id => { counted.deliveries++; return delivered(id); };
 
   const legacy = (await read('state')).value;
-  assert.deepEqual(counted, { tasks: 1, attempts: 1, deliveries: 0 });
+  assert.deepEqual(counted, { tasks: 1, attempts: 1, deliveries: 0, artifacts: 1, verifications: 1 });
   assert.equal(legacy.attemptsView, undefined);
   assert.equal(legacy.attempts.length, 46);
-  Object.assign(counted, { tasks: 0, attempts: 0, deliveries: 0 });
+  for (const key of Object.keys(counted)) counted[key] = 0;
   const panel = (await read('state?view=panel')).value;
-  assert.deepEqual(counted, { tasks: 1, attempts: 0, deliveries: 0 });
+  assert.deepEqual(counted, { tasks: 1, attempts: 0, deliveries: 0, artifacts: 0, verifications: 0 });
   assert.equal(panel.attemptsView, 'panel');
   assert.deepEqual(panel.attempts.map(item => item.id),
     ['a-recovery', 'a-legacy-hold', 'a-memory-only', ...Array.from({ length: 8 }, (_, index) => 'b-' + (index + 1))]);
   assert(panel.attempts.every(item => !item.summary && !item.meteredUsage && !item.environment));
   assert(panel.runtime.capacity.entries.some(entry => entry.id === 'deleted-hold' && entry.phase === 'cleanupPending'));
   assert.match(panel.trash[0].purgeReason, /执行资源/);
-  const { attempts: rawAttempts, ...rest } = legacy;
-  const { attempts: panelAttempts, attemptsView, ...panelRest } = panel;
+  const { attempts: rawAttempts, artifacts, verifications, ...rest } = legacy;
+  const { attempts: panelAttempts, attemptsView, evidenceView, ...panelRest } = panel;
+  assert.equal(evidenceView, 'panel');
+  assert.deepEqual(verifications.map(item => item.id), ['a-old-verification', 'b-verification']);
   assert.deepEqual(panelRest, rest);
 
   const { value: first } = await read('task-attempts?taskId=' + a.id);
@@ -74,6 +76,7 @@ test('panel keeps live and held attempts while scoped history retains old eviden
   assert.equal(first.attempts[0].summary, 'history for a-33');
   assert.equal(first.activeAttempts.find(item => item.id === 'a-recovery').recovery.reason, 'original receipt still unverified');
   assert.deepEqual(first.verifications.map(item => item.id), ['a-old-verification']);
+  assert.equal((await read('task-attempts?taskId=' + a.id + '&evidence=0')).value.verifications, undefined);
   assert.equal(older.nextBefore, null);
   assert.equal(older.verifications, undefined);
   assert.equal(older.attempts.at(-1).id, 'a-recovery');
@@ -93,6 +96,93 @@ test('panel keeps live and held attempts while scoped history retains old eviden
     .map(item => item.taskId), Array(9).fill(b.id));
   assert.equal((await read('task-attempts?taskId=' + deleted.id)).status, 404);
   assert.equal((await read('task-attempts?taskId=' + a.id + '&before=0')).status, 400);
+});
+
+test('owner evidence pages use durable scoped IDs, include historical review associations and skip deleted subjects', async t => {
+  const f = await fixture(t);
+  const a = f.task();
+  f.store.put('tasks', { ...a, status: 'succeeded', artifactIds: ['art-24'] });
+  const otherProject = f.command('project.save', { name: 'evidence isolation', repoRoot: f.root, mode: 'copy' });
+  const otherGoal = f.command('goal.create', { title: 'other scope', description: 'verification', acceptance: 'evidence',
+    projectId: otherProject.id, templateId: f.template.id, plan: false });
+  const b = f.task({ goalId: otherGoal.id });
+  const review = f.task();
+  const retired = f.task();
+  f.command('task.delete', { id: retired.id });
+  f.store.transaction(() => {
+    const artifact = (id, taskId) => f.store.put('artifacts', { id, taskId, title: id, path: id + '.md', bytes: 8,
+      blob: 'internal storage path', textIntegrity: { status: 'warning' }, archiveVerification: { textDiagnostics: { skipped: 1 } } });
+    for (let index = 0; index < 25; index++) artifact('art-' + index, a.id);
+    artifact('other-art', b.id);
+    artifact('retired-art', retired.id);
+    f.store.put('attempts', { id: 'legacy-attempt', taskId: a.id, goalId: f.goal.id });
+    f.store.put('attempts', { id: 'review-attempt', taskId: review.id, goalId: f.goal.id });
+    f.store.put('attempts', { id: 'deleted-attempt', taskId: retired.id, goalId: f.goal.id });
+    f.store.put('verifications', { id: 'legacy', attemptId: 'legacy-attempt', checks: [{ id: 'host', checkVersion: 'v1' }] });
+    for (let index = 0; index < 8; index++) f.store.put('verifications', { id: 'direct-' + index, taskId: a.id, attemptId: 'legacy-attempt' });
+    f.store.put('verifications', { id: 'reviewed', taskId: a.id, attemptId: 'review-attempt', kind: 'review', summary: 'reviewed original' });
+    f.store.put('verifications', { id: 'goal-review', taskId: f.goal.id, attemptId: 'review-attempt', kind: 'goal-review' });
+    f.store.put('verifications', { id: 'deleted-direct', taskId: retired.id, attemptId: 'legacy-attempt' });
+    f.store.put('verifications', { id: 'deleted-legacy', attemptId: 'deleted-attempt' });
+    f.store.put('verifications', { id: 'other', taskId: b.id });
+  });
+
+  const read = routesFor(f);
+  const taskScope = '&taskId=' + a.id;
+  const projectScope = '&projectId=' + f.project.id;
+  const readEvidence = (kind, suffix = '') => read('evidence?kind=' + kind + suffix);
+  const global = (await readEvidence('artifacts')).value;
+  assert.equal(global.rows.length, 20);
+  assert.equal(global.rows[0].id, 'other-art');
+  assert.equal(global.rows[0].textIntegrity, undefined);
+  const first = (await readEvidence('artifacts', taskScope)).value;
+  assert.deepEqual(first.scope, { kind: 'task', id: a.id });
+  assert.equal(first.total, 25);
+  assert.equal(first.rows[0].position, global.rows[1].position);
+  assert.deepEqual(first.rows[0].textIntegrity, { status: 'warning' });
+  assert.deepEqual(first.rows[0].archiveVerification, { textDiagnostics: { skipped: 1 } });
+  const older = (await readEvidence('artifacts', taskScope + '&before=' + first.nextBefore)).value;
+  assert.equal(older.nextBefore, null);
+  assert.deepEqual([...first.rows, ...older.rows].map(row => row.id), Array.from({ length: 25 }, (_, index) => 'art-' + (24 - index)));
+  assert([...global.rows, ...first.rows].every(row => row.blob === undefined));
+  assert.deepEqual((await readEvidence('artifacts', projectScope)).value.rows.map(row => row.id), first.rows.map(row => row.id));
+  assert.equal((await readEvidence('artifacts', taskScope + projectScope)).status, 400);
+  assert.equal((await readEvidence('artifacts', '&taskId=' + retired.id)).status, 404);
+  assert.equal((await readEvidence('artifacts', '&before=0')).status, 400);
+  assert.deepEqual((await read('artifact-counts?goalId=' + f.goal.id)).value.counts, { [a.id]: 25 });
+  assert.deepEqual((await read('artifact-counts')).value.counts, { [a.id]: 25 });
+  const readLinks = references => read('artifact-links', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ references }) });
+  const refs = ['art-0', 'other-art', 'retired-art', 'missing', 'art-0'].map(id => ({ id, taskId: a.id }));
+  const links = (await readLinks([...refs, { id: 'art-0', taskId: null }, { id: 'retired-art', taskId: null },
+    { id: 'other-art', taskId: b.id }])).value.rows;
+  assert.deepEqual(links.sort((left, right) => String(left.requestedTaskId).localeCompare(String(right.requestedTaskId))), [
+    { id: 'art-0', requestedTaskId: null, taskId: a.id, title: 'art-0', path: 'art-0.md' },
+    ...[
+      { id: 'art-0', requestedTaskId: a.id, taskId: a.id, title: 'art-0', path: 'art-0.md' },
+      { id: 'other-art', requestedTaskId: b.id, taskId: b.id, title: 'other-art', path: 'other-art.md' },
+    ].sort((left, right) => left.requestedTaskId.localeCompare(right.requestedTaskId)),
+  ]);
+  assert.equal((await readLinks(Array(101).fill(refs[0]))).status, 400);
+
+  const firstCheck = (await readEvidence('verifications', taskScope)).value;
+  const olderCheck = (await readEvidence('verifications', taskScope + '&before=' + firstCheck.nextBefore)).value;
+  assert.deepEqual([...firstCheck.rows, ...olderCheck.rows].map(row => row.id),
+    ['reviewed', 'direct-7', 'direct-6', 'direct-5', 'direct-4', 'direct-3', 'direct-2', 'direct-1', 'direct-0', 'legacy']);
+  assert.equal(olderCheck.rows.at(-1).checks[0].checkVersion, 'v1');
+  assert.equal(olderCheck.rows.at(-1).attemptTaskId, a.id);
+  assert.deepEqual((await readEvidence('verifications', '&taskId=' + review.id)).value.rows.map(row => row.id), ['goal-review', 'reviewed']);
+  for (const scope of [projectScope, '&goalId=' + f.goal.id]) {
+    const rows = (await readEvidence('verifications', scope)).value.rows;
+    assert.equal(rows[0].id, 'goal-review');
+    assert.equal(rows.at(-1).id, 'legacy');
+    assert.equal(rows.at(-1).checkCount, 1);
+    assert.equal(rows.at(-1).checks, undefined);
+    assert(rows.every(row => !['deleted-direct', 'deleted-legacy', 'other'].includes(row.id)));
+  }
+  const allChecks = (await readEvidence('verifications')).value.rows;
+  assert(allChecks.every(row => !row.id.startsWith('deleted')));
+  assert.equal(allChecks[0].id, 'other');
 });
 
 test('confirmed panel rewind invalidates in-flight state before a restored database can catch up', () => {

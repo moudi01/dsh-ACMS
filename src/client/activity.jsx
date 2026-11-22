@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
 import { activityContext, describeActivity, redactActivityText } from '../core/activity.js';
+import { deliveryArtifactIds, useActivityArtifacts } from './activity-artifacts.js';
 
 const timeOf = value => {
   const parsed = value ? new Date(value) : null;
@@ -23,6 +24,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   const [goalId, setGoalId] = useState('');
   const [taskId, setTaskId] = useState('');
   const [items, setItems] = useState([]);
+  const [itemsScope, setItemsScope] = useState(null);
   const [nextBefore, setNextBefore] = useState(null);
   const [latestSeq, setLatestSeq] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -33,6 +35,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
 
   const filters = useMemo(() => ({ projectId: projectId || undefined, goalId: goalId || undefined, taskId: taskId || undefined }), [projectId, goalId, taskId]);
   const filterKey = JSON.stringify(filters);
+  const visibleItems = itemsScope === filterKey ? items : [];
   const filtersRef = useRef(filters); filtersRef.current = filters;
   const filterKeyRef = useRef(filterKey); filterKeyRef.current = filterKey;
   const context = useMemo(() => activityContext(data), [data]);
@@ -52,6 +55,8 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
   const tasks = useMemo(() => (data.tasks ?? []).filter(task => (!projectId || task.projectId === projectId) && (!goalId || task.goalId === goalId)), [data.tasks, projectId, goalId]);
   const pendingByTask = useMemo(() => new Map((data.interactions ?? []).filter(item => item.status === 'pending').map(item => [item.taskId, item])), [data.interactions]);
   const artifactsById = useMemo(() => new Map((data.artifacts ?? []).map(item => [item.id, item])), [data.artifacts]);
+  const scopedArtifacts = data.evidenceView === 'panel';
+  const artifactLinks = useActivityArtifacts(visibleItems, available.task, scopedArtifacts, filterKey);
   const latestBlockSeq = useMemo(() => {
     const map = new Map();
     for (const entry of items) {
@@ -67,15 +72,15 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
     const token = ++request.current; const gen = ++generation.current; setLoading(true); setError(''); pendingSync.current = false;
     try {
       const page = await api.activity({ ...filters, limit: 50 });
-      if (token !== request.current || gen !== generation.current) return;
+      if (token !== request.current || gen !== generation.current || filterKey !== filterKeyRef.current) return;
       const merged = mergeEntries(page.entries, stateRef.current.items);
       stateRef.current = { items: merged, latestSeq: Math.max(stateRef.current.latestSeq, page.latestSeq), loaded: true };
-      setItems(merged); setNextBefore(page.nextBefore); setLatestSeq(previous => Math.max(previous, page.latestSeq)); setHasMore(page.hasMore); setLoaded(true);
+      setItems(merged); setItemsScope(filterKey); setNextBefore(page.nextBefore); setLatestSeq(previous => Math.max(previous, page.latestSeq)); setHasMore(page.hasMore); setLoaded(true);
       // Events may have arrived while the first page was loading; synchronize
       // from the page watermark before declaring the view settled.
       syncNewer().catch(() => {});
     } catch (cause) {
-      if (token !== request.current) return;
+      if (token !== request.current || filterKey !== filterKeyRef.current) return;
       setError(`${cause.code ? `${cause.code} · ` : ''}${cause.message}`);
     } finally {
       if (token === request.current) setLoading(false);
@@ -86,7 +91,7 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
     const token = request.current; setLoading(true); setError('');
     try {
       const page = await api.activity({ ...filters, before: nextBefore, limit: 50 });
-      if (token !== request.current) return;
+      if (token !== request.current || filterKey !== filterKeyRef.current) return;
       setItems(previous => mergeEntries(previous, page.entries));
       setNextBefore(page.nextBefore); setHasMore(page.hasMore);
       // An older page must never move the newer-event watermark: it does not
@@ -158,11 +163,11 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
       <select aria-label="筛选动态项目" value={projectId} onChange={event => changeProject(event.target.value)}><option value="">全部项目</option>{(data.projects ?? []).map(project => <option key={project.id} value={project.id}>{redactActivityText(project.name)}</option>)}</select>
       <select aria-label="筛选动态目标" value={goalId} onChange={event => changeGoal(event.target.value)}><option value="">全部目标</option>{goals.map(goal => <option key={goal.id} value={goal.id}>{redactActivityText(goal.title)}</option>)}</select>
       <select aria-label="筛选动态任务" value={taskId} onChange={event => setTaskId(event.target.value)}><option value="">全部任务</option>{tasks.map(task => <option key={task.id} value={task.id}>{redactActivityText(task.title)}</option>)}</select>
-      <span className="acms-muted">已显示 {items.length} 条</span>
+      <span className="acms-muted">已显示 {visibleItems.length} 条</span>
     </div>
     {error && <div className="acms-alert error" role="alert">{error}</div>}
-    {!loading && !items.length && !error && <div className="acms-empty"><span className="acms-empty-mark">◇</span><h3>还没有可显示的业务动态</h3><p>创建目标、分配任务或回复阻塞后，这里会按时间记录真实操作人和动作。</p></div>}
-    <div className="acms-activity-list">{items.map(entry => {
+    {!loading && itemsScope === filterKey && !visibleItems.length && !error && <div className="acms-empty"><span className="acms-empty-mark">◇</span><h3>还没有可显示的业务动态</h3><p>创建目标、分配任务或回复阻塞后，这里会按时间记录真实操作人和动作。</p></div>}
+    <div className="acms-activity-list">{visibleItems.map(entry => {
       const activity = describeActivity(entry, context);
       if (!activity) return null;
       const kind = openKind(activity.subject?.kind);
@@ -182,7 +187,16 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
           {(activity.project || activity.goal) && <p className="acms-activity-path">{[activity.project?.title, activity.goal?.title].filter(Boolean).join(' › ')}</p>}
           {activity.reason && <p className="acms-activity-reason"><b>原因：</b>{activity.reason}</p>}
           {activity.executor && <p className="acms-muted">相关执行者：{activity.executor}</p>}
-          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>{activity.delivery.map(item => <span key={item.id ?? item.title} className="acms-activity-delivery-item"><span>{item.title}（版本 {item.contractVersion ?? '未知'}、代次 {item.generation ?? '未知'}）</span>{item.artifactIds.map(id => artifactsById.get(id)).filter(Boolean).map(artifact => <button type="button" key={artifact.id} className="text acms-activity-open" onClick={() => open('artifact', artifact)}>打开产物「{redactActivityText(artifact.title ?? artifact.path)}」 →</button>)}{item.artifactIds.length > 0 && !item.artifactIds.some(id => artifactsById.has(id)) && <span>历史产物不可用，仅保留哈希 {item.artifactHash ? <code title={item.artifactHash}>{shortHash(item.artifactHash)}</code> : '（未记录）'}</span>}{item.artifactIds.length === 0 && item.artifactHash && <span>未记录产物清单，仅保留哈希 <code title={item.artifactHash}>{shortHash(item.artifactHash)}</code></span>}</span>)}{activity.deliveryTotal > activity.delivery.length && <span className="acms-muted">仅显示前 {activity.delivery.length}/{activity.deliveryTotal} 项</span>}{activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查记录 →</button>}{activity.deliveryReviewStale && <span>历史审查记录与当次交付不一致，未作为本次证据。</span>}</div>}
+          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>
+            {activity.delivery.map(item => <span key={item.id ?? item.title} className="acms-activity-delivery-item">
+              <span>{item.title}（版本 {item.contractVersion ?? '未知'}、代次 {item.generation ?? '未知'}）</span>
+              <ActivityArtifactLinks item={item} open={open} scoped={scopedArtifacts}
+                artifactLinks={artifactLinks} artifactsById={artifactsById} />
+            </span>)}
+            {activity.deliveryTotal > activity.delivery.length && <span className="acms-muted">仅显示前 {activity.delivery.length}/{activity.deliveryTotal} 项</span>}
+            {activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查记录 →</button>}
+            {activity.deliveryReviewStale && <span>历史审查记录与当次交付不一致，未作为本次证据。</span>}
+          </div>}
           {activity.type === 'goal.succeeded' && activity.delivery.length === 0 && <p className="acms-muted">历史事件未记录当次交付清单；只能打开当前目标查看最新证据。</p>}
           {(activity.evidence.artifactHash || activity.evidence.deliveryHash || activity.evidence.integratedCommit) && <p className="acms-activity-evidence">证据：{Object.entries(activity.evidence).map(([key, value]) => <code key={key} title={`${key}: ${value}`}>{key}={shortHash(value)}</code>)}</p>}
         </div>
@@ -191,5 +205,21 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
     })}</div>
     {hasMore && <div className="acms-actions acms-activity-more"><button type="button" onClick={() => loadOlder().catch(() => {})} disabled={loading}>{loading ? '正在加载…' : '加载更早的动态'}</button></div>}
     {loaded && !hasMore && items.length > 0 && <p className="acms-sectionnote">已经到达可读动态的起点。</p>}
+  </>;
+}
+
+function ActivityArtifactLinks({ item, open, scoped, artifactLinks, artifactsById }) {
+  const ids = deliveryArtifactIds(item.artifactIds);
+  const hash = item.artifactHash ? <code title={item.artifactHash}>{shortHash(item.artifactHash)}</code> : '（未记录）';
+  if (!ids.length) return item.artifactHash && <span>未记录产物清单，仅保留哈希 {hash}</span>;
+  const results = ids.map(id => scoped ? artifactLinks.get(item.id, id) : { row: artifactsById.get(id) });
+  const links = results.map(result => result?.row).filter(Boolean);
+  const loading = results.some(result => !result);
+  const failed = results.some(result => result?.error);
+  return <>{links.map(artifact => <button type="button" key={artifact.id} className="text acms-activity-open"
+    onClick={() => open('artifact', artifact)}>打开产物「{redactActivityText(artifact.title ?? artifact.path)}」 →</button>)}
+    {loading && <span className="acms-muted">正在读取产物链接…</span>}
+    {failed && <span>无法读取产物链接。<button type="button" className="text" onClick={artifactLinks.retry}>重试</button></span>}
+    {!links.length && !loading && !failed && <span>历史产物不可用，仅保留哈希 {hash}</span>}
   </>;
 }

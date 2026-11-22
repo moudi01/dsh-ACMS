@@ -48,7 +48,7 @@ export function useTaskAttempts(task, data) {
     publish({ ...current.view, loading: true, error: '' });
     try {
       const read = async (cursor, refreshIds) => {
-        const page = await api.taskAttempts(task.id, cursor, current.controller.signal, refreshIds);
+        const page = await api.taskAttempts(task.id, cursor, current.controller.signal, refreshIds, data.evidenceView !== 'panel');
         if (page.taskId !== task.id) throw new Error('当前任务执行记录无法核对。');
         return page;
       };

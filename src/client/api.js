@@ -11,11 +11,20 @@ export const api = {
   messages: (id, signal, before) => request(`conversation?id=${encodeURIComponent(id)}${before ? `&before=${encodeURIComponent(before)}` : ''}`, { signal }),
   pairing: input => request('pairing', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }),
   snapshot: signal => request('state?view=panel', { signal }),
-  taskAttempts: (taskId, before, signal, refreshIds) => {
+  taskAttempts: (taskId, before, signal, refreshIds, includeEvidence = true) => {
     const query = new URLSearchParams({ taskId, ...(before === null ? {} : { before }) });
     for (const id of refreshIds) query.append('refresh', id);
+    if (!includeEvidence) query.set('evidence', '0');
     return request(`task-attempts?${query}`, { signal });
   },
+  evidence: (kind, scope, before, signal) => {
+    const query = new URLSearchParams({ kind, ...scope, ...(before === null ? {} : { before }) });
+    return request(`evidence?${query}`, { signal });
+  },
+  artifactCounts: (scope, signal) => request(`artifact-counts?${new URLSearchParams(scope)}`, { signal }),
+  artifactLinks: (references, signal) => request('artifact-links', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ references }), signal,
+  }),
   usageSummary: (scope, groupBy, { after, attemptBefore = Number.MAX_SAFE_INTEGER } = {}) =>
     request(`usage/summary?${new URLSearchParams({ ...scope, groupBy, attemptBefore, ...(after != null ? { after } : {}) })}`),
   costForecast: goalId => request(`cost/forecast?goalId=${encodeURIComponent(goalId)}`),
@@ -26,7 +35,7 @@ export const api = {
     for (const key of ['before', 'after', 'limit', 'projectId', 'goalId', 'taskId']) if (query[key] !== undefined && query[key] !== null && query[key] !== '') params.set(key, query[key]);
     return request(`activity?${params.toString()}`, { signal });
   },
-  artifact: id => request(`artifact?id=${encodeURIComponent(id)}`),
+  artifact: (id, signal) => request(`artifact?id=${encodeURIComponent(id)}`, { signal }),
   candidateArchive: selection => request('composition/archive', { method: 'POST',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify(selection) }),
   candidateMergePreview: selection => request('composition/merge-preview', { method: 'POST',

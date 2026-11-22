@@ -2,6 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { startPreview } from './preview-server.mjs';
+import { verifyPanelEvidence } from './panel-evidence-ui-test.mjs';
 import { digest } from '../src/core/util.js';
 import { inspectDeliveryText } from '../src/runtime/text-integrity.js';
 
@@ -70,6 +71,7 @@ try {
   await page.screenshot({ path: 'test-results/ui/artifact-download.png', fullPage: true });
   if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
   console.log('artifact download UI checks passed');
+  await verifyPanelEvidence(browser);
 } finally {
   await browser.close();
   await server.close();
