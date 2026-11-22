@@ -101,9 +101,51 @@ export async function verifyScopedWorkbench(browser) {
     await page.getByRole('button', { name: '下一页任务' }).click();
     await expect(finished.getByText('2 份产物', { exact: true })).toHaveCount(15);
     expect(calls('artifact-counts')).toHaveLength(0);
+
+    const removable = command('task.create', { goalId: goalB.id, title: '核对已删除任务的选择' });
+    const taskButton = cards.filter({ has: page.getByRole('heading', { name: removable.title, exact: true }) });
+    const taskHeading = drawer.getByRole('heading', { name: removable.title, exact: true });
+    const detailRead = url => url.pathname === '/api/acms/panel-context' && url.searchParams.get('taskId') === removable.id;
+    const remoteCommand = async name => {
+      const response = await page.request.post(server.url + '/api/acms/command', {
+        data: { name, args: { id: removable.id }, requestId: crypto.randomUUID() },
+      });
+      expect(response.ok()).toBe(true);
+    };
+    const notify = () => store.transaction(() => store.event('task.changed', removable.id, {}, OWNER));
+    await page.getByRole('button', { name: /^返回进行中/ }).click();
+    await page.getByRole('button', { name: '看板', exact: true }).click();
+    await taskButton.click();
+    await expect(taskHeading).toBeVisible();
+    await page.route(detailRead, route => route.fulfill({
+      status: 503, json: { ok: false, error: { code: 'TEMPORARY', message: '暂时无法读取任务详情' } },
+    }), { times: 1 });
+    notify();
+    await expect(page.getByRole('alert').filter({ hasText: '暂时无法读取任务详情' })).toBeVisible();
+    notify();
+    await expect(taskHeading).toBeVisible();
+
+    await remoteCommand('task.delete');
+    await expect(drawer).toHaveCount(0);
+    await remoteCommand('task.restore');
+    await expect(taskButton).toBeVisible();
+    await expect(drawer).toHaveCount(0);
+    await taskButton.click();
+    await expect(taskHeading).toBeVisible();
+
+    const oldMissing = await pauseRead(page, detailRead);
+    await remoteCommand('task.delete');
+    await oldMissing.wait();
+    await drawer.getByLabel('关闭任务详情').click();
+    await remoteCommand('task.restore');
+    await taskButton.click();
+    await expect(taskHeading).toBeVisible();
+    await oldMissing.finish();
+    await expect(taskHeading).toBeVisible();
+
     expect(server.adapter.calls).toHaveLength(0);
     expect(errors).toEqual([]);
-    console.log('Scoped workbench: bounded first reads, active pagination, full search, cross-scope dependency, ID detail and pause passed.');
+    console.log('Scoped workbench: bounded first reads, active pagination, full search, cross-scope dependency, ID detail, pause and confirmed deletion passed.');
   } finally {
     await page.close();
     await server.close();

@@ -132,40 +132,57 @@ function useRuntimeClock(running) {
   }, [running]);
   return Date.now();
 }
-function usePanelContext(scope, cursor, epoch, enabled) {
+function usePanelContext(scope, cursor, epoch, enabled, selection) {
   const [result, setResult] = useState(null);
-  const key = JSON.stringify([epoch, scope]);
+  const key = JSON.stringify([epoch, scope, enabled]);
+  const active = useRef(null);
+  if (active.current?.key !== key || active.current.selection !== selection) active.current = { key, selection };
+  const requestScope = active.current;
   useEffect(() => {
     if (!enabled) return;
     const controller = new AbortController();
+    const current = () => !controller.signal.aborted && active.current === requestScope;
     api.panelContext(scope, controller.signal).then(value => {
-      if (!controller.signal.aborted) setResult({ key, data: value });
+      if (current()) setResult({ scope: requestScope, data: value });
     }).catch(error => {
-      if (!controller.signal.aborted) setResult({ key, error: error.message });
+      if (current()) setResult({ scope: requestScope, error: error.message, code: error.code });
     });
     return () => controller.abort();
-  }, [enabled, key, cursor]);
-  return enabled && result?.key === key ? result : null;
+  }, [enabled, requestScope, cursor]);
+  return enabled && result?.scope === requestScope ? result : null;
 }
 export function App() {
-  const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selected, setSelected] = useState(null);
+  const [tab, setTab] = useState('overview'); const [modal, setModal] = useState(null); const [selection, setSelection] = useState(null);
+  const selected = selection?.id;
   const [scope, setScope] = useState({}); const [entityView, setEntityView] = useState(null);
   const view = tab === 'overview' || tab === 'tasks' ? 'dashboard' : 'panel';
   const { data, epoch, error, connected, updated, refresh } = useCompany(view);
+  const currentEpoch = useRef(epoch);
+  currentEpoch.current = epoch;
   const [conversation, setConversation] = useState(null);
   const needsContext = !!(data?.dashboardView && (selected || entityView || modal || conversation));
   const contextScope = selected ? { taskId: selected } : entityView?.kind === 'goal' ? { goalId: entityView.id } :
     modal?.type === 'goalEdit' ? { goalId: modal.value.id } : {};
-  const context = usePanelContext(contextScope, data?.cursor, epoch, needsContext);
+  const context = usePanelContext(contextScope, data?.cursor, epoch, needsContext, selection);
   const detailData = needsContext ? context?.data : data;
   const chat = (agentId, taskId = null, exact = false) => setConversation({ agentId, taskId: exact ? (taskId ?? null) : (taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null) });
-  const navigate = (kind, id) => { setModal(null); setSelected(kind === 'task' ? id : null); setEntityView(kind === 'task' ? null : { kind, id }); };
+  const navigate = (kind, id) => { setModal(null); setSelection(kind === 'task' ? { id } : null); setEntityView(kind === 'task' ? null : { kind, id }); };
   const selectTask = id => navigate('task', id);
   const [busy, setBusy] = useState(false); const [notice, setNotice] = useState(''); const [actionError, setActionError] = useState('');
-  useEffect(() => { if (selected && data && !data.dashboardView && !data.tasks.some(t => t.id === selected)) setSelected(null); }, [data?.tasks, selected]);
+  const taskUnavailable = selection && data && (data.dashboardView
+    ? context?.code === 'NOT_FOUND' : !data.tasks.some(task => task.id === selected));
+  useEffect(() => {
+    if (taskUnavailable) setSelection(current => current === selection ? null : current);
+  }, [selection, taskUnavailable]);
   const act = async (name, args, success = '已保存') => {
     setBusy(true); setActionError('');
-    try { const result = await api.command(name, args); await refresh(); setNotice(result?.collaborationWarning ?? success); return result; }
+    try {
+      const result = await api.command(name, args);
+      if (name === 'task.delete' && currentEpoch.current === epoch && result?.status === 'deleted' && result.id === selected) {
+        setSelection(current => current === selection ? null : current);
+      }
+      await refresh(); setNotice(result?.collaborationWarning ?? success); return result;
+    }
     catch (e) { setActionError(`${e.code ? `${e.code} · ` : ''}${e.message}`); throw e; }
     finally { setBusy(false); }
   };
@@ -207,7 +224,7 @@ export function App() {
   }, [modal, detailData]);
   return <div className="acms-app">
     <aside className="acms-nav"><div className="acms-brand"><Logo /><div><b>ACMS</b><span>AGENT COMPANY</span></div><small>01</small></div>
-      <div className="acms-nav-label">工作空间</div><nav aria-label="ACMS 主导航">{tabs.map(([key, name, icon]) => <button key={key} data-active={tab === key} onClick={() => { setTab(key); setScope({}); setSelected(null); setEntityView(null); }}><span aria-hidden="true">{icon}</span>{name}{key === 'overview' && questions > 0 && <em>{questions}</em>}</button>)}</nav>
+      <div className="acms-nav-label">工作空间</div><nav aria-label="ACMS 主导航">{tabs.map(([key, name, icon]) => <button key={key} data-active={tab === key} onClick={() => { setTab(key); setScope({}); setSelection(null); setEntityView(null); }}><span aria-hidden="true">{icon}</span>{name}{key === 'overview' && questions > 0 && <em>{questions}</em>}</button>)}</nav>
       <div className="acms-nav-bottom"><span className={`acms-live ${connected ? 'online' : ''}`}><i />{connected ? '已连接 DSH' : '正在连接'}</span><small>本机运行 · 数据由你掌握</small><div className="acms-owner"><span>你</span><div><b>公司所有者</b><small>Owner · 最高权限</small></div></div></div>
     </aside>
     <main className="acms-main"><header className="acms-topbar"><span>工作空间 <b>/</b> {tabs.find(x => x[0] === tab)?.[1] ?? ({ runs: '当前执行', inbox: '待处理事项' })[tab]}</span><div><span className="acms-sync">{updated ? `更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}` : '正在读取公司状态'}</span><button onClick={() => refresh().catch(e => setActionError(e.message))}>刷新</button></div></header>
@@ -251,8 +268,8 @@ export function App() {
       </div>}
     </main>
     {needsContext && context?.error && <div className="acms-toast" role="alert">{context.error}
-      <button aria-label="关闭详情" onClick={() => { setSelected(null); setEntityView(null); setModal(null); setConversation(null); }}>×</button></div>}
-    {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={detailData} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
+      <button aria-label="关闭详情" onClick={() => { setSelection(null); setEntityView(null); setModal(null); setConversation(null); }}>×</button></div>}
+    {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={detailData} select={selectTask} close={() => setSelection(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
     {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={detailData} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
     {modal && detailData && !modal.hydrate && (modal.type !== 'artifact' || modal.epoch === epoch) && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`}
       modal={modal} data={detailData} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
