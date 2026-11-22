@@ -7,6 +7,7 @@ import { ACTIVITY_DEFAULT_LIMIT, ACTIVITY_EVENT_TYPES, ACTIVITY_MAX_LIMIT } from
 import { assertWorktreeRestoreReady } from "./restore-safety.js";
 import { CHECKPOINT_INDEXES } from "./goal-checkpoint-rows.js";
 import { LIVE_ATTEMPT_STATUSES } from "./entity-actions.js";
+import { PANEL_EVIDENCE_INDEXES } from "./panel-evidence.js";
 
 export const SCHEMA_VERSION = "2";
 const attemptUsageFields = { task: "$.taskId", goal: "$.goalId" };
@@ -53,6 +54,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS delivered_work_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks'
         AND json_extract(body,'$.kind')='work' AND json_extract(body,'$.status')='succeeded';
       ${CHECKPOINT_INDEXES}
+      ${PANEL_EVIDENCE_INDEXES}
       CREATE INDEX IF NOT EXISTS cost_attempts_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='goalCostAttempts';
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, type TEXT NOT NULL, entity_id TEXT, goal_id TEXT, actor TEXT NOT NULL, principal_kind TEXT, on_behalf_of TEXT, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL, at TEXT NOT NULL);

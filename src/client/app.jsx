@@ -17,6 +17,7 @@ import { AccessPage } from './access.jsx';
 import { ActivityPage } from './activity.jsx';
 import { useTaskAttempts } from './task-attempts.js';
 import { beginPanelRewind, selectPanelSnapshot } from './panel-snapshot.js';
+import { EvidencePager, useCompletedArtifactCounts, useEvidence } from './evidence.jsx';
 
 const LABEL = { ready: '待执行', blocked: '已阻塞', running: '执行中', preparing: '准备中', reviewing: '待审查', integrating: '集成中', succeeded: '已完成', failed: '失败', paused: '已暂停', stopping: '停止中', cancelled: '已取消', archived: '已归档', deferred: '本轮延期', reconciling: '待核对', completed: '执行结束', interrupted: '已中断', available: '可分配', retired: '已释放', planning: '规划中', active: '进行中', proposed: '提案', pending: '待处理', answered: '已回答', deleted: '已删除' };
 const ROLE = { manager: '管理', worker: '执行', reviewer: '审查' };
@@ -129,7 +130,7 @@ export function App() {
     finally { setBusy(false); }
   };
   const safeAct = (name, args, message) => act(name, args, message).catch(() => {});
-  const open = (type, value) => { setActionError(''); setModal({ type, value }); };
+  const open = (type, value) => { setActionError(''); setModal({ type, value, epoch }); };
   const close = () => { setModal(null); setActionError(''); };
   const task = selected && data?.tasks.find(t => t.id === selected);
   const entity = entityView && data?.[`${entityView.kind}s`]?.find(e => e.id === entityView.id);
@@ -179,25 +180,83 @@ export function App() {
           <section className="acms-panel"><div className="acms-sectionhead"><h2>最近的执行</h2><span className="acms-muted">执行结束后会自动进入检查与交付</span></div><RunTable attempts={data.attempts.slice(-8).reverse()} data={data} select={selectTask} navigate={navigate} /></section>
         </>}
         {tab === 'projects' && <ProjectsPage data={data} navigate={navigate} select={selectTask} open={open} scope={scope} act={safeAct} busy={busy} onGoal={(projectId, goalId, options = {}) => { setScope({ projectId, goalId, ...(options.completed ? { completed: true } : {}) }); setTab('tasks'); }} />}
-        {tab === 'activity' && <ActivityPage data={data} select={selectTask} navigate={navigate} updated={updated} open={open} />}
+        {tab === 'activity' && <ActivityPage key={epoch} data={data} select={selectTask} navigate={navigate} updated={updated} open={open} />}
         {tab === 'runs' && <><PageHead title="当前执行" description="占用口径与调度器一致：任务执行、Git 集成、独立对话和模型检测各占一个名额。" /><CapacityPanel capacity={data.runtime.capacity} data={data} select={selectTask} chat={chat} openModels={() => setTab('models')} /><section className="acms-panel"><div className="acms-sectionhead"><h2>任务执行明细</h2><span className="acms-muted">点击任务查看执行详情</span></div><RunTable attempts={active} data={data} select={selectTask} navigate={navigate} /></section></>}
         {tab === 'inbox' && <><PageHead title="待处理事项" description="只处理需要你提供材料或作出决定的分支。" />{!pending.length && <Empty title="暂无待处理事项" />}{pending.map(i => <section className="acms-panel" key={i.id}><button className="text" onClick={() => selectTask(i.taskId)}>{data.tasks.find(t => t.id === i.taskId)?.title}</button><p>{i.question}</p><button onClick={() => open('answer', i)}>查看并回复</button></section>)}</>}
-        {tab === 'tasks' && <Tasks navigate={navigate} data={data} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={next => setScope(next ?? {})} />}
+        {tab === 'tasks' && <Tasks navigate={navigate} data={data} epoch={epoch} select={selectTask} create={value => open('task', value)} createGoal={value => open('goal', value)} act={safeAct} busy={busy} open={open} scope={scope} clearScope={next => setScope(next ?? {})} />}
         {tab === 'models' && <ModelsPage data={data} refresh={refresh} />}
         {tab === 'agents' && <><PageHead eyebrow="PEOPLE & CAPABILITIES" title="组织管理" description="选择角色使用的模型，按工作需要设置常驻或临时人员。" action={<button className="primary" onClick={() => open('agent')}>＋ 创建角色</button>} /><div className="acms-agent-grid">{data.agents.map(a => <button key={a.id} className="acms-agent-card" onClick={() => navigate('agent', a.id)}><div className="acms-agent-top"><span className={`acms-avatar ${a.role}`}>{ROLE[a.role]}</span><Badge status={a.status} /></div><h3>{a.name}</h3><p>{a.description || '按任务范围执行工作，并提交可验收的交付物。'}</p><div className="acms-tags"><span>{a.temporary ? '临时人员' : '常驻人员'}</span></div><footer><span>{modelName(a, data.runtime)}</span><span>详情与编辑 ↗</span></footer></button>)}</div></>}
         {tab === 'workflows' && <><PageHead eyebrow="GOAL TEMPLATES" title="目标模板" description="模板描述整个目标如何实现；任务是最小执行粒度，不再有阶段。基础模板为 拆分 → 执行 → 最终审查。" action={<button className="primary" onClick={() => open('workflow')}>＋ 新建模板</button>} /><div className="acms-flow-list">{(data.templates ?? []).map(t => <section key={t.id} className="acms-panel"><div className="acms-sectionhead"><div><h2>{t.name}</h2><span className="acms-muted">版本 {t.version} · {t.finalReview ? '含最终审查' : '不含最终审查'}</span></div><button onClick={() => open('workflow', t)}>编辑并发布新版本</button></div><div className="acms-flow-stages">{(t.phases ?? []).map((p, i) => <React.Fragment key={p.id}>{i > 0 && <span className="acms-flow-arrow">→</span>}<div className={`acms-stage ${p.id === 'execute' ? 'work' : 'review'}`}><small>阶段 {i + 1}</small><h3>{p.name}</h3><span>{p.id === 'plan' ? '负责人拆分' : p.id === 'final-review' ? '目标交付后总体审查' : '执行与交付'}</span></div></React.Fragment>)}</div></section>)}</div></>}
-        {tab === 'artifacts' && <><PageHead eyebrow="DELIVERABLES & EVIDENCE" title="产物与验收" description="每份交付物都关联具体执行和验收证据。" /><section className="acms-panel">{!data.artifacts.length ? <Empty title="交付物将在这里汇集">任务执行后，查看文件、版本指纹及独立审查结果。</Empty> : <div className="acms-artifact-list">{data.artifacts.slice().reverse().map(a => <button key={a.id} onClick={() => open('artifact', a)}><span className="acms-file-icon">▧</span><div><b>{a.title}</b><small>{data.tasks.find(t => t.id === a.taskId)?.title} · {a.path}</small></div><span>{(a.bytes / 1024).toFixed(1)} KB</span><span>查看 ↗</span></button>)}</div>}</section><section className="acms-panel"><div className="acms-sectionhead"><h2>验收记录</h2></div>{data.verifications.slice(-20).reverse().map(v => <div className="acms-verification" key={v.id}><Badge status={v.passed ? 'succeeded' : 'failed'} /><div><button className="text" onClick={() => selectTask(v.taskId)}>{data.tasks.find(t => t.id === v.taskId)?.title}</button><p>{v.kind === 'review' ? v.summary : `自动检查：${v.checks?.length ?? 0} 项`}</p></div><span className="acms-muted">{v.kind === 'review' ? '独立审查' : '产物检查'}</span></div>)}</section></>}
+        {tab === 'artifacts' && <EvidencePage key={epoch} data={data} navigate={navigate} open={open} />}
         {tab === 'access' && <AccessPage data={data} refresh={refresh} />}
         {tab === 'settings' && <><PageHead eyebrow="OWNER BOUNDARIES" title="公司设置" description="这些边界由你控制。管理智能体可以在边界内调整执行方式。" /><div className="acms-overview-grid"><section className="acms-panel"><div className="acms-sectionhead"><h2>资源与权限</h2><button onClick={() => open('policy', data.policy)}>编辑边界</button></div><dl className="acms-definition"><dt>最大同时执行</dt><dd>{data.policy.maxConcurrent} 个</dd><dt>协调预留</dt><dd>{data.policy.controlSlots} 个</dd><dt>每个目标任务上限</dt><dd>{data.policy.maxTasksPerGoal} 项</dd><dt>单任务执行尝试</dt><dd>{data.policy.maxAttempts} 次</dd><dt>最大返工</dt><dd>{data.policy.maxReworks} 次</dd><dt>目标时间盒</dt><dd>{data.policy.goalTimeBoxMs ? `${(data.policy.goalTimeBoxMs / 60000).toFixed(1)} 分钟` : '未启用'}</dd><dt>收尾预留</dt><dd>{data.policy.timeBoxReserveMs ? `${(data.policy.timeBoxReserveMs / 60000).toFixed(1)} 分钟` : '未设置'}</dd><dt>单次执行时限</dt><dd>{data.policy.turnTimeoutMs / 60000} 分钟</dd><dt>允许的执行器</dt><dd>{data.policy.allowedProviders.join('、') || '使用已安装执行器'}</dd></dl></section><section className="acms-panel"><div className="acms-sectionhead"><h2>项目与检查</h2><button onClick={() => open('project')}>＋ 添加项目</button></div>{!data.projects.length ? <Empty title="尚未添加项目">指定一个工作目录，并配置验收检查。</Empty> : data.projects.map(p => <button className="acms-project-row" key={p.id} onClick={() => open('project', p)}><b>{p.name}</b><code>{p.repoRoot}</code><span>{p.mode === 'git' ? 'Git 隔离工作副本' : '独立目录副本'} · {p.checks.length} 项检查 · {p.autoMerge ? '自动集成' : '保留交付版本'}</span></button>)}</section></div><section className="acms-panel"><div className="acms-sectionhead"><h2>运行信息</h2><span>ACMS {data.runtime.version}</span></div><dl className="acms-definition"><dt>数据位置</dt><dd><code>{data.runtime.dataDir}</code></dd><dt>宿主通信</dt><dd>DSH 原生通道 · 无独立管理端口</dd><dt>执行器</dt><dd>{data.runtime.providers.map(p => p.name).join('、') || '未安装'}</dd></dl></section></>}
       </div>}
     </main>
     {task && <TaskDrawer key={`${epoch}:${task.id}`} navigate={navigate} task={task} data={data} select={selectTask} close={() => setSelected(null)} act={safeAct} busy={busy} open={open} chat={chat} />}
     {entity && <EntityDrawer kind={entityView.kind} entity={entity} data={data} close={() => setEntityView(null)} navigate={navigate} open={open} chat={chat} act={safeAct} busy={busy} runtimeNow={runtimeNow} />}
-    {modal && data && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
+    {modal && data && (modal.type !== 'artifact' || modal.epoch === epoch) && <Editor key={`${modal.type}:${modal.value?.id ?? 'new'}`} modal={modal} data={data} close={close} act={act} busy={busy} error={actionError} budgetGoal={budgetGoal} runtimeNow={runtimeNow} />}
     {conversation && data && <ConversationWindow key={`${conversation.agentId}:${conversation.taskId}`} {...conversation} data={data} close={() => setConversation(null)} />}
   </div>;
 }
 function PageHead({ eyebrow, title, description, action }) { return <div className="acms-pagehead"><div><div className="acms-eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>; }
+function EvidencePage({ data, navigate, open }) {
+  const [projectId, setProjectId] = useState('');
+  const [goalId, setGoalId] = useState('');
+  const projects = data.projects;
+  const selectedProject = projects.some(project => project.id === projectId) ? projectId : '';
+  const goals = data.goals.filter(goal => !selectedProject || goal.projectId === selectedProject);
+  const selectedGoal = goals.some(goal => goal.id === goalId) ? goalId : '';
+  const scope = selectedGoal ? { goalId: selectedGoal } : selectedProject ? { projectId: selectedProject } : {};
+  const scoped = data.evidenceView === 'panel';
+  const artifacts = useEvidence('artifacts', scope, data.cursor, scoped);
+  const verifications = useEvidence('verifications', scope, data.cursor, scoped);
+  const tasksById = new Map(data.tasks.map(task => [task.id, task]));
+  const goalsById = new Map(goals.map(goal => [goal.id, goal]));
+  const subjectFor = row => {
+    const id = row.taskId ?? row.attemptTaskId;
+    const task = tasksById.get(id);
+    const goal = goalsById.get(id);
+    if (task && (!selectedProject || task.projectId === selectedProject) && (!selectedGoal || task.goalId === selectedGoal)) {
+      return { kind: 'task', id, title: task.title };
+    }
+    if (goal && (!selectedGoal || goal.id === selectedGoal)) return { kind: 'goal', id, title: goal.title };
+    return null;
+  };
+  const files = (artifacts?.rows ?? data.artifacts.slice().reverse()).filter(row => subjectFor(row));
+  const checks = (verifications?.rows ?? data.verifications.slice(-20).reverse()).filter(row => subjectFor(row) ||
+    (!selectedGoal && !selectedProject && !row.taskId && !row.attemptTaskId));
+  return <><PageHead eyebrow="DELIVERABLES & EVIDENCE" title="产物与验收" description="每份交付物都关联具体执行和验收证据。" />
+    <div className="acms-toolbar">
+      <select aria-label="筛选产物项目" value={selectedProject} onChange={event => { setProjectId(event.target.value); setGoalId(''); }}>
+        <option value="">全部项目</option>{projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
+      </select>
+      <select aria-label="筛选产物目标" value={selectedGoal} onChange={event => setGoalId(event.target.value)}>
+        <option value="">全部目标</option>{goals.map(goal => <option key={goal.id} value={goal.id}>{goal.title}</option>)}
+      </select>
+    </div>
+    <section className="acms-panel" aria-label="交付产物">
+      {!files.length && !artifacts?.loading && !artifacts?.error && <Empty title="交付物将在这里汇集">任务执行后，查看文件、版本指纹及独立审查结果。</Empty>}
+      <div className="acms-artifact-list">{files.map(artifact => <button key={artifact.id} onClick={() => open('artifact', artifact)}>
+        <span className="acms-file-icon">▧</span><div><b>{artifact.title}</b><small>{subjectFor(artifact)?.title} · {artifact.path}</small></div>
+        <span>{(artifact.bytes / 1024).toFixed(1)} KB</span><span>查看 ↗</span>
+      </button>)}</div>
+      <EvidencePager page={artifacts} label="产物" />
+    </section>
+    <section className="acms-panel" aria-label="验收记录"><div className="acms-sectionhead"><h2>验收记录</h2></div>
+      {!checks.length && !verifications?.loading && !verifications?.error && <p className="acms-sectionnote">当前范围暂无验收记录。</p>}
+      {checks.map(verification => {
+        const subject = subjectFor(verification);
+        const type = verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '产物检查';
+        return <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} />
+          <div>{subject && <button className="text" onClick={() => navigate(subject.kind, subject.id)}>{subject.title}</button>}
+            <p>{type === '产物检查' ? `自动检查：${verification.checkCount ?? verification.checks?.length ?? 0} 项` : verification.summary}</p>
+          </div><span className="acms-muted">{type}</span>
+        </div>;
+      })}
+      <EvidencePager page={verifications} label="验收记录" />
+    </section>
+  </>;
+}
 function RunTable({ attempts, data, select, navigate }) { return !attempts.length ? <p className="acms-sectionnote">还没有执行记录。创建目标后，规划、执行和审查会自动衔接。</p> : <div className="acms-table-scroll"><table><thead><tr><th>任务</th><th>智能体</th><th>状态</th><th>开始时间</th><th>耗时</th></tr></thead><tbody>{attempts.map(a => <tr key={a.id}><td><button className="text" onClick={() => select(a.taskId)}>{data.tasks.find(t => t.id === a.taskId)?.title}</button></td><td>{navigate ? <button className="text" onClick={() => navigate('agent', a.agentId)}>{data.agents.find(g => g.id === a.agentId)?.name ?? '已删除角色'}</button> : data.agents.find(g => g.id === a.agentId)?.name ?? '已删除角色'}</td><td><Badge status={a.status} /></td><td>{date(a.startedAt)}</td><td>{a.elapsedMs ? `${(a.elapsedMs / 1000).toFixed(1)} 秒` : '—'}</td></tr>)}</tbody></table></div>; }
 function CapacityPanel({ capacity, data, select, chat, openModels }) {
   if (!capacity) return <section className="acms-panel"><div className="acms-sectionhead"><h2>执行容量</h2></div><p className="acms-sectionnote">当前宿主未提供执行容量数据。请刷新页面；若仍为空，说明宿主插件版本过旧，需先完成升级。</p></section>;
@@ -222,7 +281,7 @@ function CapacityPanel({ capacity, data, select, chat, openModels }) {
     </div>
   </section>;
 }
-function Tasks({ data, select, create, createGoal, act, busy, open, scope, navigate, clearScope }) {
+function Tasks({ data, epoch, select, create, createGoal, act, busy, open, scope, navigate, clearScope }) {
   const autoProject = defaultProjectId(data.projects, data.tasks);
   const [mode, setMode] = useState(scope.reviewQueue ? 'board' : 'tree'); const [project, setProject] = useState(() => scope.status || scope.reviewQueue || scope.allProjects ? '' : scope.projectId ?? autoProject); const [goal, setGoal] = useState(scope.goalId ?? '');
   useEffect(() => {
@@ -249,7 +308,7 @@ function Tasks({ data, select, create, createGoal, act, busy, open, scope, navig
     {scope.reviewQueue && <p className="acms-review-queue-filter">当前筛选：审查进行中（含待执行、准备中、执行中、待审查、集成中、阻塞、暂停、停止中及待核对；不含已结束审查）。<button className="text" onClick={() => { setSearch(''); setShowReviews(true); setShowTrash(false); setView('active'); clearScope({ allProjects: true }); }}>清除审查队列筛选</button></p>}
     {scope.status && view === 'active' && <p>当前仅显示指定状态的任务。<button className="text" onClick={() => clearScope()}>显示全部状态</button></p>}
     {showTrash ? <section className="acms-panel"><EntityTrash data={data} act={act} busy={busy} /><h2>任务回收站</h2><p className="acms-sectionnote">可恢复任务，或彻底删除任务记录。未完成任务恢复后保持暂停。</p>{!data.trash?.length ? <Empty title="回收站为空">已删除任务会出现在这里。</Empty> : data.trash.map(t => <div className="acms-trash-row" key={t.id}><div><h3>{t.title}</h3><small>删除于 {date(t.deletion?.at)}</small></div><ActionButton reason={busy ? '正在保存，请稍候' : !data.projects.some(p => p.id === t.projectId) || !data.goals.some(g => g.id === t.goalId) ? '请先恢复所属项目或目标' : ''} onClick={() => act('task.restore', { id: t.id, expectedRevision: t.revision }, '任务已恢复；未完成任务保持暂停')}>恢复任务</ActionButton><ActionButton className="danger" reason={busy ? '正在保存，请稍候' : t.purgeReason || ''} onClick={() => open('purgeTask', t)}>彻底删除</ActionButton></div>)}</section>
-      : view === 'completed' ? <CompletedTaskList tasks={done} data={data} select={select} />
+      : view === 'completed' ? <CompletedTaskList key={epoch} tasks={done} data={data} select={select} scope={goal ? { goalId: goal } : project ? { projectId: project } : {}} />
       : scope.reviewQueue && !active.length ? <Empty title="当前范围没有进行中的审查">已结束审查不计入队列；可以调整搜索、项目或目标筛选，或清除审查队列筛选返回任务列表。</Empty>
       : mode === 'tree' ? <ProjectHierarchy navigate={navigate} data={data} tasks={active} select={select} open={open} projectId={project} goalId={goal} />
       : !active.length ? <Empty title="当前范围没有任务">{search ? `没有任务匹配“${search}”，清空搜索或切换筛选后再试。` : project || goal ? '所选项目或目标当前没有任务；可切换筛选、查看已完成列表，或创建目标让负责人自动生成执行计划。' : '创建目标后，负责人会自动生成执行计划。'}</Empty>
@@ -271,11 +330,16 @@ function ProjectsPage({ data, navigate, select, open, scope, onGoal, act, busy }
   </>;
 }
 
-function CompletedTaskList({ tasks, data, select }) {
+function CompletedTaskList({ tasks, data, select, scope }) {
+  const scoped = data.evidenceView === 'panel';
+  const { counts, error, retry } = useCompletedArtifactCounts(scope, data.cursor, scoped && tasks.length > 0);
   if (!tasks.length) return <Empty title="没有匹配的已完成任务">完成、归档或取消的任务会出现在这里；调整搜索、项目或状态筛选后再试。</Empty>;
-  return <section className="acms-panel acms-completed" aria-label="已完成任务"><div className="acms-sectionhead"><h2>已完成任务</h2><span className="acms-count">{tasks.length}</span></div><div className="acms-completed-list">{tasks.map(task => {
-    const project = data.projects.find(p => p.id === task.projectId); const goal = data.goals.find(g => g.id === task.goalId); const artifacts = data.artifacts.filter(a => a.taskId === task.id);
-    return <div className="acms-completed-row" key={task.id}><div><button className="text" onClick={() => select(task.id)}>{task.title}</button><small>{project?.name ?? '未知项目'} · {goal?.title ?? '未知目标'} · {task.kind === 'review' ? '审查' : task.kind === 'plan' ? '规划' : '任务'}</small></div><Badge status={task.status} /><span className="acms-muted">{artifacts.length} 份产物</span><time className="acms-muted">{date(task.activityAt)}</time><button className="text" onClick={() => select(task.id)}>详情与证据 ↗</button></div>;
+  return <section className="acms-panel acms-completed" aria-label="已完成任务"><div className="acms-sectionhead"><h2>已完成任务</h2><span className="acms-count">{tasks.length}</span></div>
+  {error && <p role="alert">{error} <button onClick={retry}>重试读取产物数量</button></p>}
+  <div className="acms-completed-list">{tasks.map(task => {
+    const project = data.projects.find(p => p.id === task.projectId); const goal = data.goals.find(g => g.id === task.goalId);
+    const count = scoped ? (counts ? counts[task.id] ?? 0 : null) : data.artifacts.filter(a => a.taskId === task.id).length;
+    return <div className="acms-completed-row" key={task.id}><div><button className="text" onClick={() => select(task.id)}>{task.title}</button><small>{project?.name ?? '未知项目'} · {goal?.title ?? '未知目标'} · {task.kind === 'review' ? '审查' : task.kind === 'plan' ? '规划' : '任务'}</small></div><Badge status={task.status} /><span className="acms-muted">{count === null ? (error ? '产物数量不可用' : '正在读取产物数量…') : `${count} 份产物`}</span><time className="acms-muted">{date(task.activityAt)}</time><button className="text" onClick={() => select(task.id)}>详情与证据 ↗</button></div>;
   })}</div></section>;
 }
 
@@ -395,8 +459,12 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
   const awaitingRecovery = canReconcileTask(task, panelAttempts);
   const recoveryAttempt = history?.activeAttempts.find(isLiveAttempt) ?? attempts.find(isLiveAttempt) ??
     panelAttempts.find(isLiveAttempt) ?? attempts[0];
-  const artifacts = data.artifacts.filter(a => a.taskId === task.id);
-  const verifications = history?.verifications ?? verificationsForTask(task, attempts, data.verifications);
+  const scope = { taskId: task.id };
+  const scoped = data.evidenceView === 'panel';
+  const artifactPage = useEvidence('artifacts', scope, data.cursor, scoped);
+  const verificationPage = useEvidence('verifications', scope, data.cursor, scoped);
+  const artifacts = artifactPage?.rows ?? data.artifacts.filter(a => a.taskId === task.id);
+  const verifications = verificationPage?.rows ?? (history?.verifications ?? verificationsForTask(task, attempts, data.verifications)).slice(-6).reverse();
   const childTasks = data.tasks.filter(t => t.parentId === task.id);
   const reviewTasks = data.tasks.filter(t => t.kind === 'review' && t.reviewOf === task.id).sort((a, b) => String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt))); const latestReview = task.reviewSummary;
   const childButton = t => <button className="text" key={t.id} onClick={() => select(t.id)}>{t.title}</button>;
@@ -410,8 +478,17 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {task.kind !== 'review' && task.status !== 'deferred' && <ActionButton reason={approvalPlanner && (goal.planApproval.approvedPlanId || task.blocker?.kind === 'plan-approval') ? '请在目标详情查看计划审批。' : ['integrating', 'reconciling', 'stopping'].includes(task.status) ? '请等待集成、停止或执行核对完成后再编辑。' : ''} onClick={() => open('taskEdit', task)}>编辑任务</ActionButton>}
     {!terminal.includes(task.status) && <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : approvalPlanner ? '可暂停规划，或在目标详情取消整个目标。' : ''} onClick={() => act('task.cancel', { id: task.id }, '已请求取消任务')}>取消任务</ActionButton>}
     <ActionButton className="danger" reason={busy ? '正在保存，请稍候' : taskDeletionReason(task, data.tasks, data.attempts)} onClick={() => open('deleteTask', task)}>删除任务</ActionButton></div><section><h3>验收标准</h3><CollapsibleText text={task.acceptance} lines={3} label="验收标准" /></section><section><h3>依赖关系</h3>{task.dependencies.length ? task.dependencies.map(id => <div className="acms-dep" key={id}><Badge status={data.tasks.find(t => t.id === id)?.status} /><button className="text" onClick={() => select(id)}>{data.tasks.find(t => t.id === id)?.title}</button></div>) : <p className="acms-muted">无前置依赖</p>}{['ready', 'blocked', 'paused'].includes(task.status) && <button onClick={() => open('dependencies', task)}>调整依赖</button>}</section>
-    <section className="acms-evidence"><TextIntegrityNotices artifacts={artifacts} /><h3>产物与验收（{artifacts.length}）</h3>{!artifacts.length && !verifications.length ? <p className="acms-muted">{history?.loading ? '正在读取验收记录…' :
-      history?.error ? '可在执行记录中重试读取验收记录。' : '尚无产物或验收记录。'}</p> : <>{artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}{verifications.slice(-6).reverse().map(verification => <div className="acms-verification" key={verification.id}><Badge status={verification.passed ? 'succeeded' : 'failed'} /><span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span><small>{verification.summary ?? ''}</small><ArchiveChecks checks={verification.checks} />{verification.checks?.some(check => check.checkVersion) && <details><summary>宿主检查证据</summary><ul>{verification.checks.filter(check => check.checkVersion).map(check => <li key={check.id}>{check.id} · {check.reused ? '复用' : '本次运行'} · 退出码 {check.code ?? '未知'}{check.reason && <p>{check.reason}</p>}<dl className="acms-definition"><dt>命令</dt><dd><code>{[check.command, ...(check.args ?? [])].join(' ')}</code></dd><dt>工作目录</dt><dd><code>{check.cwd}</code></dd><dt>输入版本</dt><dd><code>{check.inputHash}</code></dd><dt>宿主环境</dt><dd><code>{check.environment}</code></dd><dt>日志指纹</dt><dd><code>{check.log?.hash}</code></dd></dl></li>)}</ul></details>}</div>)}</>}</section>
+    <section className="acms-evidence">
+      <TextIntegrityNotices artifacts={artifacts} />
+      <h3>产物与验收{!scoped ? `（${artifacts.length}）` : artifactPage.total !== null ? `（${artifactPage.total}）` : ''}</h3>
+      {!artifacts.length && !verifications.length && !artifactPage?.loading && !verificationPage?.loading &&
+        !artifactPage?.error && !verificationPage?.error && !(!scoped && history?.loading) &&
+        <p className="acms-muted">{!scoped && history?.error ? '可在执行记录中重试读取验收记录。' : '尚无产物或验收记录。'}</p>}
+      {artifacts.map(artifact => <button className="acms-entity-link" key={artifact.id} onClick={() => open('artifact', artifact)}>{artifact.title} · {artifact.path} ↗</button>)}
+      <EvidencePager page={artifactPage} label="产物" />
+      {verifications.map(verification => <TaskVerification key={verification.id} verification={verification} />)}
+      <EvidencePager page={verificationPage} label="验收记录" />
+    </section>
     {task.integration?.delivery && <section aria-label="Git 交付版本"><h3>Git 交付版本</h3><dl className="acms-definition">
       <dt>交付提交</dt><dd><code>{task.integration.delivery.commit}</code></dd>
       <dt>基准提交</dt><dd><code>{task.integration.delivery.baseCommit}</code></dd>
@@ -438,10 +515,32 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
     {interactions.map(i => <section className="acms-alert" key={i.id}><h3>需要补充信息</h3><p>{i.reason}</p><p>{i.question}</p><button onClick={() => open('answer', i)}>回复并继续</button></section>)}
     <section><h3>执行记录</h3>{!attempts.length && !history?.loading && !history?.error && <p className="acms-muted">尚未开始执行。</p>}{attempts.map(a => <details className="acms-run" key={a.id}><summary><Badge status={a.status} /><span>{date(a.startedAt)}</span></summary><p className="acms-preserve">{a.summary || '执行进行中'}</p><dl className="acms-definition"><dt>模型</dt><dd>{a.model || '未记录'}</dd><dt>思考深度</dt><dd>{a.reasoningEffort || '外部执行器默认或未公开'}</dd><dt>执行器</dt><dd>{a.provider}</dd><dt>模型通道</dt><dd>{a.llmProvider || a.selection?.chosen?.llmProvider || "未声明"}</dd>{a.selection && <><dt>选择依据</dt><dd>{taskRouteBasis(a.selection)}</dd>{a.selection.fallbacks?.length ? <><dt>回退说明</dt><dd>{(a.selection.fallbacks ?? []).slice(0, 3).map(f => f.model + "：" + f.reason).join("；")}{(a.selection.fallbacks ?? []).length > 3 ? " 等" : ""}</dd></> : null}{a.selection.costComparison && <><TaskRouteCostFacts comparison={a.selection.costComparison} />{a.preflightOnly && <><dt>执行状态</dt><dd>此轮在实际启动前结束</dd></>}</>}{a.selection.blocked ? <><dt>候选阻塞</dt><dd>{a.selection.blocked.code}</dd></> : null}</>}<dt>上下文</dt><dd><code>{a.contextKey}</code></dd><dt>工作副本</dt><dd><code>{a.workspace?.path}</code></dd></dl></details>)}{history?.loading && <p role="status" className="acms-muted">正在读取执行记录…</p>}{history?.error && <p role="alert">{history.error}</p>}{history && !history.loading && (history.nextBefore !== null || history.error) && <button onClick={history.load}>{history.error ? '重试读取执行记录' : '加载更早的执行记录'}</button>}</section><ChangeHistory kind="task" id={task.id} data={data} /><section><h3>目标模板</h3><p>{(data.goals.find(g => g.id === task.goalId)?.templateSnapshot?.name) ?? (data.templates ?? []).find(t => t.id === (data.goals.find(g => g.id === task.goalId)?.templateId ?? 'base'))?.name ?? '基础模板'}</p>{task.reviewScope && <p className="acms-muted">审查范围：{task.reviewScope === 'goal' ? '目标整体交付' : '单个交付物'}</p>}<p className="acms-muted">{task.longLived ? '任务完成后保留临时执行人员，便于后续分配' : '任务完成后临时执行人员退出可分配名单；历史记录保留'}</p></section></aside></div>;
 }
+function TaskVerification({ verification }) {
+  const hostChecks = verification.checks?.filter(check => check.checkVersion) ?? [];
+  return <div className="acms-verification"><Badge status={verification.passed ? 'succeeded' : 'failed'} />
+    <span>{verification.kind === 'goal-review' ? '目标审查' : verification.kind === 'review' ? '独立审查' : '自动检查'}</span>
+    <small>{verification.summary ?? ''}</small><ArchiveChecks checks={verification.checks} />
+    {hostChecks.length > 0 && <details><summary>宿主检查证据</summary><ul>{hostChecks.map(check => <li key={check.id}>
+      {check.id} · {check.reused ? '复用' : '本次运行'} · 退出码 {check.code ?? '未知'}{check.reason && <p>{check.reason}</p>}
+      <dl className="acms-definition"><dt>命令</dt><dd><code>{[check.command, ...(check.args ?? [])].join(' ')}</code></dd>
+        <dt>工作目录</dt><dd><code>{check.cwd}</code></dd><dt>输入版本</dt><dd><code>{check.inputHash}</code></dd>
+        <dt>宿主环境</dt><dd><code>{check.environment}</code></dd><dt>日志指纹</dt><dd><code>{check.log?.hash}</code></dd></dl>
+    </li>)}</ul></details>}
+  </div>;
+}
 function Editor({ modal, data, close, act, busy, error, budgetGoal, runtimeNow }) {
   const { type, value = {} } = modal; const [form, setForm] = useState(() => ({ ...value, ...(type === 'agent' ? initialModelBinding(value, data.runtime) : {}), phases: value.phases ?? [{ id: 'plan', name: '拆分' }, { id: 'execute', name: '执行' }, { id: 'final-review', name: '最终审查' }], checksText: JSON.stringify(value.checks ?? [], null, 2), preparationText: value.preparation ? JSON.stringify(value.preparation, null, 2) : '', ...(type === 'project' ? { deliveryRepoRoot: value.deliveryRepository?.targetRoot ?? '' } : {}), dependencies: value.dependencies ?? [], goalId: value.goalId ?? data.goals.find(g => openGoal(g) && !g.executionControl && (!value.projectId || g.projectId === value.projectId))?.id, projectId: value.projectId ?? data.projects[0]?.id, templateId: value.templateId ?? 'base', priority: value.priority ?? 50 }));
   const [localError, setLocalError] = useState(''); const [artifact, setArtifact] = useState(null);
-  useEffect(() => { if (type === 'artifact') api.artifact(value.id).then(setArtifact).catch(e => setLocalError(e.message)); }, []);
+  useEffect(() => {
+    if (type !== 'artifact') return;
+    const controller = new AbortController();
+    api.artifact(value.id, controller.signal).then(row => {
+      if (!controller.signal.aborted) setArtifact(row);
+    }).catch(error => {
+      if (!controller.signal.aborted) setLocalError(error.message);
+    });
+    return () => controller.abort();
+  }, [type, value.id]);
   const change = (key, value) => setForm(f => ({ ...f, [key]: value }));
   const changesContract = type === 'goalEdit' && ['description', 'acceptance'].some(key => form[key]?.trim() !== value[key]);
   const goalTasksUsed = changesContract ? goalTaskCount(data.tasks, value.id) : 0;

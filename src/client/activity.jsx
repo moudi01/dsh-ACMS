@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
 import { activityContext, describeActivity, redactActivityText } from '../core/activity.js';
 
@@ -182,7 +182,16 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
           {(activity.project || activity.goal) && <p className="acms-activity-path">{[activity.project?.title, activity.goal?.title].filter(Boolean).join(' › ')}</p>}
           {activity.reason && <p className="acms-activity-reason"><b>原因：</b>{activity.reason}</p>}
           {activity.executor && <p className="acms-muted">相关执行者：{activity.executor}</p>}
-          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>{activity.delivery.map(item => <span key={item.id ?? item.title} className="acms-activity-delivery-item"><span>{item.title}（版本 {item.contractVersion ?? '未知'}、代次 {item.generation ?? '未知'}）</span>{item.artifactIds.map(id => artifactsById.get(id)).filter(Boolean).map(artifact => <button type="button" key={artifact.id} className="text acms-activity-open" onClick={() => open('artifact', artifact)}>打开产物「{redactActivityText(artifact.title ?? artifact.path)}」 →</button>)}{item.artifactIds.length > 0 && !item.artifactIds.some(id => artifactsById.has(id)) && <span>历史产物不可用，仅保留哈希 {item.artifactHash ? <code title={item.artifactHash}>{shortHash(item.artifactHash)}</code> : '（未记录）'}</span>}{item.artifactIds.length === 0 && item.artifactHash && <span>未记录产物清单，仅保留哈希 <code title={item.artifactHash}>{shortHash(item.artifactHash)}</code></span>}</span>)}{activity.deliveryTotal > activity.delivery.length && <span className="acms-muted">仅显示前 {activity.delivery.length}/{activity.deliveryTotal} 项</span>}{activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查记录 →</button>}{activity.deliveryReviewStale && <span>历史审查记录与当次交付不一致，未作为本次证据。</span>}</div>}
+          {activity.delivery.length > 0 && <div className="acms-activity-delivery"><b>交付证据：</b>
+            {activity.delivery.map(item => <span key={item.id ?? item.title} className="acms-activity-delivery-item">
+              <span>{item.title}（版本 {item.contractVersion ?? '未知'}、代次 {item.generation ?? '未知'}）</span>
+              <ActivityArtifactLinks item={item} open={open} scoped={data.evidenceView === 'panel'}
+                taskAvailable={available.task.has(item.id)} artifactsById={artifactsById} />
+            </span>)}
+            {activity.deliveryTotal > activity.delivery.length && <span className="acms-muted">仅显示前 {activity.delivery.length}/{activity.deliveryTotal} 项</span>}
+            {activity.deliveryReview?.taskId && <button type="button" className="text acms-activity-open" onClick={() => select(activity.deliveryReview.taskId)}>查看当次审查记录 →</button>}
+            {activity.deliveryReviewStale && <span>历史审查记录与当次交付不一致，未作为本次证据。</span>}
+          </div>}
           {activity.type === 'goal.succeeded' && activity.delivery.length === 0 && <p className="acms-muted">历史事件未记录当次交付清单；只能打开当前目标查看最新证据。</p>}
           {(activity.evidence.artifactHash || activity.evidence.deliveryHash || activity.evidence.integratedCommit) && <p className="acms-activity-evidence">证据：{Object.entries(activity.evidence).map(([key, value]) => <code key={key} title={`${key}: ${value}`}>{key}={shortHash(value)}</code>)}</p>}
         </div>
@@ -192,4 +201,35 @@ export function ActivityPage({ data, select, navigate, updated, open }) {
     {hasMore && <div className="acms-actions acms-activity-more"><button type="button" onClick={() => loadOlder().catch(() => {})} disabled={loading}>{loading ? '正在加载…' : '加载更早的动态'}</button></div>}
     {loaded && !hasMore && items.length > 0 && <p className="acms-sectionnote">已经到达可读动态的起点。</p>}
   </>;
+}
+
+function ActivityArtifactLinks({ item, open, scoped, taskAvailable, artifactsById }) {
+  const ids = [...new Set(item.artifactIds.filter(id => typeof id === 'string' && id.length > 0 && id.length <= 200))];
+  const key = JSON.stringify([item.id, taskAvailable, ids]);
+  const [view, setView] = useState(null);
+  const [retry, setRetry] = useState(0);
+  useLayoutEffect(() => {
+    if (!scoped || !ids.length) return;
+    const controller = new AbortController();
+    const requests = [];
+    for (let start = 0; start < ids.length; start += 25) {
+      requests.push(api.artifactLinks(item.id, ids.slice(start, start + 25), controller.signal));
+    }
+    Promise.all(requests).then(pages => {
+      if (!controller.signal.aborted) setView({ key, rows: new Map(pages.flatMap(page => page.rows).map(row => [row.id, row])) });
+    }).catch(error => {
+      if (!controller.signal.aborted) setView({ key, error: error.message });
+    });
+    return () => controller.abort();
+  }, [scoped, key, retry]);
+  const hash = item.artifactHash ? <code title={item.artifactHash}>{shortHash(item.artifactHash)}</code> : '（未记录）';
+  if (!ids.length) return item.artifactHash && <span>未记录产物清单，仅保留哈希 {hash}</span>;
+  const current = view?.key === key ? view : null;
+  if (scoped && current?.error) return <span>无法读取产物链接。<button type="button" className="text" onClick={() => setRetry(value => value + 1)}>重试</button></span>;
+  if (scoped && !current) return <span className="acms-muted">正在读取产物链接…</span>;
+  const rows = scoped ? current.rows : artifactsById;
+  const links = ids.map(id => rows.get(id)).filter(Boolean);
+  return links.length ? links.map(artifact => <button type="button" key={artifact.id} className="text acms-activity-open"
+    onClick={() => open('artifact', artifact)}>打开产物「{redactActivityText(artifact.title ?? artifact.path)}」 →</button>) :
+    <span>历史产物不可用，仅保留哈希 {hash}</span>;
 }

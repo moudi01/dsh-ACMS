@@ -12,6 +12,7 @@ import { hasRecordedDeliveryApproval } from '../core/candidate-confirmation.js';
 import { attemptUsageSummary, attemptUsageView } from '../core/usage-view.js';
 import { goalCostForecast } from '../core/goal-cost-forecast.js';
 import { taskAttemptHistory } from '../core/panel-attempts.js';
+import { panelEvidence, panelArtifactCounts, panelArtifactLinks } from '../core/panel-evidence.js';
 
 const DOWNLOAD_MIME = {
   '.md': 'text/markdown; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.json': 'application/json; charset=utf-8',
@@ -77,6 +78,9 @@ export function createRoutes(runtime) {
         dataDir: runtime.dataDir } });
     },
     '/api/acms/task-attempts': async request => json(taskAttemptHistory(company.store, new URL(request.url).searchParams)),
+    '/api/acms/evidence': async request => json(panelEvidence(company.store, new URL(request.url).searchParams)),
+    '/api/acms/artifact-counts': async request => json(panelArtifactCounts(company.store, new URL(request.url).searchParams)),
+    '/api/acms/artifact-links': async request => json(panelArtifactLinks(company.store, new URL(request.url).searchParams)),
     '/api/acms/usage': async request => json(attemptUsageView(company.store, new URL(request.url).searchParams)),
     '/api/acms/usage/summary': async request => json(attemptUsageSummary(company.store, new URL(request.url).searchParams)),
     '/api/acms/cost/forecast': async request => json(goalCostForecast(company,

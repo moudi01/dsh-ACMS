@@ -836,7 +836,7 @@ export class Company {
   }
   #snapshot(panel, capacity) {
     const collections = ["projects", "goals", "tasks", "agents", "templates", "templateHistory", "workflows", "workflowHistory", "attempts", "artifacts", "verifications", "interactions", "proposals", "changes", "notifications", "plans", "deliveryApprovals", "actionBatches", "agentCredentials"];
-    const data = Object.fromEntries(collections.map(c => [c, panel && c === 'attempts' ?
+    const data = Object.fromEntries(collections.filter(c => !panel || (c !== 'artifacts' && c !== 'verifications')).map(c => [c, panel && c === 'attempts' ?
       this.store.panelAttempts([...(capacity?.live?.keys() ?? [])]) : this.store.list(c)]));
     const allAttempts = data.attempts;
     const tasksById = new Map(data.tasks.map(task => [task.id, task]));
@@ -849,7 +849,9 @@ export class Company {
     const deleted = new Set(data.tasks.filter(t => t.status === 'deleted').map(t => t.id));
     data.trash = data.tasks.filter(t => t.status === 'deleted' && t.deletion?.batchId === t.id).map(t => ({ ...t, purgeReason: taskPurgeReason(t, data.tasks, data.attempts) }));
     data.tasks = data.tasks.filter(t => !deleted.has(t.id));
-    for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) data[c] = data[c].filter(item => !deleted.has(item.taskId));
+    for (const c of ['attempts', 'artifacts', 'verifications', 'interactions']) {
+      if (data[c]) data[c] = data[c].filter(item => !deleted.has(item.taskId));
+    }
     data.attempts = data.attempts.map(panel ? attemptForPanel : attemptForOwner);
     const costBudgets = new Map(this.store.list('goalCostBudgets').map(budget => [budget.id, goalCostBudgetView(budget)]));
     data.goals = data.goals.map(goal => costBudgets.has(goal.id) ? { ...goal, costBudget: costBudgets.get(goal.id) } : goal);
@@ -916,6 +918,6 @@ export class Company {
       activityAt: (goalsByProject.get(project.id) ?? []).reduce((max, goal) => latest(max, goal.activityAt), ownActivity(project)) }));
     data.modelPreferences = sanitizePreferences(this.store.get("modelPreferences", "model"));
     data.agentCredentials = data.agentCredentials.map(credentialSnapshot);
-    return { ...data, policy, cursor: this.store.cursor(), ...(panel ? { attemptsView: 'panel' } : {}) };
+    return { ...data, policy, cursor: this.store.cursor(), ...(panel ? { attemptsView: 'panel', evidenceView: 'panel' } : {}) };
   }
 }
