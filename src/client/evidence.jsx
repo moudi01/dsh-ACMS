@@ -20,13 +20,14 @@ function acceptEvidence(previous, page, before) {
 }
 
 export function useEvidence(kind, scope, cursor, enabled) {
-  const key = JSON.stringify(scope);
+  const key = JSON.stringify([kind, scope]);
   const cycle = useRef(null);
   const [view, setView] = useState(null);
 
   async function load(current, before) {
     if (!current || current.loading || current.signal.aborted) return;
     current.loading = true;
+    if (before === null) current.refreshQueued = false;
     const publish = next => {
       if (current.signal.aborted) return;
       current.view = next;
@@ -53,16 +54,27 @@ export function useEvidence(kind, scope, cursor, enabled) {
       publish(acceptEvidence(previous, page, before));
     } catch (error) {
       publish({ ...current.view, loading: false, error: error.message, retryBefore: before });
-    } finally { current.loading = false; }
+    } finally {
+      current.loading = false;
+      if (current.refreshQueued && !current.view.error) void load(current, null);
+    }
   }
 
   useLayoutEffect(() => {
     if (!enabled) return;
     const controller = new AbortController();
-    const current = { key, signal: controller.signal, view: cycle.current?.key === key ? cycle.current.view : empty, loading: false };
+    const current = { key, signal: controller.signal, view: empty, loading: false, refreshQueued: false };
     cycle.current = current;
-    void load(current, null);
     return () => controller.abort();
+  }, [enabled, key]);
+
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    const current = cycle.current;
+    // Keep a requested page alive while ordinary events advance the company
+    // cursor. Refresh the head once after that page settles.
+    current.refreshQueued = true;
+    if (!current.view.error || current.view.retryBefore === null) void load(current, null);
   }, [enabled, key, cursor]);
 
   if (!enabled) return null;

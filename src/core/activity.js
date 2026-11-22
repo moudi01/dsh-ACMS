@@ -69,6 +69,7 @@ export const ACTIVITY_EVENT_TYPES = Object.freeze([
 const ACTIVITY_SET = new Set(ACTIVITY_EVENT_TYPES);
 export const ACTIVITY_DEFAULT_LIMIT = 50;
 export const ACTIVITY_MAX_LIMIT = 200;
+export const ACTIVITY_ARTIFACT_LINK_LIMIT = 100;
 
 const SENSITIVE_KEY = /(token|secret|password|credential|authorization|cookie|api[-_]?key|^prompt$|^messages?$|chain[-_]?of[-_]?thought|^thoughts?$|^reasoningContent$|^analysis$|^privateKey$)/i;
 const MAX_STRING = 500;

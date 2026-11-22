@@ -8,9 +8,9 @@ import { OWNER } from '../src/core/util.js';
 
 const routesFor = fixture => {
   const routes = new Map(createRoutes(fixture).map(route => [route.path, route.fetch]));
-  return async resource => {
+  return async (resource, options) => {
     const url = new URL('/api/acms/' + resource, 'http://dsh');
-    const response = await routes.get(url.pathname)(new Request(url));
+    const response = await routes.get(url.pathname)(new Request(url, options));
     return { status: response.status, value: await response.json() };
   };
 };
@@ -151,9 +151,19 @@ test('owner evidence pages use durable scoped IDs, include historical review ass
   assert.equal((await readEvidence('artifacts', '&before=0')).status, 400);
   assert.deepEqual((await read('artifact-counts?goalId=' + f.goal.id)).value.counts, { [a.id]: 25 });
   assert.deepEqual((await read('artifact-counts')).value.counts, { [a.id]: 25 });
-  assert.deepEqual((await read('artifact-links?taskId=' + a.id + '&id=art-0&id=other-art&id=retired-art&id=missing')).value.rows,
-    [{ id: 'art-0', title: 'art-0', path: 'art-0.md' }]);
-  assert.deepEqual((await read('artifact-links?id=retired-art')).value.rows, []);
+  const readLinks = references => read('artifact-links', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ references }) });
+  const refs = ['art-0', 'other-art', 'retired-art', 'missing', 'art-0'].map(id => ({ id, taskId: a.id }));
+  const links = (await readLinks([...refs, { id: 'art-0', taskId: null }, { id: 'retired-art', taskId: null },
+    { id: 'other-art', taskId: b.id }])).value.rows;
+  assert.deepEqual(links.sort((left, right) => String(left.requestedTaskId).localeCompare(String(right.requestedTaskId))), [
+    { id: 'art-0', requestedTaskId: null, taskId: a.id, title: 'art-0', path: 'art-0.md' },
+    ...[
+      { id: 'art-0', requestedTaskId: a.id, taskId: a.id, title: 'art-0', path: 'art-0.md' },
+      { id: 'other-art', requestedTaskId: b.id, taskId: b.id, title: 'other-art', path: 'other-art.md' },
+    ].sort((left, right) => left.requestedTaskId.localeCompare(right.requestedTaskId)),
+  ]);
+  assert.equal((await readLinks(Array(101).fill(refs[0]))).status, 400);
 
   const firstCheck = (await readEvidence('verifications', taskScope)).value;
   const olderCheck = (await readEvidence('verifications', taskScope + '&before=' + firstCheck.nextBefore)).value;

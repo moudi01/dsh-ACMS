@@ -3,6 +3,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { startPreview } from './preview-server.mjs';
+import { verifyActivityArtifactBatches } from './activity-artifact-batches-ui-test.mjs';
 import { OWNER, SYSTEM } from '../src/core/util.js';
 
 // Issue #18 acceptance: the activity log shows who created, blocked, reviewed and
@@ -66,8 +67,13 @@ try {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await mkdir('test-results/ui', { recursive: true });
   try {
-    await page.route(url => url.pathname === '/api/acms/artifact-links' && url.searchParams.getAll('id').includes('artifact_delivered'),
-      route => route.fulfill({ status: 503, json: { error: { message: 'temporary link read failure' } } }), { times: 1 });
+    let injected = false;
+    await page.route(url => url.pathname === '/api/acms/artifact-links', route => {
+      const { references } = route.request().postDataJSON();
+      if (injected || !references.some(ref => ref.id === 'artifact_delivered')) return route.fallback();
+      injected = true;
+      return route.fulfill({ status: 503, json: { error: { message: 'temporary link read failure' } } });
+    });
     await page.goto(server.url);
     await page.getByRole('button', { name: '动态日志', exact: true }).click();
     await expect(page.getByRole('heading', { name: '动态日志', exact: true })).toBeVisible();
@@ -128,12 +134,13 @@ try {
     await expect(completedEntry.getByRole('button', { name: '查看当次审查记录 →' })).toHaveCount(0);
     await expect(completedEntry.getByRole('button', { name: /打开任务/ })).toHaveCount(0);
     const unavailable = completedEntry.locator('.acms-activity-delivery-item').filter({ hasText: '已清除的历史交付' });
-    await expect(unavailable).toContainText('历史产物不可用，仅保留哈希');
-    await expect(unavailable.locator('code')).toHaveAttribute('title', 'e'.repeat(64));
     const delivered = completedEntry.locator('.acms-activity-delivery-item').filter({ hasText: '已交付示例' });
     await expect(delivered).toContainText('无法读取产物链接');
     await expect(delivered).not.toContainText('历史产物不可用');
+    await expect(unavailable).not.toContainText('历史产物不可用');
     await delivered.getByRole('button', { name: '重试', exact: true }).click();
+    await expect(unavailable).toContainText('历史产物不可用，仅保留哈希');
+    await expect(unavailable.locator('code')).toHaveAttribute('title', 'e'.repeat(64));
     const artifactButton = completedEntry.getByRole('button', { name: /打开产物「交付文件」/ }).first();
     await expect(artifactButton).toBeVisible();
     await artifactButton.click();
@@ -224,6 +231,7 @@ try {
     await writeFile('test-results/ui/activity-report.json', JSON.stringify(report, null, 2));
     expect(errors).toEqual([]);
     console.log(JSON.stringify(report, null, 2));
+    await verifyActivityArtifactBatches(browser);
   } catch (error) {
     console.error('Browser errors:', errors);
     await page.screenshot({ path: 'test-results/ui/activity-failure.png', fullPage: true });

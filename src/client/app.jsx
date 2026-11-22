@@ -464,7 +464,10 @@ function TaskDrawer({ task, data, close, act, busy, open, select, navigate, chat
   const artifactPage = useEvidence('artifacts', scope, data.cursor, scoped);
   const verificationPage = useEvidence('verifications', scope, data.cursor, scoped);
   const artifacts = artifactPage?.rows ?? data.artifacts.filter(a => a.taskId === task.id);
-  const verifications = verificationPage?.rows ?? (history?.verifications ?? verificationsForTask(task, attempts, data.verifications)).slice(-6).reverse();
+  const verifications = verificationPage ? verificationPage.rows.filter(row => (!row.taskId ||
+    data.tasks.some(item => item.id === row.taskId) || data.goals.some(item => item.id === row.taskId)) &&
+    (!row.goalId || data.goals.some(item => item.id === row.goalId))) :
+    (history?.verifications ?? verificationsForTask(task, attempts, data.verifications)).slice(-6).reverse();
   const childTasks = data.tasks.filter(t => t.parentId === task.id);
   const reviewTasks = data.tasks.filter(t => t.kind === 'review' && t.reviewOf === task.id).sort((a, b) => String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt))); const latestReview = task.reviewSummary;
   const childButton = t => <button className="text" key={t.id} onClick={() => select(t.id)}>{t.title}</button>;

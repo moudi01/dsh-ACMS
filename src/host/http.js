@@ -80,7 +80,7 @@ export function createRoutes(runtime) {
     '/api/acms/task-attempts': async request => json(taskAttemptHistory(company.store, new URL(request.url).searchParams)),
     '/api/acms/evidence': async request => json(panelEvidence(company.store, new URL(request.url).searchParams)),
     '/api/acms/artifact-counts': async request => json(panelArtifactCounts(company.store, new URL(request.url).searchParams)),
-    '/api/acms/artifact-links': async request => json(panelArtifactLinks(company.store, new URL(request.url).searchParams)),
+    '/api/acms/artifact-links': async request => json(panelArtifactLinks(company.store, await body(request))),
     '/api/acms/usage': async request => json(attemptUsageView(company.store, new URL(request.url).searchParams)),
     '/api/acms/usage/summary': async request => json(attemptUsageSummary(company.store, new URL(request.url).searchParams)),
     '/api/acms/cost/forecast': async request => json(goalCostForecast(company,
@@ -224,7 +224,7 @@ export function createRoutes(runtime) {
       } });
     },
   };
-  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing', '/api/acms/composition/archive', '/api/acms/composition/merge-preview'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
+  return Object.entries(handlers).map(([path, handler]) => ({ path, methods: path === '/api/acms/conversation' ? ['GET', 'POST'] : ['/api/acms/command', '/api/acms/model-details', '/api/acms/model-check', '/api/acms/pairing', '/api/acms/composition/archive', '/api/acms/composition/merge-preview', '/api/acms/artifact-links'].includes(path) ? ['POST'] : ['GET'], requestBody: 'buffered', fetch: async request => {
     try { return await handler(request); } catch (e) {
       const status = e.code === 'ARTIFACT_TOO_LARGE' ? 413 : e.code === 'ARTIFACT_MISSING' ? 410 : ['NOT_FOUND'].includes(e.code) ? 404
         : ['ARTIFACT_CORRUPT', 'CONFLICT', 'IDEMPOTENCY_CONFLICT', 'ACTIVE_LIMIT', 'REVIEW_CLEANUP_PENDING', 'STALE_COMPOSITION', 'COMPOSITE_NOT_VERIFIED',

@@ -63,8 +63,33 @@ export async function verifyPanelEvidence(browser) {
     await expect(artifacts.locator('.acms-artifact-list > button')).toHaveCount(20);
     await expect(checks.locator('.acms-verification')).toHaveCount(20);
     await expect(artifacts).not.toContainText('乙范围唯一文件');
+    const sameScope = await pauseRead(page, url => evidence(url, 'artifacts', 'projectId', projectA.id) && url.searchParams.has('before'));
     await artifacts.getByRole('button', { name: '加载更早的产物' }).click();
+    await sameScope.wait();
+    const heldPageReads = evidenceReads.length;
+    command('project.save', { id: projectB.id, name: '产物乙项目更新', repoRoot: anotherRoot, mode: 'copy' });
+    await expect(projectFilter).toContainText('产物乙项目更新');
+    await expect(projectFilter).toHaveValue(projectA.id);
+    await expect(artifacts.locator('.acms-artifact-list > button')).toHaveCount(20);
+    await sameScope.finish();
+    await expect(artifacts.locator('.acms-artifact-list > button')).toHaveCount(25);
+    await expect.poll(() => evidenceReads.slice(heldPageReads).filter(url =>
+      evidence(url, 'artifacts', 'projectId', projectA.id) && !url.searchParams.has('before')).length).toBe(1);
+    const failedPage = Promise.withResolvers();
+    let failureReady = false;
+    await page.route(url => evidence(url, 'verifications', 'projectId', projectA.id) && url.searchParams.has('before'), async route => {
+      failureReady = true;
+      await failedPage.promise;
+      await route.fulfill({ status: 503, json: { error: { message: '暂时无法读取历史验收' } } });
+    }, { times: 1 });
     await checks.getByRole('button', { name: '加载更早的验收记录' }).click();
+    await expect.poll(() => failureReady).toBe(true);
+    command('project.save', { id: projectB.id, name: '产物乙项目再次更新', repoRoot: anotherRoot, mode: 'copy' });
+    await expect(projectFilter).toContainText('产物乙项目再次更新');
+    failedPage.resolve();
+    await expect(checks.getByRole('alert')).toHaveText('暂时无法读取历史验收');
+    await expect(checks.locator('.acms-verification')).toHaveCount(20);
+    await checks.getByRole('button', { name: '重试读取验收记录' }).click();
     await expect(artifacts).toContainText('甲最早历史文件');
     await expect(checks).toContainText('甲旧式执行关联审查');
 

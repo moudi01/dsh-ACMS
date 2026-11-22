@@ -22,11 +22,9 @@ export const api = {
     return request(`evidence?${query}`, { signal });
   },
   artifactCounts: (scope, signal) => request(`artifact-counts?${new URLSearchParams(scope)}`, { signal }),
-  artifactLinks: (taskId, ids, signal) => {
-    const query = new URLSearchParams(taskId ? { taskId } : {});
-    for (const id of ids) query.append('id', id);
-    return request(`artifact-links?${query}`, { signal });
-  },
+  artifactLinks: (references, signal) => request('artifact-links', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ references }), signal,
+  }),
   usageSummary: (scope, groupBy, { after, attemptBefore = Number.MAX_SAFE_INTEGER } = {}) =>
     request(`usage/summary?${new URLSearchParams({ ...scope, groupBy, attemptBefore, ...(after != null ? { after } : {}) })}`),
   costForecast: goalId => request(`cost/forecast?goalId=${encodeURIComponent(goalId)}`),

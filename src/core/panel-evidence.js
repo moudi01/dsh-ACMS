@@ -1,4 +1,5 @@
 import { assert } from './util.js';
+import { ACTIVITY_ARTIFACT_LINK_LIMIT } from './activity.js';
 
 export const PANEL_EVIDENCE_INDEXES = `
   CREATE INDEX IF NOT EXISTS panel_artifacts_order ON entities(collection) WHERE collection='artifacts';
@@ -125,14 +126,18 @@ export function panelArtifactCounts(store, params) {
   });
 }
 
-export function panelArtifactLinks(store, params) {
-  const ids = params.getAll('id');
-  const taskId = params.get('taskId');
-  assert(ids.length > 0 && ids.length <= 25 && ids.every(id => id.length > 0 && id.length <= 200) &&
-    (taskId === null || (taskId.length > 0 && taskId.length <= 200)), 'INVALID_INPUT', '无效的产物链接。');
-  const rows = store.db.prepare(`SELECT e.id, ${property('e', 'title')} AS title, ${property('e', 'path')} AS path
-    FROM json_each(?) AS requested JOIN entities AS e ON e.collection='artifacts' AND e.id=requested.value
-    WHERE (? IS NULL OR ${property('e', 'taskId')}=?) AND ${visibleSubjects('e')}`)
-    .all(JSON.stringify([...new Set(ids)]), taskId, taskId);
+export function panelArtifactLinks(store, input) {
+  const validId = id => typeof id === 'string' && id.length > 0 && id.length <= 200;
+  const references = input?.references;
+  assert(Array.isArray(references) && references.length > 0 && references.length <= ACTIVITY_ARTIFACT_LINK_LIMIT &&
+    references.every(ref => validId(ref?.id) && (ref.taskId === null || validId(ref.taskId))), 'INVALID_INPUT', '无效的产物链接。');
+  const rows = store.db.prepare(`WITH requested AS (
+      SELECT DISTINCT json_extract(value,'$.id') AS id, json_extract(value,'$.taskId') AS taskId FROM json_each(?)
+    )
+    SELECT e.id, requested.taskId AS requestedTaskId, ${property('e', 'taskId')} AS taskId,
+      ${property('e', 'title')} AS title, ${property('e', 'path')} AS path
+    FROM requested JOIN entities AS e ON e.collection='artifacts' AND e.id=requested.id
+    WHERE (requested.taskId IS NULL OR ${property('e', 'taskId')}=requested.taskId) AND ${visibleSubjects('e')}`)
+    .all(JSON.stringify(references.map(({ id, taskId }) => ({ id, taskId }))));
   return { rows };
 }
