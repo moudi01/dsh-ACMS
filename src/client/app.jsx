@@ -132,7 +132,7 @@ function useRuntimeClock(running) {
   }, [running]);
   return Date.now();
 }
-function usePanelContext(scope, cursor, epoch, enabled, selection) {
+function usePanelContext(scope, cursor, epoch, enabled, selection, retry) {
   const [result, setResult] = useState(null);
   const key = JSON.stringify([epoch, scope, enabled]);
   const active = useRef(null);
@@ -148,7 +148,7 @@ function usePanelContext(scope, cursor, epoch, enabled, selection) {
       if (current()) setResult({ scope: requestScope, error: error.message, code: error.code });
     });
     return () => controller.abort();
-  }, [enabled, requestScope, cursor]);
+  }, [enabled, requestScope, cursor, retry]);
   return enabled && result?.scope === requestScope ? result : null;
 }
 export function App() {
@@ -163,7 +163,8 @@ export function App() {
   const needsContext = !!(data?.dashboardView && (selected || entityView || modal || conversation));
   const contextScope = selected ? { taskId: selected } : entityView?.kind === 'goal' ? { goalId: entityView.id } :
     modal?.type === 'goalEdit' ? { goalId: modal.value.id } : {};
-  const context = usePanelContext(contextScope, data?.cursor, epoch, needsContext, selection);
+  const [contextRetry, setContextRetry] = useState(0);
+  const context = usePanelContext(contextScope, data?.cursor, epoch, needsContext, selection, contextRetry);
   const detailData = needsContext ? context?.data : data;
   const chat = (agentId, taskId = null, exact = false) => setConversation({ agentId, taskId: exact ? (taskId ?? null) : (taskId ?? data?.attempts.find(a => a.agentId === agentId && a.status === 'running')?.taskId ?? null) });
   const navigate = (kind, id) => { setModal(null); setSelection(kind === 'task' ? { id } : null); setEntityView(kind === 'task' ? null : { kind, id }); };
@@ -174,6 +175,10 @@ export function App() {
   useEffect(() => {
     if (taskUnavailable) setSelection(current => current === selection ? null : current);
   }, [selection, taskUnavailable]);
+  const refreshPanel = () => {
+    if (context?.error && !taskUnavailable) setContextRetry(retry => retry + 1);
+    refresh().catch(error => setActionError(error.message));
+  };
   const act = async (name, args, success = '已保存') => {
     setBusy(true); setActionError('');
     try {
@@ -227,7 +232,7 @@ export function App() {
       <div className="acms-nav-label">工作空间</div><nav aria-label="ACMS 主导航">{tabs.map(([key, name, icon]) => <button key={key} data-active={tab === key} onClick={() => { setTab(key); setScope({}); setSelection(null); setEntityView(null); }}><span aria-hidden="true">{icon}</span>{name}{key === 'overview' && questions > 0 && <em>{questions}</em>}</button>)}</nav>
       <div className="acms-nav-bottom"><span className={`acms-live ${connected ? 'online' : ''}`}><i />{connected ? '已连接 DSH' : '正在连接'}</span><small>本机运行 · 数据由你掌握</small><div className="acms-owner"><span>你</span><div><b>公司所有者</b><small>Owner · 最高权限</small></div></div></div>
     </aside>
-    <main className="acms-main"><header className="acms-topbar"><span>工作空间 <b>/</b> {tabs.find(x => x[0] === tab)?.[1] ?? ({ runs: '当前执行', inbox: '待处理事项' })[tab]}</span><div><span className="acms-sync">{updated ? `更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}` : '正在读取公司状态'}</span><button onClick={() => refresh().catch(e => setActionError(e.message))}>刷新</button></div></header>
+    <main className="acms-main"><header className="acms-topbar"><span>工作空间 <b>/</b> {tabs.find(x => x[0] === tab)?.[1] ?? ({ runs: '当前执行', inbox: '待处理事项' })[tab]}</span><div><span className="acms-sync">{updated ? `更新于 ${updated.toLocaleTimeString('zh-CN', { hour12: false })}` : '正在读取公司状态'}</span><button onClick={refreshPanel}>刷新</button></div></header>
       {(error || actionError) && <div className="acms-alert error" role="alert">{actionError || `连接中断，保留上次数据：${error}`}</div>}
       {notice && <div className="acms-toast" role="status">{notice}<button aria-label="关闭提示" onClick={() => setNotice('')}>×</button></div>}
       {!data ? <Empty title="正在连接公司服务">从 DSH 宿主读取任务、组织与运行状态。</Empty> : <div className="acms-content">

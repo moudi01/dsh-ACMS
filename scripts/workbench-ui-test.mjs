@@ -34,6 +34,15 @@ export async function verifyScopedWorkbench(browser) {
     await expect(page.getByRole('heading', { name: '让工作持续向前。' })).toBeVisible();
     expect(calls('state').map(url => url.searchParams.get('view'))).toEqual(['dashboard']);
     for (const endpoint of ['task-attempts', 'evidence', 'activity', 'panel-context', 'dashboard', 'workbench']) expect(calls(endpoint)).toHaveLength(0);
+    const refresh = page.getByRole('button', { name: '刷新', exact: true });
+    const dashboardResponse = () => page.waitForResponse(response => {
+      const url = new URL(response.url());
+      return url.pathname === '/api/acms/state' && url.searchParams.get('view') === 'dashboard' && response.ok();
+    });
+    const emptyRefresh = dashboardResponse();
+    await refresh.click();
+    await emptyRefresh;
+    expect(calls('panel-context')).toHaveLength(0);
 
     await page.getByRole('button', { name: '任务工作台', exact: true }).click();
     const projectFilter = page.getByLabel('筛选项目');
@@ -121,9 +130,17 @@ export async function verifyScopedWorkbench(browser) {
       status: 503, json: { ok: false, error: { code: 'TEMPORARY', message: '暂时无法读取任务详情' } },
     }), { times: 1 });
     notify();
-    await expect(page.getByRole('alert').filter({ hasText: '暂时无法读取任务详情' })).toBeVisible();
-    notify();
+    const detailError = page.getByRole('alert').filter({ hasText: '暂时无法读取任务详情' });
+    await expect(detailError).toBeVisible();
+    const failedCursor = store.cursor();
+    const detailCount = requests.filter(detailRead).length;
+    const refreshed = dashboardResponse();
+    await refresh.click();
+    expect((await (await refreshed).json()).cursor).toBe(failedCursor);
     await expect(taskHeading).toBeVisible();
+    await expect(detailError).toHaveCount(0);
+    expect(requests.filter(detailRead)).toHaveLength(detailCount + 1);
+    expect(store.cursor()).toBe(failedCursor);
 
     await remoteCommand('task.delete');
     await expect(drawer).toHaveCount(0);
