@@ -175,6 +175,102 @@ test('independent chat keeps the full current message and the completed replies 
   assert.ok(f.store.require('conversationMessages', newest.id).promptContext.history.utf8Bytes <= 8 * 1024);
 });
 
+test('a long queue preserves the preceding owner message and its reply in turn order', async t => {
+  const f = await fixture(t);
+  const chats = attach(f);
+  const chat = chats.open({ agentId: 'manager' });
+  const gate = Promise.withResolvers();
+  const prompts = [];
+  f.adapter.chat = async ({ prompt, onAccepted }) => {
+    prompts.push(prompt);
+    const turn = prompts.length;
+    onAccepted();
+    if (turn === 1) await gate.promise;
+    return `第 ${turn} 轮回复`;
+  };
+  await f.start();
+  send(chats, chat.id, '请先答复第一条');
+  await until(() => prompts.length === 1);
+  let queued;
+  try {
+    queued = Array.from({ length: 65 }, (_, index) => send(chats, chat.id, `追加提问 ${index + 1}`));
+  } finally { gate.resolve(); }
+  await until(() => !chats.jobs.size, 20000);
+  assert.equal(prompts.length, 66);
+  const previous = queued.at(-2);
+  const reply = f.store.list('conversationMessages').find(row => row.replyTo === previous.id);
+  const history = promptPart(prompts.at(-1), '此前会话');
+  const preceding = history.findIndex(row => row.id === previous.id);
+  const following = history.findIndex(row => row.id === reply.id);
+  assert.equal(history[preceding]?.text, '追加提问 64');
+  assert.equal(history[following]?.text, '第 65 轮回复');
+  assert.equal(following, preceding + 1);
+  assert.equal(following, history.length - 1);
+  const receipt = f.store.require('conversationMessages', queued.at(-1).id).promptContext.history;
+  assert.equal(receipt.available, 130);
+  assert.ok(receipt.considered >= 64 && receipt.considered <= 65);
+  assert.equal(receipt.omitted, 130 - history.length);
+  assert.deepEqual(receipt.included.map(row => row.id), history.map(row => row.id));
+});
+
+test('an explicitly referenced question and answer take precedence over long unrelated replies', async t => {
+  const f = await fixture(t);
+  const task = f.task({ agentId: 'manager', title: '文档发布决定' });
+  f.command('company.pause', { afterCurrent: true });
+  const chats = attach(f);
+  const chat = chats.open({ agentId: 'manager' });
+  const gate = Promise.withResolvers();
+  const prompts = [];
+  const ordinary = '核对页面排版和归档说明，记录下一次例会中应确认的时间。'.repeat(65);
+  f.adapter.chat = async ({ prompt, onAccepted }) => {
+    prompts.push(prompt);
+    onAccepted();
+    if (prompts.length === 1) return ordinary + '先前决定是按第二版发布。';
+    if (prompts.length === 2) await gate.promise;
+    return ordinary + '普通近况说明';
+  };
+  await f.start();
+  const earlier = send(chats, chat.id, `讨论 ${task.id}。${ordinary}请确认发布版本。`);
+  await until(() => !chats.jobs.size);
+  send(chats, chat.id, ordinary + '第一条近况');
+  await until(() => prompts.length === 2);
+  let previous, current;
+  try {
+    send(chats, chat.id, ordinary + '第二条近况');
+    send(chats, chat.id, ordinary + '第三条近况');
+    previous = send(chats, chat.id, ordinary + '上一条所有者近况');
+    current = send(chats, chat.id, `请回顾「${task.title}」的决定。`);
+  } finally { gate.resolve(); }
+  await until(() => !chats.jobs.size);
+  const reply = f.store.list('conversationMessages').find(row => row.replyTo === earlier.id);
+  const history = promptPart(prompts.at(-1), '此前会话');
+  assert.ok(history.some(row => row.id === earlier.id && row.text.endsWith('请确认发布版本。')));
+  assert.ok(history.some(row => row.id === reply.id && row.text.endsWith('先前决定是按第二版发布。')));
+  assert.ok(history.some(row => row.id === previous.id && row.text.endsWith('上一条所有者近况')));
+  assert.ok(f.store.require('conversationMessages', current.id).promptContext.history.utf8Bytes <= 8 * 1024);
+});
+
+test('quoted tasks retain exact titles across supported punctuation and ignore ambiguous or split titles', async t => {
+  const f = await fixture(t);
+  const titles = ['发布手册', '工作节奏', '设计记录', '数据表', '部署「附注'];
+  const matching = titles.map(title => f.task({ agentId: 'manager', title }));
+  const ambiguous = Array.from({ length: 2 }, () => f.task({ agentId: 'manager', title: '同名材料' }));
+  const split = f.task({ agentId: 'manager', title: '分段标题' });
+  f.command('company.pause', { afterCurrent: true });
+  const chats = attach(f);
+  const chat = chats.open({ agentId: 'manager' });
+  let prompt;
+  f.adapter.chat = async input => { prompt = input.prompt; return '模拟回答'; };
+  await f.start();
+  const background = '今天先核对已经归档的材料，周会再补充排期和测试安排。'.repeat(20);
+  send(chats, chat.id, `${background}请比较「发布手册」、“工作节奏”、"设计记录"、\`数据表\`及「部署「附注」。\n` +
+    '另外记录「同名材料」。「分段\n标题」这里没有完整引用。错误示例「缺少闭合。');
+  await until(() => !chats.jobs.size);
+  const ids = new Set(promptPart(prompt, '所负责任务').map(row => row.id));
+  assert.deepEqual(ids, new Set(matching.map(task => task.id)));
+  assert.ok([...ambiguous, split].every(task => !ids.has(task.id)));
+});
+
 test('unfocused chat gives brief active task status within the current role and goal scope', async t => {
   const f = await fixture(t);
   const active = f.task({ agentId: 'manager', title: '等待补充材料' });

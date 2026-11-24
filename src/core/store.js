@@ -143,23 +143,28 @@ export class Store {
 
   independentHistory(conversationId, agentId, messageId, limit) {
     const anchor = this.db.prepare("SELECT rowid FROM entities WHERE collection='conversationMessages' AND id=?").get(messageId)?.rowid ?? 0;
-    // A queued message can be saved before the reply to an earlier owner message.
-    // Keep that completed reply, but never treat a later queued question as history.
-    const scope = `FROM entities AS message WHERE message.collection='conversationMessages'
-      AND json_extract(message.body,'$.conversationId')=? AND json_extract(message.body,'$.taskId') IS NULL
-      AND coalesce(json_extract(message.body,'$.agentId'),?)=?
-      AND ((json_extract(message.body,'$.role')='user' AND json_extract(message.body,'$.status')='delivered' AND message.rowid<?)
+    const scoped = alias => `${alias}.collection='conversationMessages'
+      AND json_extract(${alias}.body,'$.conversationId')=:conversationId AND json_extract(${alias}.body,'$.taskId') IS NULL
+      AND coalesce(json_extract(${alias}.body,'$.agentId'),:agentId)=:agentId`;
+    const priorOwner = alias => `json_extract(${alias}.body,'$.role')='user'
+      AND json_extract(${alias}.body,'$.status')='delivered' AND ${alias}.rowid<:anchor`;
+    const params = { conversationId, agentId, anchor };
+    const latestOwner = this.db.prepare(`SELECT message.id, message.body, message.revision,
+      message.rowid AS position, message.rowid AS turnPosition FROM entities AS message
+      WHERE ${scoped('message')} AND ${priorOwner('message')} ORDER BY message.rowid DESC LIMIT 1`).get(params);
+    // The reply belongs after its question, even when a queue inserts later questions first.
+    const scope = `FROM entities AS message LEFT JOIN entities AS question
+      ON question.id=json_extract(message.body,'$.replyTo') AND ${scoped('question')} AND ${priorOwner('question')}
+      WHERE ${scoped('message')} AND (${priorOwner('message')}
         OR (json_extract(message.body,'$.role')='assistant' AND json_extract(message.body,'$.status')='completed'
-          AND (message.rowid<? OR EXISTS (SELECT 1 FROM entities AS question
-            WHERE question.collection='conversationMessages' AND question.id=json_extract(message.body,'$.replyTo')
-              AND json_extract(question.body,'$.conversationId')=json_extract(message.body,'$.conversationId')
-              AND json_extract(question.body,'$.role')='user' AND json_extract(question.body,'$.status')='delivered'
-              AND json_extract(question.body,'$.taskId') IS NULL
-              AND coalesce(json_extract(question.body,'$.agentId'),?)=? AND question.rowid<?))))`;
-    const params = [conversationId, agentId, agentId, anchor, anchor, agentId, agentId, anchor];
-    const { count } = this.db.prepare(`SELECT count(*) AS count ${scope}`).get(...params);
-    const rows = this.db.prepare(`SELECT body,revision ${scope} ORDER BY rowid DESC LIMIT ?`).all(...params, limit);
-    return { count, messages: rows.reverse().map(row => ({ ...JSON.parse(row.body), revision: row.revision })) };
+          AND (message.rowid<:anchor OR question.rowid IS NOT NULL)))`;
+    const { count } = this.db.prepare(`SELECT count(*) AS count ${scope}`).get(params);
+    const rows = this.db.prepare(`SELECT message.id, message.body, message.revision, message.rowid AS position,
+      coalesce(question.rowid,message.rowid) AS turnPosition ${scope}
+      ORDER BY turnPosition DESC, position DESC LIMIT :limit`).all({ ...params, limit });
+    if (latestOwner && !rows.some(row => row.id === latestOwner.id)) rows.push(latestOwner);
+    rows.sort((a, b) => a.turnPosition - b.turnPosition || a.position - b.position);
+    return { count, latestOwnerId: latestOwner?.id, messages: rows.map(row => ({ ...JSON.parse(row.body), revision: row.revision })) };
   }
 
   taskContext(goalId, taskId) {

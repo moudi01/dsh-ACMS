@@ -7,6 +7,7 @@ const historyBytes = 8 * 1024;
 const taskRows = 6;
 const taskBytes = 4 * 1024;
 const utf8 = text => Buffer.byteLength(text, 'utf8');
+const closingQuote = { '「': '」', '“': '”', '"': '"', '`': '`' };
 
 function excerpt(value, limit) {
   const text = String(value ?? '').toWellFormed();
@@ -35,14 +36,34 @@ function pack(rows, rowLimit, byteLimit) {
   return selected;
 }
 
+function* quotedTitles(text) {
+  for (const line of text.split(/[\r\n]/)) {
+    const nextClose = new Map();
+    for (let start = 0; start < line.length; start++) {
+      const delimiter = closingQuote[line[start]];
+      if (!delimiter) continue;
+      let end = nextClose.get(delimiter) ?? -1;
+      if (end <= start) {
+        const next = line.indexOf(delimiter, start + 1);
+        end = next < 0 ? line.length : next;
+        // For each delimiter, search only after the previous closing position.
+        nextClose.set(delimiter, end);
+      }
+      if (end <= start + 1 || end === line.length) continue;
+      yield line.slice(start + 1, end);
+      start = end;
+    }
+  }
+}
+
 function matchTasks(tasks) {
   const byId = new Set(tasks.map(task => task.id));
   const byTitle = new Map();
   for (const task of tasks) byTitle.set(task.title, byTitle.has(task.title) ? null : task.id);
   return (text = '') => {
     const ids = new Set((text.match(/\btask_[A-Za-z0-9_-]+\b/g) ?? []).filter(id => byId.has(id)));
-    for (const [, chinese, curly, straight, code] of text.matchAll(/「([^」\r\n]+)」|“([^”\r\n]+)”|"([^"\r\n]+)"|`([^`\r\n]+)`/g)) {
-      const id = byTitle.get(chinese ?? curly ?? straight ?? code);
+    for (const title of quotedTitles(text)) {
+      const id = byTitle.get(title);
       if (id) ids.add(id);
     }
     return ids;
@@ -60,14 +81,14 @@ export function independentConversationPrompt(store, chat, agent, message) {
     (!agent.goalId || task.goalId === agent.goalId));
   const referenced = matchTasks(tasks);
   const focus = referenced(message.text);
-  const { count, messages } = store.independentHistory(chat.id, agent.id, message.id, historyWindow);
+  const { count, latestOwnerId, messages } = store.independentHistory(chat.id, agent.id, message.id, historyWindow);
 
-  const latestOwner = messages.findLastIndex(item => item.role === 'user');
+  const latestOwner = messages.find(item => item.id === latestOwnerId);
   const recent = messages.slice(-recentMessages);
   const matched = focus.size ? messages.filter(item => [...referenced(item.text)].some(id => focus.has(id))) : [];
   const related = new Set(matched.flatMap(item => [item.id, item.replyTo].filter(Boolean)));
   const relevant = messages.filter(item => related.has(item.id) || related.has(item.replyTo));
-  const ordered = [...new Set([messages[latestOwner], ...recent.reverse(), ...relevant.reverse()].filter(Boolean))];
+  const ordered = [...new Set([latestOwner, ...relevant.reverse(), ...recent.reverse()].filter(Boolean))];
   const history = pack(ordered.map(item => {
     const { text, truncated } = excerpt(item.text, 1536);
     return { value: { id: item.id, role: item.role, text }, revision: item.revision, truncated };
