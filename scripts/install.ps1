@@ -17,8 +17,22 @@ if (-not (Test-Path -LiteralPath $profileManifest -PathType Leaf)) { throw "Prof
 if (-not $DataDirectory) { $DataDirectory = Join-Path $DshHomePath 'acms' }
 $DataDirectory = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($DataDirectory))
 function YamlValue([string]$Value) { return "'" + $Value.Replace('\', '/').Replace("'", "''") + "'" }
+function Get-PatchDigest([string]$Text) {
+  return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text)))
+}
 $key = [Guid]::NewGuid().ToString('N')
 $staged = Join-Path $profileRoot ".acms-install-$key.tmp"
+$intent = Join-Path $profileRoot '.acms-install-pending.json'
+$stagedIntent = Join-Path $profileRoot ".acms-install-$key.json.tmp"
+function Write-InstallIntent([string]$Text) {
+  $stream = [IO.File]::Open($stagedIntent, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally { $stream.Dispose() }
+  [IO.File]::Move($stagedIntent, $intent, $true)
+}
 $previousDshHome = $env:DSH_HOME
 $profileLock = Lock-AcmsProfile $profileRoot
 $admission = $null
@@ -35,9 +49,15 @@ try {
   $env:DSH_HOME = $DshHomePath
   $activeDirectories = @(Get-AcmsActiveDataDirectories $DshCommand $TargetProfile)
   $modulePath = Join-Path $profileRoot 'node_modules\dsh-acms'
-  if ($activeDirectories.Count -eq 1 -and $activeDirectories[0] -eq $DataDirectory -and $previous.StartsWith('link:') -and
+  $registered = $previous.StartsWith('link:') -and
       [IO.Path]::GetFullPath($previous.Substring(5), [IO.Path]::GetFullPath($profileRoot)) -eq $projectRoot -and
-      (Test-Path -LiteralPath $modulePath -PathType Container) -and ([IO.Directory]::ResolveLinkTarget($modulePath, $true)).FullName -eq $projectRoot) {
+      (Test-Path -LiteralPath $modulePath -PathType Container) -and ([IO.Directory]::ResolveLinkTarget($modulePath, $true)).FullName -eq $projectRoot
+  $previousIntent = if ([IO.File]::Exists($intent)) { [IO.File]::ReadAllText($intent) }
+  $pending = if ($previousIntent) { $previousIntent | ConvertFrom-Json }
+  $matchesIntent = $registered -and $pending.candidate -eq $projectRoot
+  $resume = $matchesIntent -and $pending.patchSha256 -cne (Get-PatchDigest $original)
+  if ($registered -and -not $resume -and $activeDirectories.Count -eq 1 -and $activeDirectories[0] -eq $DataDirectory) {
+    if ($matchesIntent) { [IO.File]::Delete($intent) }
     Write-Output "ACMS already installed in profile '$TargetProfile'. Data: $DataDirectory"
     return
   }
@@ -49,19 +69,30 @@ try {
   [IO.File]::Copy($profileManifest, $manifestBackup)
   if ($hadPatch) { [IO.File]::Copy($patchPath, (Join-Path $backups "profile-$key.yml")) }
   if ($next -cne $original) { [IO.File]::WriteAllText($staged, $next, [Text.UTF8Encoding]::new($false)) }
+  $registrationBackup = if ($resume) { $pending.registrationBackup } else { $manifestBackup }
+  if ($resume) { Write-Output "Resuming ACMS installation. Previous registration backup: $registrationBackup" }
+  # The CLI registration and the profile patch are published separately.
+  Write-InstallIntent (@{ candidate = $projectRoot; patchSha256 = Get-PatchDigest $next; registrationBackup = $registrationBackup } | ConvertTo-Json -Compress)
   try {
-    & $DshCommand plugin --profile $TargetProfile add $projectRoot --ignore-scripts
-    if ($LASTEXITCODE -ne 0) { throw 'DSH plugin add failed.' }
+    if (-not $resume) {
+      & $DshCommand plugin --profile $TargetProfile add $projectRoot --ignore-scripts
+      if ($LASTEXITCODE -ne 0) { throw 'DSH plugin add failed.' }
+    }
     $admission.StandardInput.WriteLine('verify')
     $admission.StandardInput.Flush()
     Read-AcmsInstallAdmission $admission
     Publish-AcmsProfilePatch $patchPath $hadPatch $original $staged
   } catch {
     $failure = $_
-    try { Restore-AcmsRegistration $profileRoot $previous $DshCommand $TargetProfile }
+    try {
+      Restore-AcmsRegistration $profileRoot $previous $DshCommand $TargetProfile
+      if ($previousIntent) { Write-InstallIntent $previousIntent }
+      else { [IO.File]::Delete($intent) }
+    }
     catch { throw "ACMS install failed: $($failure.Exception.Message) Automatic registration recovery failed: $($_.Exception.Message) Previous registration backup: $manifestBackup" }
     throw $failure
   }
+  [IO.File]::Delete($intent)
   Write-Output "ACMS installed in profile '$TargetProfile'. Data: $DataDirectory"
   Write-Output 'Restart DSH when existing work is safely paused. Open ACMS from the DSH sidebar.'
 } finally {
@@ -69,6 +100,7 @@ try {
   try {
     Close-AcmsInstallAdmission $admission
     if ([IO.File]::Exists($staged)) { [IO.File]::Delete($staged) }
+    if ([IO.File]::Exists($stagedIntent)) { [IO.File]::Delete($stagedIntent) }
   }
   finally { $profileLock.Dispose() }
 }

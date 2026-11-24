@@ -236,18 +236,68 @@ exit 0
   Install-Candidate $new.Root $settings.otherData | Out-Host
   Assert-Profile $new.Root $settings.otherData
 
-  $settings.abrupt = $true
-  $settings.marker = Join-Path $validationRoot 'registered-before-process-exit'
-  Write-Text $wrapperSettings ($settings | ConvertTo-Json)
-  $previousErrorPreference = $PSNativeCommandUseErrorActionPreference
-  try {
-    $PSNativeCommandUseErrorActionPreference = $false
-    & pwsh @installProbe $dataDir | Out-Host
-    Assert-Check ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $settings.marker)) 'Expected the isolated installer to exit after registration.'
-  } finally { $PSNativeCommandUseErrorActionPreference = $previousErrorPreference }
+  function Invoke-InterruptedInstall([string]$Marker) {
+    $settings.abrupt = $true
+    $settings.marker = Join-Path $validationRoot $Marker
+    Write-Text $wrapperSettings ($settings | ConvertTo-Json)
+    $previousErrorPreference = $PSNativeCommandUseErrorActionPreference
+    try {
+      $PSNativeCommandUseErrorActionPreference = $false
+      & pwsh @installProbe $dataDir | Out-Host
+      Assert-Check ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $settings.marker)) 'Expected the isolated installer to exit after registration.'
+    } finally { $PSNativeCommandUseErrorActionPreference = $previousErrorPreference }
+  }
+  Invoke-InterruptedInstall 'registered-before-process-exit'
   Assert-Profile $new.Root $settings.otherData
   Install-Candidate $new.Root $dataDir | Out-Host
   Assert-Profile $new.Root $dataDir
+
+  # Keep the same data path while replacing an older versioned host.
+  Install-Candidate $old.Root $dataDir | Out-Host
+  $versionedProbe = @'
+import { pathToFileURL } from 'node:url';
+import path from 'node:path';
+const [deployScript, previousRoot, profile] = process.argv.slice(2);
+const { deployLive } = await import(pathToFileURL(deployScript));
+const { buildHost } = await import(pathToFileURL(path.join(previousRoot, 'scripts/host-bundle.mjs')));
+const { filename } = await deployLive({ root: previousRoot, profile, home: process.env.DSH_HOME, build: buildHost });
+console.log(filename);
+'@
+  $oldBundle = ($versionedProbe | node --input-type=module - $deployScript $old.Root $profile)
+  Assert-Check ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $oldBundle -PathType Leaf)) 'Could not prepare the previous candidate host.'
+  Assert-Profile $old.Root $dataDir $oldBundle
+  $oldDeployedHash = Hash-File $patch
+  $oldRegistration = Get-AcmsRegistration $profileRoot
+  Invoke-InterruptedInstall 'registered-with-old-versioned-host'
+  Assert-Profile $new.Root $dataDir $oldBundle
+  $intentFile = Join-Path $profileRoot '.acms-install-pending.json'
+  $interruptedRecordHash = Hash-File $intentFile
+  $pending = Read-Json $intentFile
+  $patchBeforeExit = Join-Path (Split-Path $pending.registrationBackup) ((Split-Path $pending.registrationBackup -Leaf).Replace('package-', 'profile-').Replace('.json', '.yml'))
+  Assert-Check ((Get-AcmsRegistration $profileRoot) -ne $oldRegistration -and (Read-Json $pending.registrationBackup).dependencies.'dsh-acms' -eq $oldRegistration) 'The interrupted registration or its old backup is incorrect.'
+  Assert-Check ((Hash-File $patch) -eq $oldDeployedHash -and (Hash-File $patchBeforeExit) -eq $oldDeployedHash) 'The old versioned patch or its backup changed before retry.'
+  Invoke-DatabaseProbe active
+  Expect-Failure { Install-Candidate $new.Root $dataDir } 'active executions'
+  Assert-Profile $new.Root $dataDir $oldBundle
+  Invoke-DatabaseProbe settle
+  $held = [IO.File]::Open($patch, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  try { Expect-Failure { Install-Candidate $new.Root $dataDir } 'Could not publish the ACMS profile configuration' }
+  finally { $held.Dispose() }
+  Assert-Profile $new.Root $dataDir $oldBundle
+  Assert-Check ((Hash-File $intentFile) -eq $interruptedRecordHash) 'A failed retry did not preserve the original pending record.'
+  Install-Candidate $new.Root $dataDir | Out-Host
+  Assert-Profile $new.Root $dataDir
+  Assert-Check (-not (Test-Path -LiteralPath $intentFile) -and (Hash-File $patchBeforeExit) -eq $oldDeployedHash -and (Read-Json $pending.registrationBackup).dependencies.'dsh-acms' -eq $oldRegistration) 'The retry left pending state or lost the original backups.'
+
+  # The same record can survive a process exit just after the patch was published.
+  Assert-Check ($pending.patchSha256 -ceq (Hash-File $patch)) 'The published patch differs from the recorded install intent.'
+  Write-Text $intentFile ($pending | ConvertTo-Json)
+  Invoke-DatabaseProbe active
+  Install-Candidate $new.Root $dataDir | Out-Host
+  Assert-Profile $new.Root $dataDir
+  Assert-Check (-not (Test-Path -LiteralPath $intentFile)) 'A fully published install did not clear its pending record.'
+  Invoke-DatabaseProbe settle
+
   $deployResult = (Invoke-Checked node @($deployScript,$profile)) -join "`n"
   $previousPatch = [regex]::Match($deployResult, '(?m)^Previous configuration: (.+)$').Groups[1].Value.Trim()
   $revision = [regex]::Match($deployResult, 'ACMS host ([a-f0-9]+) published').Groups[1].Value
@@ -304,7 +354,7 @@ exit 0
     passed = $true; dsh = $dshVersion; node = ((Invoke-Checked node @('--version')) -join '').Trim()
     previousCommit = $old.Commit; previousArchiveSha256 = $old.ArchiveSha256
     candidateCommit = $new.Commit; candidateArchiveSha256 = $new.ArchiveSha256; candidateCodexCli = $new.CodexCli
-    checks = @('fresh install', 'idempotent versioned reinstall', 'invalid data path', 'locked install and uninstall recovery', 'candidate upgrade', 'active current and destination database gates', 'concurrent package operation exclusion and process exit recovery', 'versioned host entry and rollback', 'uninstall with or without package registration', 'unrelated profile and data retention')
+    checks = @('fresh install', 'idempotent versioned reinstall', 'invalid data path', 'locked install and uninstall recovery', 'candidate upgrade', 'active current and destination database gates', 'concurrent package operation exclusion', 'interrupted same-data and cross-data upgrades', 'completed publication cleanup', 'versioned host entry and rollback', 'uninstall with or without package registration', 'unrelated profile and data retention')
   } | ConvertTo-Json -Depth 3
 } finally {
   foreach ($key in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $savedEnvironment[$key]) }

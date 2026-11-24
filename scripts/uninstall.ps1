@@ -37,6 +37,7 @@ try {
     catch { throw "ACMS uninstall failed: $($failure.Exception.Message) Automatic registration recovery failed: $($_.Exception.Message) Retry uninstall to clear the remaining managed configuration." }
     throw $failure
   }
+  [IO.File]::Delete((Join-Path $profileRoot '.acms-install-pending.json'))
   Write-Output 'ACMS removed. Company database, deliverables, worktrees are retained.'
 } finally {
   $env:DSH_HOME = $previousDshHome
