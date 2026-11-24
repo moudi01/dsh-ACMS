@@ -175,27 +175,54 @@ test('independent chat keeps the full current message and the completed replies 
   assert.ok(f.store.require('conversationMessages', newest.id).promptContext.history.utf8Bytes <= 8 * 1024);
 });
 
-test('a long queue preserves the preceding owner message and its reply in turn order', async t => {
-  const f = await fixture(t);
+test('a long queue preserves the preceding owner message and its reply in turn order', { timeout: 60000 }, async t => {
+  // This case exercises queue and query order. Restart coverage uses a disk database.
+  const f = await fixture(t, undefined, { inMemory: true });
   const chats = attach(f);
   const chat = chats.open({ agentId: 'manager' });
+  const otherChat = chats.open({ agentId: 'reviewer' });
+  const started = Promise.withResolvers();
   const gate = Promise.withResolvers();
   const prompts = [];
   f.adapter.chat = async ({ prompt, onAccepted }) => {
     prompts.push(prompt);
     const turn = prompts.length;
     onAccepted();
-    if (turn === 1) await gate.promise;
+    if (turn === 1) {
+      started.resolve();
+      await gate.promise;
+    }
     return `第 ${turn} 轮回复`;
   };
   await f.start();
-  send(chats, chat.id, '请先答复第一条');
-  await until(() => prompts.length === 1);
-  let queued;
+  const stopOnTimeout = () => { started.resolve(); gate.resolve(); chats.stop(chat.id); };
+  t.signal.addEventListener('abort', stopOnTimeout, { once: true });
+  let queued, outside;
   try {
-    queued = Array.from({ length: 65 }, (_, index) => send(chats, chat.id, `追加提问 ${index + 1}`));
-  } finally { gate.resolve(); }
-  await until(() => !chats.jobs.size, 20000);
+    send(chats, chat.id, '请先答复第一条');
+    const first = chats.jobs.get(chat.id);
+    assert.ok(first);
+    await Promise.race([started.promise, first.promise]);
+    t.signal.throwIfAborted();
+    assert.equal(prompts.length, 1, 'the first request should reach the adapter before the queue is filled');
+    queued = Array.from({ length: 64 }, (_, index) => send(chats, chat.id, `追加提问 ${index + 1}`));
+    outside = historyRow(f, otherChat, { id: 'outside-owner', role: 'user', status: 'delivered', text: '另一会话的所有者消息' });
+    queued.push(send(chats, chat.id, '追加提问 65'));
+    gate.resolve();
+
+    // Each job's finally handler starts the next queued request before its promise settles.
+    for (let turn = 1; turn <= queued.length + 1; turn++) {
+      t.signal.throwIfAborted();
+      const job = chats.jobs.get(chat.id);
+      assert.ok(job, `queue ended before turn ${turn}`);
+      await job.promise;
+    }
+    t.signal.throwIfAborted();
+  } finally {
+    gate.resolve();
+    t.signal.removeEventListener('abort', stopOnTimeout);
+  }
+  assert.equal(chats.jobs.has(chat.id), false);
   assert.equal(prompts.length, 66);
   const previous = queued.at(-2);
   const reply = f.store.list('conversationMessages').find(row => row.replyTo === previous.id);
@@ -206,6 +233,7 @@ test('a long queue preserves the preceding owner message and its reply in turn o
   assert.equal(history[following]?.text, '第 65 轮回复');
   assert.equal(following, preceding + 1);
   assert.equal(following, history.length - 1);
+  assert.equal(history.some(row => row.id === outside.id), false);
   const receipt = f.store.require('conversationMessages', queued.at(-1).id).promptContext.history;
   assert.equal(receipt.available, 130);
   assert.ok(receipt.considered >= 64 && receipt.considered <= 65);
