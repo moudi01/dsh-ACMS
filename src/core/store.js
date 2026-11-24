@@ -52,6 +52,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS attempts_usage_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS attempts_usage_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS tasks_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks';
+      CREATE INDEX IF NOT EXISTS messages_by_conversation ON entities(json_extract(body,'$.conversationId')) WHERE collection='conversationMessages';
       CREATE INDEX IF NOT EXISTS delivered_work_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks'
         AND json_extract(body,'$.kind')='work' AND json_extract(body,'$.status')='succeeded';
       ${CHECKPOINT_INDEXES}
@@ -138,6 +139,27 @@ export class Store {
   tasksForGoal(goalId) {
     return this.db.prepare("SELECT body FROM entities WHERE collection='tasks' AND json_extract(body,'$.goalId')=?")
       .all(goalId).map(({ body }) => JSON.parse(body));
+  }
+
+  independentHistory(conversationId, agentId, messageId, limit) {
+    const anchor = this.db.prepare("SELECT rowid FROM entities WHERE collection='conversationMessages' AND id=?").get(messageId)?.rowid ?? 0;
+    // A queued message can be saved before the reply to an earlier owner message.
+    // Keep that completed reply, but never treat a later queued question as history.
+    const scope = `FROM entities AS message WHERE message.collection='conversationMessages'
+      AND json_extract(message.body,'$.conversationId')=? AND json_extract(message.body,'$.taskId') IS NULL
+      AND coalesce(json_extract(message.body,'$.agentId'),?)=?
+      AND ((json_extract(message.body,'$.role')='user' AND json_extract(message.body,'$.status')='delivered' AND message.rowid<?)
+        OR (json_extract(message.body,'$.role')='assistant' AND json_extract(message.body,'$.status')='completed'
+          AND (message.rowid<? OR EXISTS (SELECT 1 FROM entities AS question
+            WHERE question.collection='conversationMessages' AND question.id=json_extract(message.body,'$.replyTo')
+              AND json_extract(question.body,'$.conversationId')=json_extract(message.body,'$.conversationId')
+              AND json_extract(question.body,'$.role')='user' AND json_extract(question.body,'$.status')='delivered'
+              AND json_extract(question.body,'$.taskId') IS NULL
+              AND coalesce(json_extract(question.body,'$.agentId'),?)=? AND question.rowid<?))))`;
+    const params = [conversationId, agentId, agentId, anchor, anchor, agentId, agentId, anchor];
+    const { count } = this.db.prepare(`SELECT count(*) AS count ${scope}`).get(...params);
+    const rows = this.db.prepare(`SELECT body,revision ${scope} ORDER BY rowid DESC LIMIT ?`).all(...params, limit);
+    return { count, messages: rows.reverse().map(row => ({ ...JSON.parse(row.body), revision: row.revision })) };
   }
 
   taskContext(goalId, taskId) {

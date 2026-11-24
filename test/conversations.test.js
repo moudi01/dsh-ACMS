@@ -8,6 +8,7 @@ import { Conversations } from '../src/runtime/conversations.js';
 import { defaultSimulation } from '../src/adapters/simulated.js';
 import { DshAdapter } from '../src/adapters/dsh.js';
 import { createRoutes } from '../src/host/http.js';
+import { digest } from '../src/core/util.js';
 
 function attach(f) {
   const chats = new Conversations(f.company, f.engine, f.adapter, f.dataDir);
@@ -15,6 +16,30 @@ function attach(f) {
   return chats;
 }
 const send = (chats, conversationId, text, extra = {}) => chats.send({ conversationId, text, requestId: randomUUID(), ...extra });
+function promptPart(prompt, prefix) {
+  const line = prompt.split('\n').find(item => item.startsWith(prefix));
+  return JSON.parse(line.slice(line.indexOf('：') + 1));
+}
+
+function historyRow(f, chat, fields) {
+  return f.store.put('conversationMessages', { conversationId: chat.id, agentId: chat.agentId, taskId: chat.taskId,
+    role: 'assistant', status: 'completed', ...fields });
+}
+
+function legacyPromptBytes(agent, chat, rows, tasks, current) {
+  const candidates = rows.filter(m => m.conversationId === chat.id && (m.status === 'completed' || m.role === 'user' && m.status === 'delivered'));
+  let remaining = 32000;
+  const history = [];
+  for (const m of [...candidates, current].slice(-24).reverse()) {
+    if (remaining <= 0) break;
+    const text = m.text.slice(-remaining);
+    history.unshift({ role: m.role, text });
+    remaining -= text.length;
+  }
+  const related = tasks.filter(t => t.agentId === agent.id && t.status !== 'deleted')
+    .map(t => ({ id: t.id, title: t.title, status: t.status, summary: t.summary?.slice(0, 1500) })).slice(-20);
+  return Buffer.byteLength(`你是 ${agent.name}。职责：${agent.description}\n这是公司所有者的独立对话。直接回答问题；不得派工、修改任务/角色、授予权限或把聊天回复当成交付验收。若需要业务操作，说明应在任务界面执行。以下任务记录仅供说明现状：${JSON.stringify(related)}\n会话记录：${JSON.stringify(history)}\n请用自然语言回复，不输出推理过程。`);
+}
 
 test('idle conversations persist multi-turn context, deduplicate sends and never edit roles or create tasks', async t => {
   const f = await fixture(t); const chats = attach(f); await f.start();
@@ -31,6 +56,150 @@ test('idle conversations persist multi-turn context, deduplicate sends and never
   assert.deepEqual(f.store.require('agents', agent.id), before);
   assert.equal(f.store.list('tasks').length, 0); assert.equal(f.adapter.activeChats, 0);
   assert.equal((await chats.view(chat.id)).messages.length, 4);
+});
+
+test('independent chat includes the referenced task and relevant prior turns while retaining full records on demand', async t => {
+  const f = await fixture(t);
+  const chats = attach(f);
+  const agent = f.store.require('agents', 'manager');
+  const chat = chats.open({ agentId: agent.id });
+  const tasks = Array.from({ length: 24 }, (_, index) => f.task({ title: `文档任务 ${index}`, agentId: agent.id }));
+  const target = tasks[0];
+  const unrelated = tasks[1];
+  const large = '中🚀"\\\u0001'.repeat(350);
+  const summary = large + '当前任务摘要确认';
+  const other = f.task({ title: '其它角色的材料' });
+  const taskChat = chats.open({ agentId: agent.id, taskId: target.id });
+  const otherChat = chats.open({ agentId: other.agentId });
+  f.store.transaction(() => {
+    for (const task of tasks) f.store.put('tasks', { ...task, summary: task.id === target.id ? summary : large + '重复附带的工作摘要' });
+    for (let index = 0; index < 85; index++) {
+      const turn = index === 45 ? { id: 'related-question', role: 'user', status: 'delivered', text: `请查 ${target.id}` } :
+        index === 46 ? { id: 'related-answer', replyTo: 'related-question', text: '答案记录在第二份材料。' } :
+        index === 84 ? { id: 'latest-owner', role: 'user', status: 'delivered', text: large + '先前最新确认' } :
+        { id: `history-${index}`, text: large + `历史消息 ${index}` };
+      historyRow(f, chat, turn);
+    }
+    historyRow(f, taskChat, { id: 'task-thread', text: '隔离任务对话' });
+    historyRow(f, otherChat, { id: 'another-chat', text: '其它角色的会话' });
+    historyRow(f, chat, { id: 'invalid-scope', taskId: target.id, text: '错误范围的会话消息' });
+    historyRow(f, chat, { id: 'interrupted', status: 'interrupted', text: '未完成消息' });
+  });
+  f.command('company.pause', { afterCurrent: true });
+  await f.start();
+  const prompts = [];
+  f.adapter.chat = async input => { prompts.push(input.prompt); input.onAccepted(); return '模拟完成'; };
+  const routes = new Map(createRoutes({ ...f, conversations: chats }).map(route => [route.path, route]));
+  const get = async (route, query) => {
+    const response = await routes.get(route).fetch(new Request(`http://localhost${route}?${query}`));
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const detail = await get('/api/acms/panel-context', `taskId=${target.id}`);
+  assert.equal(detail.tasks.find(task => task.id === target.id).summary, summary);
+  const newest = await get('/api/acms/conversation', `id=${chat.id}`);
+  assert.equal(newest.hasMore, true);
+  const older = await get('/api/acms/conversation', `id=${chat.id}&before=${newest.messages[0].id}`);
+  assert.match(older.messages[0].text, /历史消息 0/);
+  assert.equal(prompts.length, 0);
+
+  const previous = f.store.list('conversationMessages');
+  const input = { conversationId: chat.id, requestId: randomUUID(), text: `现在核对「${target.title}」，也提到了 ${other.id}。` };
+  const ownerMessage = chats.send(input);
+  await until(() => !chats.jobs.size);
+  assert.equal(chats.send(input).id, ownerMessage.id);
+  assert.equal(prompts.length, 1);
+  const [prompt] = prompts;
+  const history = promptPart(prompt, '此前会话');
+  const taskContext = promptPart(prompt, '所负责任务');
+  assert.deepEqual(taskContext.map(task => task.id), [target.id]);
+  assert.equal(taskContext[0].summary.endsWith('当前任务摘要确认'), true);
+  assert.ok(history.some(row => row.id === 'related-question'));
+  assert.ok(history.some(row => row.id === 'related-answer'));
+  assert.ok(history.some(row => row.id === 'latest-owner' && row.text.endsWith('先前最新确认')));
+  assert.equal(promptPart(prompt, '当前所有者消息'), input.text);
+  assert.equal(prompt.includes(unrelated.id), false);
+  assert.doesNotMatch(prompt, /隔离任务对话|其它角色的会话|错误范围的会话消息|未完成消息|重复附带的工作摘要/);
+  const receipt = f.store.require('conversationMessages', ownerMessage.id).promptContext;
+  assert.equal(receipt.version, 1);
+  assert.equal(receipt.promptSha256, digest(prompt));
+  assert.equal(receipt.promptUtf8Bytes, Buffer.byteLength(prompt));
+  assert.equal(receipt.history.available, 85);
+  assert.equal(receipt.history.considered, 64);
+  assert.equal(receipt.history.omitted, 85 - history.length);
+  assert.equal(receipt.tasks.available, 24);
+  assert.equal(receipt.tasks.referenced, 1);
+  assert.equal(receipt.tasks.omitted, 23);
+  assert.deepEqual(receipt.tasks.included, [{ id: target.id, revision: f.store.require('tasks', target.id).revision, truncated: true }]);
+  assert.ok(receipt.history.included.some(row => row.id === 'latest-owner' && row.truncated));
+  assert.equal(receipt.history.utf8Bytes, Buffer.byteLength(JSON.stringify(history)));
+  assert.equal(receipt.tasks.utf8Bytes, Buffer.byteLength(JSON.stringify(taskContext)));
+  assert.ok(receipt.history.utf8Bytes <= 8 * 1024);
+  assert.ok(receipt.tasks.utf8Bytes <= 4 * 1024);
+  assert.ok(history.every(row => row.text.isWellFormed()));
+  const before = legacyPromptBytes(agent, chat, previous, f.store.list('tasks'), { role: 'user', text: input.text });
+  assert.ok(receipt.promptUtf8Bytes < before / 5);
+  t.diagnostic(`Offline prompt UTF-8 bytes on the fixed long-history fixture: ${before} before, ${receipt.promptUtf8Bytes} after. One simulated call per send; retries and reads added zero calls.`);
+});
+
+test('independent chat keeps the full current message and the completed replies of earlier queued questions', async t => {
+  const f = await fixture(t);
+  const chats = attach(f);
+  const chat = chats.open({ agentId: 'manager' });
+  const captured = [];
+  const gate = Promise.withResolvers();
+  f.adapter.chat = async ({ prompt, onAccepted }) => {
+    captured.push(prompt);
+    onAccepted();
+    if (captured.length === 1) await gate.promise;
+    return `轮次 ${captured.length} 回复`;
+  };
+  await f.start();
+  const latest = '当前指令：' + '中🚀"\\\u0001'.repeat(1996) + '，最后一句';
+  const first = send(chats, chat.id, '先做一个回复');
+  await until(() => captured.length === 1);
+  const second = send(chats, chat.id, '第二条留言');
+  const newest = send(chats, chat.id, latest);
+  gate.resolve();
+  await until(() => !chats.jobs.size);
+  assert.equal(captured.length, 3);
+  assert.equal(captured[0].includes('第二条留言'), false);
+  assert.equal(captured[1].includes('当前指令'), false);
+  assert.equal(promptPart(captured[2], '当前所有者消息'), latest);
+  const history = promptPart(captured[2], '此前会话');
+  const secondReply = f.store.list('conversationMessages').find(m => m.replyTo === second.id);
+  assert.ok(history.some(row => row.id === first.id));
+  assert.ok(history.some(row => row.id === second.id));
+  assert.ok(history.some(row => row.id === secondReply.id && row.text === '轮次 2 回复'));
+  assert.equal(history.some(row => row.id === newest.id), false);
+  assert.ok(f.store.require('conversationMessages', newest.id).promptContext.history.utf8Bytes <= 8 * 1024);
+});
+
+test('unfocused chat gives brief active task status within the current role and goal scope', async t => {
+  const f = await fixture(t);
+  const active = f.task({ agentId: 'manager', title: '等待补充材料' });
+  const completed = f.task({ agentId: 'manager', title: '已交付文件' });
+  const outside = f.command('goal.create', { title: '另一个目标', projectId: f.project.id, description: '隔离', acceptance: '隔离', plan: false });
+  const unrelated = f.task({ agentId: 'manager', goalId: outside.id, title: '不在当前角色范围' });
+  f.store.transaction(() => {
+    f.store.put('tasks', { ...active, status: 'blocked', blocker: { kind: 'human' }, summary: '旧轮次工作的详细总结' });
+    f.store.put('tasks', { ...completed, status: 'succeeded', summary: '完成工作的详细总结' });
+    f.store.put('agents', { ...f.store.require('agents', 'manager'), goalId: f.goal.id });
+  });
+  f.command('company.pause', { afterCurrent: true });
+  const chats = attach(f);
+  const chat = chats.open({ agentId: 'manager' });
+  let prompt;
+  f.adapter.chat = async input => { prompt = input.prompt; return '模拟状态说明'; };
+  await f.start();
+  send(chats, chat.id, `当前进展怎么样？入口提到 ${unrelated.id}。`);
+  await until(() => !chats.jobs.size);
+  const tasks = promptPart(prompt, '所负责任务');
+  assert.deepEqual(tasks, [
+    { id: active.id, title: active.title, status: 'blocked', blocker: 'human' },
+    { id: completed.id, title: completed.title, status: 'succeeded' },
+  ]);
+  assert.doesNotMatch(prompt, /不在当前角色范围|工作的详细总结/);
 });
 
 test('same-attempt steering acknowledges executor delivery, rejects stale turns and does not replay acknowledged requests', async t => {
