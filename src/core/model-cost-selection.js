@@ -21,21 +21,23 @@ export function chooseCostRoute({ baseline, eligible, binding, requirements, con
   if (!baseline.reasoningEffort) return unchanged('unknown-depth', defaults);
 
   const previous = context.previous();
-  if (previous) {
-    if (!previous.costSelected) return unchanged('retry-default', { previousAttemptId: previous.attemptId });
-    const route = eligible.find(candidate => candidate.candidateId === previous.candidateId &&
-      candidate.reasoningEffort === previous.reasoningEffort && sameCohort(candidate, baseline) && context.available(candidate));
-    const evidence = { ...defaults, previousAttemptId: previous.attemptId };
-    return route ? { candidate: route, evidence: { ...evidence, reason: 'retry-route' } } :
-      unchanged('retry-route-unavailable', evidence);
-  }
+  if (previous && !previous.costSelected) return unchanged('retry-default', { previousAttemptId: previous.attemptId });
+  const retry = previous && eligible.find(candidate => candidate.candidateId === previous.candidateId &&
+    candidate.reasoningEffort === previous.reasoningEffort && sameCohort(candidate, baseline) && context.available(candidate));
+  const evidence = previous ? { ...defaults, previousAttemptId: previous.attemptId } : defaults;
+  if (previous && !retry) return unchanged('retry-route-unavailable', evidence);
+  if (retry && !taskReview) return { candidate: retry, evidence: { ...evidence, reason: 'retry-route' } };
 
   const sheet = context.read();
-  const observation = { ...defaults, sourceState: sheet.state, sourceFingerprint: sheet.fingerprint ?? null,
+  const observation = { ...evidence, sourceState: sheet.state, sourceFingerprint: sheet.fingerprint ?? null,
     source: sheet.source ?? null, unit: sheet.unit ?? null, expiresAt: sheet.expiresAt ?? null };
-  if (sheet.state !== 'ready') return unchanged('rates-unavailable', observation);
+  if (sheet.state !== 'ready') return unchanged(retry ? 'retry-route-unavailable' : 'rates-unavailable', observation);
   const group = sheet.groups.find(group => group.scope === scope && group.provider === baseline.provider && group.llmProvider === baseline.llmProvider &&
     group.reasoningEffort === baseline.reasoningEffort && group.prices.has(baseline.model));
+  if (retry) {
+    if (!group?.prices.has(retry.model)) return unchanged('retry-route-unavailable', observation);
+    return { candidate: retry, evidence: { ...observation, reason: 'retry-route', group: group.id } };
+  }
   if (!group || !context.available(baseline)) return unchanged('unpriced-default', observation);
   const peers = eligible.filter(candidate => sameCohort(candidate, baseline) && context.available(candidate) && group.prices.has(candidate.model));
   const comparable = { ...observation, group: group.id, compared: peers.length,

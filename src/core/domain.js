@@ -545,6 +545,11 @@ export class Company {
     assert(source.kind !== 'review', 'INVALID_INPUT', '审查任务不能再添加审查');
     assert(!source.legacyBatch, 'LEGACY_TASK', '旧任务已备份隔离，不能添加审查');
     assert(source.status === 'succeeded', 'TASK_NOT_DELIVERED', '只能对已交付（已完成）的任务添加审查');
+    if (args.costRouting === true) {
+      const expected = args.expectedDelivery;
+      assert(expected && expected.artifactHash === (source.artifactHash ?? null) && expected.generation === deliveryGeneration(source) &&
+        expected.contractVersion === taskContractVersion(source), 'CONFLICT', '请刷新任务详情，按当前交付版本重新确认审查费率选项。');
+    }
     const reviews = this.store.tasksForGoal(source.goalId).filter(task => task.kind === 'review' && task.reviewOf === source.id &&
       matchesTaskReview(task, source) && task.status !== 'deleted');
     const existing = this.existingReviewRequest(reviews, source.goalId, actor, { sourceTaskId: source.id, artifactHash: source.artifactHash });

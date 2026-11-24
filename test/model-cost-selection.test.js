@@ -72,6 +72,9 @@ function fakeNative(f, { beforeDetails, activation } = {}) {
 const selectedAttempt = (f, task, generation = task.generation) => [...f.store.attemptUsageRows('task', task.id)]
   .map(({ attempt }) => attempt).find(attempt => attempt.taskGeneration === generation && attempt.selection);
 const finish = (f, task) => until(() => f.store.require('tasks', task.id).status === 'succeeded', undefined, taskWaitDiagnostics(f, task.id));
+const reviewCostArgs = source => ({ id: source.id, costRouting: true, expectedDelivery: {
+  artifactHash: source.artifactHash ?? null, generation: source.deliveryGeneration ?? 1, contractVersion: source.goalContractVersion ?? 1,
+} });
 
 test('owner opt-in compares native rates through normal dispatch and disablement preserves attempt history', async t => {
   const f = await fixture(t);
@@ -115,20 +118,21 @@ test('a manually requested task review compares explicitly scoped rates in its o
   await saveRates(f, mixedRates);
   await f.start();
   await finish(f, task);
+  const optedReview = reviewCostArgs(f.store.require('tasks', task.id));
 
   const ordinary = await ownerCommand(f, 'review.request', { id: task.id });
   await finish(f, ordinary);
   assert.equal(ordinary.costRouting, undefined);
   assert.equal(selectedAttempt(f, ordinary).selection.costComparison, undefined);
 
-  const workRatesOnly = await ownerCommand(f, 'review.request', { id: task.id, costRouting: true });
+  const workRatesOnly = await ownerCommand(f, 'review.request', optedReview);
   await finish(f, workRatesOnly);
   assert.equal(selectedAttempt(f, workRatesOnly).model, premium);
   assert.equal(selectedAttempt(f, workRatesOnly).selection.costComparison.reason, 'unpriced-default');
 
   mixedRates.groups.push(...sheet({ scope: 'task-review' }).groups);
   await saveRates(f, mixedRates);
-  const review = await ownerCommand(f, 'review.request', { id: task.id, costRouting: true });
+  const review = await ownerCommand(f, 'review.request', optedReview);
   await finish(f, review);
   const authorAttempt = selectedAttempt(f, task);
   const reviewAttempt = selectedAttempt(f, review);
@@ -155,13 +159,13 @@ test('a manually requested task review compares explicitly scoped rates in its o
 
 test('review rate opt-in is owner-only and cannot reconfigure an existing review or a final review', async t => {
   const f = await fixture(t);
-  const source = f.task();
-  f.store.put('tasks', { ...source, status: 'succeeded', artifactHash: 'fixed-delivery', lastAuthorId: source.agentId });
-  assert.throws(() => f.command('review.request', { id: source.id, costRouting: true }, SYSTEM), { code: 'OWNER_REQUIRED' });
+  const task = f.task();
+  const source = f.store.put('tasks', { ...task, status: 'succeeded', artifactHash: 'fixed-delivery', lastAuthorId: task.agentId });
+  assert.throws(() => f.command('review.request', reviewCostArgs(source), SYSTEM), { code: 'OWNER_REQUIRED' });
   assert.throws(() => f.command('review.request', { id: source.id, costRouting: 'true' }), { code: 'INVALID_INPUT' });
   assert.throws(() => f.command('review.request', { goalId: source.goalId, costRouting: true }), { code: 'INVALID_INPUT' });
   const review = await ownerCommand(f, 'review.request', { id: source.id });
-  const duplicate = await ownerCommand(f, 'review.request', { id: source.id, costRouting: true });
+  const duplicate = await ownerCommand(f, 'review.request', reviewCostArgs(source));
   assert.deepEqual(duplicate, review);
   assert.equal(f.store.require('tasks', review.id).costRouting, undefined);
   const final = await ownerCommand(f, 'review.request', { goalId: source.goalId });
@@ -169,12 +173,37 @@ test('review rate opt-in is owner-only and cannot reconfigure an existing review
   assert.equal(final.costRouting, undefined);
 });
 
+test('a delayed opt-in cannot authorize rates for a different delivery version', async t => {
+  const f = await fixture(t);
+  const task = f.task();
+  const source = f.store.put('tasks', { ...task, status: 'succeeded', artifactHash: 'first-delivery' });
+  const stale = reviewCostArgs(source);
+  const current = f.store.put('tasks', { ...source, artifactHash: 'next-delivery', deliveryGeneration: 2, goalContractVersion: 2 });
+  const currentArgs = reviewCostArgs(current);
+  assert.equal((await ownerCommand(f, 'review.request', stale, 409)).code, 'CONFLICT');
+  assert.throws(() => f.command('review.request', { id: current.id, costRouting: true }), { code: 'CONFLICT' });
+  for (const field of ['artifactHash', 'generation', 'contractVersion']) {
+    const expectedDelivery = { ...currentArgs.expectedDelivery, [field]: stale.expectedDelivery[field] };
+    assert.throws(() => f.command('review.request', { ...currentArgs, expectedDelivery }), { code: 'CONFLICT' });
+  }
+  assert.equal(f.store.tasksForGoal(current.goalId).filter(item => item.reviewOf === current.id).length, 0);
+  const ordinary = await ownerCommand(f, 'review.request', { id: current.id });
+  assert.equal(ordinary.costRouting, undefined);
+  assert.equal(ordinary.reviewArtifactHash, current.artifactHash);
+  f.command('task.cancel', { id: ordinary.id });
+  const confirmed = await ownerCommand(f, 'review.request', currentArgs);
+  assert.equal(confirmed.costRouting, true);
+  assert.equal(confirmed.reviewArtifactHash, current.artifactHash);
+  assert.equal(confirmed.reviewedTaskGeneration, current.deliveryGeneration);
+  assert.equal(confirmed.reviewedContractVersion, current.goalContractVersion);
+});
+
 test('review rate comparison respects unknown rates, explicit routes, preferences and capabilities', async t => {
   const f = await fixture(t);
   const { adapter, probes } = fakeNative(f);
-  const source = f.task();
-  f.store.put('tasks', { ...source, status: 'succeeded', artifactHash: 'fixed-delivery', lastAuthorId: source.agentId });
-  const review = await ownerCommand(f, 'review.request', { id: source.id, costRouting: true });
+  const task = f.task();
+  const source = f.store.put('tasks', { ...task, status: 'succeeded', artifactHash: 'fixed-delivery', lastAuthorId: task.agentId });
+  const review = await ownerCommand(f, 'review.request', reviewCostArgs(source));
   const reviewer = f.store.require('agents', review.agentId);
   const select = async (task = review, agent = reviewer) => (await adapter.inspectTaskRoute(task, agent)).selection;
 
@@ -369,6 +398,57 @@ test('the same native task retry retains its eligible route and depth after rate
     () => ({ provider: channel, model: economy, reasoningEffort: 'medium' })));
   assert.deepEqual(native.probes, []);
 });
+
+for (const scenario of ['removed before preflight', 'removed after preflight', 'retained with new rates']) {
+  test(`a review retry checks the current equivalence group when it is ${scenario}`, async t => {
+    const f = await fixture(t);
+    const source = f.task({ title: 'Document with a retrying review' });
+    let changed = false;
+    const native = fakeNative(f, {
+      beforeDetails: async (_provider, model) => {
+        if (scenario !== 'removed after preflight' || changed || model !== economy || native.calls.length !== 2) return;
+        changed = true;
+        await saveRates(f);
+      },
+      activation: async (_request, next) => {
+        if (next !== 2) return;
+        if (scenario === 'removed before preflight') await saveRates(f);
+        if (scenario === 'retained with new rates') {
+          await saveRates(f, sheet({ scope: 'task-review', first: rate('1', '1'), second: rate('2', '2') }));
+        }
+        native.adapter.metadata.clear();
+        return { stopReason: 'error', diagnostic: 'Retrying an isolated review' };
+      },
+    });
+    await saveRates(f, sheet({ scope: 'task-review' }));
+    const initialFingerprint = readModelCostRates(f.dataDir).fingerprint;
+    await f.start();
+    await finish(f, source);
+    const review = await ownerCommand(f, 'review.request', reviewCostArgs(f.store.require('tasks', source.id)));
+    await finish(f, review);
+
+    const retained = scenario === 'retained with new rates';
+    assert.deepEqual(native.calls.filter(call => call.taskId === review.id).map(call => call.options), [
+      { provider: channel, model: economy, reasoningEffort: 'medium' },
+      { provider: channel, model: retained ? economy : premium, reasoningEffort: 'medium' },
+    ]);
+    const attempts = [...f.store.attemptUsageRows('task', review.id)].map(({ attempt }) => attempt);
+    const completed = attempts[0].selection.costComparison;
+    assert.equal(completed.reason, retained ? 'retry-route' : 'retry-route-unavailable');
+    assert.equal(completed.sourceFingerprint, readModelCostRates(f.dataDir).fingerprint);
+    assert.notEqual(completed.sourceFingerprint, initialFingerprint);
+    const stale = attempts.filter(attempt => attempt.preflightOnly);
+    if (scenario === 'removed after preflight') {
+      assert.equal(changed, true);
+      assert.equal(stale.length, 1);
+      assert.equal(stale[0].selection.costComparison.sourceFingerprint, initialFingerprint);
+    } else {
+      assert.equal(stale.length, 0);
+    }
+    assert.equal(f.store.require('tasks', review.id).attempts, 2);
+    assert.deepEqual(native.probes, []);
+  });
+}
 
 test('a native retry rechecks the same-depth route when the DSH default changes after preflight', async t => {
   const f = await fixture(t);
