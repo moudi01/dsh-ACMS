@@ -296,4 +296,4 @@ pwsh -File .\scripts\uninstall.ps1 -TargetProfile desktop
 | `-TargetProfile` | 已存在的 profile，默认 desktop |
 | `-DshHomePath` | DSH_HOME；隔离测试应使用独立目录 |
 
-先暂停任务再卸载。脚本移除插件注册和 ACMS 配置块，保留数据库、项目分支、交付物与认证。删除运行数据必须另行核对，不属于卸载默认行为。
+先暂停任务再卸载。脚本移除插件注册和 ACMS 配置块，保留数据库、项目分支、交付物与认证。若配置被占用而未能发布，解除占用后重试。即使旧操作已注销插件，同一命令仍可清理残留的 ACMS 管理块。删除运行数据必须另行核对，不属于卸载默认行为。

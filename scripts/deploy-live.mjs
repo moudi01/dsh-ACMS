@@ -9,26 +9,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import os from 'node:os';
 import { replaceHostEntry } from '../src/host/deployment.js';
-import { integrationPending } from '../src/core/task-actions.js';
 import { assertWorktreeRestoreReady } from '../src/core/restore-safety.js';
+import { checkIdle } from './deployment-guard.mjs';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function checkIdle(db, dataDir) {
-  assertWorktreeRestoreReady(dataDir);
-  const active = db.prepare("SELECT count(*) AS n FROM entities WHERE collection='attempts' AND (json_extract(body,'$.status') IN ('preparing','running','cancelling','reconciling') OR json_extract(body,'$.cleanupPending')=1)").get().n;
-  if (active) throw new Error('ACMS has active executions. Finish or pause them before deploying.');
-  const chats = db.prepare("SELECT count(*) AS n FROM entities WHERE collection='conversationMessages' AND (json_extract(body,'$.status') IN ('sending','streaming','restarting') OR json_extract(body,'$.cleanupPending')=1)").get().n;
-  if (chats) throw new Error('ACMS has active conversations. Finish or stop replies before deploying.');
-  for (const row of db.prepare("SELECT id, body FROM entities WHERE collection='integrations'").iterate()) {
-    const record = JSON.parse(row.body);
-    if (!integrationPending(record) && !record.cleanupPending && !record.cleanupUncertain) continue;
-    const action = record.phase === 'reconciling' || record.cleanupPending || record.cleanupUncertain
-      ? 'Verify the Git result and process cleanup in the current host before deploying.'
-      : 'Let the integration finish or pause it and confirm cleanup before deploying.';
-    throw new Error(`ACMS Git integration ${row.id} is ${record.phase}. ${action}`);
-  }
-}
 
 function archiveProfile(backup, original) {
   const temporary = backup + '.tmp';

@@ -10,6 +10,7 @@ if (-not $IsWindows) { throw 'This check requires the Windows DSH CLI.' }
 $DshCommand = (Resolve-Path -LiteralPath $DshCommand).Path
 $PreviousCandidate = (Resolve-Path -LiteralPath $PreviousCandidate).Path
 $Candidate = (Resolve-Path -LiteralPath $Candidate).Path
+. (Join-Path $PSScriptRoot 'profile-package.ps1')
 
 function Assert-Check($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Read-Json([string]$File) { Get-Content -LiteralPath $File -Raw | ConvertFrom-Json }
@@ -19,19 +20,6 @@ function Yaml-Path([string]$File) { "'" + $File.Replace('\', '/').Replace("'", "
 function Invoke-Checked([string]$Command, [string[]]$Arguments) {
   & $Command @Arguments
   if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE." }
-}
-
-function Read-DumpedPath([string]$Block, [string]$Key) {
-  # The DSH YAML emitter may fold long local paths across indented lines.
-  $pattern = '(?m)^(?<indent> +)' + [regex]::Escape($Key) + ': (?<value>[^\r\n]*)(?:\r?\n(?<fold>(?:\k<indent>  [^\r\n]*(?:\r?\n|$))+))?'
-  $match = [regex]::Match($Block, $pattern)
-  $value = $match.Groups['value'].Value
-  if ($value -eq '>-') {
-    return ($match.Groups['fold'].Value.TrimEnd() -split '\r?\n' | ForEach-Object { $_.TrimStart() }) -join ' '
-  }
-  if ($value.StartsWith("'") -and $value.EndsWith("'")) { return $value.Substring(1, $value.Length - 2).Replace("''", "'") }
-  if ($value.StartsWith('"') -and $value.EndsWith('"')) { return $value | ConvertFrom-Json }
-  return $value
 }
 
 function Expand-Candidate([string]$Directory, [string]$Output) {
@@ -96,6 +84,10 @@ try {
   function Uninstall-Candidate([string]$Package) {
     & (Join-Path $Package 'scripts\uninstall.ps1') -DshCommand $DshCommand -DshHomePath $env:DSH_HOME -TargetProfile $profile
   }
+  function Expect-Failure([scriptblock]$Action, [string]$Pattern) {
+    try { & $Action | Out-Host; throw 'Unexpected command success.' }
+    catch { Assert-Check ($_.Exception.Message -match $Pattern -and $_.Exception.Message -notmatch 'recovery failed') "Unexpected failure. $($_.Exception.Message)" }
+  }
   function Assert-Profile([string]$Package, [string]$Data, [string]$HostEntry = 'dsh-acms') {
     $spec = (Read-Json $profileManifest).dependencies.'dsh-acms'
     $module = Join-Path $profileRoot 'node_modules\dsh-acms'
@@ -137,17 +129,14 @@ try {
 
   $invalidData = Join-Path $validationRoot 'regular file'
   Write-Text $invalidData 'fixture'
-  try { Install-Candidate $new.Root $invalidData | Out-Host; throw 'Unexpected install success.' }
-  catch { Assert-Check ($_.Exception.Message -match 'Could not prepare ACMS install backups') "Expected backup directory preflight failure. $($_.Exception.Message)" }
+  Expect-Failure { Install-Candidate $new.Root $invalidData } 'Could not prepare ACMS install backups'
   Assert-Profile $old.Root $dataDir
   Assert-Check ((Hash-File $patch) -eq $installedPatch) 'Preflight failure changed the profile.'
 
   $lockedData = Join-Path $validationRoot "locked data #2"
   $held = [IO.File]::Open($patch, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-  try {
-    try { Install-Candidate $new.Root $lockedData | Out-Host; throw 'Unexpected install success.' }
-    catch { Assert-Check ($_.Exception.Message -match 'Could not publish the ACMS profile configuration' -and $_.Exception.Message -notmatch 'recovery failed') "Expected protected profile publication failure. $($_.Exception.Message)" }
-  } finally { $held.Dispose() }
+  try { Expect-Failure { Install-Candidate $new.Root $lockedData } 'Could not publish the ACMS profile configuration' }
+  finally { $held.Dispose() }
   Assert-Profile $old.Root $dataDir
   Assert-Check ((Hash-File $patch) -eq $installedPatch) 'Failed publication changed the profile.'
   $backupDir = Join-Path $lockedData 'install-backups'
@@ -176,12 +165,12 @@ if (action === 'verify') {
   const store = new Store(database);
   try {
     if (action === 'seed') store.put('goals', { id: 'goal-offline-probe', title: 'Retained before candidate upgrade', status: 'active' });
-    store.put('attempts', { id: 'attempt-offline-probe', status: action === 'seed' ? 'running' : 'completed' });
+    store.put('attempts', { id: 'attempt-offline-probe', status: action === 'settle' ? 'completed' : 'running' });
   } finally { store.close(); }
 }
 '@
-  function Invoke-DatabaseProbe([string]$Action) {
-    $databaseProbe | node --input-type=module - (Join-Path $old.Root 'src\core\store.js') $dbFile $Action
+  function Invoke-DatabaseProbe([string]$Action, [string]$Database = $dbFile) {
+    $databaseProbe | node --input-type=module - (Join-Path $old.Root 'src\core\store.js') $Database $Action
     if ($LASTEXITCODE -ne 0) { throw "Database probe failed: $Action" }
   }
   Invoke-DatabaseProbe seed
@@ -192,10 +181,71 @@ if (action === 'verify') {
     $rejected = (& node $deployScript $profile 2>&1) -join "`n"
     Assert-Check ($LASTEXITCODE -ne 0 -and $rejected -match 'active executions') 'Expected deployment to reject an active execution row.'
   } finally { $PSNativeCommandUseErrorActionPreference = $previousErrorPreference }
+  Expect-Failure { Install-Candidate $new.Root $dataDir } 'active executions'
+  Expect-Failure { Install-Candidate $new.Root $lockedData } 'active executions'
   Assert-Profile $old.Root $dataDir
   Invoke-DatabaseProbe settle
-  $dataHash = Hash-File $dbFile
 
+  # The wrapper runs the real DSH registration, then injects contention before returning to the installer.
+  $wrapper = Join-Path $validationRoot 'dsh-install-probe.ps1'
+  $wrapperSettings = Join-Path $validationRoot 'install-probe.json'
+  $writerProbe = Join-Path $validationRoot 'check-writer-lock.mjs'
+  Write-Text $writerProbe @'
+import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+try {
+  db.exec('PRAGMA busy_timeout=0');
+  assert.throws(() => db.exec('BEGIN IMMEDIATE'), /locked/);
+} finally { db.close(); }
+'@
+  Write-Text $wrapper @'
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
+$settings = Get-Content (Join-Path $PSScriptRoot 'install-probe.json') -Raw | ConvertFrom-Json
+& $settings.dsh @args
+$code = $LASTEXITCODE
+if ($code -ne 0 -or $args[0] -ne 'plugin' -or $args[3] -ne 'add') { exit $code }
+[IO.File]::WriteAllText($settings.marker, 'registered')
+if ($settings.abrupt) { [Diagnostics.Process]::GetCurrentProcess().Kill() }
+node $settings.writerProbe $settings.database
+if ($LASTEXITCODE -ne 0) { throw 'Installation did not hold the current database write lock.' }
+$common = @('-DshCommand',$settings.dsh,'-DshHomePath',$env:DSH_HOME,'-TargetProfile',$settings.profile)
+$competingInstall = (& pwsh -NoProfile -File $settings.install @common -DataDirectory $settings.otherData 2>&1) -join "`n"
+if ($LASTEXITCODE -eq 0 -or $competingInstall -notmatch 'Could not lock the ACMS profile') { throw "Unexpected overlapping install: $competingInstall" }
+$competingUninstall = (& pwsh -NoProfile -File $settings.uninstall @common 2>&1) -join "`n"
+if ($LASTEXITCODE -eq 0 -or $competingUninstall -notmatch 'Could not lock the ACMS profile') { throw "Unexpected overlapping uninstall: $competingUninstall" }
+& pwsh -NoProfile -File $settings.install -DshCommand $settings.dsh -DshHomePath $env:DSH_HOME -TargetProfile $settings.independent -DataDirectory $settings.independentData
+if ($LASTEXITCODE -ne 0) { throw 'A separate profile could not install during the first transaction.' }
+exit 0
+'@
+  $independentProfile = 'acms-release-concurrent'
+  $independentRoot = Initialize-TestProfile $independentProfile
+  $settings = @{
+    dsh = $DshCommand; install = Join-Path $new.Root 'scripts\install.ps1'; uninstall = Join-Path $new.Root 'scripts\uninstall.ps1'
+    profile = $profile; otherData = Join-Path $validationRoot 'competing data'; independent = $independentProfile
+    independentData = Join-Path $validationRoot 'independent data'; writerProbe = $writerProbe; database = $dbFile
+    marker = Join-Path $validationRoot 'registered'; abrupt = $false
+  }
+  Write-Text $wrapperSettings ($settings | ConvertTo-Json)
+  $installProbe = @('-NoProfile','-File',$settings.install,'-DshCommand',$wrapper,'-DshHomePath',$env:DSH_HOME,'-TargetProfile',$profile,'-DataDirectory')
+  Invoke-Checked pwsh ($installProbe + $dataDir) | Out-Host
+  Assert-Check ((Get-AcmsRegistration $independentRoot).StartsWith('link:')) 'The independent profile did not register the candidate.'
+  Assert-Check (-not (Test-Path -LiteralPath $settings.otherData)) 'A competing install changed the requested data path.'
+  Assert-Profile $new.Root $dataDir
+  Install-Candidate $new.Root $settings.otherData | Out-Host
+  Assert-Profile $new.Root $settings.otherData
+
+  $settings.abrupt = $true
+  $settings.marker = Join-Path $validationRoot 'registered-before-process-exit'
+  Write-Text $wrapperSettings ($settings | ConvertTo-Json)
+  $previousErrorPreference = $PSNativeCommandUseErrorActionPreference
+  try {
+    $PSNativeCommandUseErrorActionPreference = $false
+    & pwsh @installProbe $dataDir | Out-Host
+    Assert-Check ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $settings.marker)) 'Expected the isolated installer to exit after registration.'
+  } finally { $PSNativeCommandUseErrorActionPreference = $previousErrorPreference }
+  Assert-Profile $new.Root $settings.otherData
   Install-Candidate $new.Root $dataDir | Out-Host
   Assert-Profile $new.Root $dataDir
   $deployResult = (Invoke-Checked node @($deployScript,$profile)) -join "`n"
@@ -205,9 +255,31 @@ if (action === 'verify') {
   $bundle = Join-Path $new.Root "dist\host-$revision.mjs"
   Assert-Check (Test-Path -LiteralPath $bundle -PathType Leaf) 'The versioned host is missing.'
   Assert-Profile $new.Root $dataDir $bundle
+  $deployedPatch = [IO.File]::ReadAllBytes($patch)
+  $deployedHash = Hash-File $patch
+  Invoke-DatabaseProbe active
+  Install-Candidate $new.Root $dataDir | Out-Host
+  Assert-Profile $new.Root $dataDir $bundle
+  Expect-Failure { Install-Candidate $new.Root $lockedData } 'active executions'
+  Assert-Check ((Hash-File $patch) -eq $deployedHash) 'An install changed the active versioned configuration.'
+  Invoke-DatabaseProbe settle
+  Invoke-DatabaseProbe seed (Join-Path $lockedData 'company.db')
+  Expect-Failure { Install-Candidate $new.Root $lockedData } 'active executions'
+  Assert-Profile $new.Root $dataDir $bundle
+  $dataHash = Hash-File $dbFile
   [IO.File]::WriteAllBytes($patch, [IO.File]::ReadAllBytes($previousPatch))
   Assert-Profile $new.Root $dataDir
 
+  [IO.File]::WriteAllBytes($patch, $deployedPatch)
+  $held = [IO.File]::Open($patch, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  try { Expect-Failure { Uninstall-Candidate $new.Root } 'Could not publish the ACMS profile configuration' }
+  finally { $held.Dispose() }
+  Assert-Profile $new.Root $dataDir $bundle
+  Assert-Check ((Hash-File $patch) -eq $deployedHash) 'Uninstall failure changed the versioned configuration.'
+  Uninstall-Candidate $new.Root | Out-Host
+  Assert-Profile '' ''
+  # An older uninstall could unregister the package before clearing its standalone entry.
+  [IO.File]::WriteAllBytes($patch, $deployedPatch)
   Uninstall-Candidate $new.Root | Out-Host
   Assert-Profile '' ''
   Invoke-DatabaseProbe verify
@@ -232,7 +304,7 @@ if (action === 'verify') {
     passed = $true; dsh = $dshVersion; node = ((Invoke-Checked node @('--version')) -join '').Trim()
     previousCommit = $old.Commit; previousArchiveSha256 = $old.ArchiveSha256
     candidateCommit = $new.Commit; candidateArchiveSha256 = $new.ArchiveSha256; candidateCodexCli = $new.CodexCli
-    checks = @('fresh install', 'repeat install', 'invalid data path', 'locked profile publication rollback', 'candidate upgrade', 'active-record deployment gate', 'versioned host entry and rollback', 'uninstall', 'unrelated profile and data retention')
+    checks = @('fresh install', 'idempotent versioned reinstall', 'invalid data path', 'locked install and uninstall recovery', 'candidate upgrade', 'active current and destination database gates', 'concurrent package operation exclusion and process exit recovery', 'versioned host entry and rollback', 'uninstall with or without package registration', 'unrelated profile and data retention')
   } | ConvertTo-Json -Depth 3
 } finally {
   foreach ($key in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $savedEnvironment[$key]) }
