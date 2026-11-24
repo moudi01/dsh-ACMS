@@ -21,4 +21,25 @@ Set-Location .\package
 npm ci --include=optional
 ```
 
-依赖安装成功后，可按 [快速开始](../README.md#快速开始) 使用包内的安装脚本注册到已初始化的 DSH profile。候选包验证使用临时目录和模拟的模块加载器。实际 DSH 安装、升级回滚与模型验收见 [实际环境验收](validation.md#实际环境验收)。
+依赖安装成功后，可按 [快速开始](../README.md#快速开始) 使用包内的安装脚本注册到已初始化的 DSH profile。构建阶段在临时目录用模拟模块加载器校验客户端入口。
+
+## 离线 DSH 安装验收
+
+准备来自两个不同提交的本地候选目录，每个目录包含归档、锁文件及清单。使用装有 DSH CLI 的 Windows、Node.js 24、PowerShell 7 和已填充的 npm 缓存，在项目目录运行以下命令。候选来自本仓库的打包命令或可信 CI 产物。
+
+```powershell
+pwsh -File .\scripts\verify-release-install.ps1 `
+  -DshCommand 'D:\dsh\resources\runtime\cli\bin\dsh.cmd' `
+  -PreviousCandidate 'D:\releases\previous' `
+  -Candidate 'D:\releases\candidate'
+```
+
+验收用独立的临时 DSH_HOME，从内置 `web` 模板创建 profile。脚本校验两个候选的哈希并离线安装锁定依赖，再通过真实 DSH `plugin add`、`plugin remove` 和 `--dump-config` 核对首次安装、重复安装、候选切换及卸载。卸载以 profile 注销和合成配置为准。pnpm 可能保留未挂载的本地链接。通过临时数据库中的执行状态记录核对部署门禁，再构建版本化宿主、验证入口并从配置备份回退。验收核对原有非 ACMS 配置、数据库及样例交付文件。结果记录候选提交、归档哈希和工具版本，临时 profile 在结束时清理。
+
+验收覆盖实际 CLI 注册及配置合成。宿主挂载、侧边栏、认证连接和模型执行由 [实际环境验收](validation.md#实际环境验收) 跟踪。
+
+## 安装失败后的入口恢复
+
+安装脚本会先准备数据目录与备份，并在注册候选后发布完整的配置 patch。配置未变化时保留已有 patch。注册或发布失败后，脚本尝试使用离线缓存恢复原 ACMS 包入口。对本地链接候选，先保留旧解包目录，直到新配置验收通过。
+
+如果原包已移除、缓存缺失或 DSH 拒绝恢复，报错会给出 `<dataDir>/install-backups/package-<编号>.json`。停止对应 profile，查看备份中 `dependencies.dsh-acms` 的原来源。使用 DSH 的插件命令恢复该包或取消新增注册，并通过 `--dump-config` 核对入口与 `dataDir`。如需恢复原 ACMS 配置，用同编号的 `profile-<编号>.yml` 核对旧配置块，保留当前其他插件的修改。

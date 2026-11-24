@@ -183,8 +183,10 @@ test('an isolated CLI deployment after terminal integration can be rolled back u
   assert.deepEqual(await readFile(backup), f.original);
   const edited = await readFile(f.patch, 'utf8');
   assert(edited.includes(`host-${revision}.mjs`));
-  assert.equal(edited.replace(/  name: '[^\r\n]*'/, `  name: '${yaml(f.oldHost)}'`), f.original.toString('utf8'));
-  const bundle = edited.match(/  name: '([^\r\n]+)'/)?.[1].replaceAll("''", "'");
+  assert(edited.includes('- id: acms\r\n  disabled: true\r\n'));
+  assert.equal(edited.replace(/^- insert:\r\n    - id: acms-versioned-host\r\n(?: {6}[^\r\n]*\r\n)*/m, '')
+    .replace('  disabled: true', `  name: '${yaml(f.oldHost)}'`), f.original.toString('utf8'));
+  const bundle = edited.match(/^      name: '([^\r\n]+)'$/m)?.[1].replaceAll("''", "'");
   const bundleSource = await readFile(bundle, 'utf8');
   const resources = new Set(bundleSource.match(/(?:owned-job-[a-f0-9]{64}\.cs|(?:archive-worker|bare-transaction-hook)-[a-f0-9]{64}\.mjs)/g));
   assert.equal(resources.size, 3);
