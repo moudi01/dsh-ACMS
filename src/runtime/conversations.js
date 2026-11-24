@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import { assert, id, now, OWNER, SYSTEM, digest, TERMINAL } from '../core/util.js';
 import { executionOccupancy } from '../core/execution-capacity.js';
 import { assertGoalOpen, goalStopped } from '../core/goal-control.js';
+import { independentConversationPrompt } from './conversation-context.js';
 
 const LIVE = ['preparing', 'running', 'cancelling', 'reconciling'];
 const PENDING = ['queued', 'sending', 'restarting', 'streaming'];
@@ -157,13 +158,14 @@ export class Conversations {
       this.update(message.id, { status: 'sending' });
       reply = this.store.transaction(() => this.save({ id: id('message'), conversationId: chat.id, agentId: chat.agentId, taskId: null,
         role: 'assistant', text: '', status: 'streaming', replyTo: message.id }));
-      const agent = this.store.require('agents', chat.agentId);
-      const candidates = this.store.list('conversationMessages').filter(m => m.conversationId === chat.id && (m.status === 'completed' || m.id === message.id || m.role === 'user' && m.status === 'delivered')).slice(-24);
-      let remaining = 32000; const history = [];
-      for (const m of candidates.reverse()) { if (remaining <= 0) break; const text = m.text.slice(-remaining); history.unshift({ role: m.role, text }); remaining -= text.length; }
-      const tasks = this.store.list('tasks').filter(t => t.agentId === agent.id && t.status !== 'deleted').map(t => ({ id: t.id, title: t.title, status: t.status, summary: t.summary?.slice(0,1500) })).slice(-20);
-      const prompt = `你是 ${agent.name}。职责：${agent.description}\n这是公司所有者的独立对话。直接回答问题；不得派工、修改任务/角色、授予权限或把聊天回复当成交付验收。若需要业务操作，说明应在任务界面执行。以下任务记录仅供说明现状：${JSON.stringify(tasks)}\n会话记录：${JSON.stringify(history.map(m => ({ role:m.role, text:m.text })))}\n请用自然语言回复，不输出推理过程。`;
       const cwd = path.join(this.dataDir, 'conversations', chat.id); await fs.mkdir(cwd, { recursive:true });
+      controller.signal.throwIfAborted();
+      const { agent, prompt, receipt } = this.store.readSnapshot(() => {
+        const agent = this.store.require('agents', chat.agentId);
+        assert(agent.status === 'available', 'AGENT_RETIRED', '角色不可用，请先恢复角色');
+        return { agent, ...independentConversationPrompt(this.store, chat, agent, message) };
+      });
+      this.update(message.id, { promptContext: receipt });
       let lastWrite = 0;
       const text = await this.adapter.chat({ agent, prompt, cwd, contextKey: chat.id, signal: controller.signal,
         onAccepted: () => this.update(message.id, { status:'delivered', deliveredAt:now() }),

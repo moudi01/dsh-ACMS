@@ -52,6 +52,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS attempts_usage_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS attempts_usage_by_task ON entities(json_extract(body,'$.taskId')) WHERE collection='attempts';
       CREATE INDEX IF NOT EXISTS tasks_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks';
+      CREATE INDEX IF NOT EXISTS messages_by_conversation ON entities(json_extract(body,'$.conversationId')) WHERE collection='conversationMessages';
       CREATE INDEX IF NOT EXISTS delivered_work_by_goal ON entities(json_extract(body,'$.goalId')) WHERE collection='tasks'
         AND json_extract(body,'$.kind')='work' AND json_extract(body,'$.status')='succeeded';
       ${CHECKPOINT_INDEXES}
@@ -138,6 +139,32 @@ export class Store {
   tasksForGoal(goalId) {
     return this.db.prepare("SELECT body FROM entities WHERE collection='tasks' AND json_extract(body,'$.goalId')=?")
       .all(goalId).map(({ body }) => JSON.parse(body));
+  }
+
+  independentHistory(conversationId, agentId, messageId, limit) {
+    const anchor = this.db.prepare("SELECT rowid FROM entities WHERE collection='conversationMessages' AND id=?").get(messageId)?.rowid ?? 0;
+    const scoped = alias => `${alias}.collection='conversationMessages'
+      AND json_extract(${alias}.body,'$.conversationId')=:conversationId AND json_extract(${alias}.body,'$.taskId') IS NULL
+      AND coalesce(json_extract(${alias}.body,'$.agentId'),:agentId)=:agentId`;
+    const priorOwner = alias => `json_extract(${alias}.body,'$.role')='user'
+      AND json_extract(${alias}.body,'$.status')='delivered' AND ${alias}.rowid<:anchor`;
+    const params = { conversationId, agentId, anchor };
+    const latestOwner = this.db.prepare(`SELECT message.id, message.body, message.revision,
+      message.rowid AS position, message.rowid AS turnPosition FROM entities AS message
+      WHERE ${scoped('message')} AND ${priorOwner('message')} ORDER BY message.rowid DESC LIMIT 1`).get(params);
+    // The reply belongs after its question, even when a queue inserts later questions first.
+    const scope = `FROM entities AS message LEFT JOIN entities AS question
+      ON question.id=json_extract(message.body,'$.replyTo') AND ${scoped('question')} AND ${priorOwner('question')}
+      WHERE ${scoped('message')} AND (${priorOwner('message')}
+        OR (json_extract(message.body,'$.role')='assistant' AND json_extract(message.body,'$.status')='completed'
+          AND (message.rowid<:anchor OR question.rowid IS NOT NULL)))`;
+    const { count } = this.db.prepare(`SELECT count(*) AS count ${scope}`).get(params);
+    const rows = this.db.prepare(`SELECT message.id, message.body, message.revision, message.rowid AS position,
+      coalesce(question.rowid,message.rowid) AS turnPosition ${scope}
+      ORDER BY turnPosition DESC, position DESC LIMIT :limit`).all({ ...params, limit });
+    if (latestOwner && !rows.some(row => row.id === latestOwner.id)) rows.push(latestOwner);
+    rows.sort((a, b) => a.turnPosition - b.turnPosition || a.position - b.position);
+    return { count, latestOwnerId: latestOwner?.id, messages: rows.map(row => ({ ...JSON.parse(row.body), revision: row.revision })) };
   }
 
   taskContext(goalId, taskId) {

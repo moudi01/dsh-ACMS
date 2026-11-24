@@ -16,10 +16,11 @@ export const hostedWindows = process.platform === 'win32' && process.env.GITHUB_
   process.env.RUNNER_ENVIRONMENT === 'github-hosted';
 const stateWaitMs = hostedWindows ? 24000 : 8000;
 
-export async function fixture(t, handler = defaultSimulation) {
+export async function fixture(t, handler = defaultSimulation, { inMemory = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'acms-test-')); const source = path.join(root, 'source'); const dataDir = path.join(root, 'data');
   await mkdir(source); await writeFile(path.join(source, 'README.md'), '# Isolated ACMS test fixture\n');
-  const store = new Store(path.join(dataDir, 'company.db')); const company = new Company(store);
+  if (inMemory) await mkdir(dataDir);
+  const store = new Store(inMemory ? ':memory:' : path.join(dataDir, 'company.db')); const company = new Company(store);
   const workspaces = new WorkspaceManager(dataDir, company); const adapter = new SimulatedAdapter(handler);
   const engine = new Engine(company, adapter, workspaces, { intervalMs: 20 });
   const command = (name, args = {}, principal = OWNER, requestId = randomUUID()) => company.command(principal, requestId, name, args);
