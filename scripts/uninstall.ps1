@@ -14,12 +14,10 @@ $previousDshHome = $env:DSH_HOME
 $profileLock = Lock-AcmsProfile $profileRoot
 try {
   $previous = Get-AcmsRegistration $profileRoot
-  $hadPatch = Test-Path -LiteralPath $patchPath -PathType Leaf
-  if (-not $hadPatch -and (Test-Path -LiteralPath $patchPath)) { throw 'Expected cordis.patch.yml to be a file.' }
-  $original = if ($hadPatch) { [IO.File]::ReadAllText($patchPath) } else { '' }
-  $changed = [regex]::Replace($original, '(?ms)^# BEGIN ACMS MANAGED CONFIG\r?\n.*?^# END ACMS MANAGED CONFIG\r?\n?', '')
+  $original = Read-AcmsProfilePatch $patchPath
+  $changed = [regex]::Replace($original.Text, '(?ms)^# BEGIN ACMS MANAGED CONFIG\r?\n.*?^# END ACMS MANAGED CONFIG\r?\n?', '')
   if ($changed -match '(?m)^# (?:BEGIN|END) ACMS MANAGED CONFIG\r?$') { throw 'The ACMS profile configuration block is incomplete.' }
-  if ($changed -cne $original) {
+  if ($changed -cne $original.Text) {
     $meaningfulLines = @($changed -split '\r?\n' | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') })
     if (-not $meaningfulLines.Count) { $changed = $changed.TrimEnd() + "`n[]`n" }
     [IO.File]::WriteAllText($staged, $changed, [Text.UTF8Encoding]::new($false))
@@ -30,7 +28,7 @@ try {
       & $DshCommand plugin --profile $TargetProfile remove dsh-acms
       if ($LASTEXITCODE -ne 0 -or (Get-AcmsRegistration $profileRoot)) { throw 'DSH plugin removal failed.' }
     }
-    Publish-AcmsProfilePatch $patchPath $hadPatch $original $staged
+    Publish-AcmsProfilePatch $patchPath $original $staged
   } catch {
     $failure = $_
     try { Restore-AcmsRegistration $profileRoot $previous $DshCommand $TargetProfile }

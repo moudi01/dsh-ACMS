@@ -228,22 +228,22 @@ exit 0
     marker = Join-Path $validationRoot 'registered'; abrupt = $false
   }
   Write-Text $wrapperSettings ($settings | ConvertTo-Json)
-  $installProbe = @('-NoProfile','-File',$settings.install,'-DshCommand',$wrapper,'-DshHomePath',$env:DSH_HOME,'-TargetProfile',$profile,'-DataDirectory')
-  Invoke-Checked pwsh ($installProbe + $dataDir) | Out-Host
+  $installProbe = @('-NoProfile','-File',$settings.install,'-DshCommand',$wrapper,'-DshHomePath',$env:DSH_HOME)
+  Invoke-Checked pwsh ($installProbe + @('-TargetProfile',$profile,'-DataDirectory',$dataDir)) | Out-Host
   Assert-Check ((Get-AcmsRegistration $independentRoot).StartsWith('link:')) 'The independent profile did not register the candidate.'
   Assert-Check (-not (Test-Path -LiteralPath $settings.otherData)) 'A competing install changed the requested data path.'
   Assert-Profile $new.Root $dataDir
   Install-Candidate $new.Root $settings.otherData | Out-Host
   Assert-Profile $new.Root $settings.otherData
 
-  function Invoke-InterruptedInstall([string]$Marker) {
+  function Invoke-InterruptedInstall([string]$Marker, [string]$Data = $dataDir) {
     $settings.abrupt = $true
     $settings.marker = Join-Path $validationRoot $Marker
     Write-Text $wrapperSettings ($settings | ConvertTo-Json)
     $previousErrorPreference = $PSNativeCommandUseErrorActionPreference
     try {
       $PSNativeCommandUseErrorActionPreference = $false
-      & pwsh @installProbe $dataDir | Out-Host
+      & pwsh @installProbe -TargetProfile $profile -DataDirectory $Data | Out-Host
       Assert-Check ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $settings.marker)) 'Expected the isolated installer to exit after registration.'
     } finally { $PSNativeCommandUseErrorActionPreference = $previousErrorPreference }
   }
@@ -275,7 +275,7 @@ console.log(filename);
   $pending = Read-Json $intentFile
   $patchBeforeExit = Join-Path (Split-Path $pending.registrationBackup) ((Split-Path $pending.registrationBackup -Leaf).Replace('package-', 'profile-').Replace('.json', '.yml'))
   Assert-Check ((Get-AcmsRegistration $profileRoot) -ne $oldRegistration -and (Read-Json $pending.registrationBackup).dependencies.'dsh-acms' -eq $oldRegistration) 'The interrupted registration or its old backup is incorrect.'
-  Assert-Check ((Hash-File $patch) -eq $oldDeployedHash -and (Hash-File $patchBeforeExit) -eq $oldDeployedHash) 'The old versioned patch or its backup changed before retry.'
+  Assert-Check ((Hash-File $patch) -eq $oldDeployedHash -and (Hash-File $patchBeforeExit) -eq $oldDeployedHash -and $pending.originalPatchSha256 -ceq $oldDeployedHash) 'The pending record or backup does not match the old versioned patch.'
   Invoke-DatabaseProbe active
   Expect-Failure { Install-Candidate $new.Root $dataDir } 'active executions'
   Assert-Profile $new.Root $dataDir $oldBundle
@@ -298,6 +298,8 @@ console.log(filename);
   Assert-Check (-not (Test-Path -LiteralPath $intentFile)) 'A fully published install did not clear its pending record.'
   Invoke-DatabaseProbe settle
 
+  Write-Text $intentFile ($pending | ConvertTo-Json)
+  $staleIntentHash = Hash-File $intentFile
   $deployResult = (Invoke-Checked node @($deployScript,$profile)) -join "`n"
   $previousPatch = [regex]::Match($deployResult, '(?m)^Previous configuration: (.+)$').Groups[1].Value.Trim()
   $revision = [regex]::Match($deployResult, 'ACMS host ([a-f0-9]+) published').Groups[1].Value
@@ -307,6 +309,11 @@ console.log(filename);
   Assert-Profile $new.Root $dataDir $bundle
   $deployedPatch = [IO.File]::ReadAllBytes($patch)
   $deployedHash = Hash-File $patch
+  $deployedManifestHash = Hash-File $profileManifest
+  Expect-Failure { Install-Candidate $new.Root $dataDir } 'configuration differs from both states'
+  Assert-Profile $new.Root $dataDir $bundle
+  Assert-Check ((Hash-File $patch) -eq $deployedHash -and (Hash-File $profileManifest) -eq $deployedManifestHash -and (Hash-File $intentFile) -eq $staleIntentHash) 'The subsequent deployment, registration or pending record changed.'
+  [IO.File]::Move($intentFile, (Join-Path $validationRoot 'reviewed-install-intent.json'))
   Invoke-DatabaseProbe active
   Install-Candidate $new.Root $dataDir | Out-Host
   Assert-Profile $new.Root $dataDir $bundle
@@ -350,11 +357,29 @@ console.log(filename);
   Uninstall-Candidate $new.Root | Out-Host
   Assert-Profile '' ''
 
+  $profile = 'acms-release-without-patch'
+  $profileRoot = Initialize-TestProfile $profile
+  $patch = Join-Path $profileRoot 'cordis.patch.yml'
+  $profileManifest = Join-Path $profileRoot 'package.json'
+  $intentFile = Join-Path $profileRoot '.acms-install-pending.json'
+  [IO.File]::Delete($patch)
+  Invoke-InterruptedInstall 'registered-before-first-patch' $freshData
+  $pending = Read-Json $intentFile
+  Assert-Check (-not (Test-Path -LiteralPath $patch) -and $pending.PSObject.Properties['originalPatchSha256'] -and $null -eq $pending.originalPatchSha256) 'The install did not record a missing original patch.'
+  Write-Text $patch ''
+  Expect-Failure { Install-Candidate $new.Root $freshData } 'configuration differs from both states'
+  Assert-Check ((Get-Item -LiteralPath $patch).Length -eq 0 -and (Test-Path -LiteralPath $intentFile)) 'An empty file was mistaken for a missing patch.'
+  [IO.File]::Delete($patch)
+  Install-Candidate $new.Root $freshData | Out-Host
+  $originalPatch = ''
+  Assert-Profile $new.Root $freshData
+  Assert-Check (-not (Test-Path -LiteralPath $intentFile)) 'The interrupted first install did not clear its pending record.'
+
   [ordered]@{
     passed = $true; dsh = $dshVersion; node = ((Invoke-Checked node @('--version')) -join '').Trim()
     previousCommit = $old.Commit; previousArchiveSha256 = $old.ArchiveSha256
     candidateCommit = $new.Commit; candidateArchiveSha256 = $new.ArchiveSha256; candidateCodexCli = $new.CodexCli
-    checks = @('fresh install', 'idempotent versioned reinstall', 'invalid data path', 'locked install and uninstall recovery', 'candidate upgrade', 'active current and destination database gates', 'concurrent package operation exclusion', 'interrupted same-data and cross-data upgrades', 'completed publication cleanup', 'versioned host entry and rollback', 'uninstall with or without package registration', 'unrelated profile and data retention')
+    checks = @('fresh install', 'idempotent versioned reinstall', 'invalid data path', 'locked install and uninstall recovery', 'candidate upgrade', 'active current and destination database gates', 'concurrent package operation exclusion', 'interrupted same-data and cross-data upgrades', 'completed publication cleanup', 'pending install preserves a later deployment', 'missing patch differs from an empty patch', 'versioned host entry and rollback', 'uninstall with or without package registration', 'unrelated profile and data retention')
   } | ConvertTo-Json -Depth 3
 } finally {
   foreach ($key in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $savedEnvironment[$key]) }

@@ -27,10 +27,21 @@ function Restore-AcmsRegistration([string]$ProfileRoot, [string]$Registration, [
   if ($LASTEXITCODE -ne 0 -or (Get-AcmsRegistration $ProfileRoot) -cne $Registration) { throw 'Could not restore the previous ACMS registration.' }
 }
 
-function Publish-AcmsProfilePatch([string]$Patch, [bool]$HadPatch, [string]$Original, [string]$Staged) {
-  $exists = Test-Path -LiteralPath $Patch -PathType Leaf
-  $current = if ($exists) { [IO.File]::ReadAllText($Patch) } else { '' }
-  if ($exists -ne $HadPatch -or $current -cne $Original) {
+function Get-AcmsPatchDigest([byte[]]$Bytes) {
+  return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))
+}
+
+function Read-AcmsProfilePatch([string]$Patch) {
+  if ([IO.Directory]::Exists($Patch)) { throw 'Expected cordis.patch.yml to be a file.' }
+  try { $bytes = [IO.File]::ReadAllBytes($Patch) }
+  catch [IO.FileNotFoundException] { return @{ Text = ''; Sha256 = $null } }
+  $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes))
+  try { return @{ Text = $reader.ReadToEnd(); Sha256 = Get-AcmsPatchDigest $bytes; Bytes = $bytes } }
+  finally { $reader.Dispose() }
+}
+
+function Publish-AcmsProfilePatch([string]$Patch, [hashtable]$Original, [string]$Staged) {
+  if ((Read-AcmsProfilePatch $Patch).Sha256 -cne $Original.Sha256) {
     throw 'Profile configuration changed during the operation. Review the current configuration before retrying.'
   }
   if ([IO.File]::Exists($Staged)) {
