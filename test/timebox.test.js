@@ -31,6 +31,44 @@ test('time box warns the manager once, pauses ordinary dispatch and resumes afte
   await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
 });
 
+for (const [kind, reserveMs] of [['work', 360000], ['plan', 420000]]) {
+  test(`a ${reserveMs} ms reserve covering a 360000 ms cap triggers wrap-up before ${kind} dispatch`, async t => {
+    const f = await fixture(t);
+    f.command('policy.update', { patch: { maxGoalRuntimeMs: 360000, timeBoxReserveMs: reserveMs } });
+    let task;
+    if (kind === 'plan') {
+      f.command('goal.cancel', { id: f.goal.id });
+      const goal = f.command('goal.create', { title: 'Fresh planning goal', description: 'Plan delivery', acceptance: 'Deliver a file',
+        projectId: f.project.id, templateId: f.template.id });
+      task = f.store.list('tasks').find(item => item.goalId === goal.id && item.kind === 'plan');
+    } else {
+      task = f.task({ title: 'Work waiting for initial wrap-up' });
+    }
+    f.command('agent.save', { id: 'manager', status: 'retired' });
+    await f.start();
+    const warnings = () => events(f).filter(entry => entry.type === 'goal.timebox.warning' && entry.entityId === task.goalId);
+    const taskAttempts = () => f.store.list('attempts').filter(attempt => attempt.taskId === task.id);
+    await until(() => warnings().length || taskAttempts().length || f.store.require('tasks', task.id).status === 'blocked', 15000);
+    const [warning] = warnings();
+    assert.ok(warning, 'expected a time-box warning before ordinary dispatch');
+    assert.equal(warning.boxLimitMs, 0);
+    assert.equal(warning.usedMs, 0);
+    assert.ok(warning.checkpoint.tasks.some(item => item.id === task.id));
+    assert.equal(f.store.require('tasks', task.id).status, 'ready');
+    assert.equal(taskAttempts().length, 0);
+    assert.equal(f.store.list('interactions').some(item => item.kind === 'budget'), false);
+
+    const question = f.store.list('interactions').find(item => item.taskId === warning.coordinationTaskId && item.status === 'pending');
+    assert.ok(question);
+    f.command('agent.save', { id: 'manager', status: 'available' });
+    f.command('interaction.answer', { id: question.id, answer: '请负责人决定收尾范围' });
+    await until(() => f.store.require('tasks', task.id).status === 'succeeded', 20000);
+    assert.equal(f.store.require('tasks', warning.coordinationTaskId).status, 'succeeded');
+    assert.ok(f.store.require('goals', task.goalId).timeBox.releasedAt);
+    assert.equal(warnings().length, 1);
+  });
+}
+
 test('hard cap still blocks and does not create a time-box warning', async t => {
   const f = await fixture(t); f.command('policy.update', { patch: { goalTimeBoxMs: 60000, maxGoalRuntimeMs: 100000 } });
   const task = f.task({ title: 'Over hard cap' });

@@ -309,7 +309,7 @@ export class Engine {
         const taskId = pendingBox?.coordinationTaskId;
         const obsolete = taskId && !holdsTimeBox(goal, this.store.get('tasks', taskId), occupiedTaskIds);
         const openBox = obsolete ? null : pendingBox;
-        if (effectiveBoxLimit && used < hardLimit && (openBox || used >= effectiveBoxLimit)) {
+        if (effectiveBoxLimit !== null && used < hardLimit && (openBox || used >= effectiveBoxLimit)) {
           this.ensureTimeBoxWarning(goal, used, hardLimit, openBox?.boxMs ?? effectiveBoxLimit, p, occupiedTaskIds);
         } else if (obsolete) {
           this.store.transaction(() => {
@@ -381,7 +381,8 @@ export class Engine {
         if (!quoteOnly && (spent.get(goal.id) ?? goal.runtimeMs) >= goalRuntimeLimit(goal, p)) { this.block(task, 'budget', '目标累计执行时间额度已用完', '请在回复中填写给此目标追加的分钟数；单次执行时限与目标累计额度分别计算。'); continue; }
         // While the time-box decision is open, only control work (coordination,
         // review) may proceed; ordinary work waits for the manager's wrap-up.
-        if (!quoteOnly && pendingGoalTimeBox(goal) && goalTimeBoxLimit(goal, p) && ['work', 'repair', 'plan'].includes(task.kind)) continue;
+        if (!quoteOnly && pendingGoalTimeBox(goal) && goalTimeBoxLimit(goal, p) !== null &&
+          ['work', 'repair', 'plan'].includes(task.kind)) continue;
         if (task.integrationPending) {
           this.store.transaction(() => {
             this.store.put('tasks', { ...task, status: 'integrating' });
