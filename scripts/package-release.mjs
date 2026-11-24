@@ -83,7 +83,8 @@ async function buildCandidate(staging, commit, workflow) {
 
   const members = new Map(packed.files.map(file => [file.path, file.size]));
   for (const required of ['package.json', 'src/host/index.js', 'src/runtime/owned-job.cs', 'src/runtime/delivery-archive-worker.js', 'src/runtime/bare-transaction-hook.js',
-    'lib/client.js', 'cordis.patch.yml', 'scripts/install.ps1', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+    'lib/client.js', 'cordis.patch.yml', 'scripts/install.ps1', 'scripts/uninstall.ps1', 'scripts/profile-package.ps1', 'scripts/deployment-guard.mjs',
+    'LICENSE', 'THIRD_PARTY_NOTICES.md',
     'packages/codex-runtime/package.json', 'packages/codex-runtime/lib/index.js', 'packages/codex-runtime/lib/store.js', 'packages/codex-runtime/LICENSE']) {
     assert(members.get(required) > 0, `Package is missing nonempty ${required}`);
   }
