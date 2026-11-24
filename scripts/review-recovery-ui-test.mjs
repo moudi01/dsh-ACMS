@@ -21,6 +21,8 @@ const goalReview = store.put('tasks', { id: 'task_cancelled_goal_review', goalId
 const browser = await chromium.launch({ channel: 'chrome', headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, colorScheme: 'light' });
 const errors = []; page.on('pageerror', error => errors.push(error.message));
+const modelRequests = [];
+page.on('request', request => { if (/model-(check|details)/.test(request.url())) modelRequests.push(request.url()); });
 await mkdir('test-results/ui', { recursive: true });
 try {
   await page.goto(server.url);
@@ -33,6 +35,7 @@ try {
   await expect(goalDrawer.getByLabel('最终审查状态')).toContainText('误操作取消');
   await expect(goalDrawer.getByLabel('最终审查状态')).toContainText('所有者');
   await expect(goalDrawer.getByRole('button', { name: '重新发起最终审查' })).toBeVisible();
+  await expect(goalDrawer.getByLabel('允许这次低风险审查比较等价模型费率')).toHaveCount(0);
   const beforeGoalReviews = store.list('tasks').filter(item => item.kind === 'review' && item.reviewScope === 'goal').length;
   await goalDrawer.getByRole('button', { name: '重新发起最终审查' }).click();
   await expect.poll(() => store.list('tasks').filter(item => item.kind === 'review' && item.reviewScope === 'goal' && item.status === 'ready').length).toBe(1);
@@ -47,10 +50,35 @@ try {
   await expect(taskDrawer).toContainText('审查记录（1）');
   await expect(taskDrawer).toContainText('重复请求，已取消');
   await expect(taskDrawer.getByRole('button', { name: '重新发起审查' })).toBeVisible();
+  const compareRates = taskDrawer.getByRole('checkbox', { name: '允许这次低风险审查比较等价模型费率' });
+  await expect(compareRates).toBeVisible();
+  await expect(compareRates).not.toBeChecked();
+  await compareRates.check();
+  store.transaction(() => {
+    const source = store.require('tasks', task.id);
+    store.put('tasks', { ...source, title: '已交付任务（第二版）', artifactHash: 'hash-task-v2', deliveryGeneration: 2 });
+    store.event('task.changed', task.id, { fields: ['title', 'artifactHash', 'deliveryGeneration'] }, OWNER);
+  });
+  await expect(taskDrawer.getByRole('heading', { name: '已交付任务（第二版）', exact: true })).toBeVisible();
+  await expect(compareRates).not.toBeChecked();
+  await taskDrawer.getByRole('button', { name: '添加审查', exact: true }).click();
+  const latestReadyReview = () => store.list('tasks').find(item => item.reviewOf === task.id && item.status === 'ready');
+  await expect.poll(() => latestReadyReview()?.reviewArtifactHash).toBe('hash-task-v2');
+  const defaultReview = latestReadyReview();
+  expect(defaultReview.costRouting).toBeUndefined();
+  command('task.cancel', { id: defaultReview.id });
+  await expect(taskDrawer.getByRole('button', { name: '重新发起审查' })).toBeVisible();
+  await expect(compareRates).not.toBeChecked();
+  await compareRates.check();
   const beforeTaskReviews = store.list('tasks').filter(item => item.kind === 'review' && item.reviewOf === task.id).length;
   await taskDrawer.getByRole('button', { name: '重新发起审查' }).click();
   await expect.poll(() => store.list('tasks').filter(item => item.kind === 'review' && item.reviewOf === task.id && item.status === 'ready').length).toBe(1);
   expect(store.list('tasks').filter(item => item.kind === 'review' && item.reviewOf === task.id).length).toBe(beforeTaskReviews + 1);
+  const activeTaskReview = store.list('tasks').find(item => item.reviewOf === task.id && item.status === 'ready');
+  expect(activeTaskReview.costRouting).toBe(true);
+  expect(activeTaskReview.reviewArtifactHash).toBe('hash-task-v2');
+  expect(activeTaskReview.reviewedTaskGeneration).toBe(2);
+  await expect(compareRates).toHaveCount(0);
   expect(store.require('tasks', task.id).status).toBe('succeeded');
   expect(store.require('tasks', taskReview.id).status).toBe('cancelled');
   expect(store.require('tasks', goalReview.id).status).toBe('cancelled');
@@ -71,8 +99,9 @@ try {
   await expect(waitingReview.getByRole('button', { name: '发起最终审查' })).toBeDisabled();
   expect(store.require('tasks', delivered.id).status).toBe('succeeded');
   expect(server.adapter.calls.length).toBe(0);
+  expect(modelRequests).toEqual([]);
   expect(errors).toEqual([]);
-  const report = { passed: true, checked: ['cancelled goal review state and rebuild entry', 'cancelled task review state and rebuild entry', 'delivered work unchanged', 'duplicate rebuild avoided while one review is active', 'goal review explains capacity and where to adjust it', 'zero model calls'], goalId: goal.id, taskId: task.id };
+  const report = { passed: true, checked: ['cancelled goal review state and rebuild entry', 'cancelled task review state and rebuild entry', 'rate opt-in resets when the displayed delivery changes and can be reconfirmed', 'delivered work unchanged', 'goal review explains capacity and where to adjust it', 'zero model calls or model inspection requests'], goalId: goal.id, taskId: task.id };
   await writeFile('test-results/ui/review-recovery-report.json', JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {
