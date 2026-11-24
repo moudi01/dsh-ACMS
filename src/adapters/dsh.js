@@ -216,6 +216,7 @@ export class DshAdapter {
   async select(agent, { ignoreHealth = false, requirements, task } = {}) {
     const costRouting = task?.costRouting === true ? {
       kind: task.kind, defaultFingerprint: this.costDefaultFingerprint(),
+      reviewScope: task.origin?.kind === 'owner-review-request' && task.reviewOf ? task.reviewScope : null,
       read: () => readModelCostRates(this.dataDir), previous: () => this.previousTaskRoute(task, agent),
       available: route => this.healthFor(route).status !== 'unavailable',
       allowsComparison: route => this.independentNativeRoute(route),

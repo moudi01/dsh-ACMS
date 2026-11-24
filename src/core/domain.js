@@ -517,7 +517,12 @@ export class Company {
   }
   reviewRequest(args, actor) {
     this.owner(actor);
-    if (args.scope === 'goal' || args.goalId) {
+    const goalReview = args.scope === 'goal' || args.goalId;
+    if (args.costRouting !== undefined) {
+      assert(actor.kind === 'owner', 'OWNER_REQUIRED', '只有所有者可为审查启用费率比较。');
+      assert(!goalReview && typeof args.costRouting === 'boolean', 'INVALID_INPUT', '审查费率比较仅适用于手动发起的单任务审查。');
+    }
+    if (goalReview) {
       const goalId = args.goalId ?? args.id;
       const goal = this.store.require('goals', goalId);
       assertGoalOpen(goal);
@@ -544,15 +549,18 @@ export class Company {
       matchesTaskReview(task, source) && task.status !== 'deleted');
     const existing = this.existingReviewRequest(reviews, source.goalId, actor, { sourceTaskId: source.id, artifactHash: source.artifactHash });
     if (existing) return existing;
-    const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);    const review = this.createTask({
+    const reviewer = this.reviewerFor(source.goalId, source.lastAuthorId);
+    const review = this.createTask({
       goalId: source.goalId, kind: 'review', title: `审查：${source.title}`,
       description: '审查已交付成果。只核对交付物、自动检查结果和验收标准，不评价工作过程。',
       acceptance: source.acceptance, parentId: source.id, reviewOf: source.id,
       reviewArtifactHash: source.artifactHash, reviewedTaskGeneration: deliveryGeneration(source), reviewedContractVersion: taskContractVersion(source), agentId: reviewer.id, requiresArtifacts: false,
       reviewScope: 'task', origin: { kind: 'owner-review-request', decidedBy: null, createdBy: actor.kind, basis: '用户添加审查' },
     }, SYSTEM, { trustedOrigin: true });
-    this.store.event('review.requested', review.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, reviewerId: reviewer.id }, actor, { goalId: source.goalId });
-    return review;
+    const costChoice = args.costRouting === true ? { costRouting: true } : {};
+    const requested = costChoice.costRouting ? this.store.put('tasks', { ...review, ...costChoice }) : review;
+    this.store.event('review.requested', review.id, { sourceTaskId: source.id, artifactHash: source.artifactHash, reviewerId: reviewer.id, ...costChoice }, actor, { goalId: source.goalId });
+    return requested;
   }
   editTask(args, actor) {
     const task = this.store.require('tasks', args.id); assert(task.kind !== 'review', 'SYSTEM_TASK', '审查任务使用执行任务的固定验收合同，请编辑对应执行任务');

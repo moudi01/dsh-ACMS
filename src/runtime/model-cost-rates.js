@@ -24,20 +24,21 @@ function normalizeSheet(value) {
   if (value.expiresAt !== iso && value.expiresAt !== iso.replace('.000Z', 'Z')) return null;
   const seen = new Set(), ids = new Set(), groups = [];
   for (const group of value.groups) {
-    const { id, provider, llmProvider, reasoningEffort, models } = group ?? {};
+    const { id, scope = 'work', provider, llmProvider, reasoningEffort, models } = group ?? {};
     if (!boundedText(id, 80) || ids.has(id) || !boundedText(provider, 200) || !boundedText(llmProvider, 200) ||
+        !['work', 'task-review'].includes(scope) ||
         !boundedText(reasoningEffort, 80) || !Array.isArray(models) || models.length < 2 || models.length > 16) return null;
     ids.add(id);
     const prices = new Map();
     for (const entry of models) {
       const rates = normalizeRates(entry?.rates);
       if (!boundedText(entry?.model, 200) || rates === undefined) return null;
-      const key = JSON.stringify([provider, llmProvider, reasoningEffort, entry.model]);
+      const key = JSON.stringify([scope, provider, llmProvider, reasoningEffort, entry.model]);
       if (seen.has(key)) return null;
       seen.add(key);
       prices.set(entry.model, rates);
     }
-    groups.push({ id, provider, llmProvider, reasoningEffort, prices });
+    groups.push({ id, scope, provider, llmProvider, reasoningEffort, prices });
   }
   return { source: value.source, unit: value.unit, expiresAt: value.expiresAt, groups, expiry };
 }

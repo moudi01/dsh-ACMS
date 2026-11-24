@@ -10,11 +10,14 @@ const lower = (a, b) => noHigher(a, b) && !noHigher(b, a);
 export function chooseCostRoute({ baseline, eligible, binding, requirements, context }) {
   const unchanged = (reason, evidence = {}) => ({ candidate: baseline, evidence: { reason, ...evidence } });
   if (binding.mode !== 'default') return unchanged('binding-or-preference');
-  if (context.kind !== 'work' || requirements.continuity !== 'none' || requirements.isolation ||
+  const taskReview = context.kind === 'review' && context.reviewScope === 'task';
+  const supportedTask = taskReview ? requirements.isolation === 'independent-review' : context.kind === 'work' && !requirements.isolation;
+  if (!supportedTask || requirements.continuity !== 'none' ||
       requirements.inheritsParentContext === true || requirements.model || requirements.provider ||
       requirements.llmProvider || requirements.reasoningEffort || !supportsComparison(baseline) ||
       !context.allowsComparison(baseline)) return unchanged('protected-task');
-  const defaults = { defaultFingerprint: context.defaultFingerprint };
+  const scope = taskReview ? 'task-review' : 'work';
+  const defaults = { defaultFingerprint: context.defaultFingerprint, scope };
   if (!baseline.reasoningEffort) return unchanged('unknown-depth', defaults);
 
   const previous = context.previous();
@@ -31,7 +34,7 @@ export function chooseCostRoute({ baseline, eligible, binding, requirements, con
   const observation = { ...defaults, sourceState: sheet.state, sourceFingerprint: sheet.fingerprint ?? null,
     source: sheet.source ?? null, unit: sheet.unit ?? null, expiresAt: sheet.expiresAt ?? null };
   if (sheet.state !== 'ready') return unchanged('rates-unavailable', observation);
-  const group = sheet.groups.find(group => group.provider === baseline.provider && group.llmProvider === baseline.llmProvider &&
+  const group = sheet.groups.find(group => group.scope === scope && group.provider === baseline.provider && group.llmProvider === baseline.llmProvider &&
     group.reasoningEffort === baseline.reasoningEffort && group.prices.has(baseline.model));
   if (!group || !context.available(baseline)) return unchanged('unpriced-default', observation);
   const peers = eligible.filter(candidate => sameCohort(candidate, baseline) && context.available(candidate) && group.prices.has(candidate.model));
